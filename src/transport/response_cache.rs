@@ -105,6 +105,24 @@ impl CacheKey {
             representation: representation.finalize().into(),
         }
     }
+
+    fn audit_fingerprint(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut digest = Sha256::new();
+        digest.update(self.vendor.as_bytes());
+        digest.update([0]);
+        digest.update(self.url.as_bytes());
+        digest.update([0]);
+        digest.update(self.identity);
+        digest.update(self.representation);
+        let digest = digest.finalize();
+        let mut fingerprint = String::with_capacity(16);
+        for byte in &digest[..8] {
+            let _ = write!(fingerprint, "{byte:02x}");
+        }
+        fingerprint
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -126,6 +144,10 @@ struct Entry {
     bytes: StoredBytes,
     stored_bytes: usize,
     expires_at: Instant,
+    stored_at: Instant,
+    ttl: Duration,
+    response_bytes: usize,
+    upstream_latency_ms: u128,
     last_used: u64,
 }
 
@@ -148,6 +170,8 @@ struct Cache {
     entries: HashMap<CacheKey, Entry>,
     stored_bytes: usize,
     clock: u64,
+    hits: u64,
+    misses: u64,
 }
 
 fn cache() -> &'static Mutex<Cache> {
@@ -179,24 +203,97 @@ pub(super) fn request_is_cacheable(
 }
 
 pub(super) fn get(key: &CacheKey) -> Option<ResponseBody> {
+    let fingerprint = key.audit_fingerprint();
     let mut cache = cache().lock().ok()?;
     let now = Instant::now();
-    if cache
+    let expired = cache
         .entries
         .get(key)
-        .is_some_and(|entry| entry.expires_at <= now)
-    {
+        .is_some_and(|entry| entry.expires_at <= now);
+    let mut reason = "not_found";
+    let mut ttl_ms = None;
+    let mut age_ms = None;
+    let mut remaining_ttl_ms = None;
+    let mut upstream_latency_ms = None;
+    let mut response_bytes = None;
+    let mut entry_bytes = None;
+    let mut compressed = None;
+    if expired {
+        if let Some(entry) = cache.entries.get(key) {
+            reason = "expired";
+            ttl_ms = Some(entry.ttl.as_millis());
+            age_ms = Some(now.saturating_duration_since(entry.stored_at).as_millis());
+            remaining_ttl_ms = Some(0);
+            upstream_latency_ms = Some(entry.upstream_latency_ms);
+            response_bytes = Some(entry.response_bytes);
+            entry_bytes = Some(entry.stored_bytes);
+            compressed = Some(matches!(&entry.bytes, StoredBytes::Zstd(_)));
+        }
         remove(&mut cache, key);
-        return None;
     }
     cache.clock = cache.clock.wrapping_add(1);
     let tick = cache.clock;
-    let entry = cache.entries.get_mut(key)?;
-    entry.last_used = tick;
-    entry.decode()
+    let result = cache.entries.get_mut(key).and_then(|entry| {
+        entry.last_used = tick;
+        reason = "reused";
+        ttl_ms = Some(entry.ttl.as_millis());
+        age_ms = Some(now.saturating_duration_since(entry.stored_at).as_millis());
+        remaining_ttl_ms = Some(entry.expires_at.saturating_duration_since(now).as_millis());
+        upstream_latency_ms = Some(entry.upstream_latency_ms);
+        response_bytes = Some(entry.response_bytes);
+        entry_bytes = Some(entry.stored_bytes);
+        compressed = Some(matches!(&entry.bytes, StoredBytes::Zstd(_)));
+        entry.decode()
+    });
+    let outcome = if result.is_some() {
+        cache.hits = cache.hits.saturating_add(1);
+        "hit"
+    } else {
+        if reason == "reused" {
+            reason = "decode_failed";
+        }
+        cache.misses = cache.misses.saturating_add(1);
+        "miss"
+    };
+    let (hits, misses, entries, stored_bytes) = (
+        cache.hits,
+        cache.misses,
+        cache.entries.len(),
+        cache.stored_bytes,
+    );
+    drop(cache);
+    crate::audit::cache_event(crate::audit::CacheEvent {
+        timestamp: String::new(),
+        event: "http_cache_lookup",
+        session_id: "",
+        process_id: 0,
+        vendor: &key.vendor,
+        cache_key: &fingerprint,
+        outcome,
+        reason: Some(reason),
+        action: None,
+        ttl_ms,
+        age_ms,
+        remaining_ttl_ms,
+        upstream_latency_ms,
+        response_bytes,
+        entry_bytes,
+        compressed,
+        cumulative_hits: hits,
+        cumulative_misses: misses,
+        entries,
+        cache_bytes: stored_bytes,
+    });
+    result
 }
 
-pub(super) fn store(key: CacheKey, body: &ResponseBody, headers: &HeaderMap, config: &CacheConfig) {
+pub(super) fn store(
+    key: CacheKey,
+    body: &ResponseBody,
+    headers: &HeaderMap,
+    config: &CacheConfig,
+    upstream_latency: Duration,
+) {
     if headers.contains_key(SET_COOKIE)
         && !key
             .url
@@ -230,6 +327,10 @@ pub(super) fn store(key: CacheKey, body: &ResponseBody, headers: &HeaderMap, con
     let stored_bytes = match &bytes {
         StoredBytes::Plain(bytes) | StoredBytes::Zstd(bytes) => bytes.len(),
     };
+    let compressed = matches!(&bytes, StoredBytes::Zstd(_));
+    let response_bytes = plain_len(body);
+    let fingerprint = key.audit_fingerprint();
+    let vendor = key.vendor.clone();
     let mut cache = match cache().lock() {
         Ok(cache) => cache,
         Err(error) => {
@@ -240,6 +341,7 @@ pub(super) fn store(key: CacheKey, body: &ResponseBody, headers: &HeaderMap, con
     remove(&mut cache, &key);
     cache.clock = cache.clock.wrapping_add(1);
     let tick = cache.clock;
+    let now = Instant::now();
     cache.stored_bytes += stored_bytes;
     cache.entries.insert(
         key,
@@ -247,11 +349,52 @@ pub(super) fn store(key: CacheKey, body: &ResponseBody, headers: &HeaderMap, con
             kind,
             bytes,
             stored_bytes,
-            expires_at: Instant::now() + ttl,
+            expires_at: now + ttl,
+            stored_at: now,
+            ttl,
+            response_bytes,
+            upstream_latency_ms: upstream_latency.as_millis(),
             last_used: tick,
         },
     );
     evict(&mut cache, config);
+    let (hits, misses, entries, cache_bytes) = (
+        cache.hits,
+        cache.misses,
+        cache.entries.len(),
+        cache.stored_bytes,
+    );
+    drop(cache);
+    crate::audit::cache_event(crate::audit::CacheEvent {
+        timestamp: String::new(),
+        event: "http_cache_decision",
+        session_id: "",
+        process_id: 0,
+        vendor: &vendor,
+        cache_key: &fingerprint,
+        outcome: "stored",
+        reason: Some("cacheable_success"),
+        action: Some("admit"),
+        ttl_ms: Some(ttl.as_millis()),
+        age_ms: Some(0),
+        remaining_ttl_ms: Some(ttl.as_millis()),
+        upstream_latency_ms: Some(upstream_latency.as_millis()),
+        response_bytes: Some(response_bytes),
+        entry_bytes: Some(stored_bytes),
+        compressed: Some(compressed),
+        cumulative_hits: hits,
+        cumulative_misses: misses,
+        entries,
+        cache_bytes,
+    });
+}
+
+fn plain_len(body: &ResponseBody) -> usize {
+    match body {
+        ResponseBody::Json(value) => serde_json::to_vec(value).map_or(0, |bytes| bytes.len()),
+        ResponseBody::Text(text) => text.len(),
+        ResponseBody::Empty => 0,
+    }
 }
 
 pub(super) fn invalidate_namespace(vendor: &str, base_url: &str) {

@@ -85,6 +85,24 @@ Common settings:
 | NinjaOne | `NINJAONE_URL` or `NINJAONE_SERVERS`, plus one supported credential set |
 | WRDS | `WRDS_USERNAME`, `WRDS_PASSWORD`; host, port, and database have cloud defaults |
 
+Every MCP tool call is also written to a structured audit log under
+`~/.mcp/data`. Audit files are JSONL and contain the tool name, request/client
+identity, outcome, duration, and HTTP-cache hit/miss counters, but never
+arguments, credentials, URLs, cache contents, or response content. Cache keys
+are represented by short one-way fingerprints so repeated lookups can be
+correlated safely. Cache events also include the admission action, TTL, age,
+remaining TTL, response and stored sizes, compression state, upstream latency,
+and cumulative hit/miss totals. Those observations are suitable for evaluating
+future cache-admission or TTL bandits offline. Each process keeps at most five
+10 MiB segments by default and prunes
+prior-session audit data after 30 days or when it exceeds 100 MiB. Configure
+this with `AUDIT_LOG_MAX_BYTES`, `AUDIT_LOG_MAX_FILES`,
+`AUDIT_LOG_RETENTION_DAYS`, and `AUDIT_LOG_RETENTION_MAX_BYTES`; set
+`AUDIT_LOG=off` to disable it explicitly. Audit logging is independent of
+`RUST_LOG` and `LOG_STDERR`; file writes, flushes, retention, and rotation run
+off the request path on background workers, and clean shutdown drains queued
+records.
+
 Example `.env` for Atlassian:
 
 ```dotenv

@@ -8,7 +8,7 @@
 
 use std::process::ExitCode;
 
-use mcp_server_devtools::{cli, logger, server, transport::raw_response};
+use mcp_server_devtools::{audit, cli, logger, server, transport::raw_response};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -39,5 +39,6 @@ async fn main() -> ExitCode {
         }
     };
     raw_response::shutdown_and_cleanup().await;
+    audit::shutdown();
     exit
 }

@@ -1387,7 +1387,7 @@ pub async fn fetch(
         && cache_config.enabled
         && response_cache::request_is_cacheable(&url, &auth_name, &options)
     {
-        response_cache::store(cache_key, &body, &response_headers, &cache_config);
+        response_cache::store(cache_key, &body, &response_headers, &cache_config, duration);
     }
 
     let raw_path = if let ResponseBody::Json(value) = &body {

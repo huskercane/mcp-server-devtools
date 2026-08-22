@@ -35,8 +35,8 @@ use rmcp::{
     ErrorData as RmcpError, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, ContentBlock as Content, Implementation, ProtocolVersion,
-        ServerCapabilities, ServerInfo,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock as Content,
+        Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
     },
     tool, tool_handler, tool_router,
 };
@@ -1435,6 +1435,33 @@ impl DevtoolsServer {
 
 #[tool_handler]
 impl ServerHandler for DevtoolsServer {
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResponse, RmcpError> {
+        let client = context.client_info();
+        let audit = crate::audit::AuditCall::start(
+            request.name.as_ref(),
+            context.id.to_string(),
+            client.as_ref().map(|value| value.name.clone()),
+            client.as_ref().map(|value| value.version.clone()),
+        );
+        let tool_context =
+            rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let result = self.tool_router.call(tool_context).await;
+        let outcome = match &result {
+            Ok(CallToolResponse::Complete(value)) if value.is_error == Some(true) => "error",
+            Ok(CallToolResponse::Complete(_)) => "success",
+            Ok(CallToolResponse::InputRequired(_)) => "input_required",
+            Ok(CallToolResponse::Task(_)) => "task_created",
+            Ok(_) => "other",
+            Err(_) => "protocol_error",
+        };
+        audit.complete(outcome);
+        result
+    }
+
     async fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,

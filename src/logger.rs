@@ -133,6 +133,7 @@ pub fn init() -> PathBuf {
         .init();
 
     let _ = LOG_PATH.set(log_path.clone());
+    crate::audit::init(&log_dir, &session_id);
 
     let dir_for_sweep = log_dir.clone();
     let keep = log_path.clone();
@@ -336,7 +337,7 @@ fn sweep_retention(
 // --- Time helpers -----------------------------------------------------------
 
 #[allow(clippy::many_single_char_names)]
-fn iso_timestamp() -> String {
+pub(crate) fn iso_timestamp() -> String {
     let now = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
