@@ -353,6 +353,7 @@ async fn send(client: &Client, url: &str, body: &Value, step: &str) -> Result<St
         body = %sanitized_http_json(body),
         "ninjaone HTTP request"
     );
+    let call = crate::transport::HttpCallLog::new("ninjaone-session", "POST", url);
     let response = client
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -361,6 +362,7 @@ async fn send(client: &Client, url: &str, body: &Value, step: &str) -> Result<St
         .send()
         .await
         .map_err(|error| {
+            crate::transport::log_http_transport_failure(call, &error, false);
             api_error(
                 format!("NinjaOne {step} request failed: {error}"),
                 None,
@@ -382,6 +384,7 @@ async fn send(client: &Client, url: &str, body: &Value, step: &str) -> Result<St
     if status.is_success() {
         Ok(text)
     } else {
+        crate::transport::log_http_status_failure(call, status, false);
         Err(step_error(step, status, &text))
     }
 }

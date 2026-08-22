@@ -233,13 +233,15 @@ async fn resolve_analysis_id(
         .map_err(|err| api_error(format!("Invalid SonarQube ce/task URL: {err}"), None, None))?;
     url.query_pairs_mut().append_pair("id", ce_task_id);
 
+    let call = crate::transport::HttpCallLog::new("sonarqube", "GET", url.as_str());
     let response = ctx
         .client
-        .get(url)
+        .get(url.clone())
         .bearer_auth(token)
         .send()
         .await
         .map_err(|err| {
+            crate::transport::log_http_transport_failure(call, &err, false);
             api_error(
                 format!("SonarQube ce/task request failed: {err}"),
                 None,
@@ -250,6 +252,7 @@ async fn resolve_analysis_id(
     let body_text = response.text().await.unwrap_or_default();
 
     if !status.is_success() {
+        crate::transport::log_http_status_failure(call, status, false);
         return Err(error::classify(status, &body_text));
     }
 

@@ -274,7 +274,9 @@ async fn fetch_build_details(
     .map_err(|err| api_error(format!("Invalid CircleCI log API URL: {err}"), None, None))?;
     url.query_pairs_mut().append_pair("circle-token", token);
 
-    let response = ctx.client.get(url).send().await.map_err(|err| {
+    let call = crate::transport::HttpCallLog::new("circleci", "GET", url.as_str());
+    let response = ctx.client.get(url.clone()).send().await.map_err(|err| {
+        crate::transport::log_http_transport_failure(call, &err, false);
         api_error(
             format!("CircleCI log API request failed: {err}"),
             None,
@@ -285,6 +287,7 @@ async fn fetch_build_details(
     let body_text = response.text().await.unwrap_or_default();
 
     if !status.is_success() {
+        crate::transport::log_http_status_failure(call, status, false);
         return Err(error::classify(status, &body_text));
     }
 

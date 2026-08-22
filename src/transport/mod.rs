@@ -35,7 +35,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::TryStreamExt as _;
 use reqwest::header::{
@@ -46,7 +46,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, BufReader};
 use tokio_util::io::StreamReader;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::auth::Credentials;
 use crate::config::Config;
@@ -54,6 +54,146 @@ use crate::constants::{data_limits::MAX_RESPONSE_SIZE, network_timeouts::DEFAULT
 use crate::error::{McpError, OriginalError, api_error, auth_invalid, unexpected};
 use crate::vendor::Vendor;
 use crate::vendor::bitbucket::BitbucketVendor;
+
+fn sanitized_log_url(url: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return "<unparseable-url>".to_owned();
+    };
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.into()
+}
+
+fn elapsed_millis(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn bytes_per_second(bytes: u64, elapsed: Duration) -> u64 {
+    let nanos = elapsed.as_nanos().max(1);
+    let rate = u128::from(bytes)
+        .saturating_mul(1_000_000_000)
+        .checked_div(nanos)
+        .unwrap_or(0);
+    u64::try_from(rate).unwrap_or(u64::MAX)
+}
+
+fn reqwest_error_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_request() {
+        "request"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else {
+        "other"
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HttpCallLog<'a> {
+    component: &'a str,
+    method: &'a str,
+    url: &'a str,
+    started: Instant,
+    attempt: usize,
+    max_attempts: usize,
+}
+
+impl<'a> HttpCallLog<'a> {
+    pub(crate) fn new(component: &'a str, method: &'a str, url: &'a str) -> Self {
+        Self {
+            component,
+            method,
+            url,
+            started: Instant::now(),
+            attempt: 1,
+            max_attempts: 1,
+        }
+    }
+
+    fn for_attempt(mut self, attempt: usize, max_attempts: usize) -> Self {
+        self.started = Instant::now();
+        self.attempt = attempt;
+        self.max_attempts = max_attempts;
+        self
+    }
+}
+
+pub(crate) fn log_http_transport_failure(
+    call: HttpCallLog<'_>,
+    error: &reqwest::Error,
+    will_retry: bool,
+) {
+    warn!(
+        component = call.component,
+        method = call.method,
+        url = %sanitized_log_url(call.url),
+        error_kind = reqwest_error_kind(error),
+        elapsed_ms = elapsed_millis(call.started.elapsed()),
+        attempt = call.attempt,
+        max_attempts = call.max_attempts,
+        will_retry,
+        "outbound HTTP call failed"
+    );
+}
+
+pub(crate) fn log_http_status_failure(call: HttpCallLog<'_>, status: StatusCode, will_retry: bool) {
+    warn!(
+        component = call.component,
+        method = call.method,
+        url = %sanitized_log_url(call.url),
+        status = status.as_u16(),
+        elapsed_ms = elapsed_millis(call.started.elapsed()),
+        attempt = call.attempt,
+        max_attempts = call.max_attempts,
+        will_retry,
+        "outbound HTTP call returned a non-success status"
+    );
+}
+
+fn log_http_timeout_failure(call: HttpCallLog<'_>, will_retry: bool) {
+    warn!(
+        component = call.component,
+        method = call.method,
+        url = %sanitized_log_url(call.url),
+        error_kind = "deadline",
+        elapsed_ms = elapsed_millis(call.started.elapsed()),
+        attempt = call.attempt,
+        max_attempts = call.max_attempts,
+        will_retry,
+        "outbound HTTP call failed"
+    );
+}
+
+fn log_streamed_download(
+    component: &str,
+    method: &str,
+    url: &str,
+    filename_prefix: &str,
+    artifact: &raw_response::StreamedArtifact,
+    elapsed: Duration,
+    attempts: usize,
+) {
+    info!(
+        component,
+        method,
+        url = %sanitized_log_url(url),
+        filename_prefix,
+        encoded_bytes = artifact.encoded_bytes,
+        decoded_bytes = artifact.decoded_bytes,
+        elapsed_ms = elapsed_millis(elapsed),
+        encoded_bytes_per_second = bytes_per_second(artifact.encoded_bytes, elapsed),
+        decoded_bytes_per_second = bytes_per_second(artifact.decoded_bytes, elapsed),
+        attempts,
+        "completed streamed log download"
+    );
+}
 
 /// Stream a successful upstream body directly into an atomic artifact. The
 /// byte ceiling is checked for every decoded chunk, so transfer-encoded
@@ -673,6 +813,34 @@ impl StreamingAggregateQuota {
 }
 
 #[cfg(test)]
+mod http_observability_tests {
+    use std::time::Duration;
+
+    use super::{bytes_per_second, sanitized_log_url};
+
+    #[test]
+    fn logged_urls_remove_credentials_queries_and_fragments() {
+        assert_eq!(
+            sanitized_log_url(
+                "https://operator:password@example.com/log/output?circle-token=secret#fragment"
+            ),
+            "https://example.com/log/output"
+        );
+        assert_eq!(sanitized_log_url("not a URL"), "<unparseable-url>");
+    }
+
+    #[test]
+    fn transfer_rate_uses_checked_saturating_arithmetic() {
+        assert_eq!(bytes_per_second(1_000, Duration::from_secs(2)), 500);
+        assert_eq!(bytes_per_second(1, Duration::ZERO), 1_000_000_000);
+        assert_eq!(
+            bytes_per_second(u64::MAX, Duration::from_nanos(1)),
+            u64::MAX
+        );
+    }
+}
+
+#[cfg(test)]
 mod aggregate_quota_tests {
     use std::sync::Arc;
     use std::time::Duration;
@@ -872,6 +1040,7 @@ pub async fn fetch_streamed_artifact_with_policy(
     let client = streaming_client()?;
     let attempts = policy.max_attempts.max(1);
     let deadline = tokio::time::Instant::now() + policy.total_deadline;
+    let download_started = Instant::now();
     for attempt in 1..=attempts {
         if policy.cancellation.is_cancelled() {
             return Err(api_error("streaming request cancelled", Some(499), None));
@@ -886,19 +1055,37 @@ pub async fn fetch_streamed_artifact_with_policy(
             &options,
             remaining,
         );
+        let call =
+            HttpCallLog::new(vendor.name(), method.as_str(), &url).for_attempt(attempt, attempts);
         let response = tokio::select! {
             () = policy.cancellation.cancelled() => return Err(api_error("streaming request cancelled", Some(499), None)),
             result = tokio::time::timeout(remaining, request.send()) => match result {
                 Ok(Ok(response)) => response,
-                Ok(Err(error)) if attempt < attempts && (error.is_connect() || error.is_timeout()) => { retry_stream_attempt(attempt, &policy, deadline).await?; continue; }
-                Ok(Err(error)) => return Err(map_reqwest_error(&error, &url)),
-                Err(_) if attempt < attempts => { retry_stream_attempt(attempt, &policy, deadline).await?; continue; }
-                Err(_) => return Err(api_error("streaming request exceeded total deadline", Some(408), None)),
+                Ok(Err(error)) if attempt < attempts && (error.is_connect() || error.is_timeout()) => {
+                    log_http_transport_failure(call, &error, true);
+                    retry_stream_attempt(attempt, &policy, deadline).await?;
+                    continue;
+                }
+                Ok(Err(error)) => {
+                    log_http_transport_failure(call, &error, false);
+                    return Err(map_reqwest_error(&error, &url));
+                }
+                Err(_) if attempt < attempts => {
+                    log_http_timeout_failure(call, true);
+                    retry_stream_attempt(attempt, &policy, deadline).await?;
+                    continue;
+                }
+                Err(_) => {
+                    log_http_timeout_failure(call, false);
+                    return Err(api_error("streaming request exceeded total deadline", Some(408), None));
+                }
             }
         };
         let status = response.status();
         if !status.is_success() {
-            if attempt < attempts && matches!(status.as_u16(), 429 | 502 | 503 | 504) {
+            let will_retry = attempt < attempts && matches!(status.as_u16(), 429 | 502 | 503 | 504);
+            log_http_status_failure(call, status, will_retry);
+            if will_retry {
                 retry_stream_attempt(attempt, &policy, deadline).await?;
                 continue;
             }
@@ -915,12 +1102,22 @@ pub async fn fetch_streamed_artifact_with_policy(
                 None,
             ));
         }
-        return tokio::time::timeout(
+        let artifact = tokio::time::timeout(
             remaining_until(deadline)?,
             persist_decoded_response(response, filename_prefix, extension, content_type, &policy),
         )
         .await
-        .map_err(|_| api_error("streaming request exceeded total deadline", Some(408), None))?;
+        .map_err(|_| api_error("streaming request exceeded total deadline", Some(408), None))??;
+        log_streamed_download(
+            vendor.name(),
+            method.as_str(),
+            &url,
+            filename_prefix,
+            &artifact,
+            download_started.elapsed(),
+            attempt,
+        );
+        return Ok(artifact);
     }
     unreachable!("bounded streaming retry loop returns")
 }
@@ -1078,21 +1275,40 @@ pub async fn fetch_streamed_url(
 ) -> Result<raw_response::StreamedArtifact, McpError> {
     let client = streaming_client()?;
     let deadline = tokio::time::Instant::now() + policy.total_deadline;
-    for attempt in 1..=policy.max_attempts.max(1) {
+    let attempts = policy.max_attempts.max(1);
+    let download_started = Instant::now();
+    for attempt in 1..=attempts {
         let remaining = remaining_until(deadline)?;
+        let call = HttpCallLog::new("streaming-url", "GET", url).for_attempt(attempt, attempts);
         let response = tokio::select! {
             () = policy.cancellation.cancelled() => return Err(api_error("streaming request cancelled", Some(499), None)),
             result = tokio::time::timeout(remaining, client.get(url).timeout(remaining).send()) => match result {
                 Ok(Ok(response)) => response,
-                Ok(Err(error)) if attempt < policy.max_attempts && (error.is_connect() || error.is_timeout()) => { retry_stream_attempt(attempt, &policy, deadline).await?; continue; }
-                Ok(Err(error)) => return Err(map_reqwest_error(&error, url)),
-                Err(_) if attempt < policy.max_attempts => { retry_stream_attempt(attempt, &policy, deadline).await?; continue; }
-                Err(_) => return Err(api_error("streaming request exceeded total deadline", Some(408), None)),
+                Ok(Err(error)) if attempt < attempts && (error.is_connect() || error.is_timeout()) => {
+                    log_http_transport_failure(call, &error, true);
+                    retry_stream_attempt(attempt, &policy, deadline).await?;
+                    continue;
+                }
+                Ok(Err(error)) => {
+                    log_http_transport_failure(call, &error, false);
+                    return Err(map_reqwest_error(&error, url));
+                }
+                Err(_) if attempt < attempts => {
+                    log_http_timeout_failure(call, true);
+                    retry_stream_attempt(attempt, &policy, deadline).await?;
+                    continue;
+                }
+                Err(_) => {
+                    log_http_timeout_failure(call, false);
+                    return Err(api_error("streaming request exceeded total deadline", Some(408), None));
+                }
             }
         };
         let status = response.status();
         if !status.is_success() {
-            if attempt < policy.max_attempts && matches!(status.as_u16(), 429 | 502 | 503 | 504) {
+            let will_retry = attempt < attempts && matches!(status.as_u16(), 429 | 502 | 503 | 504);
+            log_http_status_failure(call, status, will_retry);
+            if will_retry {
                 retry_stream_attempt(attempt, &policy, deadline).await?;
                 continue;
             }
@@ -1113,12 +1329,22 @@ pub async fn fetch_streamed_url(
                 None,
             ));
         }
-        return tokio::time::timeout(
+        let artifact = tokio::time::timeout(
             remaining_until(deadline)?,
             persist_decoded_response(response, filename_prefix, extension, content_type, &policy),
         )
         .await
-        .map_err(|_| api_error("streaming request exceeded total deadline", Some(408), None))?;
+        .map_err(|_| api_error("streaming request exceeded total deadline", Some(408), None))??;
+        log_streamed_download(
+            "streaming-url",
+            "GET",
+            url,
+            filename_prefix,
+            &artifact,
+            download_started.elapsed(),
+            attempt,
+        );
+        return Ok(artifact);
     }
     unreachable!("bounded streaming retry loop returns")
 }
@@ -1355,13 +1581,20 @@ pub async fn fetch(
     );
     log_ninjaone_request(vendor.name(), &url, method, request_body_for_log.as_ref());
 
-    let start = std::time::Instant::now();
-    let response = req.send().await.map_err(|e| map_reqwest_error(&e, &url))?;
+    let call = HttpCallLog::new(vendor.name(), method.as_str(), &url);
+    let start = call.started;
+    let response = req.send().await.map_err(|error| {
+        log_http_transport_failure(call, &error, false);
+        map_reqwest_error(&error, &url)
+    })?;
     let duration = start.elapsed();
 
+    let status = response.status();
+    if !status.is_success() {
+        log_http_status_failure(call, status, false);
+    }
     enforce_content_length_cap(&response)?;
 
-    let status = response.status();
     let response_headers = response.headers().clone();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();

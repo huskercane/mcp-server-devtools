@@ -155,6 +155,7 @@ async fn exchange(
         .append_pair("grant_type", "account_credentials")
         .append_pair("account_id", &key.account_id)
         .finish();
+    let call = crate::transport::HttpCallLog::new("zoom-oauth", "POST", &key.token_url);
     let response = client
         .post(&key.token_url)
         .header("Authorization", format!("Basic {basic}"))
@@ -165,11 +166,15 @@ async fn exchange(
         .body(body)
         .send()
         .await
-        .map_err(|e| api_error(format!("Zoom OAuth token request failed: {e}"), None, None))?;
+        .map_err(|e| {
+            crate::transport::log_http_transport_failure(call, &e, false);
+            api_error(format!("Zoom OAuth token request failed: {e}"), None, None)
+        })?;
 
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
+        crate::transport::log_http_status_failure(call, status, false);
         return Err(classify_token_error(status, &body));
     }
 
