@@ -8,16 +8,16 @@
 
 use clap::Subcommand;
 
+use crate::bootstrap::CliRuntime;
 use crate::cli::api::{ReadOpts, WriteOpts, parse_object, parse_query_params};
 use crate::controllers::api::{
     BitbucketContext, ControllerResponse, HandleContext, handle_request,
 };
 use crate::controllers::handle_clone;
 use crate::error::McpError;
+use crate::shell::SystemCommandRunner;
 use crate::tools::args::CloneArgs;
-use crate::transport::{HttpMethod, build_client};
-use crate::vendor::bitbucket::BitbucketVendor;
-use crate::workspace::WorkspaceCache;
+use crate::transport::HttpMethod;
 
 /// Verbs exposed under `mcp-devtools bb …`.
 #[derive(Debug, Subcommand)]
@@ -61,18 +61,21 @@ pub struct CloneOpts {
 /// cache); the generic verbs use the vendor-neutral [`HandleContext`]
 /// since they go through `handle_request`.
 pub async fn dispatch(command: Command) -> Result<(), McpError> {
-    let config = crate::config::load();
-    let client = build_client()?;
-    let vendor = BitbucketVendor::new();
-    let cache = WorkspaceCache::new();
+    let runtime = CliRuntime::load()?;
+    let vendor = &runtime.vendors.bitbucket;
 
     let response = match command {
         Command::Clone(opts) => {
-            let ctx = BitbucketContext::new(&client, &config, &vendor, &cache);
+            let ctx = BitbucketContext::new(
+                &runtime.client,
+                &runtime.config,
+                vendor,
+                &runtime.workspace_cache,
+            );
             call_clone(&ctx, opts).await?
         }
         other => {
-            let ctx = HandleContext::new(&client, &config, &vendor);
+            let ctx = HandleContext::new(&runtime.client, &runtime.config, vendor);
             match other {
                 Command::Get(opts) => call_read(&ctx, HttpMethod::Get, opts).await?,
                 Command::Delete(opts) => call_read(&ctx, HttpMethod::Delete, opts).await?,
@@ -96,7 +99,7 @@ async fn call_clone(
         repo_slug: opts.repo_slug,
         target_path: opts.target_path,
     };
-    handle_clone(ctx, &args).await
+    handle_clone(ctx, &SystemCommandRunner, &args).await
 }
 
 async fn call_read(

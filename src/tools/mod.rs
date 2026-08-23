@@ -25,29 +25,44 @@
 //!   Same `ATLASSIAN_SITE_NAME`-derived base URL as Jira.
 
 pub mod args;
+mod prelude;
 
-use std::path::PathBuf;
-use std::sync::{Arc, RwLock, Weak};
-use std::time::Duration;
+mod artifact;
+mod bitbucket;
+mod circleci;
+mod confluence;
+mod edx;
+mod grafana;
+mod jira;
+mod newrelic;
+mod ninjaone;
+mod postman;
+mod slack;
+mod sonarqube;
+mod splunk;
+#[cfg(feature = "wrds")]
+mod wrds;
+mod zoom;
 
-use reqwest::Client;
+use std::sync::Arc;
+
 use rmcp::{
     ErrorData as RmcpError, ServerHandler,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::router::tool::ToolRouter,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock as Content,
         Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
     },
-    tool, tool_handler, tool_router,
+    tool_handler,
 };
 
+use crate::bootstrap::{Components, ServerBuilder};
 use crate::config::Config;
 use crate::constants::{PACKAGE_NAME, VERSION};
-use crate::controllers::api::{BitbucketContext, HandleContext, handle_read, handle_write};
+use crate::controllers::api::{BitbucketContext, HandleContext};
 use crate::controllers::circleci::CircleCiContext;
 use crate::controllers::edx::EdxContext;
 use crate::controllers::grafana::GrafanaContext;
-use crate::controllers::handle_clone;
 use crate::controllers::newrelic::NewRelicContext;
 use crate::controllers::ninjaone::NinjaOneContext;
 use crate::controllers::postman::PostmanContext;
@@ -59,38 +74,9 @@ use crate::controllers::wrds::WrdsContext;
 use crate::controllers::zoom::ZoomContext;
 use crate::error::format_error_for_mcp_tool;
 use crate::format::truncation::truncate_for_ai;
-use crate::transport::{HttpMethod, build_client};
-use crate::vendor::bitbucket::BitbucketVendor;
-use crate::vendor::circleci::CircleCiVendor;
-use crate::vendor::confluence::ConfluenceVendor;
-use crate::vendor::edx::EdxVendor;
-use crate::vendor::grafana::GrafanaVendor;
-use crate::vendor::jira::JiraVendor;
-use crate::vendor::newrelic::NewRelicVendor;
-use crate::vendor::ninjaone::NinjaOneVendor;
-use crate::vendor::postman::PostmanVendor;
-use crate::vendor::slack::SlackVendor;
-use crate::vendor::sonarqube::SonarqubeVendor;
-use crate::vendor::splunk::SplunkVendor;
-#[cfg(feature = "wrds")]
-use crate::vendor::wrds::WrdsVendor;
-use crate::vendor::zoom::ZoomVendor;
-use crate::workspace::WorkspaceCache;
-use args::{
-    ArtifactReadArgs, CircleCiLogsArgs, CloneArgs, EdxDiscussionCommentCreateArgs,
-    EdxDiscussionCommentsArgs, EdxDiscussionCourseArgs, EdxDiscussionThreadCreateArgs,
-    EdxDiscussionThreadsArgs, EdxDiscussionTopicsArgs, GrafanaListDatasourcesArgs,
-    GrafanaQueryLogsArgs, NewRelicQueryArgs, NinjaOneLoginArgs, NinjaOneReadArgs,
-    NinjaOneWriteArgs, ReadArgs, SonarqubeQualityGateArgs, SonarqubeSearchIssuesArgs,
-    SplunkCreateJobArgs, SplunkJobResultsArgs, SplunkListSavedSearchesArgs, SplunkSearchArgs,
-    WriteArgs,
-};
-#[cfg(feature = "wrds")]
-use args::{WrdsDescribeTableArgs, WrdsListLibrariesArgs, WrdsListTablesArgs, WrdsQueryArgs};
-
 #[derive(Clone)]
 pub struct DevtoolsServer {
-    state: Arc<ServerState>,
+    components: Arc<Components>,
     // The `#[tool_handler]` macro references this field by name at expansion
     // time; the rustc reference tracker doesn't see that, so we silence the
     // dead-code lint explicitly.
@@ -98,121 +84,28 @@ pub struct DevtoolsServer {
     tool_router: ToolRouter<DevtoolsServer>,
 }
 
-struct ServerState {
-    client: Client,
-    config: RwLock<Config>,
-    bitbucket_vendor: BitbucketVendor,
-    jira_vendor: JiraVendor,
-    confluence_vendor: ConfluenceVendor,
-    zoom_vendor: ZoomVendor,
-    circleci_vendor: CircleCiVendor,
-    slack_vendor: SlackVendor,
-    postman_vendor: PostmanVendor,
-    edx_vendor: EdxVendor,
-    newrelic_vendor: NewRelicVendor,
-    grafana_vendor: GrafanaVendor,
-    sonarqube_vendor: SonarqubeVendor,
-    splunk_vendor: SplunkVendor,
-    ninjaone_vendor: NinjaOneVendor,
-    /// WRDS (PostgreSQL) vendor. Feature-gated: a `--no-default-features` build
-    /// drops the Postgres dependency tree entirely, so this field and the
-    /// `wrds_*` tools simply don't exist. Constructed internally (it is cheap
-    /// and stateless apart from a lazily-built TLS config) so the public
-    /// `with_components` signature doesn't change with the feature.
-    #[cfg(feature = "wrds")]
-    wrds_vendor: WrdsVendor,
-    /// Per-instance workspace cache. Lives here (not as a process-global
-    /// singleton) so multi-server embedders never leak one account's
-    /// default workspace into another's lookups.
-    workspace_cache: WorkspaceCache,
-}
-
 impl DevtoolsServer {
-    /// Standard constructor. Loads config from the environment cascade and
-    /// builds a fresh HTTP client. Vendors are constructed eagerly, but they
-    /// do not resolve their base URLs at this point — the
-    /// `JiraVendor` defers `ATLASSIAN_SITE_NAME` lookup to per-request
-    /// time, so a Bitbucket-only deployment boots without Jira config.
+    /// Standard constructor: the environment cascade, a fresh HTTP client, the
+    /// default vendor set, and the live config watcher.
+    ///
+    /// Vendors are constructed eagerly but do not resolve their base URLs here
+    /// — `JiraVendor` defers the `ATLASSIAN_SITE_NAME` lookup to request time,
+    /// so a Bitbucket-only deployment boots without Jira config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::McpError`] when the HTTP client cannot be built.
     pub fn new() -> Result<Self, crate::error::McpError> {
-        // Snapshot the file before loading it so a change racing startup is
-        // still observed by the watcher after the server is constructed.
-        let watched_config = crate::config::global::default_path()
-            .filter(|path| path.exists())
-            .map(|path| {
-                let contents = std::fs::read(&path).ok();
-                (path, contents)
-            });
-        let config = crate::config::load();
-        let client = build_client()?;
-        let server = Self::with_components(
-            config,
-            client,
-            BitbucketVendor::new(),
-            JiraVendor::new(),
-            ConfluenceVendor::new(),
-            ZoomVendor::new(),
-            CircleCiVendor::new(),
-            SlackVendor::new(),
-            PostmanVendor::new(),
-            EdxVendor::new(),
-            NewRelicVendor::new(),
-            GrafanaVendor::new(),
-            SonarqubeVendor::new(),
-            SplunkVendor::new(),
-            NinjaOneVendor::new(),
-        );
-        if let Some((path, contents)) = watched_config {
-            spawn_config_watcher(&server.state, path, contents);
-        }
-        Ok(server)
+        ServerBuilder::new().watch_config(true).build()
     }
 
-    /// Build a server from caller-supplied components. Useful when tests or
-    /// embedders want to pre-configure the `Config` or point any vendor
-    /// at a mock URL via `with_base_url`.
-    // One owned vendor per product — the arg list grows by one with each new
-    // vendor. Bundling them into a struct would just move the same fields
-    // around without removing any, so the lint is suppressed rather than
-    // worked around.
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_components(
-        config: Config,
-        client: Client,
-        bitbucket_vendor: BitbucketVendor,
-        jira_vendor: JiraVendor,
-        confluence_vendor: ConfluenceVendor,
-        zoom_vendor: ZoomVendor,
-        circleci_vendor: CircleCiVendor,
-        slack_vendor: SlackVendor,
-        postman_vendor: PostmanVendor,
-        edx_vendor: EdxVendor,
-        newrelic_vendor: NewRelicVendor,
-        grafana_vendor: GrafanaVendor,
-        sonarqube_vendor: SonarqubeVendor,
-        splunk_vendor: SplunkVendor,
-        ninjaone_vendor: NinjaOneVendor,
-    ) -> Self {
+    /// Adopt an already-assembled dependency graph. This is the seam the
+    /// composition root builds through; prefer [`ServerBuilder`] over calling
+    /// it directly.
+    #[must_use]
+    pub fn from_components(components: Arc<Components>) -> Self {
         Self {
-            state: Arc::new(ServerState {
-                client,
-                config: RwLock::new(config),
-                bitbucket_vendor,
-                jira_vendor,
-                confluence_vendor,
-                zoom_vendor,
-                circleci_vendor,
-                slack_vendor,
-                postman_vendor,
-                edx_vendor,
-                newrelic_vendor,
-                grafana_vendor,
-                sonarqube_vendor,
-                splunk_vendor,
-                ninjaone_vendor,
-                #[cfg(feature = "wrds")]
-                wrds_vendor: WrdsVendor::new(),
-                workspace_cache: WorkspaceCache::new(),
-            }),
+            components,
             tool_router: Self::tool_router(),
         }
     }
@@ -243,16 +136,19 @@ impl DevtoolsServer {
         router
     }
 
-    fn config(&self) -> Config {
-        self.state
-            .config
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+    /// Snapshot the current config. Returns an `Arc` so a tool call costs one
+    /// atomic increment instead of deep-cloning the credential maps; `&Arc<Config>`
+    /// deref-coerces to the `&Config` every context factory takes.
+    fn config(&self) -> Arc<Config> {
+        self.components.config()
     }
 
     fn bitbucket_ctx<'a>(&'a self, config: &'a Config) -> HandleContext<'a> {
-        HandleContext::new(&self.state.client, config, &self.state.bitbucket_vendor)
+        HandleContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.bitbucket,
+        )
     }
 
     /// Bitbucket-only typed context for `bb_clone` and any future
@@ -261,19 +157,27 @@ impl DevtoolsServer {
     /// instance.
     fn bitbucket_typed_ctx<'a>(&'a self, config: &'a Config) -> BitbucketContext<'a> {
         BitbucketContext::new(
-            &self.state.client,
+            &self.components.client,
             config,
-            &self.state.bitbucket_vendor,
-            &self.state.workspace_cache,
+            &self.components.vendors.bitbucket,
+            &self.components.workspace_cache,
         )
     }
 
     fn jira_ctx<'a>(&'a self, config: &'a Config) -> HandleContext<'a> {
-        HandleContext::new(&self.state.client, config, &self.state.jira_vendor)
+        HandleContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.jira,
+        )
     }
 
     fn confluence_ctx<'a>(&'a self, config: &'a Config) -> HandleContext<'a> {
-        HandleContext::new(&self.state.client, config, &self.state.confluence_vendor)
+        HandleContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.confluence,
+        )
     }
 
     /// Zoom-specific context. Unlike the Atlassian vendors, Zoom carries its
@@ -281,7 +185,11 @@ impl DevtoolsServer {
     /// dedicated [`ZoomContext`] rather than the vendor-neutral
     /// [`HandleContext`].
     fn zoom_ctx<'a>(&'a self, config: &'a Config) -> ZoomContext<'a> {
-        ZoomContext::new(&self.state.client, config, &self.state.zoom_vendor)
+        ZoomContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.zoom,
+        )
     }
 
     /// CircleCI-specific context. Like Zoom, CircleCI carries its own
@@ -289,1149 +197,155 @@ impl DevtoolsServer {
     /// dedicated [`CircleCiContext`] rather than the vendor-neutral
     /// [`HandleContext`].
     fn circleci_ctx<'a>(&'a self, config: &'a Config) -> CircleCiContext<'a> {
-        CircleCiContext::new(&self.state.client, config, &self.state.circleci_vendor)
+        CircleCiContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.circleci,
+        )
     }
 
     /// Slack-specific context. Like CircleCI, Slack carries its own credential
     /// lookup (a static OAuth token from config), so it uses a dedicated
     /// [`SlackContext`] rather than the vendor-neutral [`HandleContext`].
     fn slack_ctx<'a>(&'a self, config: &'a Config) -> SlackContext<'a> {
-        SlackContext::new(&self.state.client, config, &self.state.slack_vendor)
+        SlackContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.slack,
+        )
     }
 
     /// Postman-specific context. Carries its own credential lookup (a static
     /// API key from config) and is the one vendor that authenticates via a
     /// custom `X-API-Key` header, so it uses a dedicated [`PostmanContext`].
     fn postman_ctx<'a>(&'a self, config: &'a Config) -> PostmanContext<'a> {
-        PostmanContext::new(&self.state.client, config, &self.state.postman_vendor)
+        PostmanContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.postman,
+        )
     }
 
     fn edx_ctx<'a>(&'a self, config: &'a Config) -> EdxContext<'a> {
-        EdxContext::new(&self.state.client, config, &self.state.edx_vendor)
+        EdxContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.edx,
+        )
     }
 
     /// New Relic-specific context. Carries its own credential lookup (a static
     /// User API key from config) and authenticates via the custom `API-Key`
     /// header, so it uses a dedicated [`NewRelicContext`].
     fn newrelic_ctx<'a>(&'a self, config: &'a Config) -> NewRelicContext<'a> {
-        NewRelicContext::new(&self.state.client, config, &self.state.newrelic_vendor)
+        NewRelicContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.newrelic,
+        )
     }
 
     /// Grafana-specific context. Carries its own credential lookup (a static
     /// service-account token from config) and authenticates via
     /// `Authorization: Bearer`, so it uses a dedicated [`GrafanaContext`].
     fn grafana_ctx<'a>(&'a self, config: &'a Config) -> GrafanaContext<'a> {
-        GrafanaContext::new(&self.state.client, config, &self.state.grafana_vendor)
+        GrafanaContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.grafana,
+        )
     }
 
     /// SonarQube-specific context. Like CircleCI/Grafana, Sonar carries its own
     /// credential lookup (a static user token from config) and authenticates via
     /// `Authorization: Bearer`, so it uses a dedicated [`SonarqubeContext`].
     fn sonarqube_ctx<'a>(&'a self, config: &'a Config) -> SonarqubeContext<'a> {
-        SonarqubeContext::new(&self.state.client, config, &self.state.sonarqube_vendor)
+        SonarqubeContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.sonarqube,
+        )
     }
 
     fn splunk_ctx<'a>(&'a self, config: &'a Config) -> SplunkContext<'a> {
-        SplunkContext::new(&self.state.client, config, &self.state.splunk_vendor)
+        SplunkContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.splunk,
+        )
     }
 
     fn ninjaone_ctx<'a>(&'a self, config: &'a Config) -> NinjaOneContext<'a> {
-        NinjaOneContext::new(&self.state.client, config, &self.state.ninjaone_vendor)
+        NinjaOneContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.ninjaone,
+        )
     }
 
     /// WRDS-specific context. WRDS is PostgreSQL, not HTTP, so this context
     /// carries no `reqwest::Client` — just config and the Postgres vendor.
     #[cfg(feature = "wrds")]
     fn wrds_ctx<'a>(&'a self, config: &'a Config) -> WrdsContext<'a> {
-        WrdsContext::new(config, &self.state.wrds_vendor)
+        WrdsContext::new(config, &self.components.vendors.wrds)
     }
-}
-
-#[tool_router(router = artifact_router)]
-impl DevtoolsServer {
-    #[tool(
-        description = "Read a resumable byte chunk from a temporary artifact returned by another tool. Data is base64 encoded; continue with nextOffset until eof is true.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn artifact_read(
-        &self,
-        Parameters(args): Parameters<ArtifactReadArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        use base64::Engine as _;
-        let max_bytes = args.max_bytes.unwrap_or(65_536).clamp(1, 1_048_576);
-        match crate::transport::raw_response::read_artifact_chunk(
-            &args.artifact_id,
-            args.offset,
-            max_bytes,
-        )
-        .await
-        {
-            Ok(Some((metadata, data, next_offset, eof))) => {
-                let value = serde_json::json!({
-                    "artifactId": metadata.id,
-                    "filename": metadata.filename,
-                    "offset": args.offset.min(metadata.size),
-                    "nextOffset": next_offset,
-                    "totalBytes": metadata.size,
-                    "eof": eof,
-                    "encoding": "base64",
-                    "data": base64::engine::general_purpose::STANDARD.encode(data),
-                });
-                Ok(CallToolResult::success(vec![Content::text(
-                    value.to_string(),
-                )]))
-            }
-            Ok(None) => Ok(CallToolResult::error(vec![Content::text(
-                "Artifact not found or expired",
-            )])),
-            Err(err) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Failed to read artifact: {err}"
-            ))])),
-        }
-    }
-}
-
-const CONFIG_WATCH_INTERVAL: Duration = Duration::from_millis(500);
-
-fn spawn_config_watcher(
-    state: &Arc<ServerState>,
-    path: PathBuf,
-    mut last_contents: Option<Vec<u8>>,
-) {
-    let state: Weak<ServerState> = Arc::downgrade(state);
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-        tracing::warn!(path = %path.display(), "global config watcher requires a Tokio runtime");
-        return;
-    };
-    runtime.spawn(async move {
-        let mut interval = tokio::time::interval(CONFIG_WATCH_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // `interval` ticks immediately; the first comparison also closes the
-        // startup race between the initial snapshot and Config::load().
-        loop {
-            interval.tick().await;
-            let Some(state) = state.upgrade() else {
-                return;
-            };
-            let contents = match tokio::fs::read(&path).await {
-                Ok(contents) => Some(contents),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-                Err(err) => {
-                    tracing::warn!(path = %path.display(), error = %err, "failed to watch global config");
-                    continue;
-                }
-            };
-            if contents == last_contents {
-                continue;
-            }
-            last_contents = contents;
-
-            // An editor may expose a partially-written file briefly. Keep the
-            // last known-good snapshot and retry when the bytes change again.
-            if path.exists()
-                && let Err(err) =
-                    crate::config::global::read_all_vendors(&path, crate::constants::PACKAGE_NAME)
-            {
-                tracing::warn!(path = %path.display(), error = %err, "global config changed but is not valid JSON; keeping previous config");
-                continue;
-            }
-
-            let config = crate::config::load_from_global_path(Some(&path));
-            *state
-                .config
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
-            state.workspace_cache.clear();
-            tracing::info!(path = %path.display(), "reloaded global config");
-        }
-    });
 }
 
 // ============================================================================
 // Bitbucket tools
 // ============================================================================
 
-#[tool_router(router = bitbucket_router)]
-impl DevtoolsServer {
-    #[doc = include_str!("descriptions/bb_get.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn bb_get(
-        &self,
-        Parameters(args): Parameters<ReadArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_read_bb(self, HttpMethod::Get, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/bb_post.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn bb_post(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_bb(self, HttpMethod::Post, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/bb_put.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn bb_put(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_bb(self, HttpMethod::Put, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/bb_patch.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn bb_patch(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_bb(self, HttpMethod::Patch, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/bb_delete.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn bb_delete(
-        &self,
-        Parameters(args): Parameters<ReadArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_read_bb(self, HttpMethod::Delete, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/bb_clone.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn bb_clone(
-        &self,
-        Parameters(args): Parameters<CloneArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_clone(self, &args).await)
-    }
-}
-
 // ============================================================================
 // edX discussion tools
 // ============================================================================
-
-#[tool_router(router = edx_discussion_router)]
-impl DevtoolsServer {
-    #[doc = include_str!("descriptions/edx_discussion_course.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn edx_discussion_course(
-        &self,
-        Parameters(args): Parameters<EdxDiscussionCourseArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_edx_discussion_course(self, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/edx_discussion_topics.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn edx_discussion_topics(
-        &self,
-        Parameters(args): Parameters<EdxDiscussionTopicsArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_edx_discussion_topics(self, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/edx_discussion_threads.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn edx_discussion_threads(
-        &self,
-        Parameters(args): Parameters<EdxDiscussionThreadsArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_edx_discussion_threads(self, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/edx_discussion_thread_create.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn edx_discussion_thread_create(
-        &self,
-        Parameters(args): Parameters<EdxDiscussionThreadCreateArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_edx_discussion_thread_create(self, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/edx_discussion_comments.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn edx_discussion_comments(
-        &self,
-        Parameters(args): Parameters<EdxDiscussionCommentsArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_edx_discussion_comments(self, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/edx_discussion_comment_create.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn edx_discussion_comment_create(
-        &self,
-        Parameters(args): Parameters<EdxDiscussionCommentCreateArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_edx_discussion_comment_create(self, &args).await)
-    }
-}
 
 // ============================================================================
 // Jira tools
 // ============================================================================
 
-#[tool_router(router = jira_router)]
-impl DevtoolsServer {
-    #[doc = include_str!("descriptions/jira_get.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn jira_get(
-        &self,
-        Parameters(args): Parameters<ReadArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_read_jira(self, HttpMethod::Get, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/jira_post.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn jira_post(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_jira(self, HttpMethod::Post, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/jira_put.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn jira_put(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_jira(self, HttpMethod::Put, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/jira_patch.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn jira_patch(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_jira(self, HttpMethod::Patch, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/jira_delete.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn jira_delete(
-        &self,
-        Parameters(args): Parameters<ReadArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_read_jira(self, HttpMethod::Delete, &args).await)
-    }
-}
-
 // ============================================================================
 // Confluence tools
 // ============================================================================
-
-#[tool_router(router = confluence_router)]
-impl DevtoolsServer {
-    #[doc = include_str!("descriptions/conf_get.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn conf_get(
-        &self,
-        Parameters(args): Parameters<ReadArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_read_confluence(self, HttpMethod::Get, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/conf_post.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn conf_post(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_confluence(self, HttpMethod::Post, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/conf_put.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn conf_put(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_confluence(self, HttpMethod::Put, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/conf_patch.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn conf_patch(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_confluence(self, HttpMethod::Patch, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/conf_delete.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn conf_delete(
-        &self,
-        Parameters(args): Parameters<ReadArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_read_confluence(self, HttpMethod::Delete, &args).await)
-    }
-}
 
 // ============================================================================
 // Zoom tools
 // ============================================================================
 
-#[tool_router(router = zoom_router)]
-impl DevtoolsServer {
-    #[doc = include_str!("descriptions/zoom_get.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn zoom_get(
-        &self,
-        Parameters(args): Parameters<ReadArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_read_zoom(self, HttpMethod::Get, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/zoom_post.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn zoom_post(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_zoom(self, HttpMethod::Post, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/zoom_put.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn zoom_put(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_zoom(self, HttpMethod::Put, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/zoom_patch.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn zoom_patch(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_zoom(self, HttpMethod::Patch, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/zoom_delete.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn zoom_delete(
-        &self,
-        Parameters(args): Parameters<ReadArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_read_zoom(self, HttpMethod::Delete, &args).await)
-    }
-}
-
 // ============================================================================
 // CircleCI tools
 // ============================================================================
-
-#[tool_router(router = circleci_router)]
-impl DevtoolsServer {
-    #[doc = include_str!("descriptions/circleci_get.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn circleci_get(
-        &self,
-        Parameters(args): Parameters<ReadArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_read_circleci(self, HttpMethod::Get, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/circleci_logs.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn circleci_logs(
-        &self,
-        Parameters(args): Parameters<CircleCiLogsArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_circleci_logs(self, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/circleci_post.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn circleci_post(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_circleci(self, HttpMethod::Post, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/circleci_put.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn circleci_put(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_circleci(self, HttpMethod::Put, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/circleci_patch.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn circleci_patch(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_circleci(self, HttpMethod::Patch, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/circleci_delete.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn circleci_delete(
-        &self,
-        Parameters(args): Parameters<ReadArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_read_circleci(self, HttpMethod::Delete, &args).await)
-    }
-}
 
 // ============================================================================
 // Slack tools
 // ============================================================================
 
-#[tool_router(router = slack_router)]
-impl DevtoolsServer {
-    #[doc = include_str!("descriptions/slack_get.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn slack_get(
-        &self,
-        Parameters(args): Parameters<ReadArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_read_slack(self, HttpMethod::Get, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/slack_post.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn slack_post(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_slack(self, HttpMethod::Post, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/slack_put.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn slack_put(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_slack(self, HttpMethod::Put, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/slack_patch.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn slack_patch(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_slack(self, HttpMethod::Patch, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/slack_delete.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn slack_delete(
-        &self,
-        Parameters(args): Parameters<ReadArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_read_slack(self, HttpMethod::Delete, &args).await)
-    }
-}
-
 // ============================================================================
 // Postman tools
 // ============================================================================
-
-#[tool_router(router = postman_router)]
-impl DevtoolsServer {
-    #[doc = include_str!("descriptions/postman_get.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn postman_get(
-        &self,
-        Parameters(args): Parameters<ReadArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_read_postman(self, HttpMethod::Get, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/postman_post.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn postman_post(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_postman(self, HttpMethod::Post, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/postman_put.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn postman_put(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_postman(self, HttpMethod::Put, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/postman_patch.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn postman_patch(
-        &self,
-        Parameters(args): Parameters<WriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_postman(self, HttpMethod::Patch, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/postman_delete.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn postman_delete(
-        &self,
-        Parameters(args): Parameters<ReadArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_read_postman(self, HttpMethod::Delete, &args).await)
-    }
-}
 
 // ============================================================================
 // New Relic tools
 // ============================================================================
 
-#[tool_router(router = newrelic_router)]
-impl DevtoolsServer {
-    #[doc = include_str!("descriptions/newrelic_query.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn newrelic_query(
-        &self,
-        Parameters(args): Parameters<NewRelicQueryArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_newrelic_query(self, &args).await)
-    }
-}
-
 // ============================================================================
 // Grafana tools
 // ============================================================================
-
-#[tool_router(router = grafana_router)]
-impl DevtoolsServer {
-    #[doc = include_str!("descriptions/grafana_query_logs.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn grafana_query_logs(
-        &self,
-        Parameters(args): Parameters<GrafanaQueryLogsArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_grafana_query_logs(self, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/grafana_list_datasources.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn grafana_list_datasources(
-        &self,
-        Parameters(args): Parameters<GrafanaListDatasourcesArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_grafana_list_datasources(self, &args).await)
-    }
-}
 
 // ============================================================================
 // SonarQube tools
 // ============================================================================
 
-#[tool_router(router = sonarqube_router)]
-impl DevtoolsServer {
-    #[doc = include_str!("descriptions/sonarqube_quality_gate.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn sonarqube_quality_gate(
-        &self,
-        Parameters(args): Parameters<SonarqubeQualityGateArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_sonarqube_quality_gate(self, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/sonarqube_search_issues.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn sonarqube_search_issues(
-        &self,
-        Parameters(args): Parameters<SonarqubeSearchIssuesArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_sonarqube_search_issues(self, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/sonarqube_get.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn sonarqube_get(
-        &self,
-        Parameters(args): Parameters<ReadArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_sonarqube_get(self, &args).await)
-    }
-}
-
 // ============================================================================
 // Splunk tools
 // ============================================================================
-
-#[tool_router(router = splunk_router)]
-impl DevtoolsServer {
-    #[doc = include_str!("descriptions/splunk_search.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn splunk_search(
-        &self,
-        Parameters(args): Parameters<SplunkSearchArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_splunk_search(self, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/splunk_create_job.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn splunk_create_job(
-        &self,
-        Parameters(args): Parameters<SplunkCreateJobArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_splunk_create_job(self, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/splunk_job_results.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn splunk_job_results(
-        &self,
-        Parameters(args): Parameters<SplunkJobResultsArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_splunk_job_results(self, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/splunk_list_saved_searches.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn splunk_list_saved_searches(
-        &self,
-        Parameters(args): Parameters<SplunkListSavedSearchesArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_splunk_list_saved_searches(self, &args).await)
-    }
-}
 
 // ============================================================================
 // NinjaOne tools
 // ============================================================================
 
-#[tool_router(router = ninjaone_router)]
-impl DevtoolsServer {
-    #[doc = include_str!("descriptions/ninjaone_login.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn ninjaone_login(
-        &self,
-        Parameters(args): Parameters<NinjaOneLoginArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_ninjaone_login(self, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/ninjaone_get.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn ninjaone_get(
-        &self,
-        Parameters(args): Parameters<NinjaOneReadArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_read_ninjaone(self, HttpMethod::Get, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/ninjaone_post.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn ninjaone_post(
-        &self,
-        Parameters(args): Parameters<NinjaOneWriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_ninjaone(self, HttpMethod::Post, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/ninjaone_put.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn ninjaone_put(
-        &self,
-        Parameters(args): Parameters<NinjaOneWriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_ninjaone(self, HttpMethod::Put, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/ninjaone_patch.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true,
-    ))]
-    async fn ninjaone_patch(
-        &self,
-        Parameters(args): Parameters<NinjaOneWriteArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_write_ninjaone(self, HttpMethod::Patch, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/ninjaone_delete.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn ninjaone_delete(
-        &self,
-        Parameters(args): Parameters<NinjaOneReadArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_read_ninjaone(self, HttpMethod::Delete, &args).await)
-    }
-}
-
 // ============================================================================
 // WRDS tools (feature = "wrds")
 // ============================================================================
-
-#[cfg(feature = "wrds")]
-#[tool_router(router = wrds_router)]
-impl DevtoolsServer {
-    #[doc = include_str!("descriptions/wrds_query.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn wrds_query(
-        &self,
-        Parameters(args): Parameters<WrdsQueryArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_wrds_query(self, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/wrds_list_libraries.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn wrds_list_libraries(
-        &self,
-        Parameters(args): Parameters<WrdsListLibrariesArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_wrds_list_libraries(self, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/wrds_list_tables.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn wrds_list_tables(
-        &self,
-        Parameters(args): Parameters<WrdsListTablesArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_wrds_list_tables(self, &args).await)
-    }
-
-    #[doc = include_str!("descriptions/wrds_describe_table.md")]
-    #[tool(annotations(
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true,
-    ))]
-    async fn wrds_describe_table(
-        &self,
-        Parameters(args): Parameters<WrdsDescribeTableArgs>,
-    ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_wrds_describe_table(self, &args).await)
-    }
-}
 
 #[tool_handler]
 impl ServerHandler for DevtoolsServer {
@@ -1492,496 +406,12 @@ impl ServerHandler for DevtoolsServer {
 
 // ---- helpers ----
 
-async fn run_read_bb(
-    server: &DevtoolsServer,
-    method: HttpMethod,
-    args: &ReadArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match handle_read(&server.bitbucket_ctx(&config), method, args).await {
-        Ok(resp) => {
-            let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
-            CallToolResult::success(vec![Content::text(text)])
-        }
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_write_bb(
-    server: &DevtoolsServer,
-    method: HttpMethod,
-    args: &WriteArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match handle_write(&server.bitbucket_ctx(&config), method, args).await {
-        Ok(resp) => {
-            let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
-            CallToolResult::success(vec![Content::text(text)])
-        }
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_read_jira(
-    server: &DevtoolsServer,
-    method: HttpMethod,
-    args: &ReadArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match handle_read(&server.jira_ctx(&config), method, args).await {
-        Ok(resp) => {
-            let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
-            CallToolResult::success(vec![Content::text(text)])
-        }
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_write_jira(
-    server: &DevtoolsServer,
-    method: HttpMethod,
-    args: &WriteArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match handle_write(&server.jira_ctx(&config), method, args).await {
-        Ok(resp) => {
-            let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
-            CallToolResult::success(vec![Content::text(text)])
-        }
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_read_confluence(
-    server: &DevtoolsServer,
-    method: HttpMethod,
-    args: &ReadArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match handle_read(&server.confluence_ctx(&config), method, args).await {
-        Ok(resp) => {
-            let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
-            CallToolResult::success(vec![Content::text(text)])
-        }
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_write_confluence(
-    server: &DevtoolsServer,
-    method: HttpMethod,
-    args: &WriteArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match handle_write(&server.confluence_ctx(&config), method, args).await {
-        Ok(resp) => {
-            let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
-            CallToolResult::success(vec![Content::text(text)])
-        }
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_read_zoom(
-    server: &DevtoolsServer,
-    method: HttpMethod,
-    args: &ReadArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::zoom::handle_read(&server.zoom_ctx(&config), method, args).await {
-        Ok(resp) => {
-            let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
-            CallToolResult::success(vec![Content::text(text)])
-        }
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_write_zoom(
-    server: &DevtoolsServer,
-    method: HttpMethod,
-    args: &WriteArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::zoom::handle_write(&server.zoom_ctx(&config), method, args).await {
-        Ok(resp) => {
-            let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
-            CallToolResult::success(vec![Content::text(text)])
-        }
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_read_circleci(
-    server: &DevtoolsServer,
-    method: HttpMethod,
-    args: &ReadArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::circleci::handle_read(&server.circleci_ctx(&config), method, args)
-        .await
-    {
-        Ok(resp) => {
-            let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
-            CallToolResult::success(vec![Content::text(text)])
-        }
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_write_circleci(
-    server: &DevtoolsServer,
-    method: HttpMethod,
-    args: &WriteArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::circleci::handle_write(&server.circleci_ctx(&config), method, args)
-        .await
-    {
-        Ok(resp) => {
-            let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
-            CallToolResult::success(vec![Content::text(text)])
-        }
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_circleci_logs(server: &DevtoolsServer, args: &CircleCiLogsArgs) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::circleci::handle_logs(&server.circleci_ctx(&config), args).await {
-        Ok(resp) => {
-            let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
-            CallToolResult::success(vec![Content::text(text)])
-        }
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_read_slack(
-    server: &DevtoolsServer,
-    method: HttpMethod,
-    args: &ReadArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::slack::handle_read(&server.slack_ctx(&config), method, args).await {
-        Ok(resp) => {
-            let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
-            CallToolResult::success(vec![Content::text(text)])
-        }
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_write_slack(
-    server: &DevtoolsServer,
-    method: HttpMethod,
-    args: &WriteArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::slack::handle_write(&server.slack_ctx(&config), method, args).await {
-        Ok(resp) => {
-            let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
-            CallToolResult::success(vec![Content::text(text)])
-        }
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_read_postman(
-    server: &DevtoolsServer,
-    method: HttpMethod,
-    args: &ReadArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::postman::handle_read(&server.postman_ctx(&config), method, args).await
-    {
-        Ok(resp) => {
-            let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
-            CallToolResult::success(vec![Content::text(text)])
-        }
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_write_postman(
-    server: &DevtoolsServer,
-    method: HttpMethod,
-    args: &WriteArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::postman::handle_write(&server.postman_ctx(&config), method, args)
-        .await
-    {
-        Ok(resp) => {
-            let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
-            CallToolResult::success(vec![Content::text(text)])
-        }
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_ninjaone_login(server: &DevtoolsServer, args: &NinjaOneLoginArgs) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::ninjaone::login(&server.ninjaone_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_read_ninjaone(
-    server: &DevtoolsServer,
-    method: HttpMethod,
-    args: &NinjaOneReadArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::ninjaone::handle_read(&server.ninjaone_ctx(&config), method, args)
-        .await
-    {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_write_ninjaone(
-    server: &DevtoolsServer,
-    method: HttpMethod,
-    args: &NinjaOneWriteArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::ninjaone::handle_write(&server.ninjaone_ctx(&config), method, args)
-        .await
-    {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_newrelic_query(server: &DevtoolsServer, args: &NewRelicQueryArgs) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::newrelic::query(&server.newrelic_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_grafana_query_logs(
-    server: &DevtoolsServer,
-    args: &GrafanaQueryLogsArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::grafana::query_logs(&server.grafana_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_grafana_list_datasources(
-    server: &DevtoolsServer,
-    args: &GrafanaListDatasourcesArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::grafana::list_datasources(&server.grafana_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_sonarqube_quality_gate(
-    server: &DevtoolsServer,
-    args: &SonarqubeQualityGateArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::sonarqube::quality_gate(&server.sonarqube_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_sonarqube_search_issues(
-    server: &DevtoolsServer,
-    args: &SonarqubeSearchIssuesArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::sonarqube::search_issues(&server.sonarqube_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_sonarqube_get(server: &DevtoolsServer, args: &ReadArgs) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::sonarqube::get(&server.sonarqube_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_splunk_search(server: &DevtoolsServer, args: &SplunkSearchArgs) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::splunk::search(&server.splunk_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_splunk_create_job(
-    server: &DevtoolsServer,
-    args: &SplunkCreateJobArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::splunk::create_job(&server.splunk_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_splunk_job_results(
-    server: &DevtoolsServer,
-    args: &SplunkJobResultsArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::splunk::job_results(&server.splunk_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_splunk_list_saved_searches(
-    server: &DevtoolsServer,
-    args: &SplunkListSavedSearchesArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::splunk::list_saved_searches(&server.splunk_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-#[cfg(feature = "wrds")]
-async fn run_wrds_query(server: &DevtoolsServer, args: &WrdsQueryArgs) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::wrds::query(&server.wrds_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-#[cfg(feature = "wrds")]
-async fn run_wrds_list_libraries(
-    server: &DevtoolsServer,
-    args: &WrdsListLibrariesArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::wrds::list_libraries(&server.wrds_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-#[cfg(feature = "wrds")]
-async fn run_wrds_list_tables(
-    server: &DevtoolsServer,
-    args: &WrdsListTablesArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::wrds::list_tables(&server.wrds_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-#[cfg(feature = "wrds")]
-async fn run_wrds_describe_table(
-    server: &DevtoolsServer,
-    args: &WrdsDescribeTableArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::wrds::describe_table(&server.wrds_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_edx_discussion_course(
-    server: &DevtoolsServer,
-    args: &EdxDiscussionCourseArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::edx::course(&server.edx_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_edx_discussion_topics(
-    server: &DevtoolsServer,
-    args: &EdxDiscussionTopicsArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::edx::topics(&server.edx_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_edx_discussion_threads(
-    server: &DevtoolsServer,
-    args: &EdxDiscussionThreadsArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::edx::threads(&server.edx_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_edx_discussion_thread_create(
-    server: &DevtoolsServer,
-    args: &EdxDiscussionThreadCreateArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::edx::create_thread(&server.edx_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_edx_discussion_comments(
-    server: &DevtoolsServer,
-    args: &EdxDiscussionCommentsArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::edx::comments(&server.edx_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_edx_discussion_comment_create(
-    server: &DevtoolsServer,
-    args: &EdxDiscussionCommentCreateArgs,
-) -> CallToolResult {
-    let config = server.config();
-    match crate::controllers::edx::create_comment(&server.edx_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-async fn run_clone(server: &DevtoolsServer, args: &CloneArgs) -> CallToolResult {
-    let config = server.config();
-    match handle_clone(&server.bitbucket_typed_ctx(&config), args).await {
-        Ok(resp) => success_response(&resp),
-        Err(err) => error_to_result(&err),
-    }
-}
-
-fn success_response(resp: &crate::controllers::ControllerResponse) -> CallToolResult {
+pub(crate) fn success_response(resp: &crate::controllers::ControllerResponse) -> CallToolResult {
     let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
     CallToolResult::success(vec![Content::text(text)])
 }
 
-fn error_to_result(err: &crate::error::McpError) -> CallToolResult {
+pub(crate) fn error_to_result(err: &crate::error::McpError) -> CallToolResult {
     let formatted = format_error_for_mcp_tool(err);
     let text = formatted
         .content
@@ -1992,70 +422,31 @@ fn error_to_result(err: &crate::error::McpError) -> CallToolResult {
 }
 
 #[cfg(test)]
-mod live_config_tests {
+mod config_snapshot_tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::config::VENDOR_BITBUCKET;
+
+    /// Every tool call snapshots the config. That snapshot must be a shared
+    /// `Arc`, not a deep copy of the credential maps — 64 tools multiplied by
+    /// a `HashMap` + `BTreeMap<String, HashMap>` clone per call is pure waste.
+    /// Reverting `config()` to `.clone()` on the inner `Config` fails here.
+    #[test]
+    fn config_snapshots_share_one_allocation() {
+        let mut values = HashMap::new();
+        values.insert("ATLASSIAN_API_TOKEN".to_owned(), "tok".to_owned());
+        let server = server_with_config(Config::from_map(values));
+
+        let first = server.config();
+        let second = server.config();
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "config() deep-copied the snapshot instead of sharing it"
+        );
+    }
 
     fn server_with_config(config: Config) -> DevtoolsServer {
-        DevtoolsServer::with_components(
-            config,
-            build_client().unwrap(),
-            BitbucketVendor::new(),
-            JiraVendor::new(),
-            ConfluenceVendor::new(),
-            ZoomVendor::new(),
-            CircleCiVendor::new(),
-            SlackVendor::new(),
-            PostmanVendor::new(),
-            EdxVendor::new(),
-            NewRelicVendor::new(),
-            GrafanaVendor::new(),
-            SonarqubeVendor::new(),
-            SplunkVendor::new(),
-            NinjaOneVendor::new(),
-        )
-    }
-
-    fn config_json(workspace: &str) -> String {
-        format!(r#"{{"bitbucket":{{"environments":{{"LIVE_RELOAD_TEST_VALUE":"{workspace}"}}}}}}"#)
-    }
-
-    #[tokio::test]
-    async fn reloads_changed_global_config_and_keeps_last_good_json() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("configs.json");
-        std::fs::write(&path, config_json("before")).unwrap();
-
-        let initial = Config::load_from_sources(Some(&path), None, &HashMap::new());
-        let server = server_with_config(initial);
-        let initial_contents = std::fs::read(&path).ok();
-        spawn_config_watcher(&server.state, path.clone(), initial_contents);
-
-        std::fs::write(&path, "{").unwrap();
-        tokio::time::sleep(CONFIG_WATCH_INTERVAL * 2).await;
-        assert_eq!(
-            server
-                .config()
-                .get_for(VENDOR_BITBUCKET, "LIVE_RELOAD_TEST_VALUE"),
-            Some("before")
-        );
-
-        std::fs::write(&path, config_json("after")).unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if server
-                    .config()
-                    .get_for(VENDOR_BITBUCKET, "LIVE_RELOAD_TEST_VALUE")
-                    == Some("after")
-                {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("watcher did not load the changed config");
+        ServerBuilder::new().config(config).build().unwrap()
     }
 }

@@ -16,6 +16,8 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
+use mcp_server_devtools::bootstrap::ConfigHandle;
+use mcp_server_devtools::config::Config;
 use mcp_server_devtools::format::jmespath::apply_jq_filter;
 use mcp_server_devtools::format::truncation::truncate_for_ai;
 use mcp_server_devtools::format::{OutputFormat, render, to_pretty_json};
@@ -126,9 +128,50 @@ fn output_size_comparison() {
     }
 }
 
+/// A credential set the size a real multi-vendor deployment carries: every
+/// vendor this server supports, each with a couple of secrets.
+fn realistic_config() -> Config {
+    let mut values = std::collections::HashMap::new();
+    for vendor in [
+        "ATLASSIAN",
+        "ZOOM",
+        "CIRCLECI",
+        "SLACK",
+        "POSTMAN",
+        "EDX",
+        "NEWRELIC",
+        "GRAFANA",
+        "SONARQUBE",
+        "SPLUNK",
+        "NINJAONE",
+        "WRDS",
+    ] {
+        values.insert(format!("{vendor}_API_TOKEN"), "x".repeat(40));
+        values.insert(
+            format!("{vendor}_USER_EMAIL"),
+            "someone@example.com".to_owned(),
+        );
+        values.insert(
+            format!("{vendor}_BASE_URL"),
+            format!("https://{vendor}.example.com"),
+        );
+    }
+    Config::from_map(values)
+}
+
 fn main() {
     println!("=== output size: is TOON earning its CPU? ===");
     output_size_comparison();
+
+    // Stage 0 runs once per *tool call*, before any payload work — so unlike the
+    // stages below it is paid even by a request that returns two bytes.
+    println!("\n=== stage 0: per-tool-call config snapshot (mean of 1000) ===");
+    let config = realistic_config();
+    let handle = ConfigHandle::new(realistic_config());
+    probe("BEFORE: deep clone of Config", 1000, || config.clone());
+    probe("NOW:    ConfigHandle::snapshot()", 1000, || {
+        handle.snapshot()
+    });
 
     for (n, iters) in [(500usize, 20u32), (5000, 4)] {
         let data = payload(n);

@@ -5,6 +5,7 @@
 //! verbatim, which closes the command-injection surface (CWE-78) the TS
 //! reference also guarded against via `execFile`.
 
+use std::future::Future;
 use std::time::Duration;
 
 use tokio::process::Command;
@@ -91,4 +92,25 @@ pub async fn execute_with_timeout(
     };
 
     Err(unexpected(format!("Failed to {operation}: {detail}"), None))
+}
+
+/// Outbound adapter: the real subprocess implementation of
+/// [`CommandRunner`](crate::ports::CommandRunner).
+///
+/// Zero-sized, so injecting it costs nothing — `&SystemCommandRunner` is a
+/// dangling-but-valid reference the optimiser discards entirely.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemCommandRunner;
+
+impl crate::ports::CommandRunner for SystemCommandRunner {
+    /// Single tail `.await` over infallible sync prep, so this is
+    /// `fn -> impl Future` rather than `async fn` — no outer state machine.
+    fn run(
+        &self,
+        file: &str,
+        args: &[&str],
+        operation: &str,
+    ) -> impl Future<Output = Result<ShellOutput, McpError>> + Send {
+        execute(file, args, operation)
+    }
 }

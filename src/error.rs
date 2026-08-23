@@ -143,10 +143,6 @@ pub fn auth_invalid(message: impl Into<String>) -> McpError {
     McpError::new(message, ErrorKind::AuthInvalid, Some(401), None)
 }
 
-pub fn auth_invalid_default() -> McpError {
-    auth_invalid("Authentication credentials are invalid")
-}
-
 pub fn api_error(
     message: impl Into<String>,
     status_code: Option<u16>,
