@@ -4,7 +4,6 @@ pub mod jmespath;
 pub mod markdown;
 pub mod truncation;
 
-use serde::Serialize;
 use serde_json::Value;
 
 /// How tool output should be rendered before being handed to the MCP client.
@@ -43,25 +42,11 @@ pub fn render(data: &Value, format: OutputFormat) -> String {
     }
 }
 
-/// Render with a caller-supplied serializable value. Same policy as
-/// [`render`], including the lazy JSON fallback.
-pub fn render_serializable<T: Serialize>(data: &T, format: OutputFormat) -> String {
-    match format {
-        OutputFormat::Json => serde_json::to_string_pretty(data).unwrap_or_default(),
-        OutputFormat::Toon => encode_toon_serializable(data)
-            .unwrap_or_else(|| serde_json::to_string_pretty(data).unwrap_or_default()),
-    }
-}
-
 /// Pretty JSON with 2-space indent — matches TS `JSON.stringify(value, null, 2)`.
 pub fn to_pretty_json(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_default()
 }
 
 fn encode_toon(value: &Value) -> Option<String> {
-    serde_toon::to_string(value).ok()
-}
-
-fn encode_toon_serializable<T: Serialize>(value: &T) -> Option<String> {
     serde_toon::to_string(value).ok()
 }

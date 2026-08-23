@@ -8,8 +8,8 @@
 //! 4. Ensure the target directory exists and is writable.
 //! 5. Fetch repository metadata and pick the preferred clone URL (SSH first,
 //!    HTTPS fallback).
-//! 6. Spawn `git clone <url> <target>/<repoSlug>` via [`crate::shell::execute`]
-//!    without a shell.
+//! 6. Spawn `git clone <url> <target>/<repoSlug>` through the injected
+//!    [`CommandRunner`] port, without a shell.
 //! 7. Return a markdown success block; on failure emit the protocol-specific
 //!    troubleshooting template.
 
@@ -21,7 +21,7 @@ use tracing::{debug, warn};
 use crate::auth::Credentials;
 use crate::controllers::api::{BitbucketContext, ControllerResponse};
 use crate::error::{McpError, unexpected};
-use crate::shell;
+use crate::ports::CommandRunner;
 use crate::tools::args::CloneArgs;
 use crate::transport::{RequestOptions, ResponseBody, fetch};
 use crate::workspace::resolve_default_workspace;
@@ -50,8 +50,19 @@ fn slug_is_valid(slug: &str) -> bool {
 }
 
 /// Main entry point invoked by both the MCP tool and the CLI subcommand.
+///
+/// `runner` is the [`CommandRunner`] port used to invoke `git`. Production
+/// passes [`SystemCommandRunner`](crate::shell::SystemCommandRunner); tests
+/// pass a fake and assert on the recorded argv instead of shadowing `git` on
+/// `PATH`. Taken as `&impl CommandRunner` rather than `&dyn` so dispatch stays
+/// static and the port adds no allocation.
+///
+/// Deliberately a parameter on this one function rather than a field on
+/// [`BitbucketContext`]: the other `bb_*` verbs never run a command, and they
+/// should not inherit a type parameter for a capability they do not use.
 pub async fn handle_clone(
     ctx: &BitbucketContext<'_>,
+    runner: &impl CommandRunner,
     args: &CloneArgs,
 ) -> Result<ControllerResponse, McpError> {
     let workspace = resolve_workspace(ctx, args.workspace_slug.as_deref()).await?;
@@ -80,13 +91,14 @@ pub async fn handle_clone(
 
     debug!(%clone_url, protocol = protocol.display(), "clone: invoking git");
     let clone_dir_str = clone_dir.to_string_lossy().into_owned();
-    let output = shell::execute(
-        "git",
-        &["clone", &clone_url, &clone_dir_str],
-        "cloning repository",
-    )
-    .await
-    .map_err(|err| enrich_clone_error(err, protocol))?;
+    let output = runner
+        .run(
+            "git",
+            &["clone", &clone_url, &clone_dir_str],
+            "cloning repository",
+        )
+        .await
+        .map_err(|err| enrich_clone_error(err, protocol))?;
 
     Ok(ControllerResponse {
         content: success_message(

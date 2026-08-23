@@ -9,11 +9,11 @@
 
 use clap::Subcommand;
 
+use crate::bootstrap::CliRuntime;
 use crate::cli::api::{ReadOpts, WriteOpts, parse_object, parse_query_params};
 use crate::controllers::api::{ControllerResponse, HandleContext, handle_request};
 use crate::error::McpError;
-use crate::transport::{HttpMethod, build_client};
-use crate::vendor::jira::JiraVendor;
+use crate::transport::HttpMethod;
 
 /// Verbs exposed under `mcp-devtools jira …`.
 #[derive(Debug, Subcommand)]
@@ -33,10 +33,8 @@ pub enum Command {
 /// Dispatch a `jira` subcommand. Constructs a Jira vendor and prints
 /// the rendered response to stdout.
 pub async fn dispatch(command: Command) -> Result<(), McpError> {
-    let config = crate::config::load();
-    let client = build_client()?;
-    let vendor = JiraVendor::new();
-    let ctx = HandleContext::new(&client, &config, &vendor);
+    let runtime = CliRuntime::load()?;
+    let ctx = HandleContext::new(&runtime.client, &runtime.config, &runtime.vendors.jira);
 
     let response = match command {
         Command::Get(opts) => call_read(&ctx, HttpMethod::Get, opts).await?,

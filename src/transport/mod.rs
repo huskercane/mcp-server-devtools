@@ -195,36 +195,6 @@ fn log_streamed_download(
     );
 }
 
-/// Stream a successful upstream body directly into an atomic artifact. The
-/// byte ceiling is checked for every decoded chunk, so transfer-encoded
-/// responses cannot bypass it by omitting Content-Length.
-#[allow(clippy::too_many_arguments)]
-pub async fn fetch_streamed_artifact(
-    _client: &Client,
-    vendor: &dyn Vendor,
-    credentials: &Credentials,
-    config: &Config,
-    path: &str,
-    options: RequestOptions,
-    filename_prefix: &str,
-    extension: &str,
-    content_type: &str,
-    max_bytes: u64,
-) -> Result<raw_response::StreamedArtifact, McpError> {
-    fetch_streamed_artifact_with_policy(
-        vendor,
-        credentials,
-        config,
-        path,
-        options,
-        filename_prefix,
-        extension,
-        content_type,
-        StreamingPolicy::new(max_bytes, max_bytes),
-    )
-    .await
-}
-
 #[derive(Debug, Clone)]
 pub struct StreamingPolicy {
     pub max_encoded_bytes: u64,
@@ -1442,13 +1412,6 @@ impl ResponseBody {
             None
         }
     }
-
-    pub fn as_text(&self) -> Option<&str> {
-        match self {
-            Self::Text(s) => Some(s.as_str()),
-            _ => None,
-        }
-    }
 }
 
 fn log_ninjaone_request(vendor_name: &str, url: &str, method: HttpMethod, body: Option<&Value>) {
@@ -1859,15 +1822,4 @@ fn map_reqwest_error(err: &reqwest::Error, url: &str) -> McpError {
         err.to_string(),
         Some(OriginalError::String(err.to_string())),
     )
-}
-
-/// Exposed for callers that just want a well-formed auth header (e.g. tests
-/// and diagnostics). Prefer [`fetch`] for real traffic.
-///
-/// Vendor-scoped; the same email may have a different token per vendor.
-/// Synchronous — safe in tests and diagnostics. Async server paths must
-/// use [`Credentials::require_for_async`] so the keychain syscall doesn't
-/// block a Tokio worker.
-pub fn require_credentials(config: &Config, vendor: &str) -> Result<Credentials, McpError> {
-    Credentials::require_for(config, vendor)
 }

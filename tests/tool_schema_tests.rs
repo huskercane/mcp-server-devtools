@@ -1,12 +1,16 @@
 //! Tool-schema sanity: round-trip the `DevtoolsServer`'s advertised info,
 //! and verify the `args` types serialise with camelCase keys (TS parity).
 
+use std::collections::HashMap;
+
+use mcp_server_devtools::bootstrap::ServerBuilder;
 use mcp_server_devtools::config::Config;
-use mcp_server_devtools::tools::DevtoolsServer;
 use mcp_server_devtools::tools::args::{
     ArtifactReadArgs, CircleCiLogsArgs, OutputFormatArg, QueryParams, ReadArgs,
     SonarqubeQualityGateArgs, SonarqubeSearchIssuesArgs, WriteArgs,
 };
+use rmcp::ServerHandler;
+use serde_json::json;
 
 #[test]
 fn artifact_read_args_support_resume_offsets() {
@@ -20,43 +24,12 @@ fn artifact_read_args_support_resume_offsets() {
     assert_eq!(args.offset, 65_536);
     assert_eq!(args.max_bytes, Some(32_768));
 }
-use mcp_server_devtools::transport::build_client;
-use mcp_server_devtools::vendor::bitbucket::BitbucketVendor;
-use mcp_server_devtools::vendor::circleci::CircleCiVendor;
-use mcp_server_devtools::vendor::confluence::ConfluenceVendor;
-use mcp_server_devtools::vendor::edx::EdxVendor;
-use mcp_server_devtools::vendor::grafana::GrafanaVendor;
-use mcp_server_devtools::vendor::jira::JiraVendor;
-use mcp_server_devtools::vendor::newrelic::NewRelicVendor;
-use mcp_server_devtools::vendor::ninjaone::NinjaOneVendor;
-use mcp_server_devtools::vendor::postman::PostmanVendor;
-use mcp_server_devtools::vendor::slack::SlackVendor;
-use mcp_server_devtools::vendor::sonarqube::SonarqubeVendor;
-use mcp_server_devtools::vendor::splunk::SplunkVendor;
-use mcp_server_devtools::vendor::zoom::ZoomVendor;
-use rmcp::ServerHandler;
-use serde_json::json;
-use std::collections::HashMap;
-
 #[test]
 fn server_info_reports_expected_identity() {
-    let server = DevtoolsServer::with_components(
-        Config::from_map(HashMap::new()),
-        build_client().unwrap(),
-        BitbucketVendor::new(),
-        JiraVendor::new(),
-        ConfluenceVendor::new(),
-        ZoomVendor::new(),
-        CircleCiVendor::new(),
-        SlackVendor::new(),
-        PostmanVendor::new(),
-        EdxVendor::new(),
-        NewRelicVendor::new(),
-        GrafanaVendor::new(),
-        SonarqubeVendor::new(),
-        SplunkVendor::new(),
-        NinjaOneVendor::new(),
-    );
+    let server = ServerBuilder::new()
+        .config(Config::from_map(HashMap::new()))
+        .build()
+        .unwrap();
     let info = server.get_info();
     assert_eq!(
         info.server_info.name,

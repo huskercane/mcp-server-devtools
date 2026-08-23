@@ -28,8 +28,6 @@ pub mod network_timeouts {
     use super::Duration;
 
     pub const DEFAULT_REQUEST: Duration = Duration::from_secs(30);
-    pub const LARGE_REQUEST: Duration = Duration::from_mins(1);
-    pub const SEARCH_REQUEST: Duration = Duration::from_secs(45);
 }
 
 pub mod data_limits {
@@ -64,6 +62,4 @@ pub mod data_limits {
     pub const STREAMING_ARTIFACT_SHUTDOWN_TIMEOUT: std::time::Duration =
         std::time::Duration::from_secs(5);
     pub const MAX_STREAMING_ARTIFACT_RECLAIMS_PER_SWEEP: usize = 64;
-    pub const MAX_PAGE_SIZE: u32 = 100;
-    pub const DEFAULT_PAGE_SIZE: u32 = 50;
 }

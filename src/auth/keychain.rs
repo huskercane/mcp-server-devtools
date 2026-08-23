@@ -68,6 +68,11 @@ impl SecretKind {
         format!("{prefix}.{vendor}")
     }
 
+    /// Pre-rename service name, used only to migrate secrets stored under the
+    /// old `mcp-server-atlassian` prefix. The sole non-test caller lives behind
+    /// `#[cfg(feature = "keychain")]`, so gate this the same way — otherwise a
+    /// `--no-default-features` build trips `-D dead-code`.
+    #[cfg(any(feature = "keychain", test))]
     fn legacy_service_for(self, vendor: &str) -> String {
         self.service_for(vendor)
             .replacen("mcp-server-devtools", "mcp-server-atlassian", 1)

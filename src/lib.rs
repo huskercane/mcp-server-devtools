@@ -10,6 +10,7 @@
 
 pub mod audit;
 pub mod auth;
+pub mod bootstrap;
 pub mod cli;
 pub mod config;
 pub mod constants;
@@ -18,7 +19,7 @@ pub mod error;
 pub mod format;
 pub mod ingestion;
 pub mod logger;
-pub mod pagination;
+pub mod ports;
 pub mod server;
 pub mod shell;
 pub mod tools;
