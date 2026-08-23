@@ -242,6 +242,53 @@ async fn search_partitions_exact_half_open_splunk_bounds() {
 }
 
 #[tokio::test]
+async fn partition_request_send_error_is_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/search/v2/jobs/export"))
+        .respond_with_err(|_: &wiremock::Request| {
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "injected transient partition request failure",
+            )
+        })
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/services/search/v2/jobs/export"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(r#"{"fields":["_time"],"rows":[]}"#, "application/json"),
+        )
+        .with_priority(2)
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let client = build_client().unwrap();
+    let config = config();
+    let vendor = SplunkVendor::with_base_url(server.uri());
+    let response = search(
+        &SplunkContext::new(&client, &config, &vendor),
+        &SplunkSearchArgs {
+            search: "search index=main".into(),
+            earliest_time: Some("100".into()),
+            latest_time: Some("110".into()),
+            time_partitions: Some(2),
+            max_time: None,
+            jq: None,
+            output_format: Some(json_output()),
+        },
+    )
+    .await
+    .unwrap();
+
+    cleanup(response.raw_response_path);
+}
+
+#[tokio::test]
 async fn search_partitions_merge_non_empty_results_in_planned_order() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

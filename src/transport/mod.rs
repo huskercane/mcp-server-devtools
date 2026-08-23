@@ -95,6 +95,13 @@ fn reqwest_error_kind(error: &reqwest::Error) -> &'static str {
     }
 }
 
+fn is_retryable_stream_request_error(error: &reqwest::Error) -> bool {
+    // Reqwest classifies some connection resets while sending as request
+    // errors rather than connect errors. All current streaming endpoints are
+    // read-only queries, including Splunk's POST export endpoint.
+    error.is_connect() || error.is_timeout() || error.is_request()
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HttpCallLog<'a> {
     component: &'a str,
@@ -1033,7 +1040,7 @@ pub async fn fetch_streamed_artifact_with_policy(
             () = policy.cancellation.cancelled() => return Err(api_error("streaming request cancelled", Some(499), None)),
             result = tokio::time::timeout(remaining, request.send()) => match result {
                 Ok(Ok(response)) => response,
-                Ok(Err(error)) if attempt < attempts && (error.is_connect() || error.is_timeout()) => {
+                Ok(Err(error)) if attempt < attempts && is_retryable_stream_request_error(&error) => {
                     log_http_transport_failure(call, &error, true);
                     retry_stream_attempt(attempt, &policy, deadline).await?;
                     continue;
@@ -1257,7 +1264,7 @@ pub async fn fetch_streamed_url(
             () = policy.cancellation.cancelled() => return Err(api_error("streaming request cancelled", Some(499), None)),
             result = tokio::time::timeout(remaining, client.get(url).timeout(remaining).send()) => match result {
                 Ok(Ok(response)) => response,
-                Ok(Err(error)) if attempt < attempts && (error.is_connect() || error.is_timeout()) => {
+                Ok(Err(error)) if attempt < attempts && is_retryable_stream_request_error(&error) => {
                     log_http_transport_failure(call, &error, true);
                     retry_stream_attempt(attempt, &policy, deadline).await?;
                     continue;

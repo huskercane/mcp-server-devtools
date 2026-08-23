@@ -39,6 +39,49 @@ async fn explicitly_decodes_and_accounts_for_zstd_without_content_length_assumpt
 }
 
 #[tokio::test]
+async fn transient_request_send_errors_are_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/transient"))
+        .respond_with_err(|_: &wiremock::Request| {
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "injected transient request failure",
+            )
+        })
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/transient"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"recovered"))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut policy = StreamingPolicy::new(64, 64);
+    policy.max_attempts = 2;
+    let artifact = fetch_streamed_url(
+        &format!("{}/transient", server.uri()),
+        "transient-request-retry",
+        "log",
+        "text/plain",
+        policy,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        tokio::fs::read(&artifact.artifact.path).await.unwrap(),
+        b"recovered"
+    );
+    let _ = mcp_server_devtools::transport::raw_response::remove_artifact(&artifact.artifact.path)
+        .await;
+}
+
+#[tokio::test]
 async fn decoded_quota_is_enforced_during_decompression() {
     let server = MockServer::start().await;
     let decoded = vec![b'x'; 32 * 1024];
