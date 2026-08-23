@@ -68,7 +68,7 @@ Configuration is resolved in this order:
 2. `.env` in the working directory
 3. Vendor sections in `~/.mcp/configs.json`
 
-Common settings:
+The [complete configuration reference](docs/configuration.md) lists every supported setting, its scope, and its default. Common integration settings are:
 
 | Integration | Required or commonly used settings |
 |---|---|
@@ -131,7 +131,14 @@ Example vendor-scoped global config:
 }
 ```
 
-The server watches the global config and reloads changes without a restart.
+The supported filename is `~/.mcp/configs.json` (not `~/.mcp/mcp.json`). A [complete sample](examples/configs.json) covers every integration. Copy it, then remove integrations you do not use and replace its placeholders:
+
+```bash
+mkdir -p ~/.mcp
+cp examples/configs.json ~/.mcp/configs.json
+```
+
+The server watches the global config and reloads changes without a restart. Startup settings such as `TRANSPORT_MODE`, `PORT`, and logging/audit controls must be process environment variables; see the reference for the exact source boundaries.
 
 ### Store secrets in the OS keychain
 
@@ -247,6 +254,22 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
+
+Before opening a PR, run the response-pipeline performance probe as well as the correctness checks:
+
+```bash
+cargo bench --bench response_pipeline
+```
+
+This prints per-stage allocation bytes, allocation counts, timing, and output-size comparisons. For changes on a hot path, run it on the base branch and the PR branch using the same machine and build profile. Allocation counts should not increase; treat small timing changes as noise unless they repeat across several runs.
+
+When profiling the TOON encoder itself, build and run its sustained workload, which lasts 12 seconds by default:
+
+```bash
+cargo bench --bench toon_encode_loop
+```
+
+Attach Instruments, `sample`, or `samply` to that workload when call-stack data is needed. These are manual profiling probes rather than pass/fail CI benchmarks.
 
 CI builds and tests the default and headless feature sets across Linux, macOS, and Windows. Releases publish checksummed archives for all supported targets.
 

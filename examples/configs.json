@@ -1,0 +1,91 @@
+{
+  "bitbucket": {
+    "environments": {
+      "ATLASSIAN_USER_EMAIL": "you@example.com",
+      "ATLASSIAN_API_TOKEN": "keychain",
+      "BITBUCKET_DEFAULT_WORKSPACE": "my-workspace"
+    }
+  },
+  "jira": {
+    "environments": {
+      "ATLASSIAN_USER_EMAIL": "you@example.com",
+      "ATLASSIAN_API_TOKEN": "keychain",
+      "ATLASSIAN_SITE_NAME": "mycompany"
+    }
+  },
+  "confluence": {
+    "environments": {
+      "ATLASSIAN_USER_EMAIL": "you@example.com",
+      "ATLASSIAN_API_TOKEN": "keychain",
+      "ATLASSIAN_SITE_NAME": "mycompany"
+    }
+  },
+  "zoom": {
+    "environments": {
+      "ZOOM_ACCOUNT_ID": "your-account-id",
+      "ZOOM_CLIENT_ID": "your-client-id",
+      "ZOOM_CLIENT_SECRET": "keychain"
+    }
+  },
+  "circleci": {
+    "environments": {
+      "CIRCLECI_TOKEN": "keychain"
+    }
+  },
+  "slack": {
+    "environments": {
+      "SLACK_TOKEN": "keychain"
+    }
+  },
+  "postman": {
+    "environments": {
+      "POSTMAN_API_KEY": "keychain"
+    }
+  },
+  "edx": {
+    "environments": {
+      "EDX_ACCESS_TOKEN": "keychain",
+      "EDX_API_BASE": "https://courses.edx.org"
+    }
+  },
+  "newrelic": {
+    "environments": {
+      "NEW_RELIC_API_KEY": "keychain",
+      "NEW_RELIC_REGION": "us"
+    }
+  },
+  "grafana": {
+    "environments": {
+      "GRAFANA_URL": "https://example.grafana.net",
+      "GRAFANA_TOKEN": "keychain"
+    }
+  },
+  "sonarqube": {
+    "environments": {
+      "SONARQUBE_URL": "https://sonarcloud.io",
+      "SONARQUBE_TOKEN": "keychain"
+    }
+  },
+  "splunk": {
+    "environments": {
+      "SPLUNK_URL": "https://splunk.example.com:8089",
+      "SPLUNK_TOKEN": "keychain"
+    }
+  },
+  "ninjaone": {
+    "environments": {
+      "NINJAONE_URL": "https://app.ninjarmm.com",
+      "NINJAONE_ACCESS_TOKEN": "keychain"
+    }
+  },
+  "wrds": {
+    "environments": {
+      "WRDS_USERNAME": "your-wrds-username",
+      "WRDS_PASSWORD": "keychain",
+      "WRDS_HOST": "wrds-pgdata.wharton.upenn.edu",
+      "WRDS_PORT": "9737",
+      "WRDS_DBNAME": "wrds",
+      "WRDS_SSLMODE": "require"
+    }
+  }
+}
