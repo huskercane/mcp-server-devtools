@@ -347,8 +347,18 @@ async fn search_partitions_merge_non_empty_results_in_planned_order() {
 }
 
 #[tokio::test]
-#[serial_test::serial]
 async fn partition_failure_cancels_drains_and_schedules_nothing_later() {
+    let mut unrelated = mcp_server_devtools::transport::raw_response::begin_artifact(
+        "splunk-search-unrelated",
+        "json",
+        "application/json",
+        64,
+    )
+    .await
+    .unwrap();
+    unrelated.write_chunk(b"unrelated").await.unwrap();
+    let unrelated = unrelated.commit().await.unwrap();
+
     let server = MockServer::start().await;
     for earliest in ["0.000000000", "2.000000000", "6.000000000"] {
         Mock::given(method("POST"))
@@ -402,19 +412,14 @@ async fn partition_failure_cancels_drains_and_schedules_nothing_later() {
     .unwrap_err();
     assert_eq!(error.status_code, Some(500));
 
-    let dir = mcp_server_devtools::transport::raw_response::init();
-    let names = std::fs::read_dir(dir)
-        .unwrap()
-        .flatten()
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    assert!(!names.iter().any(|name| {
-        name.contains("splunk-search")
-            || name.contains("canonical-logs")
-            || std::path::Path::new(name)
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("part"))
-    }));
+    assert!(unrelated.artifact.path.exists());
+    assert!(
+        mcp_server_devtools::transport::raw_response::artifact(&unrelated.artifact.id).is_some(),
+        "failure cleanup must not unregister an artifact owned by another operation"
+    );
+    mcp_server_devtools::transport::raw_response::remove_artifact(&unrelated.artifact.path)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

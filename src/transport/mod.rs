@@ -205,6 +205,7 @@ pub struct StreamingPolicy {
     pub cancellation: CancellationToken,
     pub aggregate: Option<Arc<StreamingAggregateQuota>>,
     pub disk: Option<Arc<StreamingDiskQuota>>,
+    pub operation: Option<raw_response::ArtifactOperation>,
 }
 
 #[derive(Debug)]
@@ -987,6 +988,7 @@ impl StreamingPolicy {
             cancellation: CancellationToken::new(),
             aggregate: None,
             disk: None,
+            operation: None,
         }
     }
 }
@@ -1180,11 +1182,12 @@ async fn persist_decoded_response(
 ) -> Result<raw_response::StreamedArtifact, McpError> {
     let encoded = std::sync::Arc::new(AtomicU64::new(0));
     let mut reader = decoded_reader(response, policy, encoded.clone())?;
-    let mut writer = raw_response::begin_artifact(
+    let mut writer = raw_response::begin_artifact_in_operation(
         filename_prefix,
         extension,
         content_type,
         policy.max_decoded_bytes,
+        policy.operation.as_ref(),
     )
     .await
     .map_err(|error| unexpected(format!("failed to create streamed artifact: {error}"), None))?;

@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use mcp_server_devtools::transport::raw_response::{
-    artifact, artifact_for_path, begin_artifact, read_artifact_chunk, remove_artifact, save,
-    save_artifact,
+    ArtifactOperation, artifact, artifact_for_path, begin_artifact, begin_artifact_in_operation,
+    read_artifact_chunk, remove_artifact, save, save_artifact,
 };
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -39,6 +39,28 @@ async fn removing_missing_artifact_unregisters_stale_metadata() {
 
     assert!(artifact(&metadata.id).is_none());
     assert!(artifact_for_path(&path).is_none());
+}
+
+#[tokio::test]
+async fn operation_cleanup_removes_only_owned_artifacts() {
+    let operation = ArtifactOperation::new();
+    let mut owned =
+        begin_artifact_in_operation("operation-owned", "txt", "text/plain", 32, Some(&operation))
+            .await
+            .unwrap();
+    owned.write_chunk(b"owned").await.unwrap();
+    let owned = owned.commit().await.unwrap();
+    let unrelated = save_artifact("operation-unrelated", "unrelated")
+        .await
+        .unwrap();
+
+    operation.cleanup().await.unwrap();
+
+    assert!(!owned.artifact.path.exists());
+    assert!(artifact(&owned.artifact.id).is_none());
+    assert!(unrelated.exists());
+    assert!(artifact_for_path(&unrelated).is_some());
+    cleanup(&unrelated).await;
 }
 
 #[tokio::test]

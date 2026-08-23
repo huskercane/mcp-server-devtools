@@ -999,6 +999,27 @@ pub async fn merge_partitions_cancellable_reserved(
     cancellation: &tokio_util::sync::CancellationToken,
     disk: Option<std::sync::Arc<crate::transport::StreamingDiskQuota>>,
 ) -> std::io::Result<MergeResult> {
+    merge_partitions_cancellable_reserved_in_operation(
+        paths,
+        ordering,
+        result_limit,
+        max_bytes,
+        cancellation,
+        disk,
+        None,
+    )
+    .await
+}
+
+pub async fn merge_partitions_cancellable_reserved_in_operation(
+    paths: &[PathBuf],
+    ordering: RecordOrdering,
+    result_limit: Option<u64>,
+    max_bytes: u64,
+    cancellation: &tokio_util::sync::CancellationToken,
+    disk: Option<std::sync::Arc<crate::transport::StreamingDiskQuota>>,
+    operation: Option<&raw_response::ArtifactOperation>,
+) -> std::io::Result<MergeResult> {
     let reverse = ordering == RecordOrdering::ReverseChronological;
     let mut readers = Vec::with_capacity(paths.len());
     for path in paths {
@@ -1016,11 +1037,12 @@ pub async fn merge_partitions_cancellable_reserved(
             heap.push(item);
         }
     }
-    let mut writer = raw_response::begin_artifact(
+    let mut writer = raw_response::begin_artifact_in_operation(
         "canonical-logs",
         "ndjson",
         "application/x-ndjson",
         max_bytes,
+        operation,
     )
     .await?;
     if let Some(disk) = disk {

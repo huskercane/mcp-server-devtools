@@ -122,6 +122,12 @@ introduced itself to every MCP client under a version that was never released.
 
 - **Priority order: correctness > security > performance > brevity.** Don't trade
   away correctness for a micro-optimization; don't log secrets or tokens.
+- **Architecture: follow hexagonal architecture and SOLID principles rigorously.**
+  Keep domain and orchestration logic behind explicit ports, isolate external
+  systems in adapters, and preserve focused responsibilities and dependency
+  direction. Deviate only when doing so avoids serious side effects or a
+  demonstrated, material allocation or performance problem; document the
+  tradeoff where the exception is made.
 - `unsafe_code = "deny"` in production. Test files that must mutate `std::env`
   (now `unsafe` in edition 2024) opt in locally via `#![allow(unsafe_code)]` — keep
   that confined to tests.

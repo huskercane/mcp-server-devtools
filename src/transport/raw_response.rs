@@ -136,6 +136,70 @@ pub struct StreamedArtifact {
     pub decoded_bytes: u64,
 }
 
+/// Private filesystem and registry scope for one multi-artifact operation.
+#[derive(Debug, Clone)]
+pub struct ArtifactOperation {
+    inner: std::sync::Arc<ArtifactOperationInner>,
+}
+
+#[derive(Debug)]
+struct ArtifactOperationInner {
+    id: String,
+    dir: PathBuf,
+}
+
+impl ArtifactOperation {
+    /// Allocate an operation identity without touching the filesystem until its
+    /// first artifact is created.
+    pub fn new() -> Self {
+        let id = uuid::Uuid::new_v4().to_string();
+        Self {
+            inner: std::sync::Arc::new(ArtifactOperationInner {
+                dir: init().join(&id),
+                id,
+            }),
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.inner.id
+    }
+
+    /// Remove only artifacts owned by this operation, including uncommitted
+    /// partial files, and unregister every committed artifact.
+    pub async fn cleanup(&self) -> std::io::Result<()> {
+        let paths = artifacts()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|artifact| artifact.metadata.path.starts_with(&self.inner.dir))
+            .map(|artifact| artifact.metadata.path.clone())
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for path in paths {
+            if let Err(error) = remove_artifact(&path).await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if first_error.is_none() {
+            match fs::remove_dir_all(&self.inner.dir).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => first_error = Some(error),
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Default for ArtifactOperation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Same-filesystem atomic artifact writer with bounded preview state.
 pub struct ArtifactWriter {
     id: String,
@@ -292,7 +356,17 @@ pub async fn begin_artifact(
     content_type: &str,
     max_bytes: u64,
 ) -> std::io::Result<ArtifactWriter> {
-    let dir = init();
+    begin_artifact_in_operation(filename_prefix, extension, content_type, max_bytes, None).await
+}
+
+pub async fn begin_artifact_in_operation(
+    filename_prefix: &str,
+    extension: &str,
+    content_type: &str,
+    max_bytes: u64,
+    operation: Option<&ArtifactOperation>,
+) -> std::io::Result<ArtifactWriter> {
+    let dir = operation.map_or_else(init, |operation| operation.inner.dir.clone());
     fs::create_dir_all(&dir).await?;
     let safe_prefix: String = filename_prefix
         .chars()
