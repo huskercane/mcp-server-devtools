@@ -105,6 +105,23 @@ This exists because the three numbers had silently diverged: releases reached
 (inherited from the TS reference server at port time), so a released binary
 introduced itself to every MCP client under a version that was never released.
 
+## Per-phase allocation gate (enterprise plan)
+
+At the end of **every** enterprise-plan phase (M0, A, B, …; see
+`docs/enterprise-product-plan.md`), run the allocation probe and compare
+bytes-allocated and allocation counts per stage against the numbers recorded
+at the previous phase boundary:
+
+```bash
+cargo bench --bench response_pipeline
+```
+
+Excessive allocation growth is a phase-exit blocker, not a nice-to-have:
+investigate any material regression (rule of thumb: > 20 % on any stage,
+matching the §8 budget posture) before declaring the phase done, and record
+the fresh numbers in the phase's PR/summary so the next phase has a baseline.
+This applies to the enterprise repo too — its CLAUDE.md carries the same rule.
+
 ## Layout
 
 - `src/vendor/` — per-vendor HTTP clients (auth headers, request/response shapes).
