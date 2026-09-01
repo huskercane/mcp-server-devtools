@@ -25,7 +25,7 @@ use std::io::{self, BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::ports::audit_sink::{AuditEvent, AuditSink, SequencedEvent};
+use crate::ports::audit_sink::{AuditEvent, AuditSink};
 
 /// File name inside `MCP_AUDIT_JOURNAL_DIR`.
 pub const JOURNAL_FILE_NAME: &str = "audit-journal.jsonl";
@@ -73,13 +73,28 @@ impl JournalAuditSink {
 
 impl AuditSink for JournalAuditSink {
     fn append(&self, event: &AuditEvent) -> io::Result<u64> {
+        // Serialize outside the lock (per the CLAUDE.md concurrency
+        // guidelines: no heavy work inside a critical section). The
+        // sequence number is only assigned under the lock, where it is
+        // spliced in as a prefix — line order and sequence order therefore
+        // stay identical, which the tamper-evidence story depends on.
+        let body = serde_json::to_vec(event)
+            .map_err(|error| io::Error::other(format!("serialize audit event: {error}")))?;
+        debug_assert!(
+            body.len() > 2 && body.first() == Some(&b'{'),
+            "AuditEvent must serialize to a non-empty JSON object"
+        );
+
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let seq = inner.next_seq + 1;
-        let mut line = serde_json::to_vec(&SequencedEvent { seq, event })
-            .map_err(|error| io::Error::other(format!("serialize audit event: {error}")))?;
+        let mut line = Vec::with_capacity(body.len() + 32);
+        line.extend_from_slice(b"{\"seq\":");
+        line.extend_from_slice(seq.to_string().as_bytes());
+        line.push(b',');
+        line.extend_from_slice(&body[1..]);
         line.push(b'\n');
         inner.file.write_all(&line)?;
         inner.file.flush()?;

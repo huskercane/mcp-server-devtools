@@ -427,8 +427,11 @@ impl ServerHandler for DevtoolsServer {
         if let Some((sink, vendor, upstream, client)) = enterprise {
             let duration_ms = started.elapsed().as_millis();
             let tool_name = audit.tool_name().to_owned();
+            // One timestamp for the outcome event and the usage event
+            // (CLAUDE.md perf guidelines: no repeated formatting work).
+            let completed_at = crate::logger::iso_timestamp();
             let outcome_event = AuditEvent {
-                timestamp: crate::logger::iso_timestamp(),
+                timestamp: completed_at.clone(),
                 kind: AuditEventKind::ToolCallOutcome,
                 request_id,
                 tool_name: tool_name.clone(),
@@ -447,7 +450,7 @@ impl ServerHandler for DevtoolsServer {
                 tracing::error!(%error, tool = %tool_name, "failed to journal audit outcome");
             }
             self.components.usage_sink.record(UsageEvent {
-                timestamp: crate::logger::iso_timestamp(),
+                timestamp: completed_at,
                 tool_name,
                 vendor: vendor.to_owned(),
                 outcome: outcome.to_owned(),
