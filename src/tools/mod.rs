@@ -407,7 +407,9 @@ impl ServerHandler for DevtoolsServer {
             let intent = AuditEvent {
                 timestamp: crate::logger::iso_timestamp(),
                 kind: AuditEventKind::ToolCallIntent,
-                request_id: audit.request_id().to_owned(),
+                // Caller-chosen, so sanitized before it reaches durable
+                // evidence: a JSON-RPC id is an arbitrary string.
+                request_id: crate::policy::correlation_id(audit.request_id()),
                 tool_name: request.name.as_ref().to_owned(),
                 vendor: (*vendor).to_owned(),
                 // Phase A replaces this with the validated principal from
@@ -459,7 +461,7 @@ impl ServerHandler for DevtoolsServer {
         if let Some((sink, vendor, upstream, client)) = enterprise {
             let duration_ms = started.elapsed().as_millis();
             let tool_name = audit.tool_name().to_owned();
-            let request_id = audit.request_id().to_owned();
+            let request_id = crate::policy::correlation_id(audit.request_id());
             // One timestamp for the outcome event and the usage event
             // (CLAUDE.md perf guidelines: no repeated formatting work).
             let completed_at = crate::logger::iso_timestamp();

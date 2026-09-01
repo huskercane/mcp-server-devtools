@@ -244,8 +244,7 @@ mod tests {
             decision: PolicyDecision::local_allow(),
             upstream_identity: UpstreamIdentity {
                 label: CredentialLabel::principal_slot(
-                    "jira",
-                    &TestSlot("ATLASSIAN_API_TOKEN"),
+                    &TestSlot::new("jira", "ATLASSIAN_API_TOKEN"),
                     "alice@example.com",
                 ),
                 vendor: "jira".to_owned(),

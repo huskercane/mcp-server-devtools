@@ -61,13 +61,13 @@ fn every_known_secret_key_is_registered() {
 fn no_two_rows_share_a_slot() {
     let mut seen: Vec<(SecretKind, &str, &str)> = Vec::new();
     for secret in VENDOR_SECRETS {
-        let principal = secret.principal_key.unwrap_or(secret.secret_key);
-        let slot = (secret.kind, secret.vendor, principal);
+        let principal = secret.principal_key().unwrap_or(secret.secret_key());
+        let slot = (secret.kind(), secret.vendor(), principal);
         assert!(
             !seen.contains(&slot),
             "duplicate keychain slot for {}/{}",
-            secret.vendor,
-            secret.secret_key
+            secret.vendor(),
+            secret.secret_key()
         );
         seen.push(slot);
     }
@@ -78,11 +78,11 @@ fn no_two_rows_share_a_slot() {
 #[test]
 fn principal_less_secrets_are_addressed_by_key_name() {
     let slack = secrets::lookup("slack", "SLACK_TOKEN").unwrap();
-    assert_eq!(slack.principal_key, None);
+    assert_eq!(slack.principal_key(), None);
     assert_eq!(slack.principal(None), "SLACK_TOKEN");
 
     let ninja: Vec<&str> = secrets::for_vendor("ninjaone")
-        .filter(|secret| secret.kind == SecretKind::Token)
+        .filter(|secret| secret.kind() == SecretKind::Token)
         .map(|secret| secret.principal(None))
         .collect();
     assert_eq!(
@@ -98,7 +98,7 @@ fn principal_less_secrets_are_addressed_by_key_name() {
 #[test]
 fn an_account_scoped_secret_uses_the_configured_principal() {
     let wrds = secrets::lookup("wrds", "WRDS_PASSWORD").unwrap();
-    assert_eq!(wrds.principal_key, Some("WRDS_USERNAME"));
+    assert_eq!(wrds.principal_key(), Some("WRDS_USERNAME"));
     assert_eq!(wrds.principal(Some("rohit")), "rohit");
     // Principal configured but blank falls back to the key name rather than
     // addressing an empty account.

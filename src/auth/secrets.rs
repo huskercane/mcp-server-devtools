@@ -46,17 +46,49 @@ pub enum SlotRole {
 
 /// One secret-bearing config key, and the keychain slot it maps to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Fields are `pub(crate)`, not `pub`. A row is *evidence* that a slot
+/// exists — `CredentialLabel` treats being one as proof that a string is a
+/// config key name rather than a credential — so a downstream adapter must
+/// not be able to mint one. Public getters expose everything readable; only
+/// construction is closed, and only this file constructs.
 pub struct VendorSecret {
     /// Canonical vendor name; also the keychain service suffix.
-    pub vendor: &'static str,
+    pub(crate) vendor: &'static str,
     /// The config key holding the secret (or the `"keychain"` sentinel).
-    pub secret_key: &'static str,
+    pub(crate) secret_key: &'static str,
     /// Config key holding the account this secret belongs to, when the vendor
-    /// has one. `None` means the principal is [`Self::secret_key`] itself.
-    pub principal_key: Option<&'static str>,
-    pub kind: SecretKind,
+    /// has one. `None` means the principal is the secret key itself.
+    pub(crate) principal_key: Option<&'static str>,
+    pub(crate) kind: SecretKind,
     /// Whether this slot can act on the request path. See [`SlotRole`].
-    pub role: SlotRole,
+    pub(crate) role: SlotRole,
+}
+
+impl VendorSecret {
+    #[must_use]
+    pub const fn vendor(&self) -> &'static str {
+        self.vendor
+    }
+
+    #[must_use]
+    pub const fn secret_key(&self) -> &'static str {
+        self.secret_key
+    }
+
+    #[must_use]
+    pub const fn principal_key(&self) -> Option<&'static str> {
+        self.principal_key
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> SecretKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn role(&self) -> SlotRole {
+        self.role
+    }
 }
 
 impl VendorSecret {

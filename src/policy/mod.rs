@@ -84,49 +84,79 @@ pub enum PrincipalAuthority {
 /// an authorization input unless bound to the token (e.g. a `client_id`
 /// claim) — which this type deliberately cannot express.
 ///
-/// Self-reported also means attacker-controlled: build it with
-/// [`ClientIdentity::reported`], which bounds and sanitizes each field, so a
-/// client cannot inject control characters, newlines, or megabytes of text
-/// into every audit record it triggers.
+/// Self-reported also means attacker-controlled, and every field here is
+/// copied into a durable audit record the operator cannot edit. Stripping
+/// control characters and truncating was not enough — bounding a string is
+/// not redacting it: a client reporting its name as `Bearer sk-live-…` had
+/// that persisted, merely shorter. Fields are private and built by
+/// [`ClientIdentity::reported`], which keeps a value only if it looks like
+/// the identifier it claims to be and otherwise substitutes a digest.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ClientIdentity {
-    pub name: Option<String>,
-    pub version: Option<String>,
+    name: Option<String>,
+    version: Option<String>,
 }
 
-/// Longest client-reported `name`/`version` retained. Real values are short
-/// (`"claude-ai"`, `"1.2.3"`); anything longer is padding, not information.
-const CLIENT_FIELD_MAX_CHARS: usize = 128;
+/// Longest client-reported value retained. Real values are short
+/// (`"claude-ai"`, `"1.2.3"`); anything longer is not a name.
+const CLIENT_FIELD_MAX_CHARS: usize = 64;
 
 impl ClientIdentity {
-    /// Bound and sanitize a client's self-reported `clientInfo`.
-    ///
-    /// Control characters (newlines included — they would otherwise forge
-    /// JSONL record boundaries in the journal) are dropped, the result is
-    /// truncated to [`CLIENT_FIELD_MAX_CHARS`] characters, and a field left
-    /// empty by that is recorded as absent rather than as `""`.
+    /// Sanitize a client's self-reported `clientInfo`.
     #[must_use]
     pub fn reported(name: Option<&str>, version: Option<&str>) -> Self {
         Self {
-            name: name.and_then(bounded_client_field),
-            version: version.and_then(bounded_client_field),
+            name: name.and_then(safe_identifier),
+            version: version.and_then(safe_identifier),
         }
+    }
+
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    #[must_use]
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
     }
 }
 
-fn bounded_client_field(value: &str) -> Option<String> {
-    let cleaned: String = value
-        .chars()
-        .filter(|ch| !ch.is_control())
-        .take(CLIENT_FIELD_MAX_CHARS)
-        .collect();
-    let trimmed = cleaned.trim();
+/// Sanitize the JSON-RPC request id that correlates an intent record with
+/// its outcome.
+///
+/// The id is chosen by the caller and may be any JSON string, so it reached
+/// durable evidence verbatim: a client sending `"id": "Bearer sk-live-…"`
+/// had that persisted in every record for the call. A plain identifier is
+/// kept so an operator can still line the record up against a client log;
+/// anything else becomes a digest, which correlates exactly as well, because
+/// the intent and the outcome digest the same input.
+#[must_use]
+pub fn correlation_id(raw: &str) -> String {
+    safe_identifier(raw).unwrap_or_else(|| "unset".to_owned())
+}
+
+/// Keep `value` when it is a plain identifier; digest it otherwise.
+///
+/// The accepted shape is deliberately narrow — letters, digits, and
+/// `._-:@/+`, no spaces — which covers every real client name, semantic
+/// version, and JSON-RPC id while excluding the shapes a credential takes
+/// (`Bearer <token>` and `Basic <blob>` both need the space). A rejected
+/// value still leaves a stable handle, so the record shows that *something*
+/// was reported and two calls reporting the same thing still match.
+fn safe_identifier(value: &str) -> Option<String> {
+    let trimmed = value.trim();
     if trimmed.is_empty() {
-        None
-    } else if trimmed.len() == cleaned.len() {
-        Some(cleaned)
-    } else {
+        return None;
+    }
+    let plausible = trimmed.chars().count() <= CLIENT_FIELD_MAX_CHARS
+        && trimmed.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ':' | '@' | '/' | '+')
+        });
+    if plausible {
         Some(trimmed.to_owned())
+    } else {
+        Some(extractors::opaque_handle(trimmed))
     }
 }
 
@@ -193,6 +223,10 @@ pub enum UpstreamAuthority {
 /// Sealed: only this crate implements it, so a downstream adapter cannot
 /// hand-roll a "slot" out of a secret it happens to hold.
 pub trait CredentialSlot: sealed::Sealed {
+    /// The vendor this slot belongs to. Taken from the slot rather than
+    /// passed alongside it, so a label cannot name one vendor's slot under
+    /// another vendor's heading.
+    fn slot_vendor(&self) -> &str;
     /// The config key naming this slot. Static by construction.
     fn slot_key(&self) -> &'static str;
 }
@@ -200,24 +234,52 @@ pub trait CredentialSlot: sealed::Sealed {
 mod sealed {
     pub trait Sealed {}
     impl Sealed for crate::auth::secrets::VendorSecret {}
+    #[cfg(any(test, feature = "test-support"))]
     impl Sealed for super::TestSlot {}
 }
 
 impl CredentialSlot for crate::auth::secrets::VendorSecret {
+    fn slot_vendor(&self) -> &str {
+        self.vendor()
+    }
+
     fn slot_key(&self) -> &'static str {
-        self.secret_key
+        self.secret_key()
     }
 }
 
-/// A slot name for tests and for brokers that pin an identity without a
-/// registry row. Still `&'static str`: a runtime-resolved secret is a
-/// `String` and will not coerce.
+/// A slot for tests and for brokers that pin an identity without a registry
+/// row.
+///
+/// Behind `cfg(test)` / the non-default `test-support` feature, because it is
+/// the one way to build a `CredentialSlot` that the secret registry did not
+/// issue. In a production build it does not exist, so
+/// `CredentialLabel::slot(&TestSlot(Box::leak(token.into_boxed_str())))` —
+/// which otherwise defeats the whole sealed-trait argument — will not
+/// compile.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TestSlot(pub &'static str);
+pub struct TestSlot {
+    pub vendor: &'static str,
+    pub key: &'static str,
+}
 
+#[cfg(any(test, feature = "test-support"))]
+impl TestSlot {
+    #[must_use]
+    pub const fn new(vendor: &'static str, key: &'static str) -> Self {
+        Self { vendor, key }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 impl CredentialSlot for TestSlot {
+    fn slot_vendor(&self) -> &str {
+        self.vendor
+    }
+
     fn slot_key(&self) -> &'static str {
-        self.0
+        self.key
     }
 }
 
@@ -245,21 +307,25 @@ const LABEL_SEGMENT_MAX_CHARS: usize = 128;
 
 impl CredentialLabel {
     /// `vendor/SECRET_KEY` — a slot with no account behind it.
+    ///
+    /// The vendor comes from the slot, not from a separate argument: passing
+    /// both allowed a label that named one vendor's slot under another
+    /// vendor's heading.
     #[must_use]
-    pub fn slot(vendor: &str, slot: &impl CredentialSlot) -> Self {
+    pub fn slot(slot: &impl CredentialSlot) -> Self {
         Self(format!(
             "{}/{}",
-            label_segment(vendor),
+            label_segment(slot.slot_vendor()),
             label_segment(slot.slot_key())
         ))
     }
 
     /// `vendor/SECRET_KEY/principal` — a slot bound to a named account.
     #[must_use]
-    pub fn principal_slot(vendor: &str, slot: &impl CredentialSlot, principal: &str) -> Self {
+    pub fn principal_slot(slot: &impl CredentialSlot, principal: &str) -> Self {
         Self(format!(
             "{}/{}/{}",
-            label_segment(vendor),
+            label_segment(slot.slot_vendor()),
             label_segment(slot.slot_key()),
             label_segment(principal)
         ))
@@ -420,20 +486,17 @@ pub struct ActionDetails {
 }
 
 impl ActionDetails {
-    /// A **read**, as claimed by an extractor that knows the endpoint.
+    /// A **`GET`** read.
     ///
-    /// `request_risk` is not a parameter. Making `ActionContext`'s fields
-    /// private only moved the problem: `ActionDetails` was still a public
-    /// struct literal, so an extractor could hand `assemble` a
-    /// `POST /rest/api/3/issue` carrying `RequestRisk::Read` and the
-    /// "derived, never client-supplied" invariant would be gone before
-    /// `ActionContext` ever saw it. Risk now comes from *which constructor
-    /// was called*, and a read downgrade for a POST endpoint is a visible,
-    /// greppable act ([`Self::read_downgrade`]).
+    /// Neither the method nor the risk is a parameter: this constructor can
+    /// only produce a `GET` read. `ActionDetails` was a public struct literal
+    /// once, so an extractor could hand `assemble` a `POST /rest/api/3/issue`
+    /// carrying `RequestRisk::Read` and the "derived, never client-supplied"
+    /// invariant was gone before `ActionContext` saw it. A non-`GET` read now
+    /// has to name an approved endpoint ([`Self::read_downgrade`]).
     #[must_use]
     pub fn read(
         normalized_action: NormalizedAction,
-        method: HttpMethod,
         canonical_path: String,
         query_attributes: Vec<(String, String)>,
         resource_type: ResourceType,
@@ -441,7 +504,7 @@ impl ActionDetails {
     ) -> Self {
         Self {
             normalized_action,
-            method,
+            method: HttpMethod::Get,
             canonical_path,
             query_attributes,
             resource_type,
@@ -450,29 +513,33 @@ impl ActionDetails {
         }
     }
 
-    /// A read on an endpoint whose HTTP method says otherwise — the Jira
-    /// `POST /rest/api/3/search/jql` case.
+    /// A read on an endpoint whose HTTP method says otherwise.
     ///
-    /// Separate from [`Self::read`] so every downgrade is a named call site
-    /// that a reviewer can enumerate, rather than a `RequestRisk::Read`
-    /// literal indistinguishable from any other.
+    /// The method comes from the [`ApprovedReadDowngrade`] value, whose
+    /// construction is private — so the constants on that type *are* the
+    /// approved set, and adding to it is a diff a reviewer will see. Taking
+    /// an arbitrary `HttpMethod` here (and in [`Self::read`]) left the
+    /// downgrade wide open: `read(…, HttpMethod::Post, …)` compiled and
+    /// produced exactly what this named site exists to make visible, so the
+    /// "one greppable downgrade" property was a convention, not a rule.
     #[must_use]
     pub fn read_downgrade(
+        downgrade: ApprovedReadDowngrade,
         normalized_action: NormalizedAction,
-        method: HttpMethod,
         canonical_path: String,
         query_attributes: Vec<(String, String)>,
         resource_type: ResourceType,
         resource_scope: ResourceScope,
     ) -> Self {
-        Self::read(
+        Self {
             normalized_action,
-            method,
+            method: downgrade.method,
             canonical_path,
             query_attributes,
             resource_type,
             resource_scope,
-        )
+            request_risk: RequestRisk::Read,
+        }
     }
 
     /// Anything the extractor could not classify: `Passthrough`/`Unknown`/
@@ -536,6 +603,35 @@ impl ActionDetails {
     #[must_use]
     pub const fn request_risk(&self) -> RequestRisk {
         self.request_risk
+    }
+}
+
+/// An endpoint whose HTTP method is not `GET` but whose contract is
+/// read-only, approved as such by review.
+///
+/// Construction is private, so this list *is* the approved set: there is no
+/// way to mint a downgrade for an endpoint that is not named here. Each entry
+/// is a security-relevant line item for the two-person review
+/// (`docs/read-endpoint-inventory.md`, decision 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApprovedReadDowngrade {
+    method: HttpMethod,
+    endpoint: &'static str,
+}
+
+impl ApprovedReadDowngrade {
+    /// Jira issue search. A `POST` because the JQL travels in the body; it
+    /// creates nothing. Approved after the fictitious `project` body field
+    /// was removed and the JQL gate was made sound.
+    pub const JIRA_SEARCH_JQL: Self = Self {
+        method: HttpMethod::Post,
+        endpoint: "POST /rest/api/3/search/jql",
+    };
+
+    /// The endpoint this downgrade covers, for diagnostics and review.
+    #[must_use]
+    pub const fn endpoint(self) -> &'static str {
+        self.endpoint
     }
 }
 
@@ -904,10 +1000,10 @@ mod tests {
             },
             None,
             UpstreamIdentity {
-                label: CredentialLabel::slot(
+                label: CredentialLabel::slot(&TestSlot::new(
                     crate::config::VENDOR_GRAFANA,
-                    &TestSlot("GRAFANA_TOKEN"),
-                ),
+                    "GRAFANA_TOKEN",
+                )),
                 vendor: crate::config::VENDOR_GRAFANA.to_owned(),
                 environment: EnvironmentClass::Prod,
                 authority: UpstreamAuthority::Shared,
@@ -1066,8 +1162,7 @@ mod tests {
     #[test]
     fn credential_label_debug_is_redacted_while_audit_keeps_the_text() {
         let label = CredentialLabel::principal_slot(
-            "jira",
-            &TestSlot("ATLASSIAN_API_TOKEN"),
+            &TestSlot::new("jira", "ATLASSIAN_API_TOKEN"),
             "a@b.example",
         );
         assert_eq!(label.as_str(), "jira/ATLASSIAN_API_TOKEN/a@b.example");
@@ -1087,31 +1182,127 @@ mod tests {
         assert!(!format!("{identity:?}").contains("a@b.example"));
     }
 
+    /// The sealed trait is only an argument if a slot cannot be minted. Two
+    /// escape hatches used to remain: `TestSlot` accepted any `&'static str`
+    /// in a production build (and `Box::leak` turns any token into one), and
+    /// `VendorSecret`'s public fields let downstream code build a row that
+    /// already implemented the trait.
+    #[test]
+    fn a_credential_slot_can_only_come_from_the_registry() {
+        // Every registry row is a slot, and its vendor comes with it.
+        let row = crate::auth::secrets::for_vendor(crate::config::VENDOR_SLACK)
+            .next()
+            .expect("slack has a registry row");
+        assert_eq!(CredentialLabel::slot(row).as_str(), "slack/SLACK_TOKEN");
+        assert_eq!(row.slot_vendor(), "slack");
+
+        // `TestSlot` exists only under cfg(test)/`test-support`; a release
+        // build of a downstream crate cannot name it at all. `VendorSecret`
+        // fields are `pub(crate)`, so a downstream crate cannot build a row
+        // either — both are compile-time properties, asserted by the fact
+        // that this test is the only place either appears.
+        let pinned = TestSlot::new("grafana", "GRAFANA_TOKEN");
+        assert_eq!(
+            CredentialLabel::slot(&pinned).as_str(),
+            "grafana/GRAFANA_TOKEN"
+        );
+    }
+
     #[test]
     fn label_segments_cannot_smuggle_separators_or_control_characters() {
-        let label = CredentialLabel::principal_slot("jira", &TestSlot("TOKEN"), "a\nb/c\td");
+        let label = CredentialLabel::principal_slot(&TestSlot::new("jira", "TOKEN"), "a\nb/c\td");
         assert_eq!(label.as_str(), "jira/TOKEN/abcd");
         assert_eq!(
-            CredentialLabel::principal_slot("jira", &TestSlot("TOKEN"), &"x".repeat(500))
+            CredentialLabel::principal_slot(&TestSlot::new("jira", "TOKEN"), &"x".repeat(500))
                 .as_str()
                 .len(),
             "jira/TOKEN/".len() + LABEL_SEGMENT_MAX_CHARS
         );
     }
 
+    /// Bounding is not redaction. A client-reported value is kept only if it
+    /// looks like the identifier it claims to be; anything else leaves a
+    /// handle, not the text.
     #[test]
-    fn client_identity_is_bounded_and_stripped_of_control_characters() {
+    fn client_reported_values_are_kept_only_when_they_look_like_identifiers() {
+        let ordinary = ClientIdentity::reported(Some("claude-ai"), Some("1.2.3"));
+        assert_eq!(ordinary.name(), Some("claude-ai"));
+        assert_eq!(ordinary.version(), Some("1.2.3"));
+
         let hostile = ClientIdentity::reported(
+            Some("Bearer sk-live-abcdef0123456789"),
             Some("evil\n{\"seq\":99,\"kind\":\"forged\"}"),
-            Some(&"9".repeat(4096)),
         );
-        let name = hostile.name.unwrap();
-        assert!(!name.contains('\n'), "no forged JSONL record boundaries");
-        assert_eq!(hostile.version.unwrap().len(), CLIENT_FIELD_MAX_CHARS);
-        assert_eq!(ClientIdentity::reported(Some("   "), None).name, None);
+        let serialized = serde_json::to_string(&hostile).unwrap();
+        assert!(
+            !serialized.contains("sk-live-abcdef0123456789"),
+            "a token reported as a client name must not persist: {serialized}"
+        );
+        assert!(!serialized.contains("forged"), "{serialized}");
+        assert!(hostile.name().unwrap().starts_with("sha256:"));
+        assert!(hostile.version().unwrap().starts_with("sha256:"));
+
+        // Over-long is a handle too, not a truncation.
+        let long = ClientIdentity::reported(Some(&"9".repeat(4096)), None);
+        assert!(long.name().unwrap().starts_with("sha256:"));
+
+        assert_eq!(ClientIdentity::reported(Some("   "), None).name(), None);
         assert_eq!(
             ClientIdentity::reported(None, None),
             ClientIdentity::default()
+        );
+    }
+
+    /// A JSON-RPC id is caller-chosen and lands in durable evidence.
+    #[test]
+    fn correlation_ids_are_sanitized_but_still_correlate() {
+        assert_eq!(correlation_id("42"), "42");
+        assert_eq!(correlation_id("req-2026-09-01-0001"), "req-2026-09-01-0001");
+        assert_eq!(correlation_id(""), "unset");
+
+        let hostile = correlation_id("Bearer sk-live-abcdef0123456789");
+        assert!(hostile.starts_with("sha256:"), "{hostile}");
+        assert!(!hostile.contains("sk-live"));
+        // Intent and outcome digest the same input, so the pair still lines
+        // up in the journal.
+        assert_eq!(hostile, correlation_id("Bearer sk-live-abcdef0123456789"));
+        assert_ne!(hostile, correlation_id("Bearer sk-live-somethingelse00"));
+    }
+
+    /// `read` cannot express a non-GET read at all, and a downgrade can only
+    /// name an endpoint from the approved list.
+    #[test]
+    fn read_downgrades_are_limited_to_approved_endpoints() {
+        let get = ActionDetails::read(
+            NormalizedAction::ReadIssue,
+            "/rest/api/3/issue/PLAT-1".to_owned(),
+            Vec::new(),
+            ResourceType::Issue,
+            ResourceScope::id("PLAT-1"),
+        );
+        assert_eq!(get.method(), HttpMethod::Get);
+        assert_eq!(get.request_risk(), RequestRisk::Read);
+
+        let downgraded = ActionDetails::read_downgrade(
+            ApprovedReadDowngrade::JIRA_SEARCH_JQL,
+            NormalizedAction::SearchIssues,
+            "/rest/api/3/search/jql".to_owned(),
+            Vec::new(),
+            ResourceType::Issue,
+            ResourceScope::unscoped(),
+        );
+        assert_eq!(downgraded.method(), HttpMethod::Post);
+        assert_eq!(downgraded.request_risk(), RequestRisk::Read);
+        assert_eq!(
+            ApprovedReadDowngrade::JIRA_SEARCH_JQL.endpoint(),
+            "POST /rest/api/3/search/jql"
+        );
+
+        // An unclassified call keeps the conservative method-derived risk.
+        assert_eq!(
+            ActionDetails::unclassified(HttpMethod::Post, "/rest/api/3/issue".to_owned())
+                .request_risk(),
+            RequestRisk::Write
         );
     }
 }

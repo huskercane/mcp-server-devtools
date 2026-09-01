@@ -41,10 +41,13 @@
 //!   batch — group commit. Under load the per-record sync cost amortizes,
 //!   which is why this is cheaper than the inline version it replaces, not
 //!   just safer.
-//! - Creating the journal also syncs its **parent directory**. A file sync
-//!   makes contents durable but not the directory entry naming the file, so
-//!   without this the very first acknowledged record could survive as bytes
-//!   in a file that does not exist after a power loss.
+//! - Startup syncs the journal **directory** — unconditionally, plus every
+//!   ancestor directory it had to create. A file sync makes contents durable
+//!   but not the directory entry naming the file, so without this the very
+//!   first acknowledged record could survive as bytes in a file that does not
+//!   exist after a power loss. Where the platform cannot fsync a directory,
+//!   the server refuses to create one rather than claim a guarantee it
+//!   cannot deliver.
 //! - Sequence numbers are assigned *by the writer*, in write order. Nothing
 //!   else can assign one, so line order and sequence order cannot diverge —
 //!   the tamper-evidence story depends on that, and it now holds without a
@@ -99,10 +102,28 @@ impl JournalAuditSink {
     /// validate its existing contents. Callers treat this as a startup
     /// failure — there is no degraded mode.
     pub fn open(dir: &Path) -> io::Result<Self> {
-        let existed = dir.exists();
-        std::fs::create_dir_all(dir)?;
+        // On a platform with no directory fsync there is no way to make a
+        // *newly created* directory entry durable, so the honest posture is
+        // to require the operator to create it in advance rather than to
+        // create one and claim a guarantee we cannot deliver.
+        if cfg!(windows) && !dir.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "the audit journal directory {} does not exist. On this platform the \
+                     server will not create it: a newly created directory entry cannot be \
+                     made durable here, and the audit RPO=0 guarantee depends on it. \
+                     Create the directory (on a volume with write barriers enabled) and \
+                     start again.",
+                    dir.display()
+                ),
+            ));
+        }
+
+        // Every directory this call has to create, outermost first, so each
+        // new entry can be made durable in its own parent afterwards.
+        let created = create_dir_all_tracked(dir)?;
         let path = dir.join(JOURNAL_FILE_NAME);
-        let is_new = !path.exists();
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -113,13 +134,29 @@ impl JournalAuditSink {
         // nothing about the directory entry that names it. On a brand-new
         // journal that gap swallows the whole RPO=0 claim: the first intent
         // could be written and synced, the call could dispatch, and a power
-        // loss before the parent directory's entry reached storage would
-        // leave no `audit-journal.jsonl` at all on restart — an acknowledged
-        // record with no file to be in. Sync the directory once, here, while
-        // the file is new; every later append only changes contents.
-        if is_new || !existed {
-            sync_directory(dir)?;
+        // loss before the entry reached storage would leave no
+        // `audit-journal.jsonl` at all on restart — an acknowledged record
+        // with no file to be in.
+        //
+        // Three things this has to get right, each of which was wrong once:
+        //
+        // 1. Syncing only when the file looked new left a retry hole: if the
+        //    sync failed after the file was created, the next startup saw an
+        //    existing file and skipped it forever. So the journal directory
+        //    is synced **unconditionally**, every startup. It is one fsync
+        //    per process against a directory whose entries rarely change.
+        // 2. If `create_dir_all` created the directory itself, that
+        //    directory's own entry lives in *its* parent and needs syncing
+        //    too — and so on up the chain. Hence `created`, walked
+        //    innermost-first below.
+        // 3. It has to be true on every platform, not just the ones where
+        //    the call happens to succeed — see `sync_directory`.
+        for new_dir in created.iter().rev() {
+            if let Some(parent) = new_dir.parent() {
+                sync_directory(parent)?;
+            }
         }
+        sync_directory(dir)?;
 
         // Two processes appending to one journal would each resume from the
         // same last sequence and issue the same numbers — duplicated
@@ -309,27 +346,45 @@ fn sequence_exhausted() -> io::Error {
     io::Error::other("audit journal sequence space exhausted; refusing to reuse sequence numbers")
 }
 
+/// `create_dir_all`, reporting which directories it actually created,
+/// outermost first.
+///
+/// `std::fs::create_dir_all` does not say what it made, and the difference
+/// matters: a directory it created has an entry in its parent that is not yet
+/// durable.
+fn create_dir_all_tracked(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    if dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut missing: Vec<PathBuf> = Vec::new();
+    let mut cursor = Some(dir);
+    while let Some(path) = cursor {
+        if path.is_dir() {
+            break;
+        }
+        missing.push(path.to_path_buf());
+        cursor = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+    }
+    std::fs::create_dir_all(dir)?;
+    // Collected innermost-first; hand back outermost-first.
+    missing.reverse();
+    Ok(missing)
+}
+
 /// Make a directory's own entries durable, so a newly created file is still
 /// there after a power loss.
 ///
 /// Opening a directory read-only and calling `sync_all` on it is the portable
-/// spelling of `fsync(dirfd)`. Windows has no directory handle to sync and
-/// returns an error here; that is not a reason to refuse to start, so the
-/// failure is logged and accepted — the platform's own write ordering is what
-/// backs the guarantee there.
+/// spelling of `fsync(dirfd)`. Windows has no directory handle to sync, and
+/// an earlier revision turned that failure into `Ok(())` — which made the
+/// RPO=0 claim knowingly false on that platform rather than merely
+/// unsupported. The error is propagated instead; [`JournalAuditSink::open`]
+/// keeps Windows working by refusing to *create* the journal directory there,
+/// so there is never an unsynced creation to account for.
 fn sync_directory(dir: &Path) -> io::Result<()> {
-    match File::open(dir).and_then(|handle| handle.sync_all()) {
-        Ok(()) => Ok(()),
-        Err(error) if cfg!(windows) => {
-            tracing::debug!(
-                error = %error,
-                path = %dir.display(),
-                "directory sync unavailable on this platform"
-            );
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+    File::open(dir).and_then(|handle| handle.sync_all())
 }
 
 /// One write, one sync. `sync_data` rather than `sync_all`: the bytes and
@@ -463,8 +518,7 @@ mod tests {
             decision: PolicyDecision::local_allow(),
             upstream_identity: UpstreamIdentity {
                 label: CredentialLabel::principal_slot(
-                    "jira",
-                    &TestSlot("ATLASSIAN_API_TOKEN"),
+                    &TestSlot::new("jira", "ATLASSIAN_API_TOKEN"),
                     "alice@example.com",
                 ),
                 vendor: "jira".to_owned(),
@@ -632,6 +686,43 @@ mod tests {
             .map(|line| line["seq"].as_u64().unwrap())
             .collect();
         assert_eq!(on_disk, (1..=64).collect::<Vec<u64>>());
+    }
+
+    /// A file sync does not make the directory entry naming the file
+    /// durable, and neither does syncing a directory whose own entry is new.
+    #[tokio::test]
+    async fn creating_a_nested_journal_directory_syncs_every_new_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("a").join("b").join("journal");
+        assert!(!nested.exists());
+
+        let sink = JournalAuditSink::open(&nested).unwrap();
+        assert_eq!(sink.append(&sample_event()).await.unwrap(), 1);
+        assert!(nested.join(JOURNAL_FILE_NAME).is_file());
+        drop(sink);
+
+        // Reopening an existing tree creates nothing and still syncs — the
+        // retry hole was skipping the sync whenever the file already
+        // existed, which made a failed first sync permanent.
+        let reopened = JournalAuditSink::open(&nested).unwrap();
+        assert_eq!(reopened.append(&sample_event()).await.unwrap(), 2);
+    }
+
+    #[test]
+    fn create_dir_all_tracked_reports_only_what_it_made() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("x").join("y");
+
+        let created = create_dir_all_tracked(&nested).unwrap();
+        assert_eq!(
+            created,
+            vec![root.path().join("x"), nested.clone()],
+            "outermost first, so each entry can be synced in its parent"
+        );
+        assert!(nested.is_dir());
+
+        // Second call creates nothing, so there is nothing new to sync.
+        assert!(create_dir_all_tracked(&nested).unwrap().is_empty());
     }
 
     #[test]

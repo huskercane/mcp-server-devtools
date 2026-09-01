@@ -249,8 +249,8 @@ fn slot_label(config: &Config, backend: &dyn KeychainBackend, vendor: &str) -> A
 
         if resolves {
             return Attribution::Slot(match configured_principal {
-                Some(principal) => CredentialLabel::principal_slot(vendor, row, principal),
-                None => CredentialLabel::slot(vendor, row),
+                Some(principal) => CredentialLabel::principal_slot(row, principal),
+                None => CredentialLabel::slot(row),
             });
         }
 
@@ -617,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn static_broker_pins_identities_for_tests() {
         let pinned = UpstreamIdentity {
-            label: CredentialLabel::slot(VENDOR_GRAFANA, &TestSlot("TEST_SLOT")),
+            label: CredentialLabel::slot(&TestSlot::new(VENDOR_GRAFANA, "TEST_SLOT")),
             vendor: "grafana".to_owned(),
             environment: EnvironmentClass::Prod,
             authority: UpstreamAuthority::Shared,

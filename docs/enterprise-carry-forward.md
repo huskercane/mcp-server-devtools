@@ -10,7 +10,7 @@ removed only when it is done, not when it is explained.
 
 Status legend: **open** · **blocked** (needs a decision) · **done**.
 
-Last updated: 2026-09-01, after the two-person WP 0.8 review (both passes).
+Last updated: 2026-09-01, after the third WP 0.8 review pass.
 
 ---
 
@@ -42,6 +42,15 @@ credential resolution to move ahead of dispatch across every controller
 
 *Do not close by*: adding more per-vendor special cases to `slot_label`. The
 registry is the wrong source of truth for something the vendors decide.
+
+### CF-13 · NinjaOne calls served by a cached login session
+**Open · Phase A · security-relevant · sub-case of CF-1**
+
+Recorded separately because it is the concrete evidence gap, not just an
+architectural preference. A NinjaOne call served by the in-memory session
+minted by `ninjaone_login` dispatches with **no attributable credential** in
+the record — the broker reports `ninjaone/indeterminate`, which is honest but
+is not "which credential acted". Closed by CF-1.
 
 ### CF-2 · `constrained_by` for resource semantics
 **Open · Phase A · blocks the §3.2 freeze**
@@ -122,9 +131,10 @@ like any other caller.
 ### CF-8 · Per-record signing and checkpoints (B.6)
 **Open · Phase B**
 
-The journal is durable (`sync_data` per batch, directory synced on creation)
-and tamper-*evident* by contiguous sequence, but not tamper-*proof*. Signed
-checkpoints every N records or T seconds are B.6.
+The journal is durable (`sync_data` per batch; the journal directory and
+every ancestor it creates synced at startup) and tamper-*evident* by
+contiguous sequence, but not tamper-*proof*. Signed checkpoints every N
+records or T seconds are B.6.
 
 ### CF-9 · `POST /rest/api/3/issue/bulkfetch`
 **Blocked · needs its own review**

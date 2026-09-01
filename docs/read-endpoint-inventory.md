@@ -183,16 +183,33 @@ and holds the §3.2 freeze open — see `docs/enterprise-carry-forward.md` CF-2.
    malformed-body behaviour, and adversarial tests. The default for POST
    remains `write`, and every downgrade stays a line item for the
    two-person review.
-5. **Raw query text — decided: not retained as raw text for audit.**
+5. **Caller-controlled attribute text — decided: parse it or digest it.**
    The earlier note promised LogQL and JQL would be kept "for audit". They
    are user- and model-authored search expressions: they can carry tokens
    pasted into a query, customer identifiers, or the contents of whatever
    someone was hunting for. What audit needs is *what was addressed*, which
    the scope already carries. Query text is retained only as a bounded,
-   allowlisted `query_attributes` entry. **Enforced, not just written
-   down**: `extractors::Retention::Digest` marks `jql` and `query` so they
-   are retained as `sha256:<64 bits>/<length>` and never as text, and
-   verbatim attributes are bounded. The first revision of this decision was
-   documented and then contradicted by the implementation, which cloned the
-   expression whole and unbounded — `search_expressions_never_reach_query_attributes_as_text`
-   now fails if that returns.
+   allowlisted `query_attributes` entry.
+
+   The decision covers **every** retained attribute, not only the search
+   expressions. `query_attributes` has no verbatim option: each key declares
+   a shape (`Integer`, `Enumerated`, `TimeBound`, `IdentifierList`,
+   `Digest`), the value is retained only if it *parses* as that shape, and
+   anything else — including anything over-long — becomes
+   `sha256:<64 bits>/<length>`. Bounding a caller-controlled string is not
+   redacting it: a token supplied as Jira's `fields` or Grafana's
+   `direction` previously reached the serialized `ActionContext` intact,
+   merely shorter.
+
+   The same rule now governs the other caller-controlled strings that reach
+   durable evidence: the JSON-RPC request id (`policy::correlation_id`) and
+   the self-reported `clientInfo` name and version
+   (`ClientIdentity::reported`) are kept only when they look like plain
+   identifiers, and are digested otherwise — which still correlates, because
+   the intent and outcome records digest the same input.
+
+   The first revision of this decision was documented and then contradicted
+   by the implementation, which cloned the expression whole and unbounded.
+   `search_expressions_never_reach_query_attributes_as_text` and
+   `caller_supplied_attribute_values_must_parse_or_become_a_digest` fail if
+   that returns.

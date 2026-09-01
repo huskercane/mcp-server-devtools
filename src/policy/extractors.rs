@@ -34,7 +34,7 @@
 
 use crate::transport::HttpMethod;
 
-use super::{ActionDetails, NormalizedAction, ResourceScope, ResourceType};
+use super::{ActionDetails, ApprovedReadDowngrade, NormalizedAction, ResourceScope, ResourceType};
 
 /// Minimal tool-level path normalization shared by extractors. See module
 /// docs for what this deliberately does not do yet.
@@ -60,11 +60,28 @@ fn normalize_path(path: &str) -> String {
 }
 
 /// How an allowlisted query value is retained in `query_attributes`.
+///
+/// There is deliberately **no verbatim option**. Every value here is written
+/// by the caller, and bounding a caller-controlled string is not redacting
+/// it: a token supplied as Jira's `fields` or Grafana's `direction` used to
+/// land in the serialized `ActionContext` intact, just shorter. A value is
+/// retained only if it *parses* as the shape the endpoint documents; anything
+/// else is a digest, so an attribute can never carry text nobody validated.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Retention {
-    /// A short structural knob (`limit`, `direction`, `fields`, `start`).
-    /// Kept verbatim, bounded by [`MAX_ATTRIBUTE_VALUE`].
-    Verbatim,
+    /// A non-negative integer (`limit`, `maxResults`). Retained as the
+    /// parsed number, so nothing but digits can survive.
+    Integer,
+    /// One of a fixed set of literals (`direction`). Retained only on an
+    /// exact, case-insensitive match against the set.
+    Enumerated(&'static [&'static str]),
+    /// A time bound: an integer epoch, a duration literal like `5m`, or an
+    /// RFC 3339 timestamp. Retained only in one of those shapes.
+    TimeBound,
+    /// A comma-separated list of field identifiers (`fields`). Retained only
+    /// if every element is `[A-Za-z0-9_.*-]+`, capped at
+    /// [`MAX_IDENTIFIER_LIST`] elements.
+    IdentifierList,
     /// A **search expression the caller wrote** — `LogQL`, JQL. Kept as a
     /// digest and a length, never as text.
     ///
@@ -80,9 +97,10 @@ enum Retention {
     Digest,
 }
 
-/// Longest verbatim attribute value retained. Structural knobs are short;
-/// anything longer is not a knob.
+/// Longest value of any shape retained, parsed or not.
 const MAX_ATTRIBUTE_VALUE: usize = 256;
+/// Most elements kept from a comma-separated identifier list.
+const MAX_IDENTIFIER_LIST: usize = 32;
 
 /// Retain only allowlisted query keys, sorted by key (§3.2
 /// `query_attributes`), each according to its declared [`Retention`].
@@ -103,36 +121,99 @@ fn allowlisted_attributes(
     kept
 }
 
+/// Retain `value` as its declared shape, or as a digest if it is not that
+/// shape. Failing to a digest rather than dropping the key keeps the *fact*
+/// that the caller sent something odd visible in the evidence.
 fn retain(value: &str, retention: Retention) -> String {
-    match retention {
-        Retention::Verbatim => {
-            let mut bounded: String = value.chars().take(MAX_ATTRIBUTE_VALUE).collect();
-            if bounded.len() < value.len() {
-                bounded.push('…');
-            }
-            bounded
-        }
-        Retention::Digest => expression_digest(value),
+    if value.len() > MAX_ATTRIBUTE_VALUE {
+        return expression_digest(value);
     }
+    let parsed = match retention {
+        Retention::Integer => parse_integer(value),
+        Retention::Enumerated(allowed) => parse_enumerated(value, allowed),
+        Retention::TimeBound => parse_time_bound(value),
+        Retention::IdentifierList => parse_identifier_list(value),
+        Retention::Digest => None,
+    };
+    parsed.unwrap_or_else(|| expression_digest(value))
+}
+
+fn parse_integer(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    // Parsed and re-rendered, so `+007` and `1_0` cannot pass through.
+    trimmed.parse::<u64>().ok().map(|number| number.to_string())
+}
+
+fn parse_enumerated(value: &str, allowed: &[&'static str]) -> Option<String> {
+    let trimmed = value.trim();
+    allowed
+        .iter()
+        .find(|candidate| candidate.eq_ignore_ascii_case(trimmed))
+        .map(|candidate| (*candidate).to_owned())
+}
+
+/// Epoch seconds/nanos, a duration literal (`5m`, `1h30m`), or RFC 3339.
+/// Each is checked by shape, not merely by length.
+fn parse_time_bound(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return None;
+    }
+    let all = |predicate: fn(char) -> bool| trimmed.chars().all(predicate);
+    let numeric = all(|ch| ch.is_ascii_digit());
+    let duration = all(|ch| ch.is_ascii_digit() || matches!(ch, 'n' | 'u' | 'm' | 's' | 'h' | 'd'))
+        && trimmed.starts_with(|ch: char| ch.is_ascii_digit());
+    let rfc3339 = all(|ch| {
+        ch.is_ascii_digit() || matches!(ch, '-' | ':' | 'T' | 'Z' | '.' | '+' | 't' | 'z')
+    }) && trimmed.starts_with(|ch: char| ch.is_ascii_digit());
+    (numeric || duration || rfc3339).then(|| trimmed.to_owned())
+}
+
+fn parse_identifier_list(value: &str) -> Option<String> {
+    let mut out = String::with_capacity(value.len());
+    for (index, element) in value.split(',').enumerate() {
+        let element = element.trim();
+        if index >= MAX_IDENTIFIER_LIST || element.is_empty() {
+            return None;
+        }
+        if !element
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '*' | '-'))
+        {
+            return None;
+        }
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(element);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// `sha256:<16 hex chars>/<byte length>` — enough to correlate two identical
-/// expressions and to see how big one was, and nothing else. Truncated to 64
-/// bits because this is a correlation handle, not a commitment.
+/// values and to see how big one was, and nothing else. Truncated to 64 bits
+/// because this is a correlation handle, not a commitment.
+///
+/// Shared with [`super::ClientIdentity`], which needs the same "keep a
+/// handle, not the text" treatment for client-reported names and request
+/// ids. One implementation so the format cannot drift between them.
+#[must_use]
+pub(crate) fn opaque_handle(value: &str) -> String {
+    expression_digest(value)
+}
+
 fn expression_digest(value: &str) -> String {
+    use std::fmt::Write as _;
+
     use sha2::{Digest as _, Sha256};
 
     let digest = Sha256::digest(value.as_bytes());
     let mut out = String::with_capacity(40);
     out.push_str("sha256:");
     for byte in &digest[..8] {
-        use std::fmt::Write as _;
         let _ = write!(out, "{byte:02x}");
     }
-    let _ = {
-        use std::fmt::Write as _;
-        write!(out, "/{}", value.len())
-    };
+    let _ = write!(out, "/{}", value.len());
     out
 }
 
@@ -152,12 +233,12 @@ pub mod grafana {
     /// selectors inside it never restricted *which* datasource is read, so
     /// nothing about policy depends on having the expression.
     const QUERY_LOGS_ALLOWLIST: &[(&str, Retention)] = &[
-        ("direction", Retention::Verbatim),
-        ("end", Retention::Verbatim),
-        ("limit", Retention::Verbatim),
+        ("direction", Retention::Enumerated(&["backward", "forward"])),
+        ("end", Retention::TimeBound),
+        ("limit", Retention::Integer),
         ("query", Retention::Digest),
-        ("start", Retention::Verbatim),
-        ("step", Retention::Verbatim),
+        ("start", Retention::TimeBound),
+        ("step", Retention::TimeBound),
     ];
 
     /// Path prefix of the datasource proxy, without the UID.
@@ -205,7 +286,6 @@ pub mod grafana {
         }
         ActionDetails::read(
             NormalizedAction::QueryLogs,
-            HttpMethod::Get,
             format!("{PROXY_PREFIX}/{datasource_uid}/loki/api/v1/query_range"),
             allowlisted_attributes(params, QUERY_LOGS_ALLOWLIST),
             ResourceType::Datasource,
@@ -221,7 +301,6 @@ pub mod grafana {
     pub fn list_datasources() -> ActionDetails {
         ActionDetails::read(
             NormalizedAction::ListDatasources,
-            HttpMethod::Get,
             "/api/datasources".to_owned(),
             Vec::new(),
             ResourceType::Datasource,
@@ -234,17 +313,17 @@ pub mod grafana {
 /// generic `jira_*` verb tools onto normalized actions.
 pub mod jira {
     use super::{
-        ActionDetails, HttpMethod, NormalizedAction, ResourceScope, ResourceType, Retention,
-        allowlisted_attributes, normalize_path,
+        ActionDetails, ApprovedReadDowngrade, HttpMethod, NormalizedAction, ResourceScope,
+        ResourceType, Retention, allowlisted_attributes, normalize_path,
     };
 
     /// Query keys retained for the GET search endpoint. The scope claim is
     /// extracted from `jql` before this runs; the expression itself is
     /// retained only as a digest.
     const SEARCH_QUERY_ALLOWLIST: &[(&str, Retention)] = &[
-        ("fields", Retention::Verbatim),
+        ("fields", Retention::IdentifierList),
         ("jql", Retention::Digest),
-        ("maxResults", Retention::Verbatim),
+        ("maxResults", Retention::Integer),
     ];
 
     /// The **only** body field the POST search extractor reads.
@@ -317,15 +396,13 @@ pub mod jira {
         match classify(method, &canonical_path) {
             Route::ReadIssue(key) => ActionDetails::read(
                 NormalizedAction::ReadIssue,
-                method,
                 canonical_path,
-                allowlisted_attributes(query, &[("fields", Retention::Verbatim)]),
+                allowlisted_attributes(query, &[("fields", Retention::IdentifierList)]),
                 ResourceType::Issue,
                 ResourceScope::id(key),
             ),
             Route::ListProjects => ActionDetails::read(
                 NormalizedAction::ReadProject,
-                method,
                 canonical_path,
                 Vec::new(),
                 ResourceType::Project,
@@ -333,7 +410,6 @@ pub mod jira {
             ),
             Route::ReadProject(key) => ActionDetails::read(
                 NormalizedAction::ReadProject,
-                method,
                 canonical_path,
                 Vec::new(),
                 ResourceType::Project,
@@ -372,11 +448,20 @@ pub mod jira {
         let resource_scope = jql
             .and_then(project_keys_from_jql)
             .map_or(ResourceScope::unscoped(), ResourceScope::ids);
-        // The one downgrade in this module, named as such: POST would derive
-        // `Write`, and only this endpoint's read-only contract overrides it.
+        // GET is an ordinary read; POST is the module's one downgrade, and
+        // it can only be spelled by naming the approved endpoint.
+        if method == HttpMethod::Get {
+            return ActionDetails::read(
+                NormalizedAction::SearchIssues,
+                canonical_path,
+                query_attributes,
+                ResourceType::Issue,
+                resource_scope,
+            );
+        }
         ActionDetails::read_downgrade(
+            ApprovedReadDowngrade::JIRA_SEARCH_JQL,
             NormalizedAction::SearchIssues,
-            method,
             canonical_path,
             query_attributes,
             ResourceType::Issue,
@@ -640,10 +725,10 @@ mod tests {
             "/api/datasources/proxy/uid/loki-prod/loki/api/v1/query_range"
         );
         assert_eq!(
-            details.query_attributes[0],
+            details.query_attributes()[0],
             ("limit".to_owned(), "100".to_owned())
         );
-        let (key, value) = &details.query_attributes[1];
+        let (key, value) = &details.query_attributes()[1];
         assert_eq!(key, "query");
         assert!(
             value.starts_with("sha256:") && value.ends_with("/11"),
@@ -944,7 +1029,7 @@ mod tests {
         assert_eq!(issue.canonical_path, "/rest/api/3/issue/PLAT-123");
         assert_eq!(issue.resource_scope, ResourceScope::id("PLAT-123"));
         assert_eq!(
-            issue.query_attributes,
+            issue.query_attributes(),
             vec![("fields".to_owned(), "summary".to_owned())]
         );
 
@@ -976,7 +1061,7 @@ mod tests {
         assert!(!serialized.contains("text ~"));
 
         let jql = details
-            .query_attributes
+            .query_attributes()
             .iter()
             .find(|(key, _)| key == "jql")
             .expect("jql attribute retained");
@@ -990,7 +1075,7 @@ mod tests {
         );
         assert_eq!(
             again
-                .query_attributes
+                .query_attributes()
                 .iter()
                 .find(|(key, _)| key == "jql")
                 .map(|(_, value)| value),
@@ -1000,8 +1085,111 @@ mod tests {
         assert_eq!(details.resource_scope, ResourceScope::id("PLAT"));
     }
 
+    /// Bounding a caller-controlled string is not redacting it. Every
+    /// retained attribute must *parse* as its documented shape, or become a
+    /// digest — a token supplied as `fields` or `direction` must not reach
+    /// the serialized context intact, merely shorter.
     #[test]
-    fn verbatim_attribute_values_are_bounded() {
+    fn caller_supplied_attribute_values_must_parse_or_become_a_digest() {
+        let token = "Bearer sk-live-abcdef0123456789";
+        let details = jira::extract(
+            HttpMethod::Get,
+            "/rest/api/3/search/jql",
+            &[
+                ("fields", token),
+                ("maxResults", token),
+                ("jql", "project = PLAT"),
+            ],
+            None,
+        );
+        let serialized = serde_json::to_string(&details).unwrap();
+        assert!(
+            !serialized.contains("sk-live-abcdef0123456789"),
+            "a token smuggled through a structural attribute must not \
+             survive: {serialized}"
+        );
+        for (key, value) in details.query_attributes() {
+            assert!(
+                value.starts_with("sha256:"),
+                "{key} did not parse and must be a digest, got {value}"
+            );
+        }
+
+        let grafana = grafana::query_logs(
+            "loki-prod",
+            &[
+                ("direction", token),
+                ("limit", "12x"),
+                ("start", "'; DROP TABLE --"),
+                ("step", token),
+            ],
+        );
+        let serialized = serde_json::to_string(&grafana).unwrap();
+        assert!(!serialized.contains("sk-live"), "{serialized}");
+        assert!(!serialized.contains("DROP TABLE"), "{serialized}");
+    }
+
+    #[test]
+    fn well_formed_attribute_values_survive_in_their_parsed_shape() {
+        let details = grafana::query_logs(
+            "loki-prod",
+            &[
+                ("direction", "BACKWARD"),
+                ("limit", "500"),
+                ("start", "1735689600"),
+                ("step", "5m"),
+                ("end", "2026-09-01T00:00:00Z"),
+            ],
+        );
+        let attributes: Vec<(&str, &str)> = details
+            .query_attributes()
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(
+            attributes,
+            vec![
+                ("direction", "backward"), // normalised to the known literal
+                ("end", "2026-09-01T00:00:00Z"),
+                ("limit", "500"),
+                ("start", "1735689600"),
+                ("step", "5m"),
+            ]
+        );
+
+        let jira = jira::extract(
+            HttpMethod::Get,
+            "/rest/api/3/issue/PLAT-1",
+            &[("fields", "summary, status,customfield_10001")],
+            None,
+        );
+        assert_eq!(
+            jira.query_attributes()[0].1,
+            "summary,status,customfield_10001"
+        );
+    }
+
+    #[test]
+    fn integers_are_reparsed_rather_than_pattern_matched() {
+        // `+007` and `1_0` parse as text that "looks numeric" to a naive
+        // check; re-rendering the parsed number is what stops them.
+        for odd in ["+007", "1_0", "0x10", " 12 ", "-1", "12.0"] {
+            let details = grafana::query_logs("loki-prod", &[("limit", odd)]);
+            let (_, value) = &details.query_attributes()[0];
+            let canonical_number = value.chars().all(|ch| ch.is_ascii_digit())
+                && value.parse::<u64>().is_ok_and(|n| n.to_string() == *value);
+            assert!(
+                canonical_number || value.starts_with("sha256:"),
+                "limit {odd:?} retained as {value}: neither a canonical \
+                 number nor a digest"
+            );
+            // Whatever survives, none of the caller's own characters do.
+            assert!(!value.contains('+') && !value.contains('_') && !value.contains('x'));
+        }
+    }
+
+    #[test]
+    fn over_long_attribute_values_are_digested_not_truncated() {
         let long = "x".repeat(5000);
         let details = jira::extract(
             HttpMethod::Get,
@@ -1009,13 +1197,12 @@ mod tests {
             &[("fields", long.as_str())],
             None,
         );
-        let (_, value) = &details.query_attributes[0];
+        let (_, value) = &details.query_attributes()[0];
         assert!(
-            value.chars().count() <= MAX_ATTRIBUTE_VALUE + 1,
-            "unbounded attribute value: {} chars",
-            value.chars().count()
+            value.starts_with("sha256:"),
+            "an over-long value must be digested, not truncated: {value}"
         );
-        assert!(value.ends_with('…'), "truncation is visible");
+        assert!(value.len() < 64);
     }
 
     #[test]
