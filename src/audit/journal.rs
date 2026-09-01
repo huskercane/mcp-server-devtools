@@ -19,6 +19,16 @@
 //! §8 budgets fsync **batched per signed checkpoint**, and checkpoints are
 //! Phase B work (B.6). The degraded-read mode (`MCP_AUDIT_DEGRADED_READS`)
 //! is unresolved question 5 and intentionally not implemented.
+//!
+//! Tokio-guideline note (CLAUDE.md, "Blocking & Tokio Reactor Health"):
+//! this append runs synchronously on the calling worker thread by design,
+//! not via `spawn_blocking`. It is a kernel-buffered append + flush (no
+//! fsync), far under the guideline's >1 ms offload threshold and inside
+//! the §8 budget (<200 µs p99 on local NVMe); write-before-dispatch
+//! ordering depends on completing it before the call proceeds, and a
+//! per-call `spawn_blocking` round-trip would cost more than the write.
+//! Revisit if checkpoint fsync (B.6) or slow storage moves it past the
+//! threshold — that is the point to batch through a dedicated writer.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write as _};
