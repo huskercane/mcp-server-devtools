@@ -26,6 +26,7 @@ ordered by partner demand and are not scheduled until Gate B passes.
 | 2 | 2026-08-29 | Canonical `ActionContext` for resource-aware policy; durable `AuditSink` split from lossy `UsageSink`; licensing boundary moved to M0; minimal `CredentialBroker` in the first slice; commercial gates moved before Phase C; wedge vendors demoted to a hypothesis; Phase 5 split into C/D; revocation, canonicalization, client-identity, response-metadata, and availability corrections; business-plan gaps and trial metrics added | Independent review |
 | 2.1 | 2026-09-01 | ADR-001 decided: enterprise crate lives in a private repository from day one; community crate gains a library target exposing the ports | Owner |
 | 2.2 | 2026-09-01 | WP 0.5 spike answered: rmcp 3.1.2 propagates per-request axum extensions into `call_tool`'s `RequestContext` on both the stateless and session HTTP paths (`docs/spikes/rmcp-extensions.md`); the §9 session-keyed fallback is not needed and was not built | Spike |
+| 2.3 | 2026-09-01 | M0 engineering landed on `feat/m0-enterprise-foundation`: WP 0.1 (LICENSE, library surface, private repo scaffolded and pushed), 0.4 (core types, `MCP_AUTH_MODE`, fail-closed bind, local-mode byte-identical tests), 0.5 (spike, rev 2.2), 0.6 (`CredentialBroker`), 0.7 (`AuditSink`/`UsageSink`, journal, write-before-dispatch fail-closed), 0.8 start (Grafana+Jira inventory, extractors; schema findings recorded in `docs/read-endpoint-inventory.md` — `ActionContext` not frozen yet). WPs 0.2/0.3 and ADR-002 counsel remain open | Owner + implementation |
 
 Unresolved questions are collected in §11.
 
@@ -330,6 +331,24 @@ spread across collaborators. **Only M0, Phase A, and Phase B are committed.**
 **Done when:** licensing boundary exists (private enterprise repository builds against the community library; community repo carries `LICENSE`); threat model
 reviewed; one partner committed; both builds pass CI with zero warnings; an
 audit record with upstream identity is written before any tool dispatches.
+
+**Status 2026-09-01 (engineering scope):**
+
+- [x] Licensing boundary: `LICENSE` (ISC) in the community repo; private
+  `mcp-devtools-enterprise` builds and smoke-tests against the community
+  library (github.com/huskercane/mcp-devtools-enterprise; licence text
+  itself still ADR-002, with counsel).
+- [ ] Threat model (WP 0.2) — owner-led, not started here.
+- [ ] Partner commitment (WP 0.3) — owner-led, not started here.
+- [x] Both repos pass build + clippy `-D warnings` + tests + fmt + deny
+  locally; community CI runs the three-OS matrix on push.
+- [x] Audit record with upstream identity before dispatch:
+  `tests/audit_journal_tests.rs` proves intent-before-dispatch, the
+  fail-closed refusal (vendor sees zero requests), and sequence resume.
+- [x] WP 0.4/0.5/0.6/0.7 landed; WP 0.8 started (Grafana + Jira, extractor
+  code + inventory; the §3.2 schema is deliberately **not frozen** — see
+  the findings section of `docs/read-endpoint-inventory.md`, pending the
+  two-person review).
 
 ### Phase A — Secure remote vertical slice (weeks 3–9)
 
