@@ -705,8 +705,8 @@ mod tests {
     fn test_config() -> CacheConfig {
         CacheConfig {
             enabled: true,
-            default_ttl: Duration::from_secs(60),
-            max_ttl: Duration::from_secs(600),
+            default_ttl: Duration::from_mins(1),
+            max_ttl: Duration::from_mins(10),
             max_entries: 10,
             max_bytes: 1_000_000,
             compression_threshold: 1024,
@@ -743,11 +743,11 @@ mod tests {
         headers.insert(CACHE_CONTROL, HeaderValue::from_static("max-age=3600"));
         let upstream = response_ttl(&headers, &config).expect("cacheable");
         assert_eq!(upstream.source, "cache_control");
-        assert_eq!(upstream.ttl, Duration::from_secs(600));
+        assert_eq!(upstream.ttl, Duration::from_mins(10));
 
         let defaulted = response_ttl(&HeaderMap::new(), &config).expect("cacheable");
         assert_eq!(defaulted.source, "default");
-        assert_eq!(defaulted.ttl, Duration::from_secs(60));
+        assert_eq!(defaulted.ttl, Duration::from_mins(1));
     }
 
     #[test]
