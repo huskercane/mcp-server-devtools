@@ -595,6 +595,47 @@ pub fn vendor_aliases(package_name: &str) -> Vec<(&'static str, Vec<String>)> {
     ]
 }
 
+/// Inbound authentication mode (`MCP_AUTH_MODE`).
+///
+/// `Off` is the community default: no inbound authentication, with the
+/// stdio pipe or loopback bind as the trust boundary. `Okta` opts into the
+/// enterprise inbound-auth path (Phase A). Parsing is fail-closed: an
+/// unrecognised value is an error, never silently mapped to `Off`, because
+/// "typo disables authentication" is exactly the failure mode
+/// `docs/enterprise-product-plan.md` §1.2 forbids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthMode {
+    /// No inbound authentication (community default).
+    #[default]
+    Off,
+    /// Okta-validated inbound bearer tokens (enterprise, Phase A).
+    Okta,
+}
+
+impl AuthMode {
+    /// Parse the raw `MCP_AUTH_MODE` value. Absent or empty means [`Off`]
+    /// (the documented default); anything not exactly `off`/`okta`
+    /// (ASCII-case-insensitive) is an error the server must refuse to start
+    /// on.
+    ///
+    /// [`Off`]: AuthMode::Off
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when the value is unrecognised.
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(str::trim) {
+            None | Some("") => Ok(Self::Off),
+            Some(value) if value.eq_ignore_ascii_case("off") => Ok(Self::Off),
+            Some(value) if value.eq_ignore_ascii_case("okta") => Ok(Self::Okta),
+            Some(other) => Err(format!(
+                "unrecognised MCP_AUTH_MODE {other:?} (expected \"off\" or \"okta\"); \
+                 refusing to guess an authentication mode"
+            )),
+        }
+    }
+}
+
 /// Cross-platform `~/.mcp/configs.json` resolver.
 pub fn default_global_path() -> Option<PathBuf> {
     global::default_path()
@@ -670,6 +711,30 @@ mod streaming_config_tests {
                     std::time::Duration::from_mins(1)
                 }
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod auth_mode_tests {
+    use super::AuthMode;
+
+    #[test]
+    fn absent_or_off_is_off_and_okta_is_okta() {
+        assert_eq!(AuthMode::parse(None), Ok(AuthMode::Off));
+        assert_eq!(AuthMode::parse(Some("")), Ok(AuthMode::Off));
+        assert_eq!(AuthMode::parse(Some("off")), Ok(AuthMode::Off));
+        assert_eq!(AuthMode::parse(Some(" OFF ")), Ok(AuthMode::Off));
+        assert_eq!(AuthMode::parse(Some("okta")), Ok(AuthMode::Okta));
+        assert_eq!(AuthMode::parse(Some("Okta")), Ok(AuthMode::Okta));
+    }
+
+    #[test]
+    fn unknown_values_error_instead_of_silently_disabling_auth() {
+        for bad in ["on", "true", "oauth", "octa", "0"] {
+            let err = AuthMode::parse(Some(bad)).unwrap_err();
+            assert!(err.contains("MCP_AUTH_MODE"), "{err}");
+            assert!(err.contains(bad), "{err}");
         }
     }
 }
