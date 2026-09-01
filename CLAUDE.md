@@ -159,3 +159,65 @@ This applies to the enterprise repo too — its CLAUDE.md carries the same rule.
   bug-fix test must fail on the unfixed code and pass on the fixed code.
 - **Parity**: tool names, descriptions, schemas, and error envelopes mirror the TS
   servers. Changing them is a deliberate, called-out change — not incidental.
+
+# Rust Performance & Optimization Guidelines
+
+When reviewing, writing, or refactoring Rust code, enforce these strict guidelines to prevent excess allocations, CPU bottlenecks, and synchronization overhead.
+
+---
+
+## 1. Allocations & Memory Usage
+
+- **Default to Borrowing:** Prefer taking `&str`, `&[T]`, or `&Path` over owned types (`String`, `Vec<T>`, `PathBuf`) unless ownership transfer is strictly required.
+- **Avoid Hidden Clones:**
+  - Watch out for `.clone()` inside loops, iterators, or closure bodies.
+  - Suggest zero-copy alternatives (e.g., `Cow<'a, T>`, `bytes::Bytes`, or referencing fields directly).
+- **Pre-allocate Collections:**
+  - Flag any `Vec`, `HashMap`, `HashSet`, or `String` constructed in a loop or with a known upper bound that doesn't use `with_capacity(cap)`.
+- **Prevent Frequent Small Heap Allocations:**
+  - Recommend `smallvec` or `arrayvec` for collections that almost always hold fewer than 8–16 items.
+  - Flag unnecessary `Box<T>` for small types or lightweight structs.
+- **String Manipulations:**
+  - Flag repeated `+` or `format!()` inside hot loops. Suggest using `push_str()`, `write!`, or pre-allocated `String` buffers.
+
+---
+
+## 2. Synchronization & Concurrency
+
+- **Minimize Lock Contention:**
+  - Keep critical sections inside `MutexGuard` or `RwLockReadGuard`/`RwLockWriteGuard` as short as humanly possible.
+  - Flag any `.await`, heavy computation, or I/O performed while holding a synchronization lock.
+  - Recommend holding locks in short, explicit blocks:
+    ```rust
+    let item = {
+        let guard = state.lock().unwrap();
+        guard.get_item()
+    }; // Lock dropped here before async/heavy work
+    ```
+- **Lock Granularity & Atomics:**
+  - Suggest `AtomicBool`, `AtomicUsize`, or `AtomicPtr` over `Mutex` for simple scalar flags or counters.
+  - Suggest `RwLock` over `Mutex` *only* if read operations drastically outnumber write operations; otherwise, highlight that `Mutex` is often faster under low-to-medium contention.
+- **Lock-Free / Channel Selection:**
+  - Warn when using standard `std::sync::mpsc` in high-throughput async code; suggest `tokio::sync::mpsc` or `crossbeam-channel` instead.
+  - Flag unbounded channels (`mpsc::unbounded_channel`) unless explicitly required, to prevent unbounded memory growth.
+
+---
+
+## 3. CPU & Algorithmic Bottlenecks
+
+- **Hashing Performance:**
+  - Highlight usage of standard `std::collections::HashMap` when HashDoS resilience is not required (e.g., non-web contexts, trusted integer keys).
+  - Suggest fast hashers like `rustc-hash` (`FxHashMap`) or `ahash`.
+- **Iterators vs. Allocations:**
+  - Flag intermediate `.collect::<Vec<_>>()` calls in the middle of iterator chains. Chain operations lazily (`map`, `filter`, `flat_map`) and collect only at the final step.
+- **Monomorphization Bloat:**
+  - Watch for heavy generic functions with complex code generated for many type parameters. Suggest extracting non-generic helper functions (e.g., taking `&[u8]` instead of `impl AsRef<[u8]>`) to reduce compile time and code cache size.
+
+---
+
+## 4. Agent Instructions for Code Reviews & Refactoring
+
+Whenever analyzing code or generating solutions:
+1. **Highlight Hidden Cost:** Point out implicit clones, re-allocations, or broad lock scopes immediately.
+2. **Offer Zero-Allocation Alternatives:** Show how to refactor owned structures to borrowed references or stack-allocated alternatives where feasible.
+3. **Check Async Safety:** Explicitly check if a lock guard (`MutexGuard`) crosses an `.await` point (which breaks `Send` and leads to deadlocks/contention).

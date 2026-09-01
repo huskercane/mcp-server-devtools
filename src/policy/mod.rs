@@ -25,6 +25,8 @@
 //! legacy `AUDIT_LOG` JSONL keeps its camelCase shape untouched — that
 //! surface is parity-locked; this one is new.)
 
+pub mod extractors;
+
 use serde::Serialize;
 
 use crate::transport::HttpMethod;
