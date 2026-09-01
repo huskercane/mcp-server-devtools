@@ -134,6 +134,13 @@ async fn failed_journal_write_refuses_the_call_and_never_contacts_the_vendor() {
         sink.events().is_empty(),
         "no partial evidence should be recorded by the failing sink"
     );
+    // The sink's own error goes to the operator log, never to the model. A
+    // sink is free to be an HTTP client, and its errors can quote request
+    // headers; this response is rendered into a transcript.
+    assert!(
+        !text.contains("test switch"),
+        "the sink's raw error must not be echoed to the caller: {text}"
+    );
 }
 
 #[tokio::test]
@@ -166,6 +173,7 @@ async fn intent_with_upstream_identity_is_journaled_before_dispatch_and_outcome_
     assert_eq!(intent["decision"]["effect"], "allow");
     assert_eq!(intent["principal"]["subject"], "local");
     assert_eq!(intent["client"]["name"], "audit-test");
+    assert_eq!(intent["client"]["version"], "0.0.0");
     // WP 0.6: the upstream identity appears in every event, with the
     // config-derived label and environment classification.
     assert_eq!(

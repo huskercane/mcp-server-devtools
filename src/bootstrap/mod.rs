@@ -201,15 +201,22 @@ impl ServerBuilder {
     }
 }
 
+/// Config key enabling the durable audit journal.
+pub const AUDIT_JOURNAL_DIR_KEY: &str = "MCP_AUDIT_JOURNAL_DIR";
+
+/// The configured journal directory, if any. Blank counts as absent.
+fn configured_journal_dir(config: &Config) -> Option<&str> {
+    config
+        .get(AUDIT_JOURNAL_DIR_KEY)
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+}
+
 /// Open the durable audit journal when `MCP_AUDIT_JOURNAL_DIR` is
 /// configured. Absent or blank means local mode (no journal). A configured
 /// journal that cannot be opened is a hard startup error — never a warning.
 fn open_configured_journal(config: &Config) -> Result<Option<Arc<dyn AuditSink>>, McpError> {
-    let Some(dir) = config
-        .get("MCP_AUDIT_JOURNAL_DIR")
-        .map(str::trim)
-        .filter(|dir| !dir.is_empty())
-    else {
+    let Some(dir) = configured_journal_dir(config) else {
         return Ok(None);
     };
     let sink = crate::audit::journal::JournalAuditSink::open(std::path::Path::new(dir)).map_err(
@@ -243,13 +250,50 @@ impl CliRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`McpError`] when the HTTP client cannot be constructed.
+    /// Returns [`McpError`] when the HTTP client cannot be constructed, or
+    /// when a durable audit journal is configured — see
+    /// [`refuse_unaudited_cli`].
     pub fn load() -> Result<Self, McpError> {
+        let config = crate::config::load();
+        refuse_unaudited_cli(&config)?;
         Ok(Self {
-            config: Arc::new(crate::config::load()),
+            config: Arc::new(config),
             client: build_client()?,
             vendors: Vendors::default(),
             workspace_cache: WorkspaceCache::new(),
         })
     }
+}
+
+/// Refuse operational CLI subcommands while a durable audit journal is
+/// configured.
+///
+/// `mcp-devtools jira post ...` reaches the same vendor APIs the MCP tools
+/// do, but it goes straight through [`CliRuntime`] — no intent record, no
+/// outcome record, nothing in the journal. On a deployment that has switched
+/// journaling on, that is a hole straight through the evidence trail: the
+/// same binary, the same credentials, no audit. Until the CLI paths route
+/// through the audited boundary, an operator who has asked for durable
+/// auditing gets a refusal rather than an unrecorded call.
+///
+/// This deliberately does **not** cover `creds`, `config`, or `--version`:
+/// those are local administration, and they build no [`CliRuntime`].
+///
+/// # Errors
+///
+/// [`McpError`] when `MCP_AUDIT_JOURNAL_DIR` is set.
+pub fn refuse_unaudited_cli(config: &Config) -> Result<(), McpError> {
+    if configured_journal_dir(config).is_some() {
+        return Err(crate::error::unexpected(
+            format!(
+                "{AUDIT_JOURNAL_DIR_KEY} is set, but the one-shot CLI subcommands do not \
+                 write to the durable audit journal yet. Running them here would reach \
+                 the vendor APIs with no evidence recorded. Use the MCP server \
+                 (`mcp-devtools` stdio/http), or unset {AUDIT_JOURNAL_DIR_KEY} for an \
+                 explicitly unaudited session."
+            ),
+            None,
+        ));
+    }
+    Ok(())
 }

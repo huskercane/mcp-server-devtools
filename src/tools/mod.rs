@@ -349,6 +349,15 @@ impl DevtoolsServer {
 // WRDS tools (feature = "wrds")
 // ============================================================================
 
+/// What a caller is told when the audit journal will not accept a record.
+///
+/// Deliberately fixed and detail-free. The underlying error goes to the
+/// operator log; a sink may be an HTTP client whose errors quote request
+/// headers, and this string is returned to a model and rendered into a
+/// transcript.
+const AUDIT_UNAVAILABLE_MESSAGE: &str = "Audit journal unavailable; call refused (fail closed). \
+     See the server log for the cause.";
+
 #[tool_handler]
 impl ServerHandler for DevtoolsServer {
     async fn call_tool(
@@ -358,10 +367,12 @@ impl ServerHandler for DevtoolsServer {
     ) -> Result<CallToolResponse, RmcpError> {
         let started = std::time::Instant::now();
         let client = context.client_info();
-        let request_id = context.id.to_string();
+        // One `to_string()`, no clone: local mode pays exactly what it paid
+        // before enterprise types existed. The enterprise branch below reads
+        // the id back off `audit` when it actually needs an owned copy.
         let audit = crate::audit::AuditCall::start(
             request.name.as_ref(),
-            request_id.clone(),
+            context.id.to_string(),
             client.as_ref().map(|value| value.name.clone()),
             client.as_ref().map(|value| value.version.clone()),
         );
@@ -370,24 +381,33 @@ impl ServerHandler for DevtoolsServer {
         // journal is configured; local mode takes the `None` branch and the
         // call path is byte-for-byte what it was before enterprise types
         // existed (one `Option` check).
-        let enterprise = self.components.audit_sink.as_ref().map(|sink| {
-            let config = self.config();
-            let vendor = vendor_for_tool(request.name.as_ref()).unwrap_or("unknown");
-            let upstream = self
-                .components
-                .credential_broker
-                .upstream_identity(&config, vendor);
-            let client = ClientIdentity {
-                name: client.as_ref().map(|value| value.name.clone()),
-                version: client.as_ref().map(|value| value.version.clone()),
-            };
-            (Arc::clone(sink), vendor, upstream, client)
-        });
+        let enterprise = match self.components.audit_sink.as_ref() {
+            None => None,
+            Some(sink) => {
+                let config = self.config();
+                let vendor = vendor_for_tool(request.name.as_ref()).unwrap_or("unknown");
+                // Awaited because answering can require a keychain probe.
+                // The broker still *predicts* which slot will act — the
+                // credential is resolved later, in the controller — but it
+                // now predicts with the resolver's own rules, implicit
+                // keychain fallback included (WP 0.6).
+                let upstream = self
+                    .components
+                    .credential_broker
+                    .upstream_identity(&config, vendor)
+                    .await;
+                let client = ClientIdentity::reported(
+                    client.as_ref().map(|value| value.name.as_str()),
+                    client.as_ref().map(|value| value.version.as_str()),
+                );
+                Some((Arc::clone(sink), vendor, upstream, client))
+            }
+        };
         if let Some((sink, vendor, upstream, client)) = &enterprise {
             let intent = AuditEvent {
                 timestamp: crate::logger::iso_timestamp(),
                 kind: AuditEventKind::ToolCallIntent,
-                request_id: request_id.clone(),
+                request_id: audit.request_id().to_owned(),
                 tool_name: request.name.as_ref().to_owned(),
                 vendor: (*vendor).to_owned(),
                 // Phase A replaces this with the validated principal from
@@ -399,15 +419,27 @@ impl ServerHandler for DevtoolsServer {
                 outcome: None,
                 duration_ms: None,
             };
-            if let Err(error) = sink.append(&intent) {
+            if let Err(error) = sink.append(&intent).await {
                 // Fail closed: evidence first, dispatch second. The vendor
                 // is never contacted (tests/audit_journal_tests.rs proves
                 // wiremock sees zero requests).
+                //
+                // The sink's own error goes to the operator log, never to
+                // the model: a sink is free to be an HTTP client, and its
+                // errors can quote request headers. What the caller gets is
+                // a fixed sentence, so no sink can turn a failure into an
+                // exfiltration channel.
+                // A *category*, never the adapter's error text: an HTTP
+                // audit sink's error can quote a request header, and this
+                // line is not covered by the logger's redaction patterns.
+                tracing::error!(
+                    failure = %crate::ports::audit_sink::AuditFailure::classify(&error),
+                    tool = %request.name.as_ref(),
+                    "audit journal unavailable; refusing the call (fail closed)"
+                );
                 audit.complete("audit_unavailable");
                 return Ok(CallToolResponse::Complete(CallToolResult::error(vec![
-                    Content::text(format!(
-                        "Audit journal unavailable; call refused (fail closed): {error}"
-                    )),
+                    Content::text(AUDIT_UNAVAILABLE_MESSAGE),
                 ])));
             }
         }
@@ -427,6 +459,7 @@ impl ServerHandler for DevtoolsServer {
         if let Some((sink, vendor, upstream, client)) = enterprise {
             let duration_ms = started.elapsed().as_millis();
             let tool_name = audit.tool_name().to_owned();
+            let request_id = audit.request_id().to_owned();
             // One timestamp for the outcome event and the usage event
             // (CLAUDE.md perf guidelines: no repeated formatting work).
             let completed_at = crate::logger::iso_timestamp();
@@ -443,11 +476,16 @@ impl ServerHandler for DevtoolsServer {
                 outcome: Some(outcome.to_owned()),
                 duration_ms: Some(duration_ms),
             };
-            if let Err(error) = sink.append(&outcome_event) {
+            if let Err(error) = sink.append(&outcome_event).await {
                 // The dispatch already happened; nothing to refuse. Loud,
                 // not silent (guiding constraint 5) — and the legacy
-                // AUDIT_LOG record below still lands.
-                tracing::error!(%error, tool = %tool_name, "failed to journal audit outcome");
+                // AUDIT_LOG record below still lands. Category only, for the
+                // same reason as the intent branch above.
+                tracing::error!(
+                    failure = %crate::ports::audit_sink::AuditFailure::classify(&error),
+                    tool = %tool_name,
+                    "failed to journal audit outcome"
+                );
             }
             self.components.usage_sink.record(UsageEvent {
                 timestamp: completed_at,

@@ -23,7 +23,7 @@ const ALLOWED_ORIGIN: &str = "http://localhost:3000";
 async fn spawn_app(idle_ttl: Duration, sweep_interval: Duration) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
-    let app = build_app(idle_ttl, sweep_interval);
+    let app = build_app(idle_ttl, sweep_interval).expect("build_app");
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("axum::serve");
     });

@@ -25,7 +25,7 @@ pub mod command_runner;
 pub mod credential_broker;
 pub mod usage_sink;
 
-pub use audit_sink::{AuditEvent, AuditEventKind, AuditSink, InMemoryAuditSink};
+pub use audit_sink::{AuditEvent, AuditEventKind, AuditFailure, AuditSink, InMemoryAuditSink};
 pub use command_runner::{CommandOutput, CommandRunner};
 pub use credential_broker::{ConfigCredentialBroker, CredentialBroker, StaticCredentialBroker};
 pub use usage_sink::{BoundedUsageChannel, NoopUsageSink, UsageEvent, UsageSink};

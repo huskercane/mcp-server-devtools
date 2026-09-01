@@ -29,7 +29,11 @@ ordered by partner demand and are not scheduled until Gate B passes.
 | 2.3 | 2026-09-01 | M0 engineering landed on `feat/m0-enterprise-foundation`: WP 0.1 (LICENSE, library surface, private repo scaffolded and pushed), 0.4 (core types, `MCP_AUTH_MODE`, fail-closed bind, local-mode byte-identical tests), 0.5 (spike, rev 2.2), 0.6 (`CredentialBroker`), 0.7 (`AuditSink`/`UsageSink`, journal, write-before-dispatch fail-closed), 0.8 start (Grafana+Jira inventory, extractors; schema findings recorded in `docs/read-endpoint-inventory.md` — `ActionContext` not frozen yet). WPs 0.2/0.3 and ADR-002 counsel remain open | Owner + implementation |
 | 2.4 | 2026-09-01 | ADR-007 decided: Phase D console is htmx 4.x + askama server-rendering from the `control` role (rendering as a client of the admin API); one vendored, exact-pinned JS asset, no npm toolchain, strict CSP without eval | Owner |
 
-Unresolved questions are collected in §11.
+Unresolved questions are collected in §11. Work that a phase deliberately
+did **not** finish — deferred fixes, decisions we owe someone, and the
+allocation baseline for the next phase's comparison — is tracked in
+[`docs/enterprise-carry-forward.md`](enterprise-carry-forward.md), which is
+the register a phase exit is checked against.
 
 ## 1. Guiding constraints
 
@@ -57,7 +61,7 @@ These are fixed unless a decision below explicitly revisits them.
    two never share a pipeline (§3.3).
 6. **Ship every phase independently.** Each phase below has a "done when" that
    is a deployable, tested state on `main`, not a branch.
-7. **Baseline stays pinned.** Rust 1.95 / edition 2024 / exact-pinned deps.
+7. **Baseline stays pinned.** Rust 1.96 / edition 2024 / exact-pinned deps.
    New deps (JWT, JWKS, policy, journal) are pinned the same way and pass
    `cargo deny`.
 
@@ -192,7 +196,8 @@ ActionContext
   canonical_path       normalized per §3.5
   query_attributes     allowlisted, decoded, sorted query keys/values
   resource_type        issue | project | channel | datasource | ...
-  resource_id          exact id or pattern extracted from path/args/allowed body fields
+  resource_scope       unscoped | collection | ids[...] — which resources of that type
+                       the call addresses, extracted from path/args/allowed body fields
   resource_class       optional classification from configuration (e.g. "restricted")
   upstream_identity    from CredentialBroker: label, Shared | Delegated
   request_risk         read | write | destructive — derived, never client-supplied
@@ -200,10 +205,26 @@ ActionContext
 
 Purpose-built tools build this from typed arguments. Passthrough tools use
 per-vendor **extractors**: small, tested functions that pull `resource_type`
-and `resource_id` from the canonical path, allowlisted query keys, and an
-allowlist of body fields (for example `jql` and `project` on
+and `resource_scope` from the canonical path, allowlisted query keys, and an
+allowlist of body fields (`jql` — and only `jql` — on
 `POST /rest/api/3/search/jql`). Anything an extractor cannot classify is
 `resource_type = unknown`, which default-deny policy treats as denied.
+
+`resource_scope` is three distinct states, not a nullable id, and the
+distinction is load-bearing (`docs/read-endpoint-inventory.md`, decisions
+1–2):
+
+- `unscoped` — the extractor could not prove what the call reaches;
+- `collection` — the endpoint addresses the collection (a list endpoint),
+  which is its own permission;
+- `ids[...]` — provably restricted to exactly these ids.
+
+**Matching a `resource_id` list against `ids` is all-of, never any-of.**
+Every id the call addresses must be allowed. Under any-of,
+`project in (PUBLIC, SECRET)` would be authorized by a rule that allows
+`PUBLIC` alone, and the response would come back full of `SECRET`. Neither
+`unscoped` nor `collection` is matched by an id-scoped rule; each needs an
+explicit rule of its own.
 
 Policy rules then match on any subset of these fields:
 
@@ -267,7 +288,7 @@ Availability model, stated plainly for v1:
 | Sessions | Ingress stickiness on `Mcp-Session-Id`; a miss returns the MCP "session not found" so the client re-initialises. Session store adapter (Redis/Valkey) only if measured. |
 | Artifacts | Shared `ReadWriteMany` volume or download routed by the same stickiness key; unavailable storage ⇒ the tool returns an explicit error, never a silent truncation. Object-storage adapter later. |
 | Cache | Per-pod, bounded, per-principal; hit rate divided by N is accepted. |
-| RPO / RTO | Audit RPO = 0 for acknowledged records (journal written before dispatch); rollups RPO = last `control` backup (default hourly); RTO = pod restart. |
+| RPO / RTO | Audit RPO = 0 for acknowledged records: the journal is written **and `sync_data`-ed** before dispatch, so "acknowledged" means the record survives host loss, not merely that it reached the page cache. Rollups RPO = last `control` backup (default hourly); RTO = pod restart. |
 
 ### 3.5 Outbound request canonicalization
 

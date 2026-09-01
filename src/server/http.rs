@@ -36,6 +36,7 @@ use tracing::{info, warn};
 
 use crate::config::AuthMode;
 use crate::constants::VERSION;
+use crate::error::McpError;
 use crate::server::session::{DEFAULT_IDLE_TTL, DEFAULT_SWEEP_INTERVAL, ReapingSessionManager};
 use crate::server::shutdown;
 use crate::tools::DevtoolsServer;
@@ -61,13 +62,20 @@ pub async fn run_http() -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
     let auth_mode = AuthMode::parse(std::env::var("MCP_AUTH_MODE").ok().as_deref())?;
     let addr = resolve_bind_addr(std::env::var("MCP_BIND_ADDR").ok().as_deref(), port)?;
     validate_startup_security(auth_mode, &addr)?;
-    let listener = TcpListener::bind(addr).await?;
-    let bound = listener.local_addr()?;
 
     // Shared across rmcp (drops in-flight SSE on cancel) and axum (stops
     // accepting new connections + drains existing ones on cancel).
     let cancel = CancellationToken::new();
-    let app = build_app_with_cancel(DEFAULT_IDLE_TTL, DEFAULT_SWEEP_INTERVAL, cancel.clone());
+    // Built **before the port opens**. A `DevtoolsServer` that cannot be
+    // assembled — an audit journal that will not open, say — used to be
+    // stored as an error *inside* the router, so the process logged
+    // "listening", held the port, and failed every call while a health check
+    // marked it ready. Constructing first means a startup failure never
+    // reaches the point of being reachable at all.
+    let app = build_app_with_cancel(DEFAULT_IDLE_TTL, DEFAULT_SWEEP_INTERVAL, cancel.clone())?;
+
+    let listener = TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?;
 
     info!(%bound, "mcp-server-devtools listening on streamable-HTTP transport");
     let shutdown_cancel = cancel;
@@ -85,17 +93,28 @@ pub async fn run_http() -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
 
 /// Build the full Axum app with a caller-owned cancellation token. Tests use
 /// the unparameterized [`build_app`].
+///
+/// # Errors
+///
+/// When the `DevtoolsServer` cannot be assembled — a configured audit
+/// journal that will not open, most importantly. Returning it means the
+/// caller binds and logs readiness only for a server that actually works.
 pub fn build_app_with_cancel(
     idle_ttl: Duration,
     sweep_interval: Duration,
     cancel: CancellationToken,
-) -> Router {
+) -> Result<Router, McpError> {
     // Stateless MCP means each request carries its own protocol metadata; it
     // does not mean application state should be reconstructed per request.
     // Build one handler and clone it: DevtoolsServer's clone shares its
     // Arc<Components>, including NinjaOne console sessions and other caches.
-    let shared_server = DevtoolsServer::new().map_err(|e| format!("DevtoolsServer::new: {e}"));
-    build_app_inner(shared_server, idle_ttl, sweep_interval, cancel)
+    let shared_server = DevtoolsServer::new()?;
+    Ok(build_app_inner(
+        shared_server,
+        idle_ttl,
+        sweep_interval,
+        cancel,
+    ))
 }
 
 /// Build the app around an already-assembled server. This is the seam
@@ -107,11 +126,11 @@ pub fn build_app_with_server(
     sweep_interval: Duration,
     cancel: CancellationToken,
 ) -> Router {
-    build_app_inner(Ok(server), idle_ttl, sweep_interval, cancel)
+    build_app_inner(server, idle_ttl, sweep_interval, cancel)
 }
 
 fn build_app_inner(
-    shared_server: Result<DevtoolsServer, String>,
+    shared_server: DevtoolsServer,
     idle_ttl: Duration,
     sweep_interval: Duration,
     cancel: CancellationToken,
@@ -119,7 +138,7 @@ fn build_app_inner(
     let manager = Arc::new(ReapingSessionManager::new(idle_ttl));
     manager.spawn_reaper(sweep_interval);
     let streamable = StreamableHttpService::new(
-        move || shared_server.clone().map_err(std::io::Error::other),
+        move || Ok(shared_server.clone()),
         Arc::clone(&manager),
         StreamableHttpServerConfig::default()
             // Keep initialized sessions for older clients while requiring the
@@ -255,7 +274,11 @@ fn parse_range(value: &str, size: u64) -> Option<(u64, u64)> {
 
 /// Build the app without an externally-owned cancellation token. Convenience
 /// for tests that don't exercise shutdown semantics.
-pub fn build_app(idle_ttl: Duration, sweep_interval: Duration) -> Router {
+///
+/// # Errors
+///
+/// As [`build_app_with_cancel`].
+pub fn build_app(idle_ttl: Duration, sweep_interval: Duration) -> Result<Router, McpError> {
     build_app_with_cancel(idle_ttl, sweep_interval, CancellationToken::new())
 }
 

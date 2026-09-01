@@ -1,6 +1,6 @@
 # MCP DevTools enterprise product brief
 
-Status: product hypothesis and proposed direction; circulated to prospective collaborators  
+Status: product hypothesis and proposed direction; circulated to prospective collaborators\
 Last reviewed: August 28, 2026
 
 ## Executive summary
@@ -487,4 +487,3 @@ introduction to a design partner or a few hours on the policy model.
 - [Anthropic: Centrally manage authorization for MCP connectors](https://claude.com/blog/enterprise-managed-auth)
 - [MCP project: Enterprise-Managed Authorization announcement](https://blog.modelcontextprotocol.io/posts/enterprise-managed-auth/)
 - [MCP 2026-07-28 specification release notes](https://blog.modelcontextprotocol.io/posts/2026-07-28/)
-

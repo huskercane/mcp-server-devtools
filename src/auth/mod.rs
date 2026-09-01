@@ -60,7 +60,7 @@ pub enum Credentials {
 /// Process-wide [`OsKeychain`] instance. Reused across all credential
 /// resolution calls so the per-(kind, vendor, principal) breadcrumb dedup
 /// state survives between requests.
-fn os_keychain() -> &'static OsKeychain {
+pub(crate) fn os_keychain() -> &'static OsKeychain {
     static KC: std::sync::OnceLock<OsKeychain> = std::sync::OnceLock::new();
     KC.get_or_init(OsKeychain::new)
 }

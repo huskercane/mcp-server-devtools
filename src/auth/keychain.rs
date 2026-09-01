@@ -161,6 +161,19 @@ pub trait KeychainBackend: Send + Sync {
     ) -> KeychainResult<()>;
     fn delete(&self, kind: SecretKind, vendor: &str, principal: &str) -> KeychainResult<()>;
 
+    /// Whether a usable entry exists at `(kind, vendor, principal)` — a
+    /// presence question, answered without handing the secret back.
+    ///
+    /// The credential broker needs to know *which slot would resolve* so it
+    /// can attribute a call, and it must learn that without ever holding a
+    /// credential. This default implementation asks [`Self::get`] and drops
+    /// the value inside this function; a backend that can answer without
+    /// reading the secret should override it. Errors read as "absent": a
+    /// backend outage must not invent an attribution.
+    fn contains(&self, kind: SecretKind, vendor: &str, principal: &str) -> bool {
+        matches!(self.get(kind, vendor, principal), Ok(Some(value)) if !value.is_empty())
+    }
+
     /// Record that we successfully resolved `(kind, vendor, principal)` from
     /// the keychain so that subsequent hits within the same process don't
     /// re-emit the provenance breadcrumb. Default impl is a no-op so test

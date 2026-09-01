@@ -107,6 +107,13 @@ impl AuditCall {
         &self.tool
     }
 
+    /// MCP request id this call was started for. Read by the enterprise
+    /// audit path instead of keeping a second owned copy alive across the
+    /// whole call — local mode allocates the id exactly once.
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
     pub fn start(
         tool: &str,
         request_id: String,

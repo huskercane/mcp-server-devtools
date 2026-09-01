@@ -145,6 +145,33 @@ fn stdio_conversation(auth_mode: Option<&str>) -> Vec<u8> {
     stdout
 }
 
+/// The MCP handshake surface, locked to a checked-in golden.
+///
+/// `stdio_is_byte_identical_with_auth_mode_off_and_unset` below compares two
+/// runs of the *same* build, so a change that moves both branches together
+/// passes it. This one compares against bytes recorded before the enterprise
+/// work started, so drift in the handshake shows up as a diff no matter how
+/// evenly it lands. The crate version is the one field expected to move, so
+/// it is substituted rather than pinned (`binary_tests` already asserts it
+/// is the crate version).
+#[test]
+fn local_mode_initialize_response_matches_the_pre_enterprise_golden() {
+    let stdout = stdio_conversation(None);
+    let text = String::from_utf8_lossy(&stdout);
+    let first = text.lines().next().expect("initialize response");
+    let actual: serde_json::Value = serde_json::from_str(first).expect("initialize is JSON");
+
+    let golden = include_str!("golden/initialize_result.json")
+        .replace("<crate-version>", env!("CARGO_PKG_VERSION"));
+    let expected: serde_json::Value = serde_json::from_str(&golden).expect("golden is JSON");
+
+    assert_eq!(
+        actual, expected,
+        "the local-mode handshake changed; if this is intended, update \
+         tests/golden/initialize_result.json in the same commit"
+    );
+}
+
 #[test]
 fn stdio_is_byte_identical_with_auth_mode_off_and_unset() {
     let unset = stdio_conversation(None);
