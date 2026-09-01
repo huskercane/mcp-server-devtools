@@ -21,5 +21,9 @@
 //! heap allocation on every request.
 
 pub mod command_runner;
+pub mod credential_broker;
 
 pub use command_runner::{CommandOutput, CommandRunner};
+pub use credential_broker::{
+    ConfigCredentialBroker, CredentialBroker, StaticCredentialBroker,
+};
