@@ -221,3 +221,27 @@ Whenever analyzing code or generating solutions:
 1. **Highlight Hidden Cost:** Point out implicit clones, re-allocations, or broad lock scopes immediately.
 2. **Offer Zero-Allocation Alternatives:** Show how to refactor owned structures to borrowed references or stack-allocated alternatives where feasible.
 3. **Check Async Safety:** Explicitly check if a lock guard (`MutexGuard`) crosses an `.await` point (which breaks `Send` and leads to deadlocks/contention).
+
+## 5. Tokio & Async Performance Guidelines
+
+### Task Allocation & Future Bloat
+- **Minimize Frame Sizes:** Flag large arrays, heavy structs, or deeply nested state machines stored directly inside `async fn` stack frames, as they cause massive task heap allocations.
+- **Avoid Excess `tokio::spawn`:** Warn against spawning tasks inside tight loops for trivial compute. Suggest batching or processing sequentially via `futures::stream::BufferUnordered` / `JoinSet`.
+- **Pre-allocate Channel Buffers:** Always specify bounded capacities (`tokio::sync::mpsc::channel(cap)`) sized according to expected peak load to avoid dynamic queue re-allocations.
+
+### Blocking & Tokio Reactor Health
+- **Flag Sync I/O / Compute in Async Tasks:** Detect blocking calls like `std::fs`, `std::thread::sleep`, or CPU-bound loops (`>1ms`) running directly on worker threads.
+- **Enforce Offloading:** Require `tokio::task::spawn_blocking` or `rayon` for heavy compute / filesystem operations.
+
+### Async Synchronization & Locking
+- **Async vs Sync Mutex Usage:**
+  - Standard `std::sync::Mutex` **is allowed** across regular code if locks are held for quick state updates and *never* across `.await` points.
+  - Require `tokio::sync::Mutex` **only** if the lock must be held across `.await` boundaries.
+- **Detect Mutex Guards Across `.await`:** Flag any standard `MutexGuard` or `RwLockGuard` held when calling `.await` (causes compilation failure or runtime deadlocks/thread starvation).
+- **Favor Tokio Synchronization Primitives:**
+  - Use `tokio::sync::Notify` or `watch` instead of `Mutex<bool>` for signaling task completion or state updates.
+  - Recommend `tokio::sync::Semaphore` for concurrency limiting over manual counter locking.
+
+### Task Cancellation & Resource Leaks
+- **Cancellation Safety:** Flag non-cancellation-safe operations used inside `tokio::select!` branches (e.g., partial reads without buffering, half-completed state modifications).
+- **Graceful Shutdown & JoinSet:** Recommend `tokio::task::JoinSet` over `tokio::spawn` for structured concurrency and ensuring spawned tasks aren't left orphaned.
