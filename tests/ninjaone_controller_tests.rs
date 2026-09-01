@@ -85,3 +85,40 @@ async fn post_supports_the_sample_search_shape_with_cookie_auth() {
         let _ = std::fs::remove_file(path);
     }
 }
+
+#[tokio::test]
+async fn post_forwards_an_empty_object_as_an_object_not_a_json_string() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backup/lockhart/scheduled-deletion"))
+        .and(header("cookie", "sessionKey=abc123"))
+        .and(body_json(json!({})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let config = Config::from_map(HashMap::from([(
+        "NINJAONE_SESSION_COOKIE".to_owned(),
+        "sessionKey=abc123".to_owned(),
+    )]));
+    let client = build_client().unwrap();
+    let vendor = NinjaOneVendor::with_base_url(server.uri());
+    let context = NinjaOneContext::new(&client, &config, &vendor);
+    let args: NinjaOneWriteArgs = serde_json::from_value(json!({
+        "path": "/backup/lockhart/scheduled-deletion",
+        "body": {},
+        "outputFormat": "json"
+    }))
+    .unwrap();
+
+    let response = handle_write(&context, HttpMethod::Post, &args)
+        .await
+        .unwrap();
+    let requests = server.received_requests().await.unwrap();
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body, b"{}");
+    if let Some(path) = response.raw_response_path {
+        let _ = std::fs::remove_file(path);
+    }
+}

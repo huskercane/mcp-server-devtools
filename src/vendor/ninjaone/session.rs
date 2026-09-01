@@ -30,6 +30,13 @@
 //! `NINJAONE_SERVERS` entry, which is how one operator holds a different
 //! account per environment. This module only performs the exchange; where the
 //! credentials came from is [`super`]'s concern.
+//!
+//! [`LoginRequest`] carries two base URLs, not one, because not every server
+//! agrees on where these three endpoints live relative to the rest of its
+//! API: `endpoint_base_url` is where the HTTP calls actually go, `base_url`
+//! is the identity the resulting key is cached under (see the fields' docs).
+//! They differ only for a `NINJAONE_SERVERS` entry marked
+//! `"loginIgnoresPrefix": true`.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -62,7 +69,16 @@ struct SessionId {
 /// originate from a tool argument.
 #[derive(Debug, Clone, Copy)]
 pub struct LoginRequest<'a> {
+    /// Identity the minted session key is cached under (paired with `email`).
+    /// This is the vendor's normal, possibly-prefixed base URL — later calls
+    /// look the cache up by that same value, so it must stay what it always
+    /// was even when `endpoint_base_url` points somewhere else.
     pub base_url: &'a str,
+    /// Where the three login-exchange HTTP calls are actually sent. Equal to
+    /// `base_url` for most servers; a server whose console splits login from
+    /// the rest of its API (see `NinjaOneVendor::login_endpoint_base_url`)
+    /// sets this to the unprefixed origin instead.
+    pub endpoint_base_url: &'a str,
     pub email: &'a str,
     pub password: &'a str,
     pub mfa_code: Option<&'a str>,
@@ -183,7 +199,7 @@ impl SessionCache {
 
         let login = post_step(
             client,
-            &url(request.base_url, LOGIN_PATH),
+            &url(request.endpoint_base_url, LOGIN_PATH),
             &json!({
                 "email": request.email,
                 "password": request.password,
@@ -268,7 +284,7 @@ impl SessionCache {
 
         let response = post_step(
             client,
-            &url(request.base_url, MFA_LOGIN_PATH),
+            &url(request.endpoint_base_url, MFA_LOGIN_PATH),
             &body,
             "mfa-login",
         )
@@ -313,7 +329,7 @@ async fn fetch_auth_state(
     let body = json!({ "email": request.email });
     let text = send(
         client,
-        &url(request.base_url, AUTH_STATE_PATH),
+        &url(request.endpoint_base_url, AUTH_STATE_PATH),
         &body,
         "authentication-state",
     )

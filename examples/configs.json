@@ -10,14 +10,16 @@
     "environments": {
       "ATLASSIAN_USER_EMAIL": "you@example.com",
       "ATLASSIAN_API_TOKEN": "keychain",
-      "ATLASSIAN_SITE_NAME": "mycompany"
+      "ATLASSIAN_SITE_NAME": "mycompany",
+      "ATLASSIAN_API_TOKEN_MODE": "classic"
     }
   },
   "confluence": {
     "environments": {
       "ATLASSIAN_USER_EMAIL": "you@example.com",
       "ATLASSIAN_API_TOKEN": "keychain",
-      "ATLASSIAN_SITE_NAME": "mycompany"
+      "ATLASSIAN_SITE_NAME": "mycompany",
+      "ATLASSIAN_API_TOKEN_MODE": "classic"
     }
   },
   "zoom": {
@@ -75,7 +77,21 @@
   "ninjaone": {
     "environments": {
       "NINJAONE_URL": "https://app.ninjarmm.com",
-      "NINJAONE_ACCESS_TOKEN": "keychain"
+      "NINJAONE_ACCESS_TOKEN": "keychain",
+      "NINJAONE_DB_ENVIRONMENTS": {
+        "qa5": {
+          "centralHost": "central.qa5.internal",
+          "divisionHosts": {
+            "db-host-1": {
+              "host": "division-1.qa5.internal",
+              "username": "division_readonly_user",
+              "password": "your-division-readonly-db-password"
+            }
+          },
+          "username": "central_readonly_user",
+          "password": "your-central-readonly-db-password"
+        }
+      }
     }
   },
   "wrds": {

@@ -263,7 +263,14 @@ impl NinjaOneVendor {
         mfa_code: Option<&str>,
         recaptcha_token: Option<&str>,
     ) -> Result<LoginOutcome, McpError> {
+        // The session-cache key: unchanged by `loginIgnoresPrefix`, and always
+        // this vendor's normal (prefixed) base URL. Every later `ninjaone_*`
+        // call looks the cached key up by this same value (`cached_session_key`
+        // below), so the identity a session is minted under and the identity
+        // it is later found under must never diverge, even though the HTTP
+        // requests that mint it may target a different origin.
         let base_url = self.base_url(config)?;
+        let endpoint_base_url = self.login_endpoint_base_url(config)?;
         let login = self.login_config(config)?;
         let email = login.email.clone().ok_or_else(missing_login_email)?;
         // Password comes through the shared keychain-aware resolver, so
@@ -287,6 +294,7 @@ impl NinjaOneVendor {
                 client,
                 LoginRequest {
                     base_url: &base_url,
+                    endpoint_base_url: &endpoint_base_url,
                     email: &email,
                     password: &password,
                     mfa_code: code.as_deref(),
@@ -294,6 +302,32 @@ impl NinjaOneVendor {
                 },
             )
             .await
+    }
+
+    /// The base URL the three login-exchange HTTP calls (`authentication-state`,
+    /// `login`, `mfa-login`) are actually sent to.
+    ///
+    /// Equal to [`base_url`](Self::base_url) — the alias's `url` with `prefix`
+    /// folded in — for every server, *except* one whose entry sets
+    /// `"loginIgnoresPrefix": true`. That flag exists because two real
+    /// topologies disagree on where login lives: `dev-backup*` serves its
+    /// whole console (login included) under one path, so `prefix` must apply
+    /// to login too (confirmed against a captured browser HAR); the
+    /// `qa4`/`qa5`/`qa6.engineering-env.ninja` shard hosts serve login at the
+    /// bare origin while `prefix` (`/swb/s1`-shaped) applies only to the rest
+    /// of the API (also confirmed against a captured HAR — folding that
+    /// prefix into the login calls there 404s every one of them). There is no
+    /// way to tell these apart from the URL alone, so the alias opts in
+    /// explicitly.
+    fn login_endpoint_base_url(&self, config: &Config) -> Result<String, McpError> {
+        if let Some(alias) = self.server_alias.as_deref() {
+            let entry = ServerEntry::parse(config, alias)?;
+            if entry.login_ignores_prefix {
+                validate_base_url(&entry.url)?;
+                return Ok(entry.url.trim_end_matches('/').to_owned());
+            }
+        }
+        self.base_url(config)
     }
 
     /// Drop the cached session key for this vendor's base URL. Called after a
@@ -482,6 +516,19 @@ struct ServerEntry {
     password: Option<String>,
     totp_command: Option<String>,
     totp_secret: Option<String>,
+    /// Set `"loginIgnoresPrefix": true` on a server entry whose console splits
+    /// the login/session-bootstrap endpoints (`/ws/account/*`,
+    /// `/ws/webapp/sessionproperties`, `/ws/properties`) from the rest of its
+    /// API surface: those three login-exchange calls always live at the bare
+    /// `url` origin, while `prefix` still applies to every other request made
+    /// against this alias. This is the `qa4`/`qa5`/`qa6.engineering-env.ninja`
+    /// shape — confirmed against a captured browser HAR, where login hits
+    /// `/ws/account/login` directly but every other call needs the `/swb/s1`
+    /// shard prefix. It defaults to `false`: a server whose whole console
+    /// (login included) sits under one path — e.g. `dev-backup*`, `prefix:
+    /// "/ws"`, also confirmed against a captured HAR — must keep applying
+    /// `prefix` to login too, which is what the default already does.
+    login_ignores_prefix: bool,
 }
 
 impl ServerEntry {
@@ -527,6 +574,8 @@ impl ServerEntry {
                     password: string_field(server, "password", alias)?,
                     totp_command: string_field(server, "totpCommand", alias)?,
                     totp_secret: string_field(server, "totpSecret", alias)?,
+                    login_ignores_prefix: bool_field(server, "loginIgnoresPrefix", alias)?
+                        .unwrap_or(false),
                 })
             }
             _ => Err(invalid_server_entry(alias)),
@@ -536,6 +585,19 @@ impl ServerEntry {
     fn base_url(&self) -> Result<String, McpError> {
         append_prefix(&self.url, &self.prefix)
     }
+}
+
+/// Read an optional boolean field, rejecting anything but a JSON boolean with
+/// the same "malformed entry" error the other fields use.
+fn bool_field(
+    server: &serde_json::Map<String, Value>,
+    field: &str,
+    alias: &str,
+) -> Result<Option<bool>, McpError> {
+    server
+        .get(field)
+        .map(|value| value.as_bool().ok_or_else(|| invalid_server_entry(alias)))
+        .transpose()
 }
 
 /// Read an optional string field, rejecting a non-string with the same
@@ -636,7 +698,7 @@ fn non_blank<'a>(config: &'a Config, key: &str) -> Option<&'a str> {
 fn invalid_server_entry(alias: &str) -> McpError {
     unexpected(
         format!(
-            "NINJAONE_SERVERS entry `{alias}` must be a URL string or an object with a non-empty `url` and optional string `prefix`, `email`, `password`, `totpCommand`, and `totpSecret` fields"
+            "NINJAONE_SERVERS entry `{alias}` must be a URL string or an object with a non-empty `url`, optional string `prefix`, `email`, `password`, `totpCommand`, and `totpSecret` fields, and an optional boolean `loginIgnoresPrefix` field"
         ),
         None,
     )

@@ -48,6 +48,89 @@ fn base_url_trims_whitespace_around_site_name() {
 }
 
 #[test]
+fn omitted_token_mode_preserves_classic_base_url() {
+    let config = cfg(&[("ATLASSIAN_SITE_NAME", "mycompany")]);
+    assert_eq!(
+        JiraVendor::new().base_url(&config).unwrap(),
+        "https://mycompany.atlassian.net"
+    );
+}
+
+#[test]
+fn classic_token_mode_is_trimmed_and_case_insensitive() {
+    let config = cfg(&[
+        ("ATLASSIAN_API_TOKEN_MODE", "  CLASSIC  "),
+        ("ATLASSIAN_SITE_NAME", "  mycompany  "),
+    ]);
+    assert_eq!(
+        JiraVendor::new().base_url(&config).unwrap(),
+        "https://mycompany.atlassian.net"
+    );
+}
+
+#[test]
+fn scoped_token_mode_uses_trimmed_cloud_id() {
+    let config = cfg(&[
+        ("ATLASSIAN_API_TOKEN_MODE", "  scoped  "),
+        (
+            "ATLASSIAN_CLOUD_ID",
+            "  00000000-0000-0000-0000-000000000000  ",
+        ),
+    ]);
+    assert_eq!(
+        JiraVendor::new().base_url(&config).unwrap(),
+        "https://api.atlassian.com/ex/jira/00000000-0000-0000-0000-000000000000"
+    );
+}
+
+#[test]
+fn scoped_token_mode_requires_non_blank_cloud_id() {
+    for entries in [
+        vec![("ATLASSIAN_API_TOKEN_MODE", "scoped")],
+        vec![
+            ("ATLASSIAN_API_TOKEN_MODE", "scoped"),
+            ("ATLASSIAN_CLOUD_ID", "   "),
+        ],
+    ] {
+        let err = JiraVendor::new().base_url(&cfg(&entries)).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::AuthMissing);
+        assert!(err.message.contains("ATLASSIAN_CLOUD_ID"));
+    }
+}
+
+#[test]
+fn invalid_token_mode_is_actionable() {
+    for value in ["oauth", "   "] {
+        let config = cfg(&[("ATLASSIAN_API_TOKEN_MODE", value)]);
+        let err = JiraVendor::new().base_url(&config).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::AuthMissing);
+        assert!(err.message.contains("ATLASSIAN_API_TOKEN_MODE"));
+        assert!(err.message.contains("classic"));
+        assert!(err.message.contains("scoped"));
+    }
+}
+
+#[test]
+fn scoped_settings_do_not_fall_back_to_confluence_section() {
+    let dir = TempDir::new().unwrap();
+    let global_path = dir.path().join("configs.json");
+    std::fs::write(
+        &global_path,
+        serde_json::to_string(&json!({
+            "jira": { "environments": { "ATLASSIAN_API_TOKEN_MODE": "scoped" } },
+            "confluence": { "environments": { "ATLASSIAN_CLOUD_ID": "wrong-product" } }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let config = Config::load_from_sources(Some(&global_path), None, &HashMap::new());
+
+    let err = JiraVendor::new().base_url(&config).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::AuthMissing);
+    assert!(err.message.contains("ATLASSIAN_CLOUD_ID"));
+}
+
+#[test]
 fn base_url_missing_site_returns_auth_missing() {
     // The crucial guarantee: a Bitbucket-only deployment must never crash
     // at server boot just because Jira isn't configured. The error only
@@ -160,6 +243,31 @@ fn classify_401_maps_to_auth_invalid_with_ts_prefix() {
         err.message
     );
     assert!(err.message.contains("Login required"));
+}
+
+#[test]
+fn contextual_401_identifies_mode_and_sanitized_base_without_credentials() {
+    let vendor = JiraVendor::new();
+    let config = cfg(&[
+        ("ATLASSIAN_API_TOKEN_MODE", "scoped"),
+        ("ATLASSIAN_CLOUD_ID", "cloud-id"),
+        ("ATLASSIAN_USER_EMAIL", "alice@example.com"),
+        ("ATLASSIAN_API_TOKEN", "super-secret-token"),
+    ]);
+    let err = vendor.classify_error_with_context(
+        StatusCode::UNAUTHORIZED,
+        r#"{"message":"Unauthorized"}"#,
+        &config,
+        "https://api.atlassian.com/ex/jira/cloud-id",
+    );
+    assert!(err.message.contains("token mode: scoped"));
+    assert!(
+        err.message
+            .contains("https://api.atlassian.com/ex/jira/cloud-id")
+    );
+    assert!(!err.message.contains("alice@example.com"));
+    assert!(!err.message.contains("super-secret-token"));
+    assert!(!err.message.contains("Basic "));
 }
 
 #[test]

@@ -6,6 +6,7 @@
 //! serialized records; a dedicated worker owns all file I/O and rotation.
 
 use std::fs::{File, OpenOptions};
+use std::future::Future;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, mpsc};
@@ -17,10 +18,20 @@ use crate::constants::UNSCOPED_PACKAGE_NAME;
 
 const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_MAX_FILES: usize = 5;
-const DEFAULT_RETENTION_DAYS: u64 = 30;
+const DEFAULT_RETENTION_DAYS: u64 = 45;
 const DEFAULT_RETENTION_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 static AUDIT_LOG: OnceLock<Option<AuditLog>> = OnceLock::new();
+
+#[derive(Clone)]
+struct AuditContext {
+    call_id: String,
+    tool: String,
+}
+
+tokio::task_local! {
+    static CURRENT_AUDIT_CALL: AuditContext;
+}
 
 struct AuditLog {
     session_id: String,
@@ -61,7 +72,7 @@ struct AuditRecord<'a> {
     duration_ms: Option<u128>,
 }
 
-#[derive(Serialize)]
+#[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CacheEvent<'a> {
     pub timestamp: String,
@@ -70,20 +81,70 @@ pub(crate) struct CacheEvent<'a> {
     pub process_id: u32,
     pub vendor: &'a str,
     pub cache_key: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_fingerprint: Option<&'a str>,
     pub outcome: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_probability: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_actions: Option<&'a [&'a str]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_source: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub age_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub remaining_ttl_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_latency_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub response_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub compressed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression_duration_us: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_duration_us: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_etag: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_last_modified: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hit_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_saved_latency_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residency_byte_ms: Option<u128>,
     pub cumulative_hits: u64,
     pub cumulative_misses: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entries_before: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_bytes_before: Option<usize>,
     pub entries: usize,
     pub cache_bytes: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CorrelatedCacheEvent<'a, 'b> {
+    #[serde(flatten)]
+    event: &'a CacheEvent<'b>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    call_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool: Option<&'a str>,
 }
 
 /// In-flight tool-call audit state. Dropping it without calling [`complete`]
@@ -124,6 +185,19 @@ impl AuditCall {
             Some(outcome),
             Some(duration_ms),
         );
+    }
+
+    /// Run a tool future with correlation metadata available to lower layers.
+    pub async fn scope<F: Future>(&self, future: F) -> F::Output {
+        CURRENT_AUDIT_CALL
+            .scope(
+                AuditContext {
+                    call_id: self.call_id.clone(),
+                    tool: self.tool.clone(),
+                },
+                future,
+            )
+            .await
     }
 }
 
@@ -191,7 +265,28 @@ pub(crate) fn cache_event(mut event: CacheEvent<'_>) {
     event.timestamp = crate::logger::iso_timestamp();
     event.session_id = &log.session_id;
     event.process_id = std::process::id();
-    write_json(log, &event);
+    let _ = CURRENT_AUDIT_CALL
+        .try_with(|context| {
+            write_json(
+                log,
+                &CorrelatedCacheEvent {
+                    event: &event,
+                    call_id: Some(&context.call_id),
+                    tool: Some(&context.tool),
+                },
+            );
+        })
+        .or_else(|_| {
+            write_json(
+                log,
+                &CorrelatedCacheEvent {
+                    event: &event,
+                    call_id: None,
+                    tool: None,
+                },
+            );
+            Ok::<(), ()>(())
+        });
 }
 
 fn write_record(call: &AuditCall, event: &str, outcome: Option<&str>, duration_ms: Option<u128>) {
@@ -372,6 +467,57 @@ fn sweep_retention(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_event_serializes_policy_and_call_correlation() {
+        let actions = ["admit"];
+        let event = CacheEvent {
+            timestamp: "2026-08-24T00:00:00Z".into(),
+            event: "http_cache_decision",
+            session_id: "session",
+            process_id: 42,
+            vendor: "jira",
+            cache_key: "request-hash",
+            resource_fingerprint: Some("resource-hash"),
+            outcome: "stored",
+            action: Some("admit"),
+            decision_id: Some("decision"),
+            policy_version: Some("fixed-v1"),
+            action_probability: Some(1.0),
+            candidate_actions: Some(&actions),
+            ttl_source: Some("default"),
+            cumulative_hits: 1,
+            cumulative_misses: 2,
+            entries: 3,
+            cache_bytes: 4,
+            ..Default::default()
+        };
+        let value = serde_json::to_value(CorrelatedCacheEvent {
+            event: &event,
+            call_id: Some("call"),
+            tool: Some("jira_get"),
+        })
+        .unwrap();
+
+        assert_eq!(value["decisionId"], "decision");
+        assert_eq!(value["callId"], "call");
+        assert_eq!(value["tool"], "jira_get");
+        assert_eq!(value["candidateActions"][0], "admit");
+        assert!(value.get("decodeDurationUs").is_none());
+    }
+
+    #[tokio::test]
+    async fn audit_scope_exposes_call_context_to_lower_layers() {
+        let audit = AuditCall::start("bb_get", "request".into(), None, None);
+        audit
+            .scope(async {
+                CURRENT_AUDIT_CALL.with(|context| {
+                    assert_eq!(context.tool, "bb_get");
+                    assert_eq!(context.call_id, audit.call_id);
+                });
+            })
+            .await;
+    }
 
     #[test]
     fn writer_rotates_and_bounds_archive_count() {

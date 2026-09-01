@@ -36,6 +36,8 @@ mod grafana;
 mod jira;
 mod newrelic;
 mod ninjaone;
+#[cfg(feature = "ninjaone-db")]
+mod ninjaone_db;
 mod postman;
 mod slack;
 mod sonarqube;
@@ -65,6 +67,8 @@ use crate::controllers::edx::EdxContext;
 use crate::controllers::grafana::GrafanaContext;
 use crate::controllers::newrelic::NewRelicContext;
 use crate::controllers::ninjaone::NinjaOneContext;
+#[cfg(feature = "ninjaone-db")]
+use crate::controllers::ninjaone_db::NinjaOneDbContext;
 use crate::controllers::postman::PostmanContext;
 use crate::controllers::slack::SlackContext;
 use crate::controllers::sonarqube::SonarqubeContext;
@@ -130,6 +134,10 @@ impl DevtoolsServer {
             + Self::sonarqube_router()
             + Self::splunk_router();
         let router = router + Self::ninjaone_router();
+        // The NinjaOne database tools ride their own feature so a deployment
+        // without QA/dev Postgres access drops them and the driver entirely.
+        #[cfg(feature = "ninjaone-db")]
+        let router = router + Self::ninjaone_db_router();
         // WRDS tools only exist when the `wrds` feature is on (default).
         #[cfg(feature = "wrds")]
         let router = router + Self::wrds_router();
@@ -289,6 +297,13 @@ impl DevtoolsServer {
     fn wrds_ctx<'a>(&'a self, config: &'a Config) -> WrdsContext<'a> {
         WrdsContext::new(config, &self.components.vendors.wrds)
     }
+
+    /// NinjaOne database context. Like WRDS this is a direct Postgres path, so
+    /// it carries config and the vendor only.
+    #[cfg(feature = "ninjaone-db")]
+    fn ninjaone_db_ctx<'a>(&'a self, config: &'a Config) -> NinjaOneDbContext<'a> {
+        NinjaOneDbContext::new(config, &self.components.vendors.ninjaone_db)
+    }
 }
 
 // ============================================================================
@@ -363,7 +378,7 @@ impl ServerHandler for DevtoolsServer {
         );
         let tool_context =
             rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let result = self.tool_router.call(tool_context).await;
+        let result = audit.scope(self.tool_router.call(tool_context)).await;
         let outcome = match &result {
             Ok(CallToolResponse::Complete(value)) if value.is_error == Some(true) => "error",
             Ok(CallToolResponse::Complete(_)) => "success",

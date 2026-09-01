@@ -27,6 +27,8 @@ use crate::vendor::grafana::GrafanaVendor;
 use crate::vendor::jira::JiraVendor;
 use crate::vendor::newrelic::NewRelicVendor;
 use crate::vendor::ninjaone::NinjaOneVendor;
+#[cfg(feature = "ninjaone-db")]
+use crate::vendor::ninjaone_db::NinjaOneDbVendor;
 use crate::vendor::postman::PostmanVendor;
 use crate::vendor::slack::SlackVendor;
 use crate::vendor::sonarqube::SonarqubeVendor;
@@ -58,6 +60,11 @@ pub struct Vendors {
     pub sonarqube: SonarqubeVendor,
     pub splunk: SplunkVendor,
     pub ninjaone: NinjaOneVendor,
+    /// Read-only `PostgreSQL` access to allowlisted `NinjaOne` QA/dev
+    /// environments. Feature-gated alongside `wrds`: both share the Postgres
+    /// dependency set, and either can be compiled out on its own.
+    #[cfg(feature = "ninjaone-db")]
+    pub ninjaone_db: NinjaOneDbVendor,
     /// WRDS (`PostgreSQL`) vendor. Feature-gated: a `--no-default-features`
     /// build drops the Postgres dependency tree entirely, so this field and
     /// the `wrds_*` tools do not exist.
@@ -81,6 +88,8 @@ impl Default for Vendors {
             sonarqube: SonarqubeVendor::new(),
             splunk: SplunkVendor::new(),
             ninjaone: NinjaOneVendor::new(),
+            #[cfg(feature = "ninjaone-db")]
+            ninjaone_db: NinjaOneDbVendor::new(),
             #[cfg(feature = "wrds")]
             wrds: WrdsVendor::new(),
         }

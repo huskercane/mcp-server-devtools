@@ -939,6 +939,48 @@ fn migrate_moves_non_atlassian_vendor_secrets() {
     );
 }
 
+/// The same holds for the nested spelling of the DB document: migrate has no
+/// business in it, so it must survive untouched and unflattened.
+#[test]
+fn migrate_leaves_a_nested_database_environment_document_alone() {
+    let dir = TempDir::new().unwrap();
+    let path = make_path(&dir, "configs.json");
+    let document = json!({
+        "qa5": {
+            "centralHost": "central.qa5.internal",
+            "divisionHosts": { "db-host-1": "division-1.qa5.internal" },
+            "username": "readonly_user",
+            "password": "secret",
+        },
+    });
+    write_config(
+        &path,
+        &json!({
+            "ninjaone": {
+                "environments": {
+                    "NINJAONE_DB_ENVIRONMENTS": document,
+                    "NINJAONE_EMAIL": "tech@example.com",
+                    "NINJAONE_PASSWORD": "plaintext",
+                },
+            },
+        }),
+    );
+    let kc = InMemoryKeychain::new();
+
+    creds::migrate_with(&kc, &path, false).unwrap();
+
+    let rewritten = read_config(&path);
+    assert_eq!(
+        rewritten["ninjaone"]["environments"]["NINJAONE_DB_ENVIRONMENTS"],
+        document
+    );
+    // The rewrite really did happen; the document just was not part of it.
+    assert_eq!(
+        rewritten["ninjaone"]["environments"]["NINJAONE_PASSWORD"],
+        json!("keychain")
+    );
+}
+
 /// The DB blob holds passwords but is not a single secret, so migrate must
 /// leave it exactly as it found it rather than storing the whole document.
 #[test]
@@ -1063,6 +1105,57 @@ fn migrate_moves_each_server_entrys_own_credentials() {
     let rewritten = std::fs::read_to_string(&path).unwrap();
     assert!(!rewritten.contains("qa4-plaintext"));
     assert!(!rewritten.contains("qa5-plaintext"));
+}
+
+/// `NINJAONE_SERVERS` may be authored as real nested JSON rather than an
+/// escaped string. The runtime honours both, so migrate has to walk both —
+/// otherwise a nested-form config would keep its plaintext passwords with no
+/// diagnostic — and it writes the value back in the shape it found it.
+#[test]
+fn migrate_walks_a_nested_json_servers_map_and_keeps_it_nested() {
+    let dir = TempDir::new().unwrap();
+    let path = make_path(&dir, "configs.json");
+    write_config(
+        &path,
+        &json!({
+            "ninjaone": {
+                "environments": {
+                    "NINJAONE_SERVERS": {
+                        "qa5": {
+                            "url": "https://qa5.example",
+                            "email": "qa5@example.com",
+                            "password": "qa5-plaintext",
+                        },
+                    },
+                },
+            },
+        }),
+    );
+    let kc = InMemoryKeychain::new();
+
+    let outcome = creds::migrate_with(&kc, &path, false).unwrap();
+
+    assert_eq!(
+        kc.get(SecretKind::Password, VENDOR_NINJAONE, "qa5@example.com")
+            .unwrap()
+            .as_deref(),
+        Some("qa5-plaintext")
+    );
+    assert_eq!(outcome.migrated.len(), 1);
+
+    let rewritten = read_config(&path);
+    let servers = &rewritten["ninjaone"]["environments"]["NINJAONE_SERVERS"];
+    assert!(
+        servers.is_object(),
+        "nested JSON must not be rewritten as an escaped string: {servers}"
+    );
+    assert_eq!(servers["qa5"]["password"], json!("keychain"));
+    assert_eq!(servers["qa5"]["email"], json!("qa5@example.com"));
+    assert!(
+        !std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("qa5-plaintext")
+    );
 }
 
 #[test]

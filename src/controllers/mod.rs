@@ -11,6 +11,8 @@ pub mod edx;
 pub mod grafana;
 pub mod newrelic;
 pub mod ninjaone;
+#[cfg(feature = "ninjaone-db")]
+pub mod ninjaone_db;
 pub mod postman;
 pub mod slack;
 pub mod sonarqube;
@@ -26,6 +28,8 @@ pub use edx::EdxContext;
 pub use grafana::GrafanaContext;
 pub use newrelic::NewRelicContext;
 pub use ninjaone::NinjaOneContext;
+#[cfg(feature = "ninjaone-db")]
+pub use ninjaone_db::NinjaOneDbContext;
 pub use postman::PostmanContext;
 pub use slack::SlackContext;
 pub use sonarqube::SonarqubeContext;

@@ -464,14 +464,29 @@ fn read_environments_at(root: &Value, key: &str) -> Option<HashMap<String, Strin
     let env = section.get("environments").and_then(Value::as_object)?;
     Some(
         env.iter()
-            .filter_map(|(k, v)| match v {
-                Value::String(s) => Some((k.clone(), s.clone())),
-                Value::Bool(b) => Some((k.clone(), b.to_string())),
-                Value::Number(n) => Some((k.clone(), n.to_string())),
-                _ => None,
-            })
+            .filter_map(|(k, v)| Some((k.clone(), config_value_as_string(v)?)))
             .collect(),
     )
+}
+
+/// Coerce one `environments` value into the string every config consumer sees.
+///
+/// A config value is a string because the env-var path can only carry a string,
+/// and both paths must resolve to the same text. Scalars stringify the obvious
+/// way. A value that is *itself* a JSON document — `NINJAONE_DB_ENVIRONMENTS`,
+/// `NINJAONE_SERVERS` — may be written as real nested JSON in `configs.json`
+/// rather than a hand-escaped string; it is re-encoded here, so the consumer
+/// sees identical text either way and needs no knowledge of which spelling the
+/// operator used. `null` reads as absent, same as an omitted key.
+fn config_value_as_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Number(n) => Some(n.to_string()),
+        // `preserve_order` is on, so this round-trips in authored key order.
+        Value::Object(_) | Value::Array(_) => serde_json::to_string(value).ok(),
+        Value::Null => None,
+    }
 }
 
 /// Aliases we try inside `configs.json`, in priority order. Matches TS

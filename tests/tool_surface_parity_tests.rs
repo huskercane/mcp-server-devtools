@@ -82,6 +82,13 @@ fn live_tool_surface() -> Value {
 /// Sort by tool name so router-registration order never makes this flaky.
 fn normalise(mut tools: Value) -> Value {
     let arr = tools.as_array_mut().expect("tools is an array");
+    for tool in arr.iter_mut() {
+        if let Some(description) = tool.get_mut("description")
+            && let Some(text) = description.as_str()
+        {
+            *description = Value::String(text.replace("\r\n", "\n"));
+        }
+    }
     arr.sort_by(|a, b| {
         a.get("name")
             .and_then(Value::as_str)

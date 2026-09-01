@@ -24,6 +24,11 @@
 pub mod raw_response;
 mod response_cache;
 
+/// Emit terminal outcomes for live response-cache entries before audit shutdown.
+pub fn shutdown_response_cache() {
+    response_cache::shutdown();
+}
+
 /// Re-export of the Bitbucket error parser at its old path. Kept so
 /// downstream tests (`tests/bitbucket_error_tests.rs`) and any external
 /// consumers continue to compile after the parser moved into
@@ -1069,7 +1074,7 @@ pub async fn fetch_streamed_artifact_with_policy(
                 continue;
             }
             let body = response.text().await.unwrap_or_default();
-            return Err(vendor.classify_error(status, &body));
+            return Err(vendor.classify_error_with_context(status, &body, config, &base));
         }
         if response
             .content_length()
@@ -1572,7 +1577,7 @@ pub async fn fetch(
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
         log_ninjaone_error_response(vendor.name(), &url, method, status, &body_text);
-        return Err(vendor.classify_error(status, &body_text));
+        return Err(vendor.classify_error_with_context(status, &body_text, config, &base));
     }
 
     let body = classify_body(response).await?;

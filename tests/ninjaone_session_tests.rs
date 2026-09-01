@@ -487,6 +487,65 @@ async fn login_does_not_duplicate_a_ws_server_alias_prefix() {
     assert!(response.content.contains("\"authenticated\": true"));
 }
 
+/// The `qa4`/`qa5`/`qa6.engineering-env.ninja` shape (confirmed against a
+/// captured browser HAR): login lives at the bare origin, but every other
+/// call still needs the alias's `/swb/s1`-style prefix. Without
+/// `loginIgnoresPrefix: true`, the login exchange 404s here exactly as it did
+/// against the real qa4 host — this is the regression the flag exists to fix.
+#[tokio::test]
+async fn login_ignores_prefix_flag_bypasses_prefix_for_login_only() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/ws/account/authentication-state"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "authState": "NATIVE",
+            "recaptchaRequired": false,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/ws/account/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(session_success()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // No mock for "/swb/s1/ws/account/*": reaching it (the pre-fix behaviour)
+    // would 404 and fail this test.
+    Mock::given(method("GET"))
+        .and(path("/swb/s1/backup/lockhart/lockhart-status"))
+        .and(header("cookie", SESSION_COOKIE))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ok"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = build_client().unwrap();
+    let servers = json!({
+        "qa4-1": { "url": server.uri(), "prefix": "/swb/s1", "loginIgnoresPrefix": true },
+    })
+    .to_string();
+    let config = config(&[("NINJAONE_SERVERS", servers.as_str())]);
+    let vendor = NinjaOneVendor::default();
+    let ctx = NinjaOneContext::new(&client, &config, &vendor);
+
+    let mut args = login_args();
+    args.server = Some("qa4-1".to_owned());
+    let response = login(&ctx, &args).await.unwrap();
+    assert!(response.content.contains("\"authenticated\": true"));
+
+    // The rest of the API surface still gets the prefix: the flag scopes
+    // narrowly to the three login-exchange endpoints.
+    let mut read = read_args();
+    read.server = Some("qa4-1".to_owned());
+    read.path = "/backup/lockhart/lockhart-status".to_owned();
+    let read_response = handle_read(&ctx, HttpMethod::Get, &read).await.unwrap();
+    assert!(read_response.content.contains("ok"));
+    if let Some(path) = read_response.raw_response_path {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 #[tokio::test]
 async fn login_requires_server_held_credentials() {
     let server = MockServer::start().await;

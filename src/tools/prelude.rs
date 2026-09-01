@@ -36,6 +36,8 @@ pub(crate) use super::args::{
     SplunkCreateJobArgs, SplunkJobResultsArgs, SplunkListSavedSearchesArgs, SplunkSearchArgs,
     WriteArgs,
 };
+#[cfg(feature = "ninjaone-db")]
+pub(crate) use super::args::{QueryCentralDbArgs, QueryDivisionDbArgs, ResolveDivisionArgs};
 #[cfg(feature = "wrds")]
 pub(crate) use super::args::{
     WrdsDescribeTableArgs, WrdsListLibrariesArgs, WrdsListTablesArgs, WrdsQueryArgs,

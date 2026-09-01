@@ -156,6 +156,7 @@ pub struct WriteArgs {
     /// Request body as a JSON object. Structure depends on the endpoint.
     /// Example for PR:
     /// `{"title": "My PR", "source": {"branch": {"name": "feature"}}}`
+    #[schemars(with = "BTreeMap<String, Value>")]
     pub body: Value,
 
     /// Optional query parameters as key-value pairs.
@@ -211,6 +212,7 @@ pub struct NinjaOneWriteArgs {
     pub path: String,
 
     /// JSON request body expected by the selected endpoint.
+    #[schemars(with = "BTreeMap<String, Value>")]
     pub body: Value,
 
     /// Optional query parameters as key-value pairs.
@@ -898,4 +900,84 @@ pub struct EdxDiscussionCommentCreateArgs {
 
     #[serde(default, flatten)]
     pub output: EdxDiscussionOutputArgs,
+}
+
+/// Arguments for `resolve_division`.
+#[cfg(feature = "ninjaone-db")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveDivisionArgs {
+    /// Fixed QA/dev alias from `NINJAONE_DB_ENVIRONMENTS`, e.g. `qa5` or
+    /// `dev-backup2`. Arbitrary hosts and production aliases are rejected.
+    pub environment: String,
+
+    /// Division UID, exact `div_...` database name, `db_host`, or a partial
+    /// database/hostname fragment.
+    pub division: String,
+
+    /// Optional JMESPath expression to filter/transform matching rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `query_division_db`.
+#[cfg(feature = "ninjaone-db")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryDivisionDbArgs {
+    /// Fixed QA/dev alias from `NINJAONE_DB_ENVIRONMENTS`.
+    pub environment: String,
+
+    /// `db_host` key returned by `resolve_division`. It must map to a connection
+    /// in the selected environment's `divisionHosts` allowlist. May be omitted
+    /// when the environment configures exactly one division host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_host: Option<String>,
+
+    /// Physical `div_<company>_<suffix>` database name returned by
+    /// `resolve_division`.
+    pub db_name: String,
+
+    /// One read-only SELECT or WITH ... SELECT statement.
+    pub sql: String,
+
+    /// Maximum rows returned. Defaults to 500 and is capped at 10,000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_limit: Option<u32>,
+
+    /// Optional JMESPath expression to filter/transform the result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `query_central_db`.
+#[cfg(feature = "ninjaone-db")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryCentralDbArgs {
+    /// Fixed QA/dev alias from `NINJAONE_DB_ENVIRONMENTS`.
+    pub environment: String,
+
+    /// One read-only SELECT or WITH ... SELECT statement against `centraldb`.
+    pub sql: String,
+
+    /// Maximum rows returned. Defaults to 500 and is capped at 10,000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_limit: Option<u32>,
+
+    /// Optional JMESPath expression to filter/transform the result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
 }

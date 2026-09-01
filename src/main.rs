@@ -39,6 +39,7 @@ async fn main() -> ExitCode {
         }
     };
     raw_response::shutdown_and_cleanup().await;
+    mcp_server_devtools::transport::shutdown_response_cache();
     audit::shutdown();
     exit
 }

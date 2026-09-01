@@ -33,6 +33,10 @@ pub mod grafana;
 pub mod jira;
 pub mod newrelic;
 pub mod ninjaone;
+#[cfg(feature = "ninjaone-db")]
+pub mod ninjaone_db;
+#[cfg(any(feature = "wrds", feature = "ninjaone-db"))]
+pub mod postgres;
 pub mod postman;
 pub mod slack;
 pub mod sonarqube;
@@ -67,6 +71,19 @@ pub trait Vendor: Send + Sync {
     /// Convert a non-2xx response (status + body text) into the typed
     /// [`McpError`] for this vendor's error envelope shape(s).
     fn classify_error(&self, status: StatusCode, body: &str) -> McpError;
+
+    /// Classify an HTTP error with request context available for safe,
+    /// vendor-specific diagnostics. The default preserves the context-free
+    /// classifier used by most vendors.
+    fn classify_error_with_context(
+        &self,
+        status: StatusCode,
+        body: &str,
+        _config: &Config,
+        _base_url: &str,
+    ) -> McpError {
+        self.classify_error(status, body)
+    }
 
     /// Inspect a **successful** (2xx) JSON body for an application-level error
     /// the HTTP status did not signal. Slack's Web API is the motivating case:

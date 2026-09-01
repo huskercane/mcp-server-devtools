@@ -7,8 +7,9 @@
 //! API**. Programmatic access is a direct **PostgreSQL** connection to
 //! `wrds-pgdata.wharton.upenn.edu:9737` (SSL required) — exactly what the
 //! official `wrds` Python package wraps. So this module deliberately does *not*
-//! implement [`Vendor`]; it owns a Postgres connection path instead, and maps
-//! [`tokio_postgres::Error`] onto the same [`McpError`] envelope (see [`error`]).
+//! implement [`Vendor`]; it rides the shared Postgres adapter in
+//! [`crate::vendor::postgres`] instead, which also maps
+//! [`tokio_postgres::Error`] onto the same [`McpError`] envelope.
 //!
 //! ## Design notes
 //!
@@ -32,21 +33,15 @@
 //!   pass the library/table names as bound query parameters against
 //!   `information_schema`, never string-interpolated.
 
-pub mod error;
-
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use rustls::ClientConfig;
 use serde_json::Value;
-use tokio_postgres::Config as PgConfig;
 use tokio_postgres::config::SslMode;
 use tokio_postgres::types::ToSql;
-use tokio_postgres_rustls::MakeRustlsConnect;
-use tracing::debug;
 
 use crate::config::{Config, VENDOR_WRDS};
-use crate::error::{McpError, OriginalError, api_error, auth_missing};
+use crate::error::{McpError, auth_missing};
+use crate::vendor::postgres::{self, ConnectSpec, PgVendor, TlsCache};
 
 /// Default WRDS Cloud Postgres host.
 pub const DEFAULT_HOST: &str = "wrds-pgdata.wharton.upenn.edu";
@@ -60,12 +55,13 @@ pub const DEFAULT_ROW_LIMIT: u32 = 1_000;
 /// Hard upper bound on the row cap a caller may request.
 pub const MAX_ROW_LIMIT: u32 = 100_000;
 
-/// Per-statement timeout applied to every session.
-const STATEMENT_TIMEOUT_MS: u32 = 60_000;
 /// Connection establishment timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// `application_name` reported to Postgres (shows up in `pg_stat_activity`).
 const APPLICATION_NAME: &str = "mcp-devtools";
+
+/// Identity and session policy this vendor hands the shared Postgres adapter.
+const PG: PgVendor = PgVendor::new("WRDS", Duration::from_mins(1));
 
 /// Clamp a caller-supplied row limit into `[1, MAX_ROW_LIMIT]`, defaulting when
 /// absent.
@@ -81,7 +77,7 @@ pub fn clamp_row_limit(requested: Option<u32>) -> u32 {
 /// the server's `Arc<ServerState>` like every other vendor.
 #[derive(Default)]
 pub struct WrdsVendor {
-    tls: OnceLock<Arc<ClientConfig>>,
+    tls: TlsCache,
 }
 
 /// Resolved connection parameters for one WRDS session.
@@ -150,46 +146,30 @@ impl WrdsVendor {
         })
     }
 
-    /// Build (once) and cache the rustls client config. Uses the OS trust store
-    /// for roots and the aws-lc-rs provider already linked via reqwest, so it
-    /// adds no crypto code of its own. On a build failure nothing is cached and
-    /// the (rare) error propagates.
-    fn tls_config(&self) -> Result<Arc<ClientConfig>, McpError> {
-        if let Some(cfg) = self.tls.get() {
-            return Ok(cfg.clone());
-        }
-        let cfg = Arc::new(build_tls_config()?);
-        // A concurrent builder may have won the race; either value is valid.
-        let _ = self.tls.set(cfg.clone());
-        Ok(cfg)
-    }
-
-    /// Open a fresh authenticated, TLS-secured connection and spawn its driver
-    /// task. The returned client owns the connection; dropping it ends the
-    /// driver.
+    /// Open a fresh authenticated, TLS-secured connection. The returned client
+    /// owns the connection; dropping it ends the background driver task the
+    /// shared adapter spawned.
     async fn connect(&self, config: &Config) -> Result<tokio_postgres::Client, McpError> {
         let params = Self::conn_params(config).await?;
-        let tls_cfg = self.tls_config()?;
-        let tls = MakeRustlsConnect::new((*tls_cfg).clone());
-
-        let mut pg = PgConfig::new();
-        pg.host(&params.host)
-            .port(params.port)
-            .dbname(&params.dbname)
-            .user(&params.user)
-            .password(&params.password)
-            .ssl_mode(params.ssl_mode)
-            .application_name(APPLICATION_NAME)
-            .connect_timeout(CONNECT_TIMEOUT);
-
-        debug!(host = %params.host, port = params.port, db = %params.dbname, "wrds: connecting");
-        let (client, connection) = pg.connect(tls).await.map_err(|e| error::classify(&e))?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                debug!(error = %e, "wrds: connection closed");
-            }
-        });
-        Ok(client)
+        postgres::connect(
+            &self.tls,
+            PG,
+            ConnectSpec {
+                host: &params.host,
+                port: params.port,
+                database: &params.dbname,
+                user: &params.user,
+                password: &params.password,
+                ssl_mode: params.ssl_mode,
+                allow_invalid_certificates: false,
+                application_name: APPLICATION_NAME,
+                connect_timeout: CONNECT_TIMEOUT,
+                // WRDS Cloud fronts Postgres with a pooler; the session
+                // settings go in as a `SET` after connecting instead.
+                startup_options: None,
+            },
+        )
+        .await
     }
 
     /// Run `base_sql` (with optional bound `params`) and return the result set
@@ -205,24 +185,20 @@ impl WrdsVendor {
     ) -> Result<Value, McpError> {
         let client = self.connect(config).await?;
 
-        // Enforce read-only + a statement timeout for the whole session. Both
-        // values are server-controlled integers/keywords — no user input.
+        // Belt and braces: the connection already carries these as startup
+        // options, but a pooler that hands back a reused backend may not have
+        // applied them.
         client
-            .batch_execute(&format!(
-                "SET statement_timeout = {STATEMENT_TIMEOUT_MS}; \
-                 SET default_transaction_read_only = on;"
-            ))
+            .batch_execute(&PG.read_only_session_sql())
             .await
-            .map_err(|e| error::classify(&e))?;
+            .map_err(|e| PG.classify(&e))?;
 
-        let wrapped = wrap_query(base_sql, limit);
+        let wrapped = postgres::wrap_query(base_sql, limit);
         let row = client
             .query_one(&wrapped, params)
             .await
-            .map_err(|e| error::classify(&e))?;
-        let data: Value = row
-            .try_get(0)
-            .map_err(|e| api_error(format!("WRDS: failed to decode result: {e}"), None, None))?;
+            .map_err(|e| PG.classify(&e))?;
+        let data: Value = row.try_get(0).map_err(|e| PG.decode_error(&e))?;
         Ok(data)
     }
 
@@ -302,58 +278,9 @@ fn missing(key: &str) -> McpError {
     ))
 }
 
-/// Wrap a caller `SELECT` so Postgres aggregates it to a JSONB array
-/// server-side and the row count is capped. A trailing `;` is stripped so the
-/// wrapped subquery parses; any *embedded* statement separator simply fails to
-/// parse, which is the desired rejection of multi-statement input.
-fn wrap_query(base_sql: &str, limit: u32) -> String {
-    let trimmed = base_sql.trim().trim_end_matches(';').trim_end();
-    format!(
-        "SELECT coalesce(jsonb_agg(__r), '[]'::jsonb) AS data \
-         FROM (SELECT to_jsonb(__t) AS __r FROM ({trimmed}) __t LIMIT {limit}) __s"
-    )
-}
-
-/// Build a rustls client config: OS trust store for roots, aws-lc-rs provider
-/// (already linked via reqwest) for crypto. Explicit provider selection avoids
-/// depending on a process-global default being installed.
-fn build_tls_config() -> Result<ClientConfig, McpError> {
-    let mut roots = rustls::RootCertStore::empty();
-    let loaded = rustls_native_certs::load_native_certs();
-    for cert in loaded.certs {
-        let _ = roots.add(cert);
-    }
-    if roots.is_empty() {
-        return Err(api_error(
-            "WRDS TLS: no system root certificates available to validate the WRDS server",
-            None,
-            loaded
-                .errors
-                .first()
-                .map(|e| OriginalError::String(e.to_string())),
-        ));
-    }
-
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| api_error(format!("WRDS TLS setup failed: {e}"), None, None))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Ok(config)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn wrap_query_strips_trailing_semicolon_and_caps_rows() {
-        let sql = wrap_query("SELECT 1 AS n;  ", 50);
-        assert!(sql.contains("FROM (SELECT 1 AS n) __t"));
-        assert!(sql.ends_with("LIMIT 50) __s"));
-        assert!(sql.starts_with("SELECT coalesce(jsonb_agg"));
-    }
 
     #[test]
     fn clamp_row_limit_applies_default_and_bounds() {

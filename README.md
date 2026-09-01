@@ -72,7 +72,7 @@ The [complete configuration reference](docs/configuration.md) lists every suppor
 
 | Integration | Required or commonly used settings |
 |---|---|
-| Atlassian | `ATLASSIAN_USER_EMAIL`, `ATLASSIAN_API_TOKEN`, `ATLASSIAN_SITE_NAME` for Jira/Confluence, `BITBUCKET_DEFAULT_WORKSPACE` optionally |
+| Atlassian | `ATLASSIAN_USER_EMAIL`, `ATLASSIAN_API_TOKEN`; classic Jira/Confluence also use `ATLASSIAN_SITE_NAME`, while scoped Jira/Confluence use `ATLASSIAN_API_TOKEN_MODE=scoped` and `ATLASSIAN_CLOUD_ID`. Bitbucket scoped tokens need no mode or Cloud ID. |
 | Zoom | `ZOOM_ACCOUNT_ID`, `ZOOM_CLIENT_ID`, `ZOOM_CLIENT_SECRET` |
 | CircleCI | `CIRCLECI_TOKEN` |
 | Slack | `SLACK_TOKEN` |
@@ -92,10 +92,18 @@ arguments, credentials, URLs, cache contents, or response content. Cache keys
 are represented by short one-way fingerprints so repeated lookups can be
 correlated safely. Cache events also include the admission action, TTL, age,
 remaining TTL, response and stored sizes, compression state, upstream latency,
-and cumulative hit/miss totals. Those observations are suitable for evaluating
-future cache-admission or TTL bandits offline. Each process keeps at most five
-10 MiB segments by default and prunes
-prior-session audit data after 30 days or when it exceeds 100 MiB. Configure
+and cumulative hit/miss totals. Cache decisions additionally record a unique
+decision ID, fixed-policy version and action propensity, privacy-safe resource
+fingerprint, TTL source, validator availability, cache occupancy, and
+compression cost. They inherit the active tool-call ID when available. Every
+admitted entry later emits an `http_cache_outcome` when it expires, is
+invalidated, evicted, replaced, or closed at clean process shutdown. That
+terminal record includes its hit count, residency cost, and estimated latency
+saved, allowing decisions and delayed rewards to be joined without recording
+URLs, headers, arguments, or content. Those observations are suitable for
+evaluating future cache-admission or TTL bandits offline. Each process keeps at
+most five 10 MiB segments by default and prunes
+prior-session audit data after 45 days or when it exceeds 100 MiB. Configure
 this with `AUDIT_LOG_MAX_BYTES`, `AUDIT_LOG_MAX_FILES`,
 `AUDIT_LOG_RETENTION_DAYS`, and `AUDIT_LOG_RETENTION_MAX_BYTES`; set
 `AUDIT_LOG=off` to disable it explicitly. Audit logging is independent of
@@ -120,7 +128,8 @@ Example vendor-scoped global config:
     "environments": {
       "ATLASSIAN_USER_EMAIL": "you@example.com",
       "ATLASSIAN_API_TOKEN": "keychain",
-      "ATLASSIAN_SITE_NAME": "mycompany"
+      "ATLASSIAN_SITE_NAME": "mycompany",
+      "ATLASSIAN_API_TOKEN_MODE": "classic"
     }
   },
   "circleci": {

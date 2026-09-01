@@ -22,7 +22,7 @@ path = "src/main.rs"
 # for headless Linux (CI, SSH, containers): keyring + libsecret aren't useful
 # without a logged-in desktop session, and disabling avoids the libsecret
 # build dep entirely.
-default  = ["keychain", "wrds"]
+default  = ["keychain", "wrds", "ninjaone-db"]
 # `wrds` activates the WRDS (Wharton Research Data Services) integration. WRDS
 # has no REST API — it is a PostgreSQL database — so this is the one vendor that
 # does not ride the shared `reqwest`/`Vendor` HTTP path. The feature pulls in a
@@ -34,6 +34,10 @@ default  = ["keychain", "wrds"]
 # deployments). At runtime the connection is lazy: nothing dials WRDS until a
 # `wrds_*` tool is actually called.
 wrds     = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
+# Direct, read-only PostgreSQL access to allowlisted NinjaOne QA/dev databases.
+# Kept separate from `wrds` so either Postgres integration can be compiled out
+# independently while sharing the same optional dependency set.
+ninjaone-db = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
 # `dep:keyring` activates the optional `keyring` dep declared per-target below.
 # We pick an explicit credential-store feature on each OS — without one,
 # `keyring` falls back to a mock store that silently no-ops `set` and returns

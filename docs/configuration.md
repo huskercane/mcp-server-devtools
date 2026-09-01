@@ -22,7 +22,8 @@ The global file has this shape:
     "environments": {
       "ATLASSIAN_USER_EMAIL": "you@example.com",
       "ATLASSIAN_API_TOKEN": "keychain",
-      "ATLASSIAN_SITE_NAME": "mycompany"
+      "ATLASSIAN_SITE_NAME": "mycompany",
+      "ATLASSIAN_API_TOKEN_MODE": "classic"
     }
   }
 }
@@ -30,18 +31,59 @@ The global file has this shape:
 
 Recognized section names are `bitbucket`, `jira`, `confluence`, `zoom`, `circleci`, `slack`, `postman`, `edx`, `newrelic`, `grafana`, `sonarqube`, `splunk`, `ninjaone`, and `wrds`.
 
+### Settings whose value is itself a JSON document
+
+A few settings — `NINJAONE_SERVERS` and `NINJAONE_DB_ENVIRONMENTS` — carry a JSON document rather than a scalar. In `.env` and process environment variables they have to be a single-line JSON string, because that is all an environment variable can hold. In `configs.json` they may be written either way, and the two spellings are equivalent:
+
+```json
+{
+  "ninjaone": {
+    "environments": {
+      "NINJAONE_DB_ENVIRONMENTS": {
+        "qa5": {
+          "centralHost": "central.qa5.internal",
+          "divisionHosts": {
+            "db-host-1": {
+              "host": "division-1.qa5.internal",
+              "username": "division_reader",
+              "password": "division_secret"
+            }
+          },
+          "username": "central_reader",
+          "password": "central_secret"
+        }
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "ninjaone": {
+    "environments": {
+      "NINJAONE_DB_ENVIRONMENTS": "{\"qa5\":{\"centralHost\":\"central.qa5.internal\",\"divisionHosts\":{\"db-host-1\":{\"host\":\"division-1.qa5.internal\",\"username\":\"division_reader\",\"password\":\"division_secret\"}},\"username\":\"central_reader\",\"password\":\"central_secret\"}}"
+    }
+  }
+}
+```
+
+Prefer the nested form: it is diffable, and an editor validates it. `mcp-devtools creds migrate` reads both and writes each value back in the shape it found it, so migrating a nested document does not flatten it into a string.
+
 ## Integration settings
 
 | Section | Setting | Required/default | Purpose |
 |---|---|---|---|
 | `bitbucket` | `ATLASSIAN_USER_EMAIL` | Required with API token | Atlassian account email. |
-| `bitbucket` | `ATLASSIAN_API_TOKEN` | Required with account email | Atlassian API token; preferred when both Bitbucket credential forms are configured. |
+| `bitbucket` | `ATLASSIAN_API_TOKEN` | Required with account email | Scoped Bitbucket API token; preferred when both Bitbucket credential forms are configured. It uses `api.bitbucket.org/2.0` directly and needs no token-mode or Cloud-ID setting. |
 | `bitbucket` | `ATLASSIAN_BITBUCKET_USERNAME` | Alternative | Bitbucket username for app-password authentication. |
 | `bitbucket` | `ATLASSIAN_BITBUCKET_APP_PASSWORD` | Alternative | Bitbucket app password. |
 | `bitbucket` | `BITBUCKET_DEFAULT_WORKSPACE` | Optional | Default workspace used when a tool does not receive one. |
 | `jira`, `confluence` | `ATLASSIAN_USER_EMAIL` | Required | Atlassian account email. |
 | `jira`, `confluence` | `ATLASSIAN_API_TOKEN` | Required | Atlassian API token. |
-| `jira`, `confluence` | `ATLASSIAN_SITE_NAME` | Required | Site prefix, for example `mycompany` for `mycompany.atlassian.net`. Jira and Confluence may share this value. |
+| `jira`, `confluence` | `ATLASSIAN_SITE_NAME` | Required for classic tokens | Site prefix, for example `mycompany` for `mycompany.atlassian.net`. Jira and Confluence may share this value. |
+| `jira`, `confluence` | `ATLASSIAN_API_TOKEN_MODE` | `classic` | Product token type. Set to `scoped` to use that product's Atlassian API gateway. Configure it in each product section. |
+| `jira`, `confluence` | `ATLASSIAN_CLOUD_ID` | Required in `scoped` mode | Cloud ID used in `https://api.atlassian.com/ex/{product}/{cloudId}`. Configure it in each product section; it is not inherited across products. |
 | `zoom` | `ZOOM_ACCOUNT_ID` | Required | Server-to-Server OAuth account ID. |
 | `zoom` | `ZOOM_CLIENT_ID` | Required | Server-to-Server OAuth client ID. |
 | `zoom` | `ZOOM_CLIENT_SECRET` | Required | Server-to-Server OAuth client secret. |
@@ -69,6 +111,7 @@ Recognized section names are `bitbucket`, `jira`, `confluence`, `zoom`, `circlec
 | `ninjaone` | `NINJAONE_PASSWORD` | Required for login flow | Console account password. |
 | `ninjaone` | `NINJAONE_TOTP_COMMAND` | Optional | Command that returns a current MFA code. |
 | `ninjaone` | `NINJAONE_TOTP_SECRET` | Optional | Base32 seed or `otpauth://` URI used to generate MFA codes. |
+| `ninjaone` | `NINJAONE_DB_ENVIRONMENTS` | Required for the database tools | JSON document mapping a QA/dev alias to its database hosts and read-only credentials; see below. |
 | `wrds` | `WRDS_USERNAME` | Required | WRDS username. |
 | `wrds` | `WRDS_PASSWORD` | Required | WRDS password. |
 | `wrds` | `WRDS_HOST` | `wrds-pgdata.wharton.upenn.edu` | PostgreSQL host. |
@@ -76,10 +119,18 @@ Recognized section names are `bitbucket`, `jira`, `confluence`, `zoom`, `circlec
 | `wrds` | `WRDS_DBNAME` | `wrds` | PostgreSQL database. |
 | `wrds` | `WRDS_SSLMODE` | `require` | `require`, `prefer`, or `disable`. |
 
-`NINJAONE_SERVERS` is itself a JSON string when placed in `.env` or the `environments` object. Each alias can be a URL or an object with required `url` and optional `prefix`, `email`, `password`, `totpCommand`, and `totpSecret` fields:
+`NINJAONE_SERVERS` is a JSON document (see [above](#settings-whose-value-is-itself-a-json-document)). Each alias can be a URL or an object with required `url` and optional `prefix`, `email`, `password`, `totpCommand`, and `totpSecret` fields:
 
 ```dotenv
 NINJAONE_SERVERS={"production":{"url":"https://app.ninjarmm.com","email":"you@example.com","password":"keychain","totpSecret":"keychain"},"sandbox":"https://sandbox.example.com"}
+```
+
+`NINJAONE_DB_ENVIRONMENTS` is also a JSON document, mapping an environment alias to one entry with required `centralHost`, `divisionHosts`, `username`, and `password` fields and optional `centralDatabase` (`centraldb`), `port` (`5432`), `sslMode` (`require`), and `allowInvalidCertificates` (`false`) fields. The environment-level connection is for the central database. Each `divisionHosts` key is the `db_host` value carried by a division row, and its value may be a complete object with required `host`, `username`, and `password` plus the same optional connection fields (`port`, `sslMode`, and `allowInvalidCertificates`). This allows every division server to use separate credentials. A hostname string is still accepted as a compatibility shorthand and inherits all environment-level credentials and connection settings. A tool caller names the key, never a hostname.
+
+Aliases must begin with `qa` or `dev`; a document containing any other alias is refused whole, so production credentials cannot sit alongside QA ones. `sslMode: "prefer"` attempts TLS but permits plaintext only when the server declines TLS; it does not weaken certificate checks. Set `allowInvalidCertificates: true` explicitly for a QA/dev server whose custom certificate is not trusted by the operating system. The connection remains encrypted, but its server identity is not authenticated.
+
+```dotenv
+NINJAONE_DB_ENVIRONMENTS={"qa5":{"centralHost":"central.qa5.internal","divisionHosts":{"db-host-1":{"host":"division-1.qa5.internal","username":"division_reader","password":"division_secret"}},"username":"central_reader","password":"central_secret"}}
 ```
 
 ## Shared request, cache, and streaming settings
@@ -113,8 +164,7 @@ These are read directly from the process environment during startup. They do **n
 | `AUDIT_LOG` | enabled | `off`, `false`, `0`, or `no` disables structured audit logging. |
 | `AUDIT_LOG_MAX_BYTES` | `10485760` (10 MiB) | Maximum bytes per audit segment. |
 | `AUDIT_LOG_MAX_FILES` | `5` | Maximum segments retained by the current process. |
-| `AUDIT_LOG_RETENTION_DAYS` | `30` | Age limit for prior-session audit logs. |
+| `AUDIT_LOG_RETENTION_DAYS` | `45` | Age limit for prior-session audit logs. |
 | `AUDIT_LOG_RETENTION_MAX_BYTES` | `104857600` (100 MiB) | Total size limit for prior-session audit logs. |
 
 Diagnostic and audit logs are written below `~/.mcp/data`. Diagnostic log retention is fixed at seven days and 50 MiB; audit retention is configurable as shown above.
-

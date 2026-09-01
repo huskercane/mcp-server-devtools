@@ -1,8 +1,8 @@
 //! Jira Cloud vendor implementation.
 //!
-//! - Base URL is derived from `ATLASSIAN_SITE_NAME` (resolved per-request,
-//!   never at server construction). Tests can bypass the env lookup with
-//!   [`JiraVendor::with_base_url`].
+//! - Base URL is selected from `ATLASSIAN_API_TOKEN_MODE` (resolved
+//!   per-request, never at server construction). Classic tokens use the site
+//!   URL; scoped tokens use Atlassian's Jira gateway and an explicit Cloud ID.
 //! - Path normalisation only ensures a leading `/`; Jira REST callers pass
 //!   the full path including the API version (e.g. `/rest/api/3/myself`).
 //! - Error parsing handles the canonical Jira envelope plus the OAuth and
@@ -10,11 +10,44 @@
 
 pub mod error;
 
+use std::fmt::Write as _;
+
 use reqwest::StatusCode;
 
 use crate::config::{Config, VENDOR_CONFLUENCE, VENDOR_JIRA};
 use crate::error::{McpError, auth_missing};
 use crate::vendor::Vendor;
+
+const TOKEN_MODE_KEY: &str = "ATLASSIAN_API_TOKEN_MODE";
+const CLOUD_ID_KEY: &str = "ATLASSIAN_CLOUD_ID";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenMode {
+    Classic,
+    Scoped,
+}
+
+impl TokenMode {
+    fn resolve(config: &Config) -> Result<Self, McpError> {
+        let Some(raw) = config.get_for(VENDOR_JIRA, TOKEN_MODE_KEY) else {
+            return Ok(Self::Classic);
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "classic" => Ok(Self::Classic),
+            "scoped" => Ok(Self::Scoped),
+            value => Err(auth_missing(format!(
+                "Invalid {TOKEN_MODE_KEY} value {value:?}; expected `classic` or `scoped`."
+            ))),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::Scoped => "scoped",
+        }
+    }
+}
 
 /// Jira Cloud [`Vendor`] strategy.
 ///
@@ -50,6 +83,38 @@ impl JiraVendor {
             base_url_override: Some(base_url.into()),
         }
     }
+
+    fn classic_base_url(config: &Config) -> Result<String, McpError> {
+        let raw = config
+            .get_for_with_fallback(VENDOR_JIRA, &[VENDOR_CONFLUENCE], "ATLASSIAN_SITE_NAME")
+            .ok_or_else(|| {
+                auth_missing(
+                    "ATLASSIAN_SITE_NAME is required for jira_* tools. Set the env var \
+                     (e.g. `mycompany` for mycompany.atlassian.net) or add it under the \
+                     `jira` (or `confluence`) section of ~/.mcp/configs.json.",
+                )
+            })?;
+        let site = raw.trim();
+        if site.is_empty() {
+            return Err(auth_missing("ATLASSIAN_SITE_NAME is set but empty."));
+        }
+        Ok(format!("https://{site}.atlassian.net"))
+    }
+
+    fn scoped_base_url(config: &Config) -> Result<String, McpError> {
+        let raw = config.get_for(VENDOR_JIRA, CLOUD_ID_KEY).ok_or_else(|| {
+            auth_missing(
+                "ATLASSIAN_CLOUD_ID is required when ATLASSIAN_API_TOKEN_MODE is `scoped`. Add it to the `jira` section of ~/.mcp/configs.json.",
+            )
+        })?;
+        let cloud_id = raw.trim();
+        if cloud_id.is_empty() {
+            return Err(auth_missing(
+                "ATLASSIAN_CLOUD_ID is set but empty; a Cloud ID is required for scoped Jira API tokens.",
+            ));
+        }
+        Ok(format!("https://api.atlassian.com/ex/jira/{cloud_id}"))
+    }
 }
 
 impl Vendor for JiraVendor {
@@ -68,24 +133,28 @@ impl Vendor for JiraVendor {
         if let Some(base) = &self.base_url_override {
             return Ok(base.clone());
         }
-        // Site name is shared with Confluence (same Atlassian site), so a
-        // user with `ATLASSIAN_SITE_NAME` only under the `confluence`
-        // section still gets a working `jira_*` surface. The fallback is
-        // explicit to keep unrelated vendors (Bitbucket) out of the lookup.
-        let raw = config
-            .get_for_with_fallback(VENDOR_JIRA, &[VENDOR_CONFLUENCE], "ATLASSIAN_SITE_NAME")
-            .ok_or_else(|| {
-                auth_missing(
-                    "ATLASSIAN_SITE_NAME is required for jira_* tools. Set the env var \
-                     (e.g. `mycompany` for mycompany.atlassian.net) or add it under the \
-                     `jira` (or `confluence`) section of ~/.mcp/configs.json.",
-                )
-            })?;
-        let site = raw.trim();
-        if site.is_empty() {
-            return Err(auth_missing("ATLASSIAN_SITE_NAME is set but empty."));
+        match TokenMode::resolve(config)? {
+            TokenMode::Classic => Self::classic_base_url(config),
+            TokenMode::Scoped => Self::scoped_base_url(config),
         }
-        Ok(format!("https://{site}.atlassian.net"))
+    }
+
+    fn classify_error_with_context(
+        &self,
+        status: StatusCode,
+        body: &str,
+        config: &Config,
+        base_url: &str,
+    ) -> McpError {
+        let mut err = error::classify(status, body);
+        if status == StatusCode::UNAUTHORIZED {
+            let mode = TokenMode::resolve(config).map_or("unknown", TokenMode::as_str);
+            let _ = write!(
+                err.message,
+                " Selected Jira token mode: {mode}; base URL: {base_url}. Verify the token-owner email, token expiry or revocation, the URL required by the token mode, and the token's Jira scopes."
+            );
+        }
+        err
     }
 
     /// Jira paths are passed through verbatim — callers supply the full

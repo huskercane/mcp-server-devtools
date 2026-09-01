@@ -5,9 +5,10 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use mcp_server_devtools::config::{
-    Config, Resolved, VENDOR_BITBUCKET, VENDOR_CONFLUENCE, VENDOR_JIRA, candidate_keys,
-    extract_all_vendor_sections, extract_environments_for,
+    Config, Resolved, VENDOR_BITBUCKET, VENDOR_CONFLUENCE, VENDOR_JIRA, VENDOR_NINJAONE,
+    candidate_keys, extract_all_vendor_sections, extract_environments_for,
 };
+use mcp_server_devtools::vendor::ninjaone_db::environments::Environments;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
@@ -170,6 +171,66 @@ fn coerces_non_string_environment_values() {
     assert_eq!(entries.get("A_BOOL").unwrap(), "true");
     assert_eq!(entries.get("A_NUM").unwrap(), "42");
     assert_eq!(entries.get("A_STR").unwrap(), "hello");
+}
+
+/// A config key whose value *is* a JSON document (`NINJAONE_DB_ENVIRONMENTS`,
+/// `NINJAONE_SERVERS`) may be authored as real nested JSON instead of a
+/// hand-escaped string. Consumers still see one string, because the env-var
+/// path can only carry a string.
+#[test]
+fn nested_json_environment_values_are_encoded_as_json_text() {
+    let doc = json!({
+        "bitbucket": {
+            "environments": {
+                "AN_OBJECT": { "qa5": { "host": "central.qa5.internal", "port": 5432 } },
+                "AN_ARRAY": ["a", "b"],
+                "A_NULL": null
+            }
+        }
+    });
+    let entries = extract_environments_for(&doc, PKG);
+    assert_eq!(
+        entries.get("AN_OBJECT").unwrap(),
+        r#"{"qa5":{"host":"central.qa5.internal","port":5432}}"#
+    );
+    assert_eq!(entries.get("AN_ARRAY").unwrap(), r#"["a","b"]"#);
+    assert!(!entries.contains_key("A_NULL"), "null reads as absent");
+}
+
+/// The two spellings are interchangeable: whichever an operator picks, the
+/// vendor client is handed the same document.
+#[test]
+fn nested_and_escaped_spellings_resolve_to_the_same_document() {
+    let escaped = r#"{"qa5":{"centralHost":"central.qa5.internal","divisionHosts":{"db-host-1":"division-1.qa5.internal"},"username":"readonly_user","password":"secret"}}"#;
+    let dir = TempDir::new().unwrap();
+    let global = write_global(
+        &dir,
+        &json!({
+            "ninjaone": {
+                "environments": {
+                    "NINJAONE_DB_ENVIRONMENTS": {
+                        "qa5": {
+                            "centralHost": "central.qa5.internal",
+                            "divisionHosts": { "db-host-1": "division-1.qa5.internal" },
+                            "username": "readonly_user",
+                            "password": "secret"
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    let cfg = Config::load_from_sources(Some(&global), None, &HashMap::new());
+    let nested = cfg
+        .get_for(VENDOR_NINJAONE, "NINJAONE_DB_ENVIRONMENTS")
+        .expect("nested document is loaded");
+    assert_eq!(nested, escaped);
+
+    // And it is a document the vendor actually accepts, not merely valid JSON.
+    let parsed = Environments::parse(nested).expect("nested form parses");
+    let (alias, environment) = parsed.get("QA5").unwrap();
+    assert_eq!(alias, "qa5");
+    assert_eq!(environment.central_host, "central.qa5.internal");
 }
 
 // ---- full cascade (global -> dotenv -> process env) ----

@@ -48,6 +48,73 @@ fn base_url_trims_whitespace_around_site_name() {
 }
 
 #[test]
+fn omitted_token_mode_preserves_classic_base_url() {
+    let config = cfg(&[("ATLASSIAN_SITE_NAME", "mycompany")]);
+    assert_eq!(
+        ConfluenceVendor::new().base_url(&config).unwrap(),
+        "https://mycompany.atlassian.net"
+    );
+}
+
+#[test]
+fn scoped_token_mode_uses_trimmed_cloud_id() {
+    let config = cfg(&[
+        ("ATLASSIAN_API_TOKEN_MODE", "  scoped  "),
+        ("ATLASSIAN_CLOUD_ID", "  cloud-id  "),
+    ]);
+    assert_eq!(
+        ConfluenceVendor::new().base_url(&config).unwrap(),
+        "https://api.atlassian.com/ex/confluence/cloud-id"
+    );
+}
+
+#[test]
+fn scoped_token_mode_requires_confluence_cloud_id() {
+    for entries in [
+        vec![("ATLASSIAN_API_TOKEN_MODE", "scoped")],
+        vec![
+            ("ATLASSIAN_API_TOKEN_MODE", "scoped"),
+            ("ATLASSIAN_CLOUD_ID", "   "),
+        ],
+    ] {
+        let err = ConfluenceVendor::new()
+            .base_url(&cfg(&entries))
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::AuthMissing);
+        assert!(err.message.contains("ATLASSIAN_CLOUD_ID"));
+    }
+}
+
+#[test]
+fn invalid_token_mode_is_actionable() {
+    let err = ConfluenceVendor::new()
+        .base_url(&cfg(&[("ATLASSIAN_API_TOKEN_MODE", "granular")]))
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::AuthMissing);
+    assert!(err.message.contains("classic"));
+    assert!(err.message.contains("scoped"));
+}
+
+#[test]
+fn scoped_mode_does_not_inherit_cloud_id_from_jira_section() {
+    let dir = TempDir::new().unwrap();
+    let global_path = dir.path().join("configs.json");
+    std::fs::write(
+        &global_path,
+        serde_json::to_string(&json!({
+            "confluence": { "environments": { "ATLASSIAN_API_TOKEN_MODE": "scoped" } },
+            "jira": { "environments": { "ATLASSIAN_CLOUD_ID": "wrong-product" } }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let config = Config::load_from_sources(Some(&global_path), None, &HashMap::new());
+
+    let err = ConfluenceVendor::new().base_url(&config).unwrap_err();
+    assert!(err.message.contains("ATLASSIAN_CLOUD_ID"));
+}
+
+#[test]
 fn base_url_missing_site_returns_auth_missing() {
     // Critical guarantee: a Bitbucket-only deployment must never crash at
     // server boot just because Confluence isn't configured. The error

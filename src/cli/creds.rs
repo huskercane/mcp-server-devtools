@@ -23,6 +23,7 @@
 //! for the `mcp-server-devtools.*` service prefix.
 
 use clap::{Args, Subcommand};
+use std::borrow::Cow;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -764,19 +765,25 @@ struct RollbackEntry {
     prior: Option<String>,
 }
 
-/// Read a string-valued env entry from the canonical vendor's section,
-/// merging across the vendor's alias list. The first alias in priority
-/// order with a non-empty string wins. Within a single canonical vendor,
-/// disagreement between alias spellings is still a conflict — that is a
-/// copy-paste / migration mistake, not a per-product choice — and is
-/// surfaced as `Err`.
-fn read_vendor_string<'a>(
+/// Read an env entry from the canonical vendor's section, merging across the
+/// vendor's alias list. The first alias in priority order with a non-empty
+/// value wins. Within a single canonical vendor, disagreement between alias
+/// spellings is still a conflict — that is a copy-paste / migration mistake,
+/// not a per-product choice — and is surfaced as `Err`.
+///
+/// `coerce` decides what shapes that key accepts and how they read as text; it
+/// returns `Ok(None)` for a value that counts as absent. Conflicts compare the
+/// coerced text, so two alias sections spelling the same document differently
+/// (nested JSON in one, an escaped string in the other) agree rather than
+/// clash.
+fn read_vendor_entry<'a>(
     json: &'a Value,
     canonical: &str,
     alias_list: &[String],
     key: &str,
-) -> Result<Option<&'a str>, McpError> {
-    let mut chosen: Option<(&str, &str)> = None;
+    coerce: impl Fn(&'a Value, &str) -> Result<Option<Cow<'a, str>>, McpError>,
+) -> Result<Option<Cow<'a, str>>, McpError> {
+    let mut chosen: Option<(&str, Cow<'a, str>)> = None;
     let mut conflicts: Vec<(String, String)> = Vec::new();
     for alias in alias_list {
         let Some(val) = json
@@ -786,31 +793,20 @@ fn read_vendor_string<'a>(
         else {
             continue;
         };
-        match val {
-            Value::Null => {}
-            Value::String(s) if s.is_empty() => {}
-            Value::String(s) => match chosen {
-                None => chosen = Some((alias.as_str(), s.as_str())),
-                Some((_, prev)) if prev == s.as_str() => {}
-                Some(_) => conflicts.push((alias.clone(), s.clone())),
-            },
-            other => {
-                return Err(unexpected(
-                    format!(
-                        "{key} in section `{alias}` is a JSON {} value; migrate refuses \
-                         to coerce. Quote the value as a string in configs.json first.",
-                        json_type_name(other)
-                    ),
-                    None,
-                ));
-            }
+        let Some(text) = coerce(val, alias)? else {
+            continue;
+        };
+        match &chosen {
+            None => chosen = Some((alias.as_str(), text)),
+            Some((_, prev)) if *prev == text => {}
+            Some(_) => conflicts.push((alias.clone(), text.into_owned())),
         }
     }
 
     if !conflicts.is_empty()
-        && let Some((first_alias, first_val)) = chosen
+        && let Some((first_alias, first_val)) = &chosen
     {
-        let mut all = vec![(first_alias.to_owned(), first_val.to_owned())];
+        let mut all = vec![((*first_alias).to_owned(), first_val.to_string())];
         all.extend(conflicts);
         let rendered = all
             .iter()
@@ -829,6 +825,74 @@ fn read_vendor_string<'a>(
     Ok(chosen.map(|(_, v)| v))
 }
 
+/// A plain string-valued config key. A non-string is refused rather than
+/// coerced: a token or an email is a scalar, so any other shape is a config
+/// mistake worth showing the operator.
+fn read_vendor_string<'a>(
+    json: &'a Value,
+    canonical: &str,
+    alias_list: &[String],
+    key: &str,
+) -> Result<Option<Cow<'a, str>>, McpError> {
+    read_vendor_entry(
+        json,
+        canonical,
+        alias_list,
+        key,
+        |value, alias| match value {
+            Value::Null => Ok(None),
+            Value::String(s) if s.is_empty() => Ok(None),
+            Value::String(s) => Ok(Some(Cow::Borrowed(s.as_str()))),
+            other => Err(refuses_to_coerce(key, alias, other)),
+        },
+    )
+}
+
+/// A config key whose value *is* a JSON document. The loader accepts it either
+/// as real nested JSON or as an escaped string (see
+/// `config::config_value_as_string`), so migrate has to read both spellings —
+/// otherwise the runtime would honour a config that migrate refused to walk,
+/// leaving plaintext credentials behind with no diagnostic.
+fn read_vendor_document<'a>(
+    json: &'a Value,
+    canonical: &str,
+    alias_list: &[String],
+    key: &str,
+) -> Result<Option<Cow<'a, str>>, McpError> {
+    read_vendor_entry(
+        json,
+        canonical,
+        alias_list,
+        key,
+        |value, alias| match value {
+            Value::Null => Ok(None),
+            Value::String(s) if s.is_empty() => Ok(None),
+            Value::String(s) => Ok(Some(Cow::Borrowed(s.as_str()))),
+            Value::Object(_) => serde_json::to_string(value)
+                .map(Cow::Owned)
+                .map(Some)
+                .map_err(|error| {
+                    unexpected(
+                        format!("{key} in section `{alias}` cannot be re-encoded as JSON: {error}"),
+                        None,
+                    )
+                }),
+            other => Err(refuses_to_coerce(key, alias, other)),
+        },
+    )
+}
+
+fn refuses_to_coerce(key: &str, alias: &str, value: &Value) -> McpError {
+    unexpected(
+        format!(
+            "{key} in section `{alias}` is a JSON {} value; migrate refuses \
+             to coerce. Quote the value as a string in configs.json first.",
+            json_type_name(value)
+        ),
+        None,
+    )
+}
+
 fn plan_candidate(
     candidate: &secrets::VendorSecret,
     canonical: &str,
@@ -840,7 +904,7 @@ fn plan_candidate(
     // only to account-scoped secrets.
     let principal = match candidate.principal_key {
         Some(key) => read_vendor_string(json, canonical, alias_list, key)?,
-        None => Some(candidate.secret_key),
+        None => Some(Cow::Borrowed(candidate.secret_key)),
     };
     let principal_key = candidate.principal_key.unwrap_or(candidate.secret_key);
     let secret = read_vendor_string(json, canonical, alias_list, candidate.secret_key)?;
@@ -850,7 +914,7 @@ fn plan_candidate(
             kind: candidate.kind,
             vendor: canonical.to_owned(),
         })),
-        (None, Some("keychain")) => Err(unexpected(
+        (None, Some(secret)) if secret == "keychain" => Err(unexpected(
             format!(
                 "vendor `{canonical}` sets {}=\"keychain\" but {} is missing; cannot migrate",
                 candidate.secret_key, principal_key
@@ -869,22 +933,25 @@ fn plan_candidate(
             kind: candidate.kind,
             vendor: canonical.to_owned(),
         })),
-        (Some(principal), Some("keychain")) => Ok(CandidateOutcome::Migrate(PlannedAction {
-            kind: candidate.kind,
-            vendor: canonical.to_owned(),
-            principal: principal.to_owned(),
-            site: SecretSite::VendorKey(candidate.secret_key),
-            value: String::new(),
-            action: PlannedKind::VerifySentinel,
-        })),
-        (Some(principal), Some(secret)) => Ok(CandidateOutcome::Migrate(PlannedAction {
-            kind: candidate.kind,
-            vendor: canonical.to_owned(),
-            principal: principal.to_owned(),
-            site: SecretSite::VendorKey(candidate.secret_key),
-            value: secret.to_owned(),
-            action: PlannedKind::WriteFromPlaintext,
-        })),
+        (Some(principal), Some(secret)) => {
+            let sentinel = secret == "keychain";
+            Ok(CandidateOutcome::Migrate(PlannedAction {
+                kind: candidate.kind,
+                vendor: canonical.to_owned(),
+                principal: principal.into_owned(),
+                site: SecretSite::VendorKey(candidate.secret_key),
+                value: if sentinel {
+                    String::new()
+                } else {
+                    secret.into_owned()
+                },
+                action: if sentinel {
+                    PlannedKind::VerifySentinel
+                } else {
+                    PlannedKind::WriteFromPlaintext
+                },
+            }))
+        }
     }
 }
 
@@ -907,13 +974,14 @@ fn plan_server_entry_secrets(
     alias_list: &[String],
     json: &Value,
 ) -> Result<Vec<PlannedAction>, McpError> {
-    let Some(raw) = read_vendor_string(json, canonical, alias_list, NINJAONE_SERVERS_KEY)? else {
+    let Some(raw) = read_vendor_document(json, canonical, alias_list, NINJAONE_SERVERS_KEY)? else {
         return Ok(Vec::new());
     };
-    let servers = parse_servers(raw)?;
+    let servers = parse_servers(&raw)?;
     // An entry without its own `email` logs in as the top-level account, so
     // that is the principal its secrets belong to.
-    let fallback = read_vendor_string(json, canonical, alias_list, "NINJAONE_EMAIL")?;
+    let fallback =
+        read_vendor_string(json, canonical, alias_list, "NINJAONE_EMAIL")?.map(Cow::into_owned);
 
     let mut planned = Vec::new();
     for (entry_alias, entry) in &servers {
@@ -923,7 +991,7 @@ fn plan_server_entry_secrets(
         };
         let email = entry_string(entry, entry_alias, "email")?
             .map(str::to_owned)
-            .or_else(|| fallback.map(str::to_owned));
+            .or_else(|| fallback.clone());
 
         for (field, kind) in [
             ("password", SecretKind::Password),
@@ -1098,10 +1166,13 @@ fn rewrite_vendor_aliases_to_sentinel(json: &mut Value, secret_key: &str, alias_
 /// Replace one field of one `NINJAONE_SERVERS` entry with the sentinel, in
 /// every config section that carries that map.
 ///
-/// The map is JSON encoded as a string, so this parses, edits, and re-encodes
-/// it — which normalises that string's internal whitespace and escaping. It
-/// therefore writes back only when a field actually changed, so a run that
-/// migrates nothing leaves the file byte-identical.
+/// The map may be written as real nested JSON or JSON encoded as a string. The
+/// string form is parsed, edited, and re-encoded — which normalises that
+/// string's internal whitespace and escaping — so this writes back only when a
+/// field actually changed, leaving a run that migrates nothing byte-identical.
+/// Either way the value goes back in the shape it was found in: rewriting an
+/// operator's nested JSON as an escaped string would be an unasked-for edit to
+/// a hand-maintained file.
 fn rewrite_server_entry_to_sentinel(
     json: &mut Value,
     alias_list: &[String],
@@ -1119,11 +1190,13 @@ fn rewrite_server_entry_to_sentinel(
         else {
             continue;
         };
-        let Some(Value::String(raw)) = env.get(NINJAONE_SERVERS_KEY) else {
-            continue;
-        };
-        let Ok(mut servers) = serde_json::from_str::<Value>(raw) else {
-            continue;
+        let (mut servers, was_encoded_as_string) = match env.get(NINJAONE_SERVERS_KEY) {
+            Some(Value::String(raw)) => match serde_json::from_str::<Value>(raw) {
+                Ok(parsed) => (parsed, true),
+                Err(_) => continue,
+            },
+            Some(nested @ Value::Object(_)) => (nested.clone(), false),
+            _ => continue,
         };
         let Some(entry) = servers.get_mut(entry_alias).and_then(Value::as_object_mut) else {
             continue;
@@ -1133,10 +1206,15 @@ fn rewrite_server_entry_to_sentinel(
             _ => continue,
         }
         entry.insert(field.to_owned(), Value::String("keychain".to_owned()));
-        let Ok(encoded) = serde_json::to_string(&servers) else {
-            continue;
+        let rewritten = if was_encoded_as_string {
+            let Ok(encoded) = serde_json::to_string(&servers) else {
+                continue;
+            };
+            Value::String(encoded)
+        } else {
+            servers
         };
-        env.insert(NINJAONE_SERVERS_KEY.to_owned(), Value::String(encoded));
+        env.insert(NINJAONE_SERVERS_KEY.to_owned(), rewritten);
     }
 }
 
