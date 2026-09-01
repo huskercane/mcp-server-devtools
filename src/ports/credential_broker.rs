@@ -132,14 +132,15 @@ impl StaticCredentialBroker {
 
 impl CredentialBroker for StaticCredentialBroker {
     fn upstream_identity(&self, _config: &Config, vendor: &str) -> UpstreamIdentity {
-        self.identities.get(vendor).cloned().unwrap_or_else(|| {
-            UpstreamIdentity {
+        self.identities
+            .get(vendor)
+            .cloned()
+            .unwrap_or_else(|| UpstreamIdentity {
                 label: format!("{vendor}/unconfigured"),
                 vendor: vendor.to_owned(),
                 environment: EnvironmentClass::Unclassified,
                 authority: UpstreamAuthority::Shared,
-            }
-        })
+            })
     }
 }
 

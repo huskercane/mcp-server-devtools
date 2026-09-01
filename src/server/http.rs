@@ -90,14 +90,34 @@ pub fn build_app_with_cancel(
     sweep_interval: Duration,
     cancel: CancellationToken,
 ) -> Router {
-    let manager = Arc::new(ReapingSessionManager::new(idle_ttl));
-    manager.spawn_reaper(sweep_interval);
-
     // Stateless MCP means each request carries its own protocol metadata; it
     // does not mean application state should be reconstructed per request.
-    // Build one handler and clone it here: DevtoolsServer's clone shares its
-    // Arc<ServerState>, including NinjaOne console sessions and other caches.
+    // Build one handler and clone it: DevtoolsServer's clone shares its
+    // Arc<Components>, including NinjaOne console sessions and other caches.
     let shared_server = DevtoolsServer::new().map_err(|e| format!("DevtoolsServer::new: {e}"));
+    build_app_inner(shared_server, idle_ttl, sweep_interval, cancel)
+}
+
+/// Build the app around an already-assembled server. This is the seam
+/// integration tests use to serve a `DevtoolsServer` with mock vendors,
+/// pinned brokers, or in-memory audit sinks over the real HTTP transport.
+pub fn build_app_with_server(
+    server: DevtoolsServer,
+    idle_ttl: Duration,
+    sweep_interval: Duration,
+    cancel: CancellationToken,
+) -> Router {
+    build_app_inner(Ok(server), idle_ttl, sweep_interval, cancel)
+}
+
+fn build_app_inner(
+    shared_server: Result<DevtoolsServer, String>,
+    idle_ttl: Duration,
+    sweep_interval: Duration,
+    cancel: CancellationToken,
+) -> Router {
+    let manager = Arc::new(ReapingSessionManager::new(idle_ttl));
+    manager.spawn_reaper(sweep_interval);
     let streamable = StreamableHttpService::new(
         move || shared_server.clone().map_err(std::io::Error::other),
         Arc::clone(&manager),

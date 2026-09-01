@@ -5,6 +5,8 @@
 //! cannot accidentally disable the audit trail. Request threads only enqueue
 //! serialized records; a dedicated worker owns all file I/O and rotation.
 
+pub mod journal;
+
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -98,6 +100,13 @@ pub struct AuditCall {
 }
 
 impl AuditCall {
+    /// Tool name this call was started for. Used by the enterprise audit
+    /// path so the outcome event names the same tool without re-borrowing
+    /// the (already consumed) request.
+    pub fn tool_name(&self) -> &str {
+        &self.tool
+    }
+
     pub fn start(
         tool: &str,
         request_id: String,
