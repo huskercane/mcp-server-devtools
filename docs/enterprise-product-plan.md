@@ -25,6 +25,7 @@ ordered by partner demand and are not scheduled until Gate B passes.
 | 1.1 | 2026-08-29 | Admin CLI, policy-engine options, stay-in-Rust decision, Kubernetes topology, container in Phase 1 | Owner |
 | 2 | 2026-08-29 | Canonical `ActionContext` for resource-aware policy; durable `AuditSink` split from lossy `UsageSink`; licensing boundary moved to M0; minimal `CredentialBroker` in the first slice; commercial gates moved before Phase C; wedge vendors demoted to a hypothesis; Phase 5 split into C/D; revocation, canonicalization, client-identity, response-metadata, and availability corrections; business-plan gaps and trial metrics added | Independent review |
 | 2.1 | 2026-09-01 | ADR-001 decided: enterprise crate lives in a private repository from day one; community crate gains a library target exposing the ports | Owner |
+| 2.2 | 2026-09-01 | WP 0.5 spike answered: rmcp 3.1.2 propagates per-request axum extensions into `call_tool`'s `RequestContext` on both the stateless and session HTTP paths (`docs/spikes/rmcp-extensions.md`); the §9 session-keyed fallback is not needed and was not built | Spike |
 
 Unresolved questions are collected in §11.
 
