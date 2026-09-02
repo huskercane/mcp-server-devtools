@@ -8,8 +8,8 @@ anything LLM-facing.
 
 ## Toolchain & baseline (match it, don't fragment it)
 
-- Rust is **pinned**: `rust-toolchain.toml` → `1.95.0`, `edition = "2024"`,
-  `rust-version = "1.95"`. Use stable only — no nightly/unstable/preview features.
+- Rust is **pinned**: `rust-toolchain.toml` → `1.96.0`, `edition = "2024"`,
+  `rust-version = "1.96"`. Use stable only — no nightly/unstable/preview features.
 - Dependencies are **exact-pinned** (`=x.y.z`) on purpose. When adding/upgrading a
   dep, pin it the same way and update `Cargo.lock` deliberately; don't loosen
   existing pins to a range.
@@ -105,6 +105,23 @@ This exists because the three numbers had silently diverged: releases reached
 (inherited from the TS reference server at port time), so a released binary
 introduced itself to every MCP client under a version that was never released.
 
+## Per-phase allocation gate (enterprise plan)
+
+At the end of **every** enterprise-plan phase (M0, A, B, …; see
+`docs/enterprise-product-plan.md`), run the allocation probe and compare
+bytes-allocated and allocation counts per stage against the numbers recorded
+at the previous phase boundary:
+
+```bash
+cargo bench --bench response_pipeline
+```
+
+Excessive allocation growth is a phase-exit blocker, not a nice-to-have:
+investigate any material regression (rule of thumb: > 20 % on any stage,
+matching the §8 budget posture) before declaring the phase done, and record
+the fresh numbers in the phase's PR/summary so the next phase has a baseline.
+This applies to the enterprise repo too — its CLAUDE.md carries the same rule.
+
 ## Layout
 
 - `src/vendor/` — per-vendor HTTP clients (auth headers, request/response shapes).
@@ -142,3 +159,89 @@ introduced itself to every MCP client under a version that was never released.
   bug-fix test must fail on the unfixed code and pass on the fixed code.
 - **Parity**: tool names, descriptions, schemas, and error envelopes mirror the TS
   servers. Changing them is a deliberate, called-out change — not incidental.
+
+# Rust Performance & Optimization Guidelines
+
+When reviewing, writing, or refactoring Rust code, enforce these strict guidelines to prevent excess allocations, CPU bottlenecks, and synchronization overhead.
+
+---
+
+## 1. Allocations & Memory Usage
+
+- **Default to Borrowing:** Prefer taking `&str`, `&[T]`, or `&Path` over owned types (`String`, `Vec<T>`, `PathBuf`) unless ownership transfer is strictly required.
+- **Avoid Hidden Clones:**
+  - Watch out for `.clone()` inside loops, iterators, or closure bodies.
+  - Suggest zero-copy alternatives (e.g., `Cow<'a, T>`, `bytes::Bytes`, or referencing fields directly).
+- **Pre-allocate Collections:**
+  - Flag any `Vec`, `HashMap`, `HashSet`, or `String` constructed in a loop or with a known upper bound that doesn't use `with_capacity(cap)`.
+- **Prevent Frequent Small Heap Allocations:**
+  - Recommend `smallvec` or `arrayvec` for collections that almost always hold fewer than 8–16 items.
+  - Flag unnecessary `Box<T>` for small types or lightweight structs.
+- **String Manipulations:**
+  - Flag repeated `+` or `format!()` inside hot loops. Suggest using `push_str()`, `write!`, or pre-allocated `String` buffers.
+
+---
+
+## 2. Synchronization & Concurrency
+
+- **Minimize Lock Contention:**
+  - Keep critical sections inside `MutexGuard` or `RwLockReadGuard`/`RwLockWriteGuard` as short as humanly possible.
+  - Flag any `.await`, heavy computation, or I/O performed while holding a synchronization lock.
+  - Recommend holding locks in short, explicit blocks:
+    ```rust
+    let item = {
+        let guard = state.lock().unwrap();
+        guard.get_item()
+    }; // Lock dropped here before async/heavy work
+    ```
+- **Lock Granularity & Atomics:**
+  - Suggest `AtomicBool`, `AtomicUsize`, or `AtomicPtr` over `Mutex` for simple scalar flags or counters.
+  - Suggest `RwLock` over `Mutex` *only* if read operations drastically outnumber write operations; otherwise, highlight that `Mutex` is often faster under low-to-medium contention.
+- **Lock-Free / Channel Selection:**
+  - Warn when using standard `std::sync::mpsc` in high-throughput async code; suggest `tokio::sync::mpsc` or `crossbeam-channel` instead.
+  - Flag unbounded channels (`mpsc::unbounded_channel`) unless explicitly required, to prevent unbounded memory growth.
+
+---
+
+## 3. CPU & Algorithmic Bottlenecks
+
+- **Hashing Performance:**
+  - Highlight usage of standard `std::collections::HashMap` when HashDoS resilience is not required (e.g., non-web contexts, trusted integer keys).
+  - Suggest fast hashers like `rustc-hash` (`FxHashMap`) or `ahash`.
+- **Iterators vs. Allocations:**
+  - Flag intermediate `.collect::<Vec<_>>()` calls in the middle of iterator chains. Chain operations lazily (`map`, `filter`, `flat_map`) and collect only at the final step.
+- **Monomorphization Bloat:**
+  - Watch for heavy generic functions with complex code generated for many type parameters. Suggest extracting non-generic helper functions (e.g., taking `&[u8]` instead of `impl AsRef<[u8]>`) to reduce compile time and code cache size.
+
+---
+
+## 4. Agent Instructions for Code Reviews & Refactoring
+
+Whenever analyzing code or generating solutions:
+1. **Highlight Hidden Cost:** Point out implicit clones, re-allocations, or broad lock scopes immediately.
+2. **Offer Zero-Allocation Alternatives:** Show how to refactor owned structures to borrowed references or stack-allocated alternatives where feasible.
+3. **Check Async Safety:** Explicitly check if a lock guard (`MutexGuard`) crosses an `.await` point (which breaks `Send` and leads to deadlocks/contention).
+
+## 5. Tokio & Async Performance Guidelines
+
+### Task Allocation & Future Bloat
+- **Minimize Frame Sizes:** Flag large arrays, heavy structs, or deeply nested state machines stored directly inside `async fn` stack frames, as they cause massive task heap allocations.
+- **Avoid Excess `tokio::spawn`:** Warn against spawning tasks inside tight loops for trivial compute. Suggest batching or processing sequentially via `futures::stream::BufferUnordered` / `JoinSet`.
+- **Pre-allocate Channel Buffers:** Always specify bounded capacities (`tokio::sync::mpsc::channel(cap)`) sized according to expected peak load to avoid dynamic queue re-allocations.
+
+### Blocking & Tokio Reactor Health
+- **Flag Sync I/O / Compute in Async Tasks:** Detect blocking calls like `std::fs`, `std::thread::sleep`, or CPU-bound loops (`>1ms`) running directly on worker threads.
+- **Enforce Offloading:** Require `tokio::task::spawn_blocking` or `rayon` for heavy compute / filesystem operations.
+
+### Async Synchronization & Locking
+- **Async vs Sync Mutex Usage:**
+  - Standard `std::sync::Mutex` **is allowed** across regular code if locks are held for quick state updates and *never* across `.await` points.
+  - Require `tokio::sync::Mutex` **only** if the lock must be held across `.await` boundaries.
+- **Detect Mutex Guards Across `.await`:** Flag any standard `MutexGuard` or `RwLockGuard` held when calling `.await` (causes compilation failure or runtime deadlocks/thread starvation).
+- **Favor Tokio Synchronization Primitives:**
+  - Use `tokio::sync::Notify` or `watch` instead of `Mutex<bool>` for signaling task completion or state updates.
+  - Recommend `tokio::sync::Semaphore` for concurrency limiting over manual counter locking.
+
+### Task Cancellation & Resource Leaks
+- **Cancellation Safety:** Flag non-cancellation-safe operations used inside `tokio::select!` branches (e.g., partial reads without buffering, half-completed state modifications).
+- **Graceful Shutdown & JoinSet:** Recommend `tokio::task::JoinSet` over `tokio::spawn` for structured concurrency and ensuring spawned tasks aren't left orphaned.

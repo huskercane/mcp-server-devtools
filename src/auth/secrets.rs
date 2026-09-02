@@ -25,17 +25,70 @@ use crate::config::{
     VENDOR_SPLUNK, VENDOR_WRDS, VENDOR_ZOOM,
 };
 
+/// What a registry row is used for on the **request path**.
+///
+/// The registry's declaration order doubles as the resolution order the
+/// credential broker predicts, so a row that is not a request credential at
+/// all must say so. `NinjaOne` is why: `NINJAONE_PASSWORD` and
+/// `NINJAONE_TOTP_SECRET` are inputs to an interactive console login and are
+/// never sent with a tool request, but they are declared before
+/// `NINJAONE_ACCESS_TOKEN`. A broker that walked rows blindly labelled the
+/// password slot for a call the access token actually served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotRole {
+    /// Resolved and sent with an upstream request. Eligible to be named as
+    /// the identity that acted.
+    RequestCredential,
+    /// An input to an interactive login exchange, which mints something else
+    /// (a session) that does the acting. Never an attribution target.
+    LoginInput,
+}
+
 /// One secret-bearing config key, and the keychain slot it maps to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Fields are `pub(crate)`, not `pub`. A row is *evidence* that a slot
+/// exists — `CredentialLabel` treats being one as proof that a string is a
+/// config key name rather than a credential — so a downstream adapter must
+/// not be able to mint one. Public getters expose everything readable; only
+/// construction is closed, and only this file constructs.
 pub struct VendorSecret {
     /// Canonical vendor name; also the keychain service suffix.
-    pub vendor: &'static str,
+    pub(crate) vendor: &'static str,
     /// The config key holding the secret (or the `"keychain"` sentinel).
-    pub secret_key: &'static str,
+    pub(crate) secret_key: &'static str,
     /// Config key holding the account this secret belongs to, when the vendor
-    /// has one. `None` means the principal is [`Self::secret_key`] itself.
-    pub principal_key: Option<&'static str>,
-    pub kind: SecretKind,
+    /// has one. `None` means the principal is the secret key itself.
+    pub(crate) principal_key: Option<&'static str>,
+    pub(crate) kind: SecretKind,
+    /// Whether this slot can act on the request path. See [`SlotRole`].
+    pub(crate) role: SlotRole,
+}
+
+impl VendorSecret {
+    #[must_use]
+    pub const fn vendor(&self) -> &'static str {
+        self.vendor
+    }
+
+    #[must_use]
+    pub const fn secret_key(&self) -> &'static str {
+        self.secret_key
+    }
+
+    #[must_use]
+    pub const fn principal_key(&self) -> Option<&'static str> {
+        self.principal_key
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> SecretKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn role(&self) -> SlotRole {
+        self.role
+    }
 }
 
 impl VendorSecret {
@@ -59,6 +112,7 @@ const fn token(vendor: &'static str, secret_key: &'static str) -> VendorSecret {
         secret_key,
         principal_key: None,
         kind: SecretKind::Token,
+        role: SlotRole::RequestCredential,
     }
 }
 
@@ -74,6 +128,23 @@ const fn owned(
         secret_key,
         principal_key: Some(principal_key),
         kind,
+        role: SlotRole::RequestCredential,
+    }
+}
+
+/// Like [`owned`], for a credential that only feeds an interactive login.
+const fn login_input(
+    vendor: &'static str,
+    secret_key: &'static str,
+    principal_key: &'static str,
+    kind: SecretKind,
+) -> VendorSecret {
+    VendorSecret {
+        vendor,
+        secret_key,
+        principal_key: Some(principal_key),
+        kind,
+        role: SlotRole::LoginInput,
     }
 }
 
@@ -141,13 +212,20 @@ pub const VENDOR_SECRETS: &[VendorSecret] = &[
     ),
     // NinjaOne: console login (account-scoped) plus three carrier credentials
     // that have no account of their own.
-    owned(
+    //
+    // The password and TOTP seed are *login inputs*: `vendor::ninjaone::login`
+    // exchanges them for a session, and the session — not these — travels with
+    // a tool request. They are declared first for keychain-migration order, so
+    // they must be marked, or the broker names them for calls the access token
+    // serves. The three carriers below are in the order
+    // `NinjaOneVendor::resolve_auth` actually tries them.
+    login_input(
         VENDOR_NINJAONE,
         "NINJAONE_PASSWORD",
         "NINJAONE_EMAIL",
         SecretKind::Password,
     ),
-    owned(
+    login_input(
         VENDOR_NINJAONE,
         "NINJAONE_TOTP_SECRET",
         "NINJAONE_EMAIL",
@@ -179,6 +257,26 @@ pub fn for_vendor(vendor: &str) -> impl Iterator<Item = &'static VendorSecret> {
     VENDOR_SECRETS
         .iter()
         .filter(move |secret| secret.vendor == vendor)
+}
+
+/// Whether the broker can tell, from configuration alone, which slot will act
+/// for `vendor`.
+///
+/// `false` means the vendor's resolver consults state the broker cannot see
+/// before dispatch, so a config-only prediction may name the wrong slot.
+/// `NinjaOne` is the case: `resolve_auth` prefers an **in-memory session key**
+/// minted by `ninjaone_login` over the configured `NINJAONE_SESSION_KEY`, and
+/// a `NINJAONE_SERVERS` alias can carry its own credentials selected per
+/// request. Neither is visible from `Config` plus this table.
+///
+/// The broker answers `indeterminate` rather than guessing in that case. The
+/// real fix — resolving the credential selection once, before the intent
+/// record, and labelling from that same selection — needs credential
+/// resolution to move ahead of dispatch across every controller; it is
+/// tracked as a Phase A work package in `docs/enterprise-carry-forward.md`.
+#[must_use]
+pub fn resolution_is_observable(vendor: &str) -> bool {
+    vendor != VENDOR_NINJAONE
 }
 
 /// Whether a `(kind, vendor)` pair addresses any real slot. Drives the CLI

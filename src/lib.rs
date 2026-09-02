@@ -19,6 +19,7 @@ pub mod error;
 pub mod format;
 pub mod ingestion;
 pub mod logger;
+pub mod policy;
 pub mod ports;
 pub mod server;
 pub mod shell;

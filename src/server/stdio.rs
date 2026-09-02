@@ -13,6 +13,20 @@ use crate::tools::DevtoolsServer;
 /// `startServer('stdio')` + the SIGINT/SIGTERM handlers in
 /// `setupGracefulShutdown` (`src/index.ts:411-478`).
 pub async fn run_stdio() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Fail closed on a mode this transport cannot honour: stdio has no
+    // inbound token to validate, so silently ignoring MCP_AUTH_MODE=okta
+    // would look authenticated while being nothing of the kind.
+    match crate::config::AuthMode::parse(std::env::var("MCP_AUTH_MODE").ok().as_deref())? {
+        crate::config::AuthMode::Off => {}
+        crate::config::AuthMode::Okta => {
+            return Err(
+                "refusing to start: MCP_AUTH_MODE=okta is not supported on the stdio \
+                 transport (there is no inbound token to validate). Unset MCP_AUTH_MODE \
+                 (or set it to \"off\") for local stdio use"
+                    .into(),
+            );
+        }
+    }
     crate::transport::raw_response::start_retention_sweeper();
     // Registered before the transport is serving, for the same reason as the
     // HTTP transport: see `shutdown::install`.

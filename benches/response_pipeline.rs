@@ -21,6 +21,8 @@ use mcp_server_devtools::config::Config;
 use mcp_server_devtools::format::jmespath::apply_jq_filter;
 use mcp_server_devtools::format::truncation::truncate_for_ai;
 use mcp_server_devtools::format::{OutputFormat, render, to_pretty_json};
+use mcp_server_devtools::policy::extractors::{grafana, jira};
+use mcp_server_devtools::transport::HttpMethod;
 use serde_json::{Value, json};
 
 static BYTES: AtomicU64 = AtomicU64::new(0);
@@ -159,9 +161,55 @@ fn realistic_config() -> Config {
     Config::from_map(values)
 }
 
+/// The policy extractors run once per tool call, on the request, before any
+/// payload exists — so like the config snapshot they are paid even by a call
+/// that returns nothing. They are also the stage most likely to regress
+/// quietly: a scanner is easy to write with a `String` per token.
+fn extractor_stage() {
+    let long_jql = format!(
+        "project in (PLAT, WEB, OPS) AND status = Open AND summary ~ \"{}\"",
+        "timeout ".repeat(64)
+    );
+    let query: &[(&str, &str)] = &[
+        ("jql", long_jql.as_str()),
+        ("maxResults", "100"),
+        ("fields", "summary,status"),
+        ("expand", "changelog"),
+    ];
+
+    probe("jira::extract GET /issue/{key}", 2000, || {
+        jira::extract(
+            HttpMethod::Get,
+            "/rest/api/3/issue/PLAT-12345",
+            &[("fields", "summary")],
+            None,
+        )
+    });
+    probe("jira::extract GET /search/jql (long JQL)", 2000, || {
+        jira::extract(HttpMethod::Get, "/rest/api/3/search/jql", query, None)
+    });
+    probe("jira::project_keys_from_jql (long JQL)", 2000, || {
+        jira::project_keys_from_jql(&long_jql)
+    });
+    probe("jira::extract unmapped (default arm)", 2000, || {
+        jira::extract(HttpMethod::Post, "/rest/api/3/issue", &[], None)
+    });
+    probe("grafana::query_logs", 2000, || {
+        grafana::query_logs(
+            "loki-prod",
+            &[("query", "{app=\"api\"}"), ("limit", "500"), ("start", "0")],
+        )
+    });
+}
+
 fn main() {
     println!("=== output size: is TOON earning its CPU? ===");
     output_size_comparison();
+
+    // Stage -1: the enterprise request-path work, which happens before the
+    // response pipeline below and so is invisible to every probe in it.
+    println!("\n=== stage -1: policy extractors, per tool call (mean of 2000) ===");
+    extractor_stage();
 
     // Stage 0 runs once per *tool call*, before any payload work — so unlike the
     // stages below it is paid even by a request that returns two bytes.

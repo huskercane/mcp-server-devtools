@@ -24,6 +24,7 @@ use crate::constants::data_limits::MAX_STREAMED_ARTIFACT_SIZE;
 use crate::controllers::api::{ControllerResponse, HandleContext, dispatch_with_creds};
 use crate::error::McpError;
 use crate::format::OutputFormat;
+use crate::policy::extractors::grafana::is_valid_datasource_uid;
 use crate::tools::args::{GrafanaListDatasourcesArgs, GrafanaQueryLogsArgs, QueryParams};
 use crate::transport::{HttpMethod, RequestOptions};
 use crate::vendor::grafana::{
@@ -59,6 +60,21 @@ pub async fn query_logs(
     ctx: &GrafanaContext<'_>,
     args: &GrafanaQueryLogsArgs,
 ) -> Result<ControllerResponse, McpError> {
+    // The UID is interpolated into a proxy path below, and the policy
+    // extractor classifies the call by that same UID. Validating here — at
+    // the one entry point both the single and partitioned paths go through,
+    // against the *same* predicate the extractor uses — is what makes
+    // "the UID is one path segment" true rather than assumed. A UID
+    // carrying `/`, `..`, `%2f`, `?`, or `#` would otherwise reach a
+    // different endpoint than the one that was authorized.
+    if !is_valid_datasource_uid(&args.datasource_uid) {
+        return Err(crate::error::api_error(
+            "datasource_uid must be a Grafana datasource UID \
+             (letters, digits, `-`, `_`; 1-64 characters)",
+            Some(400),
+            None,
+        ));
+    }
     if let Some(count) = usable_partition_count(args.time_partitions)
         && let (Some(start), Some(end)) = (
             args.start
@@ -103,7 +119,8 @@ async fn query_logs_single(
     let token = ctx.vendor.token(ctx.config).await?;
     let creds = Credentials::Bearer { token };
 
-    // datasource UIDs are `[a-zA-Z0-9_-]`, so direct interpolation is safe.
+    // `query_logs` validated the UID against `is_valid_datasource_uid`
+    // before any of this ran, so it is one `[A-Za-z0-9_-]` path segment.
     let path = format!(
         "{DATASOURCE_PROXY_PREFIX}/{uid}{LOKI_QUERY_RANGE_PATH}",
         uid = args.datasource_uid,

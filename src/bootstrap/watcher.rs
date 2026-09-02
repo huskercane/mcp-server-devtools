@@ -135,6 +135,9 @@ mod tests {
             client: build_client().unwrap(),
             vendors: Vendors::default(),
             workspace_cache: WorkspaceCache::new(),
+            credential_broker: Arc::new(crate::ports::ConfigCredentialBroker),
+            audit_sink: None,
+            usage_sink: Arc::new(crate::ports::NoopUsageSink),
         })
     }
 

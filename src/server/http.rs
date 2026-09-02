@@ -34,7 +34,9 @@ use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{info, warn};
 
+use crate::config::AuthMode;
 use crate::constants::VERSION;
+use crate::error::McpError;
 use crate::server::session::{DEFAULT_IDLE_TTL, DEFAULT_SWEEP_INTERVAL, ReapingSessionManager};
 use crate::server::shutdown;
 use crate::tools::DevtoolsServer;
@@ -57,14 +59,23 @@ pub async fn run_http() -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
     // it outright instead of draining. See `shutdown::install`.
     let shutdown_signal = shutdown::install();
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = TcpListener::bind(addr).await?;
-    let bound = listener.local_addr()?;
+    let auth_mode = AuthMode::parse(std::env::var("MCP_AUTH_MODE").ok().as_deref())?;
+    let addr = resolve_bind_addr(std::env::var("MCP_BIND_ADDR").ok().as_deref(), port)?;
+    validate_startup_security(auth_mode, &addr)?;
 
     // Shared across rmcp (drops in-flight SSE on cancel) and axum (stops
     // accepting new connections + drains existing ones on cancel).
     let cancel = CancellationToken::new();
-    let app = build_app_with_cancel(DEFAULT_IDLE_TTL, DEFAULT_SWEEP_INTERVAL, cancel.clone());
+    // Built **before the port opens**. A `DevtoolsServer` that cannot be
+    // assembled — an audit journal that will not open, say — used to be
+    // stored as an error *inside* the router, so the process logged
+    // "listening", held the port, and failed every call while a health check
+    // marked it ready. Constructing first means a startup failure never
+    // reaches the point of being reachable at all.
+    let app = build_app_with_cancel(DEFAULT_IDLE_TTL, DEFAULT_SWEEP_INTERVAL, cancel.clone())?;
+
+    let listener = TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?;
 
     info!(%bound, "mcp-server-devtools listening on streamable-HTTP transport");
     let shutdown_cancel = cancel;
@@ -82,21 +93,52 @@ pub async fn run_http() -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
 
 /// Build the full Axum app with a caller-owned cancellation token. Tests use
 /// the unparameterized [`build_app`].
+///
+/// # Errors
+///
+/// When the `DevtoolsServer` cannot be assembled — a configured audit
+/// journal that will not open, most importantly. Returning it means the
+/// caller binds and logs readiness only for a server that actually works.
 pub fn build_app_with_cancel(
+    idle_ttl: Duration,
+    sweep_interval: Duration,
+    cancel: CancellationToken,
+) -> Result<Router, McpError> {
+    // Stateless MCP means each request carries its own protocol metadata; it
+    // does not mean application state should be reconstructed per request.
+    // Build one handler and clone it: DevtoolsServer's clone shares its
+    // Arc<Components>, including NinjaOne console sessions and other caches.
+    let shared_server = DevtoolsServer::new()?;
+    Ok(build_app_inner(
+        shared_server,
+        idle_ttl,
+        sweep_interval,
+        cancel,
+    ))
+}
+
+/// Build the app around an already-assembled server. This is the seam
+/// integration tests use to serve a `DevtoolsServer` with mock vendors,
+/// pinned brokers, or in-memory audit sinks over the real HTTP transport.
+pub fn build_app_with_server(
+    server: DevtoolsServer,
+    idle_ttl: Duration,
+    sweep_interval: Duration,
+    cancel: CancellationToken,
+) -> Router {
+    build_app_inner(server, idle_ttl, sweep_interval, cancel)
+}
+
+fn build_app_inner(
+    shared_server: DevtoolsServer,
     idle_ttl: Duration,
     sweep_interval: Duration,
     cancel: CancellationToken,
 ) -> Router {
     let manager = Arc::new(ReapingSessionManager::new(idle_ttl));
     manager.spawn_reaper(sweep_interval);
-
-    // Stateless MCP means each request carries its own protocol metadata; it
-    // does not mean application state should be reconstructed per request.
-    // Build one handler and clone it here: DevtoolsServer's clone shares its
-    // Arc<ServerState>, including NinjaOne console sessions and other caches.
-    let shared_server = DevtoolsServer::new().map_err(|e| format!("DevtoolsServer::new: {e}"));
     let streamable = StreamableHttpService::new(
-        move || shared_server.clone().map_err(std::io::Error::other),
+        move || Ok(shared_server.clone()),
         Arc::clone(&manager),
         StreamableHttpServerConfig::default()
             // Keep initialized sessions for older clients while requiring the
@@ -232,7 +274,11 @@ fn parse_range(value: &str, size: u64) -> Option<(u64, u64)> {
 
 /// Build the app without an externally-owned cancellation token. Convenience
 /// for tests that don't exercise shutdown semantics.
-pub fn build_app(idle_ttl: Duration, sweep_interval: Duration) -> Router {
+///
+/// # Errors
+///
+/// As [`build_app_with_cancel`].
+pub fn build_app(idle_ttl: Duration, sweep_interval: Duration) -> Result<Router, McpError> {
     build_app_with_cancel(idle_ttl, sweep_interval, CancellationToken::new())
 }
 
@@ -399,5 +445,121 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+}
+
+/// Resolve the HTTP bind address. `MCP_BIND_ADDR` accepts an IP
+/// (`127.0.0.1`, `::1`, `0.0.0.0`) or an `ip:port` pair (`0.0.0.0:8443`,
+/// `[::1]:8443`); a bare IP takes its port from `PORT`. Absent means the
+/// historical loopback default. A value that parses as neither is an error —
+/// the server must not fall back to a bind the operator did not ask for.
+fn resolve_bind_addr(raw: Option<&str>, default_port: u16) -> Result<SocketAddr, String> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(SocketAddr::from(([127, 0, 0, 1], default_port)));
+    };
+    if let Ok(addr) = raw.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(ip) = raw.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, default_port));
+    }
+    Err(format!(
+        "unrecognised MCP_BIND_ADDR {raw:?} (expected an IP address or ip:port pair)"
+    ))
+}
+
+/// Fail-closed startup gate (`docs/enterprise-product-plan.md` §1.2 / §3.7).
+///
+/// - Auth off + non-loopback bind: refuse. The loopback bind *is* the
+///   community trust boundary; removing it without inbound authentication
+///   would expose every configured credential to the network.
+/// - Auth okta: refuse until the inbound token-validation path (Phase A)
+///   exists. Starting "temporarily permissive" is exactly what the plan
+///   forbids.
+fn validate_startup_security(auth_mode: AuthMode, addr: &SocketAddr) -> Result<(), String> {
+    match auth_mode {
+        AuthMode::Off if addr.ip().is_loopback() => Ok(()),
+        AuthMode::Off => Err(format!(
+            "refusing to start: MCP_BIND_ADDR={} is not a loopback address and \
+             MCP_AUTH_MODE=off means no inbound authentication exists. Bind a loopback \
+             address, or configure inbound authentication (fail-closed; see \
+             docs/enterprise-product-plan.md §1.2)",
+            addr.ip()
+        )),
+        AuthMode::Okta => Err(
+            "refusing to start: MCP_AUTH_MODE=okta is not available yet — inbound token \
+             validation lands in Phase A of docs/enterprise-product-plan.md. Unset \
+             MCP_AUTH_MODE (or set it to \"off\") to run in local mode"
+                .to_owned(),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod startup_security_tests {
+    use std::net::SocketAddr;
+
+    use crate::config::AuthMode;
+
+    use super::{resolve_bind_addr, validate_startup_security};
+
+    #[test]
+    fn bind_addr_defaults_to_loopback_with_the_port_env_port() {
+        assert_eq!(
+            resolve_bind_addr(None, 3000).unwrap(),
+            "127.0.0.1:3000".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            resolve_bind_addr(Some("  "), 8080).unwrap(),
+            "127.0.0.1:8080".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn bind_addr_accepts_ip_and_ip_port_forms() {
+        assert_eq!(
+            resolve_bind_addr(Some("0.0.0.0"), 3000).unwrap(),
+            "0.0.0.0:3000".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            resolve_bind_addr(Some("0.0.0.0:8443"), 3000).unwrap(),
+            "0.0.0.0:8443".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            resolve_bind_addr(Some("::1"), 3000).unwrap(),
+            "[::1]:3000".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            resolve_bind_addr(Some("[::1]:9000"), 3000).unwrap(),
+            "[::1]:9000".parse::<SocketAddr>().unwrap()
+        );
+        assert!(resolve_bind_addr(Some("localhost"), 3000).is_err());
+    }
+
+    #[test]
+    fn loopback_with_auth_off_is_todays_behaviour() {
+        for addr in ["127.0.0.1:3000", "[::1]:3000"] {
+            let addr: SocketAddr = addr.parse().unwrap();
+            assert_eq!(validate_startup_security(AuthMode::Off, &addr), Ok(()));
+        }
+    }
+
+    #[test]
+    fn non_loopback_bind_without_auth_is_refused_with_a_clear_reason() {
+        for addr in ["0.0.0.0:3000", "192.168.1.10:8443", "[::]:3000"] {
+            let addr: SocketAddr = addr.parse().unwrap();
+            let reason = validate_startup_security(AuthMode::Off, &addr).unwrap_err();
+            assert!(reason.contains("refusing to start"), "{reason}");
+            assert!(reason.contains("MCP_AUTH_MODE=off"), "{reason}");
+            assert!(reason.contains("loopback"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn okta_mode_is_refused_until_token_validation_exists() {
+        let addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let reason = validate_startup_security(AuthMode::Okta, &addr).unwrap_err();
+        assert!(reason.contains("MCP_AUTH_MODE=okta"), "{reason}");
+        assert!(reason.contains("Phase A"), "{reason}");
     }
 }

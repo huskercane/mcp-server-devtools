@@ -74,6 +74,8 @@ use crate::controllers::wrds::WrdsContext;
 use crate::controllers::zoom::ZoomContext;
 use crate::error::format_error_for_mcp_tool;
 use crate::format::truncation::truncate_for_ai;
+use crate::policy::{ClientIdentity, PolicyDecision, Principal};
+use crate::ports::{AuditEvent, AuditEventKind, UsageEvent};
 #[derive(Clone)]
 pub struct DevtoolsServer {
     components: Arc<Components>,
@@ -347,6 +349,15 @@ impl DevtoolsServer {
 // WRDS tools (feature = "wrds")
 // ============================================================================
 
+/// What a caller is told when the audit journal will not accept a record.
+///
+/// Deliberately fixed and detail-free. The underlying error goes to the
+/// operator log; a sink may be an HTTP client whose errors quote request
+/// headers, and this string is returned to a model and rendered into a
+/// transcript.
+const AUDIT_UNAVAILABLE_MESSAGE: &str = "Audit journal unavailable; call refused (fail closed). \
+     See the server log for the cause.";
+
 #[tool_handler]
 impl ServerHandler for DevtoolsServer {
     async fn call_tool(
@@ -354,13 +365,87 @@ impl ServerHandler for DevtoolsServer {
         request: CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResponse, RmcpError> {
+        let started = std::time::Instant::now();
         let client = context.client_info();
+        // One `to_string()`, no clone: local mode pays exactly what it paid
+        // before enterprise types existed. The enterprise branch below reads
+        // the id back off `audit` when it actually needs an owned copy.
         let audit = crate::audit::AuditCall::start(
             request.name.as_ref(),
             context.id.to_string(),
             client.as_ref().map(|value| value.name.clone()),
             client.as_ref().map(|value| value.version.clone()),
         );
+
+        // WP 0.7: durable write-before-dispatch. Only active when an audit
+        // journal is configured; local mode takes the `None` branch and the
+        // call path is byte-for-byte what it was before enterprise types
+        // existed (one `Option` check).
+        let enterprise = match self.components.audit_sink.as_ref() {
+            None => None,
+            Some(sink) => {
+                let config = self.config();
+                let vendor = vendor_for_tool(request.name.as_ref()).unwrap_or("unknown");
+                // Awaited because answering can require a keychain probe.
+                // The broker still *predicts* which slot will act — the
+                // credential is resolved later, in the controller — but it
+                // now predicts with the resolver's own rules, implicit
+                // keychain fallback included (WP 0.6).
+                let upstream = self
+                    .components
+                    .credential_broker
+                    .upstream_identity(&config, vendor)
+                    .await;
+                let client = ClientIdentity::reported(
+                    client.as_ref().map(|value| value.name.as_str()),
+                    client.as_ref().map(|value| value.version.as_str()),
+                );
+                Some((Arc::clone(sink), vendor, upstream, client))
+            }
+        };
+        if let Some((sink, vendor, upstream, client)) = &enterprise {
+            let intent = AuditEvent {
+                timestamp: crate::logger::iso_timestamp(),
+                kind: AuditEventKind::ToolCallIntent,
+                // Caller-chosen, so sanitized before it reaches durable
+                // evidence: a JSON-RPC id is an arbitrary string.
+                request_id: crate::policy::correlation_id(audit.request_id()),
+                tool_name: request.name.as_ref().to_owned(),
+                vendor: (*vendor).to_owned(),
+                // Phase A replaces this with the validated principal from
+                // `context.extensions` (see docs/spikes/rmcp-extensions.md).
+                principal: Principal::local(),
+                client: client.clone(),
+                decision: PolicyDecision::local_allow(),
+                upstream_identity: upstream.clone(),
+                outcome: None,
+                duration_ms: None,
+            };
+            if let Err(error) = sink.append(&intent).await {
+                // Fail closed: evidence first, dispatch second. The vendor
+                // is never contacted (tests/audit_journal_tests.rs proves
+                // wiremock sees zero requests).
+                //
+                // The sink's own error goes to the operator log, never to
+                // the model: a sink is free to be an HTTP client, and its
+                // errors can quote request headers. What the caller gets is
+                // a fixed sentence, so no sink can turn a failure into an
+                // exfiltration channel.
+                // A *category*, never the adapter's error text: an HTTP
+                // audit sink's error can quote a request header, and this
+                // line is not covered by the logger's redaction patterns.
+                tracing::error!(
+                    failure = %crate::ports::audit_sink::AuditFailure::classify(&error),
+                    tool = %request.name.as_ref(),
+                    "audit journal unavailable; refusing the call (fail closed)"
+                );
+                audit.complete("audit_unavailable");
+                return Ok(CallToolResponse::Complete(CallToolResult::error(vec![
+                    Content::text(AUDIT_UNAVAILABLE_MESSAGE),
+                ])));
+            }
+        }
+
         let tool_context =
             rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         let result = self.tool_router.call(tool_context).await;
@@ -372,6 +457,47 @@ impl ServerHandler for DevtoolsServer {
             Ok(_) => "other",
             Err(_) => "protocol_error",
         };
+
+        if let Some((sink, vendor, upstream, client)) = enterprise {
+            let duration_ms = started.elapsed().as_millis();
+            let tool_name = audit.tool_name().to_owned();
+            let request_id = crate::policy::correlation_id(audit.request_id());
+            // One timestamp for the outcome event and the usage event
+            // (CLAUDE.md perf guidelines: no repeated formatting work).
+            let completed_at = crate::logger::iso_timestamp();
+            let outcome_event = AuditEvent {
+                timestamp: completed_at.clone(),
+                kind: AuditEventKind::ToolCallOutcome,
+                request_id,
+                tool_name: tool_name.clone(),
+                vendor: vendor.to_owned(),
+                principal: Principal::local(),
+                client,
+                decision: PolicyDecision::local_allow(),
+                upstream_identity: upstream,
+                outcome: Some(outcome.to_owned()),
+                duration_ms: Some(duration_ms),
+            };
+            if let Err(error) = sink.append(&outcome_event).await {
+                // The dispatch already happened; nothing to refuse. Loud,
+                // not silent (guiding constraint 5) — and the legacy
+                // AUDIT_LOG record below still lands. Category only, for the
+                // same reason as the intent branch above.
+                tracing::error!(
+                    failure = %crate::ports::audit_sink::AuditFailure::classify(&error),
+                    tool = %tool_name,
+                    "failed to journal audit outcome"
+                );
+            }
+            self.components.usage_sink.record(UsageEvent {
+                timestamp: completed_at,
+                tool_name,
+                vendor: vendor.to_owned(),
+                outcome: outcome.to_owned(),
+                duration_ms,
+            });
+        }
+
         audit.complete(outcome);
         result
     }
@@ -406,6 +532,34 @@ impl ServerHandler for DevtoolsServer {
 
 // ---- helpers ----
 
+/// Canonical vendor for a tool name, by its prefix. `None` for tools that
+/// address no vendor (`artifact_read`) and for unknown names — the audit
+/// path records those as vendor `"unknown"` rather than dropping evidence.
+pub(crate) fn vendor_for_tool(tool: &str) -> Option<&'static str> {
+    use crate::config::{
+        VENDOR_BITBUCKET, VENDOR_CIRCLECI, VENDOR_CONFLUENCE, VENDOR_EDX, VENDOR_GRAFANA,
+        VENDOR_JIRA, VENDOR_NEWRELIC, VENDOR_NINJAONE, VENDOR_POSTMAN, VENDOR_SLACK,
+        VENDOR_SONARQUBE, VENDOR_SPLUNK, VENDOR_WRDS, VENDOR_ZOOM,
+    };
+    match tool.split_once('_').map(|(prefix, _)| prefix)? {
+        "bb" => Some(VENDOR_BITBUCKET),
+        "jira" => Some(VENDOR_JIRA),
+        "conf" => Some(VENDOR_CONFLUENCE),
+        "zoom" => Some(VENDOR_ZOOM),
+        "circleci" => Some(VENDOR_CIRCLECI),
+        "slack" => Some(VENDOR_SLACK),
+        "postman" => Some(VENDOR_POSTMAN),
+        "edx" => Some(VENDOR_EDX),
+        "newrelic" => Some(VENDOR_NEWRELIC),
+        "grafana" => Some(VENDOR_GRAFANA),
+        "sonarqube" => Some(VENDOR_SONARQUBE),
+        "splunk" => Some(VENDOR_SPLUNK),
+        "ninjaone" => Some(VENDOR_NINJAONE),
+        "wrds" => Some(VENDOR_WRDS),
+        _ => None,
+    }
+}
+
 pub(crate) fn success_response(resp: &crate::controllers::ControllerResponse) -> CallToolResult {
     let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
     CallToolResult::success(vec![Content::text(text)])
@@ -419,6 +573,29 @@ pub(crate) fn error_to_result(err: &crate::error::McpError) -> CallToolResult {
         .next()
         .map_or_else(String::new, |c| c.text);
     CallToolResult::error(vec![Content::text(text)])
+}
+
+#[cfg(test)]
+mod vendor_mapping_tests {
+    use super::*;
+
+    /// Every registered tool must map to a vendor, except the vendor-less
+    /// artifact reader. A new integration whose prefix is missing from
+    /// `vendor_for_tool` would journal `vendor: "unknown"` on every call —
+    /// catch that at review time, not in an audit export.
+    #[test]
+    fn every_registered_tool_maps_to_a_vendor_except_artifact_read() {
+        for tool in DevtoolsServer::tool_router().list_all() {
+            let name = tool.name.as_ref();
+            match vendor_for_tool(name) {
+                Some(_) => {}
+                None => assert_eq!(
+                    name, "artifact_read",
+                    "tool {name} has no vendor mapping in vendor_for_tool"
+                ),
+            }
+        }
+    }
 }
 
 #[cfg(test)]

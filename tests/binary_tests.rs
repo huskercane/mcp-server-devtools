@@ -382,3 +382,99 @@ fn version_reported_to_users_is_the_crate_version() {
         env!("CARGO_PKG_VERSION")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Fail-closed startup: an audit-incapable process must not report itself ready
+// ---------------------------------------------------------------------------
+
+/// A `MCP_AUDIT_JOURNAL_DIR` that cannot become a directory, because a plain
+/// file already occupies the path.
+fn unusable_journal_dir() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("not-a-directory");
+    std::fs::write(&path, b"x").expect("write blocking file");
+    (dir, path)
+}
+
+/// The HTTP transport used to stash a failed `DevtoolsServer::new()` inside
+/// the router, so the process logged "listening", stayed alive, and failed
+/// every call — while a health check happily marked it ready. Startup must
+/// fail before the listener is announced.
+#[tokio::test]
+async fn http_refuses_to_start_when_the_configured_audit_journal_cannot_open() {
+    let (_guard, journal) = unusable_journal_dir();
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        TokioCommand::new(cargo_bin(BIN))
+            .env("TRANSPORT_MODE", "http")
+            .env("PORT", "0")
+            .env("MCP_AUDIT_JOURNAL_DIR", &journal)
+            .env_remove("RUST_LOG")
+            .output(),
+    )
+    .await
+    .expect("the process must exit, not sit there serving an audit-incapable server")
+    .expect("run binary");
+
+    assert!(
+        !output.status.success(),
+        "an unopenable audit journal must be a startup failure"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains(STARTUP_MARKER),
+        "the process announced readiness despite having no audit journal:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("MCP_AUDIT_JOURNAL_DIR"),
+        "the failure should name the setting that caused it:\n{stderr}"
+    );
+}
+
+/// The one-shot CLI reaches the same vendor APIs the MCP tools do, but does
+/// not journal. On a deployment that has switched durable auditing on, that
+/// is a hole through the evidence trail — so it refuses instead.
+#[test]
+fn cli_subcommands_refuse_to_run_unaudited_while_a_journal_is_configured() {
+    let (_guard, journal) = unusable_journal_dir();
+    let output = StdCommand::new(cargo_bin(BIN))
+        .args(["jira", "get", "--path", "/rest/api/3/myself"])
+        .env("MCP_AUDIT_JOURNAL_DIR", &journal)
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("run binary");
+
+    assert!(!output.status.success(), "the call must be refused");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("MCP_AUDIT_JOURNAL_DIR"),
+        "the refusal should say why:\n{combined}"
+    );
+}
+
+/// Local mode is untouched: with no journal configured the same subcommand
+/// parses and runs (failing on credentials, not on the audit guard).
+#[test]
+fn cli_subcommands_still_run_when_no_journal_is_configured() {
+    let output = StdCommand::new(cargo_bin(BIN))
+        .args(["jira", "get", "--path", "/rest/api/3/myself"])
+        .env_remove("MCP_AUDIT_JOURNAL_DIR")
+        .env_remove("ATLASSIAN_API_TOKEN")
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("run binary");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("MCP_AUDIT_JOURNAL_DIR"),
+        "the audit guard must not fire in local mode:\n{combined}"
+    );
+}
