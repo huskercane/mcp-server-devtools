@@ -170,6 +170,82 @@ async fn quality_gate_ce_task_without_analysis_id_surfaces_status() {
     assert!(err.message.contains("IN_PROGRESS"));
 }
 
+/// The `ceTaskId` → `analysisId` lookup is a second upstream request the
+/// quality-gate tool makes before its own. Under an enforcing call scope it
+/// must be decided at the egress chokepoint like any other — a tool-level
+/// allow does not let it out unexamined.
+#[tokio::test]
+async fn quality_gate_ce_task_lookup_is_subject_to_egress_policy() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use mcp_server_devtools::policy::{
+        CallScope, ClientIdentity, CredentialLabel, Enforcement, EnvironmentClass, FilePolicy,
+        Principal, PrincipalAuthority, UpstreamAuthority, UpstreamIdentity,
+    };
+    use mcp_server_devtools::ports::{InMemoryAuditSink, PolicyDecisionPoint};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/ce/task"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "task": {"id": "AXm-task-1", "status": "SUCCESS", "analysisId": "AYn-analysis-9"}
+        })))
+        .mount(&server)
+        .await;
+
+    let client = build_client().unwrap();
+    let config = Config::from_map(creds());
+    let vendor = vendor(&server);
+    let ctx = SonarqubeContext::new(&client, &config, &vendor);
+    let mut args = gate_args();
+    args.ce_task_id = Some("AXm-task-1".into());
+
+    let policy: Arc<dyn PolicyDecisionPoint> =
+        FilePolicy::from_bytes(b"version: 1\nrules: []\n").expect("empty policy compiles");
+    let slot = mcp_server_devtools::auth::secrets::for_vendor("sonarqube")
+        .next()
+        .expect("registered secret");
+    let scope = Arc::new(
+        CallScope::new(
+            Principal {
+                tenant: "acme".to_owned(),
+                subject: "alice@acme.example".to_owned(),
+                groups: vec!["SRE".to_owned()],
+                scopes: vec!["mcp:tools".to_owned()],
+                authority: PrincipalAuthority::Okta,
+            },
+            ClientIdentity::default(),
+            "sonarqube_quality_gate",
+            "sha256:test",
+        )
+        .with_enforcement(Enforcement {
+            policy,
+            audit: Arc::new(InMemoryAuditSink::new()),
+            upstream: UpstreamIdentity {
+                label: CredentialLabel::slot(slot),
+                vendor: "sonarqube".to_owned(),
+                environment: EnvironmentClass::Qa,
+                authority: UpstreamAuthority::Shared,
+            },
+            append_timeout: Duration::from_secs(1),
+        }),
+    );
+
+    let err = CallScope::enter(scope, quality_gate(&ctx, &args))
+        .await
+        .unwrap_err();
+    assert!(
+        err.message.contains("Policy denied"),
+        "the ce/task lookup must be refused by policy: {}",
+        err.message
+    );
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "a denied request must never reach SonarQube"
+    );
+}
+
 #[tokio::test]
 async fn quality_gate_requires_a_selector() {
     // No projectKey / ceTaskId / analysisId → a validation error before any network.
