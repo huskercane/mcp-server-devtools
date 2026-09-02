@@ -45,9 +45,9 @@
 //!   ancestor directory it had to create. A file sync makes contents durable
 //!   but not the directory entry naming the file, so without this the very
 //!   first acknowledged record could survive as bytes in a file that does not
-//!   exist after a power loss. Where the platform cannot fsync a directory,
-//!   the server refuses to create one rather than claim a guarantee it
-//!   cannot deliver.
+//!   exist after a power loss. Where the platform cannot fsync a directory at
+//!   all, the server refuses to *create* the directory or the journal file —
+//!   both must already exist — and never calls the sync it could not honor.
 //! - Sequence numbers are assigned *by the writer*, in write order. Nothing
 //!   else can assign one, so line order and sequence order cannot diverge —
 //!   the tamper-evidence story depends on that, and it now holds without a
@@ -105,7 +105,11 @@ impl JournalAuditSink {
         // On a platform with no directory fsync there is no way to make a
         // *newly created* directory entry durable, so the honest posture is
         // to require the operator to create it in advance rather than to
-        // create one and claim a guarantee we cannot deliver.
+        // create one and claim a guarantee we cannot deliver. The same
+        // applies to the journal file itself: this function never calls
+        // `sync_directory` on this platform (see below), so the file's own
+        // directory entry must already be durable before `open` runs, not
+        // merely created by it.
         if cfg!(windows) && !dir.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -119,13 +123,32 @@ impl JournalAuditSink {
                 ),
             ));
         }
+        let path = dir.join(JOURNAL_FILE_NAME);
+        if cfg!(windows) && !path.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "the audit journal file {} does not exist. On this platform the server \
+                     will not create it: a newly created file's directory entry cannot be \
+                     made durable here, and the audit RPO=0 guarantee depends on it. Create \
+                     an empty {JOURNAL_FILE_NAME} file (on a volume with write barriers \
+                     enabled) and start again.",
+                    path.display()
+                ),
+            ));
+        }
 
         // Every directory this call has to create, outermost first, so each
-        // new entry can be made durable in its own parent afterwards.
+        // new entry can be made durable in its own parent afterwards. On
+        // Windows this is always empty: the directory check above already
+        // required `dir` to exist.
         let created = create_dir_all_tracked(dir)?;
-        let path = dir.join(JOURNAL_FILE_NAME);
+        // On every other platform the file may be newly created here, and
+        // its directory entry is made durable below. On Windows the
+        // preflight check above already required it to exist, so opening
+        // never creates it.
         let file = OpenOptions::new()
-            .create(true)
+            .create(!cfg!(windows))
             .read(true)
             .append(true)
             .open(&path)?;
@@ -138,7 +161,7 @@ impl JournalAuditSink {
         // `audit-journal.jsonl` at all on restart — an acknowledged record
         // with no file to be in.
         //
-        // Three things this has to get right, each of which was wrong once:
+        // Four things this has to get right, each of which was wrong once:
         //
         // 1. Syncing only when the file looked new left a retry hole: if the
         //    sync failed after the file was created, the next startup saw an
@@ -151,12 +174,26 @@ impl JournalAuditSink {
         //    innermost-first below.
         // 3. It has to be true on every platform, not just the ones where
         //    the call happens to succeed — see `sync_directory`.
+        // 4. On a platform where `sync_directory` cannot succeed at all, the
+        //    preflight checks above — not this call — are what makes the
+        //    guarantee hold: they refuse to start unless the directory and
+        //    file were already durable before `open` ran, so there is never
+        //    an unsynced creation to account for here. An earlier revision
+        //    stated that as the reason `sync_directory` was safe to call
+        //    unconditionally on every platform, but the call below ran
+        //    regardless of platform and `sync_directory` fails by
+        //    construction on a platform with no directory handle to sync —
+        //    so `open` could never succeed there at all, pre-created
+        //    directory or not. This call is skipped on that platform, not
+        //    merely expected to succeed vacuously.
         for new_dir in created.iter().rev() {
             if let Some(parent) = new_dir.parent() {
                 sync_directory(parent)?;
             }
         }
-        sync_directory(dir)?;
+        if !cfg!(windows) {
+            sync_directory(dir)?;
+        }
 
         // Two processes appending to one journal would each resume from the
         // same last sequence and issue the same numbers — duplicated
@@ -377,12 +414,16 @@ fn create_dir_all_tracked(dir: &Path) -> io::Result<Vec<PathBuf>> {
 /// there after a power loss.
 ///
 /// Opening a directory read-only and calling `sync_all` on it is the portable
-/// spelling of `fsync(dirfd)`. Windows has no directory handle to sync, and
-/// an earlier revision turned that failure into `Ok(())` — which made the
-/// RPO=0 claim knowingly false on that platform rather than merely
-/// unsupported. The error is propagated instead; [`JournalAuditSink::open`]
-/// keeps Windows working by refusing to *create* the journal directory there,
-/// so there is never an unsynced creation to account for.
+/// spelling of `fsync(dirfd)`. Windows has no directory handle to sync — this
+/// call fails there by construction, for any directory, whether or not it
+/// already existed. An earlier revision turned that failure into `Ok(())`,
+/// which made the RPO=0 claim knowingly false on that platform rather than
+/// merely unsupported; a later one propagated the error but still called
+/// this function unconditionally on every platform, so [`JournalAuditSink::
+/// open`] could never succeed on Windows at all. This function is never
+/// called on Windows now: `open`'s preflight checks require the directory
+/// *and* the journal file to already exist there, so there is never an
+/// unsynced creation for this call to account for, and it does not run.
 fn sync_directory(dir: &Path) -> io::Result<()> {
     File::open(dir).and_then(|handle| handle.sync_all())
 }
@@ -530,6 +571,26 @@ mod tests {
         }
     }
 
+    /// Satisfy the Windows-only preflight `open` now enforces: the
+    /// directory and the journal file must already exist there, because
+    /// this platform can never durably sync a newly created directory
+    /// entry (see `sync_directory`). A no-op on every other platform, where
+    /// `open` is the one that creates both.
+    ///
+    /// Tests that call `JournalAuditSink::open` on a fresh directory need
+    /// this first; tests that write the journal file's contents directly
+    /// before opening (`std::fs::write`) already satisfy it, because that
+    /// write creates the file.
+    fn ensure_windows_can_open(dir: &Path) {
+        if cfg!(windows) {
+            std::fs::create_dir_all(dir).unwrap();
+            let path = dir.join(JOURNAL_FILE_NAME);
+            if !path.exists() {
+                File::create(&path).unwrap();
+            }
+        }
+    }
+
     /// Every line, parsed. Panics on anything unparseable — which is the
     /// assertion: the journal is only evidence if all of it reads back.
     fn journal_lines(path: &Path) -> Vec<serde_json::Value> {
@@ -546,6 +607,7 @@ mod tests {
     #[tokio::test]
     async fn appends_sequence_from_one_and_persist_every_field() {
         let dir = tempfile::tempdir().unwrap();
+        ensure_windows_can_open(dir.path());
         let sink = JournalAuditSink::open(dir.path()).unwrap();
         assert_eq!(sink.append(&sample_event()).await.unwrap(), 1);
         assert_eq!(sink.append(&sample_event()).await.unwrap(), 2);
@@ -566,6 +628,7 @@ mod tests {
     #[tokio::test]
     async fn sequence_resumes_across_reopen_instead_of_restarting() {
         let dir = tempfile::tempdir().unwrap();
+        ensure_windows_can_open(dir.path());
         {
             let sink = JournalAuditSink::open(dir.path()).unwrap();
             sink.append(&sample_event()).await.unwrap();
@@ -586,6 +649,7 @@ mod tests {
     #[tokio::test]
     async fn a_torn_trailing_record_is_truncated_so_the_next_append_is_readable() {
         let dir = tempfile::tempdir().unwrap();
+        ensure_windows_can_open(dir.path());
         {
             let sink = JournalAuditSink::open(dir.path()).unwrap();
             sink.append(&sample_event()).await.unwrap();
@@ -652,6 +716,7 @@ mod tests {
     #[test]
     fn a_second_writer_cannot_open_the_same_journal() {
         let dir = tempfile::tempdir().unwrap();
+        ensure_windows_can_open(dir.path());
         let _held = JournalAuditSink::open(dir.path()).unwrap();
         let second = JournalAuditSink::open(dir.path());
         assert!(
@@ -663,6 +728,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_appends_are_contiguous_and_ordered() {
         let dir = tempfile::tempdir().unwrap();
+        ensure_windows_can_open(dir.path());
         let sink = Arc::new(JournalAuditSink::open(dir.path()).unwrap());
         let mut tasks = tokio::task::JoinSet::new();
         for _ in 0..64 {
@@ -690,6 +756,13 @@ mod tests {
 
     /// A file sync does not make the directory entry naming the file
     /// durable, and neither does syncing a directory whose own entry is new.
+    ///
+    /// Not on Windows: auto-creating a directory that does not exist yet is
+    /// exactly what this platform's preflight check refuses to do, because
+    /// it cannot durably sync the entry that creation would add. See
+    /// `windows_refuses_to_auto_create_the_journal_directory` for the
+    /// Windows-side counterpart of this test.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn creating_a_nested_journal_directory_syncs_every_new_entry() {
         let root = tempfile::tempdir().unwrap();
@@ -706,6 +779,53 @@ mod tests {
         // existed, which made a failed first sync permanent.
         let reopened = JournalAuditSink::open(&nested).unwrap();
         assert_eq!(reopened.append(&sample_event()).await.unwrap(), 2);
+    }
+
+    /// The counterpart of `creating_a_nested_journal_directory_syncs_every_new_entry`
+    /// for the platform that test is skipped on: `open` must refuse a
+    /// directory that does not exist yet, not create it, because it cannot
+    /// durably sync the new entry (`sync_directory` fails unconditionally
+    /// on this platform).
+    #[cfg(windows)]
+    #[test]
+    fn windows_refuses_to_auto_create_the_journal_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("a").join("b").join("journal");
+        assert!(!nested.exists());
+
+        let opened = JournalAuditSink::open(&nested);
+        assert!(
+            opened.is_err(),
+            "a journal directory that does not exist yet must not be \
+             auto-created on this platform"
+        );
+    }
+
+    /// The regression this fix closes: an earlier revision required only
+    /// the directory to be pre-created here, then called `sync_directory`
+    /// on it unconditionally regardless of platform. `sync_directory` fails
+    /// by construction on this platform, so `open` could never succeed at
+    /// all — a pre-created directory did not help. `open` must now succeed
+    /// once both the directory and the journal file already exist, and
+    /// refuse when only the directory does.
+    #[cfg(windows)]
+    #[test]
+    fn windows_requires_both_the_directory_and_the_journal_file_precreated() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let missing_file = JournalAuditSink::open(dir.path());
+        assert!(
+            missing_file.is_err(),
+            "must refuse when only the directory is pre-created"
+        );
+
+        File::create(dir.path().join(JOURNAL_FILE_NAME)).unwrap();
+        let sink = JournalAuditSink::open(dir.path());
+        assert!(
+            sink.is_ok(),
+            "must open once both the directory and the journal file exist: {:?}",
+            sink.err()
+        );
     }
 
     #[test]

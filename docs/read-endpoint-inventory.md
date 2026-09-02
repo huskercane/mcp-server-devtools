@@ -193,23 +193,39 @@ and holds the §3.2 freeze open — see `docs/enterprise-carry-forward.md` CF-2.
 
    The decision covers **every** retained attribute, not only the search
    expressions. `query_attributes` has no verbatim option: each key declares
-   a shape (`Integer`, `Enumerated`, `TimeBound`, `IdentifierList`,
-   `Digest`), the value is retained only if it *parses* as that shape, and
-   anything else — including anything over-long — becomes
-   `sha256:<64 bits>/<length>`. Bounding a caller-controlled string is not
-   redacting it: a token supplied as Jira's `fields` or Grafana's
-   `direction` previously reached the serialized `ActionContext` intact,
-   merely shorter.
+   a shape (`Integer`, `Enumerated`, `TimeBound`, `Digest`), the value is
+   retained only if it *parses* as that shape, and anything else — including
+   anything over-long — becomes `sha256:<64 bits>/<length>`. Bounding a
+   caller-controlled string is not redacting it: a token supplied as Jira's
+   `fields` or Grafana's `direction` previously reached the serialized
+   `ActionContext` intact, merely shorter.
+
+   `fields` was originally its own shape (`IdentifierList`): retained
+   verbatim when every comma-separated element matched `[A-Za-z0-9_.*-]+`.
+   That alphabet is also every popular credential format's alphabet
+   (`sk-live-…`, `xoxb-…`, a JWT), so a bare token — no `Bearer ` prefix, so
+   no space to trip the existing tests — parsed as a one-element list and
+   reached durable evidence unchanged. `fields` is `Digest` now, with no
+   shape-based carve-out; `Integer` and `TimeBound` keep theirs because
+   their accepted alphabets (digits; digits plus a handful of duration/RFC
+   3339 punctuation) are narrow enough that no real credential format
+   matches them.
 
    The same rule now governs the other caller-controlled strings that reach
    durable evidence: the JSON-RPC request id (`policy::correlation_id`) and
    the self-reported `clientInfo` name and version
-   (`ClientIdentity::reported`) are kept only when they look like plain
-   identifiers, and are digested otherwise — which still correlates, because
-   the intent and outcome records digest the same input.
+   (`ClientIdentity::reported`) are **always** digested — the same
+   "looks like a plain identifier" shape check had the same bare-token gap,
+   for the same reason, and there is no closed set of legitimate client
+   names or request ids to allowlist instead. This still correlates,
+   because the intent and outcome records digest the same input.
 
    The first revision of this decision was documented and then contradicted
    by the implementation, which cloned the expression whole and unbounded.
-   `search_expressions_never_reach_query_attributes_as_text` and
-   `caller_supplied_attribute_values_must_parse_or_become_a_digest` fail if
-   that returns.
+   A second revision closed that gap for values containing a space but left
+   the bare-token shape open. `search_expressions_never_reach_query_attributes_as_text`,
+   `caller_supplied_attribute_values_must_parse_or_become_a_digest`,
+   `bare_tokens_in_fields_are_digested_not_passed_through`,
+   `client_reported_values_are_always_digested`, and
+   `correlation_ids_are_digested_but_still_correlate` fail if any of that
+   returns.

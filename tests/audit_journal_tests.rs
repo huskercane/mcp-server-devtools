@@ -172,8 +172,18 @@ async fn intent_with_upstream_identity_is_journaled_before_dispatch_and_outcome_
     assert_eq!(intent["vendor"], "jira");
     assert_eq!(intent["decision"]["effect"], "allow");
     assert_eq!(intent["principal"]["subject"], "local");
-    assert_eq!(intent["client"]["name"], "audit-test");
-    assert_eq!(intent["client"]["version"], "0.0.0");
+    // Client name/version are self-reported and never kept verbatim — see
+    // `policy::ClientIdentity` — so the journal holds a correlation digest,
+    // not the reported text. `correlation_id` shares the same digest
+    // implementation, so it doubles as the expected-value oracle here.
+    assert_eq!(
+        intent["client"]["name"].as_str().unwrap(),
+        mcp_server_devtools::policy::correlation_id("audit-test")
+    );
+    assert_eq!(
+        intent["client"]["version"].as_str().unwrap(),
+        mcp_server_devtools::policy::correlation_id("0.0.0")
+    );
     // WP 0.6: the upstream identity appears in every event, with the
     // config-derived label and environment classification.
     assert_eq!(
@@ -207,6 +217,18 @@ async fn journal_configured_via_config_is_written_through_and_fails_startup_when
         .await;
 
     let journal_dir = tempfile::tempdir().expect("tempdir");
+    // On Windows the journal adapter refuses to auto-create the journal
+    // file: it can never durably sync a newly created directory entry
+    // there, so the operator must pre-create it. A no-op elsewhere, where
+    // `JournalAuditSink::open` creates it itself.
+    if cfg!(windows) {
+        std::fs::File::create(
+            journal_dir
+                .path()
+                .join(mcp_server_devtools::audit::journal::JOURNAL_FILE_NAME),
+        )
+        .expect("pre-create journal file for the Windows preflight check");
+    }
     let mut values = HashMap::from([
         (
             "ATLASSIAN_USER_EMAIL".to_owned(),

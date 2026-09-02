@@ -23,11 +23,6 @@ path = "src/main.rs"
 # without a logged-in desktop session, and disabling avoids the libsecret
 # build dep entirely.
 default  = ["keychain", "wrds"]
-# Exposes `policy::TestSlot`, the one way to build a `CredentialSlot`
-# the secret registry did not issue. Off by default on purpose: in a
-# production build there is no way to mint a credential label for a slot
-# that does not exist. Enable it from `dev-dependencies` only.
-test-support = []
 # `wrds` activates the WRDS (Wharton Research Data Services) integration. WRDS
 # has no REST API — it is a PostgreSQL database — so this is the one vendor that
 # does not ride the shared `reqwest`/`Vendor` HTTP path. The feature pulls in a

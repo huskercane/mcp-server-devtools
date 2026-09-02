@@ -78,12 +78,20 @@ enum Retention {
     /// A time bound: an integer epoch, a duration literal like `5m`, or an
     /// RFC 3339 timestamp. Retained only in one of those shapes.
     TimeBound,
-    /// A comma-separated list of field identifiers (`fields`). Retained only
-    /// if every element is `[A-Za-z0-9_.*-]+`, capped at
-    /// [`MAX_IDENTIFIER_LIST`] elements.
-    IdentifierList,
-    /// A **search expression the caller wrote** — `LogQL`, JQL. Kept as a
-    /// digest and a length, never as text.
+    /// A **caller-authored value with no closed shape** — a comma-separated
+    /// field list (`fields`) as much as a search expression (`jql`,
+    /// `LogQL`). Kept as a digest and a length, never as text.
+    ///
+    /// An earlier revision gave field lists their own "parses as
+    /// `[A-Za-z0-9_.*-]+`" shape and kept the value verbatim when it
+    /// matched. That alphabet is also every popular credential format's
+    /// alphabet (`sk-live-…`, `xoxb-…`, a JWT's dot-separated base64url
+    /// segments), so `fields=xoxb-secret-token` parsed as a one-element list
+    /// and passed through unchanged. Unlike [`Retention::Integer`] or
+    /// [`Retention::TimeBound`], whose accepted alphabets are narrow enough
+    /// that no real credential format matches them, there is no shape this
+    /// endpoint's caller-supplied identifiers could take that would exclude
+    /// a token — so nothing here is retained by shape at all.
     ///
     /// `docs/read-endpoint-inventory.md` decision 5 says raw query text does
     /// not enter audit, and it says so for a concrete reason: an expression
@@ -99,8 +107,6 @@ enum Retention {
 
 /// Longest value of any shape retained, parsed or not.
 const MAX_ATTRIBUTE_VALUE: usize = 256;
-/// Most elements kept from a comma-separated identifier list.
-const MAX_IDENTIFIER_LIST: usize = 32;
 
 /// Retain only allowlisted query keys, sorted by key (§3.2
 /// `query_attributes`), each according to its declared [`Retention`].
@@ -132,7 +138,6 @@ fn retain(value: &str, retention: Retention) -> String {
         Retention::Integer => parse_integer(value),
         Retention::Enumerated(allowed) => parse_enumerated(value, allowed),
         Retention::TimeBound => parse_time_bound(value),
-        Retention::IdentifierList => parse_identifier_list(value),
         Retention::Digest => None,
     };
     parsed.unwrap_or_else(|| expression_digest(value))
@@ -167,27 +172,6 @@ fn parse_time_bound(value: &str) -> Option<String> {
         ch.is_ascii_digit() || matches!(ch, '-' | ':' | 'T' | 'Z' | '.' | '+' | 't' | 'z')
     }) && trimmed.starts_with(|ch: char| ch.is_ascii_digit());
     (numeric || duration || rfc3339).then(|| trimmed.to_owned())
-}
-
-fn parse_identifier_list(value: &str) -> Option<String> {
-    let mut out = String::with_capacity(value.len());
-    for (index, element) in value.split(',').enumerate() {
-        let element = element.trim();
-        if index >= MAX_IDENTIFIER_LIST || element.is_empty() {
-            return None;
-        }
-        if !element
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '*' | '-'))
-        {
-            return None;
-        }
-        if index > 0 {
-            out.push(',');
-        }
-        out.push_str(element);
-    }
-    (!out.is_empty()).then_some(out)
 }
 
 /// `sha256:<16 hex chars>/<byte length>` — enough to correlate two identical
@@ -318,10 +302,10 @@ pub mod jira {
     };
 
     /// Query keys retained for the GET search endpoint. The scope claim is
-    /// extracted from `jql` before this runs; the expression itself is
+    /// extracted from `jql` before this runs; both `jql` and `fields` are
     /// retained only as a digest.
     const SEARCH_QUERY_ALLOWLIST: &[(&str, Retention)] = &[
-        ("fields", Retention::IdentifierList),
+        ("fields", Retention::Digest),
         ("jql", Retention::Digest),
         ("maxResults", Retention::Integer),
     ];
@@ -397,7 +381,7 @@ pub mod jira {
             Route::ReadIssue(key) => ActionDetails::read(
                 NormalizedAction::ReadIssue,
                 canonical_path,
-                allowlisted_attributes(query, &[("fields", Retention::IdentifierList)]),
+                allowlisted_attributes(query, &[("fields", Retention::Digest)]),
                 ResourceType::Issue,
                 ResourceScope::id(key),
             ),
@@ -449,7 +433,9 @@ pub mod jira {
             .and_then(project_keys_from_jql)
             .map_or(ResourceScope::unscoped(), ResourceScope::ids);
         // GET is an ordinary read; POST is the module's one downgrade, and
-        // it can only be spelled by naming the approved endpoint.
+        // it can only be spelled by naming the approved endpoint — which
+        // binds its own action, path, and resource type, so only the
+        // genuinely call-site-variable scope and attributes are passed here.
         if method == HttpMethod::Get {
             return ActionDetails::read(
                 NormalizedAction::SearchIssues,
@@ -461,10 +447,7 @@ pub mod jira {
         }
         ActionDetails::read_downgrade(
             ApprovedReadDowngrade::JIRA_SEARCH_JQL,
-            NormalizedAction::SearchIssues,
-            canonical_path,
             query_attributes,
-            ResourceType::Issue,
             resource_scope,
         )
     }
@@ -1028,10 +1011,9 @@ mod tests {
         assert_eq!(issue.normalized_action, NormalizedAction::ReadIssue);
         assert_eq!(issue.canonical_path, "/rest/api/3/issue/PLAT-123");
         assert_eq!(issue.resource_scope, ResourceScope::id("PLAT-123"));
-        assert_eq!(
-            issue.query_attributes(),
-            vec![("fields".to_owned(), "summary".to_owned())]
-        );
+        assert_eq!(issue.query_attributes().len(), 1);
+        assert_eq!(issue.query_attributes()[0].0, "fields");
+        assert!(issue.query_attributes()[0].1.starts_with("sha256:"));
 
         let project = jira::extract(HttpMethod::Get, "/rest/api/3/project/WEB", &[], None);
         assert_eq!(project.normalized_action, NormalizedAction::ReadProject);
@@ -1129,6 +1111,49 @@ mod tests {
         assert!(!serialized.contains("DROP TABLE"), "{serialized}");
     }
 
+    /// A bare token — no `Bearer ` prefix, so no space — is the gap the
+    /// "parses as `[A-Za-z0-9_.*-]+`" identifier-list shape used to miss:
+    /// `xoxb-secret-token` is indistinguishable, by that alphabet, from a
+    /// real Jira field name. `fields` no longer has a verbatim shape at all.
+    #[test]
+    fn bare_tokens_in_fields_are_digested_not_passed_through() {
+        let details = jira::extract(
+            HttpMethod::Get,
+            "/rest/api/3/issue/PLAT-1",
+            &[("fields", "xoxb-secret-token")],
+            None,
+        );
+        let serialized = serde_json::to_string(&details).unwrap();
+        assert!(
+            !serialized.contains("xoxb-secret-token"),
+            "a bare token in fields must not survive: {serialized}"
+        );
+        assert_eq!(details.query_attributes()[0].0, "fields");
+        assert!(details.query_attributes()[0].1.starts_with("sha256:"));
+
+        // A genuinely ordinary field list digests too — there is no
+        // shape-based carve-out any more.
+        let ordinary = jira::extract(
+            HttpMethod::Get,
+            "/rest/api/3/issue/PLAT-1",
+            &[("fields", "summary,status,customfield_10001")],
+            None,
+        );
+        assert!(ordinary.query_attributes()[0].1.starts_with("sha256:"));
+        // Same list, same handle — correlation still works.
+        assert_eq!(
+            ordinary.query_attributes()[0].1,
+            jira::extract(
+                HttpMethod::Get,
+                "/rest/api/3/issue/PLAT-1",
+                &[("fields", "summary,status,customfield_10001")],
+                None,
+            )
+            .query_attributes()[0]
+                .1
+        );
+    }
+
     #[test]
     fn well_formed_attribute_values_survive_in_their_parsed_shape() {
         let details = grafana::query_logs(
@@ -1155,17 +1180,6 @@ mod tests {
                 ("start", "1735689600"),
                 ("step", "5m"),
             ]
-        );
-
-        let jira = jira::extract(
-            HttpMethod::Get,
-            "/rest/api/3/issue/PLAT-1",
-            &[("fields", "summary, status,customfield_10001")],
-            None,
-        );
-        assert_eq!(
-            jira.query_attributes()[0].1,
-            "summary,status,customfield_10001"
         );
     }
 
