@@ -62,7 +62,8 @@ fn http_refuses_non_loopback_bind_with_auth_off() {
 }
 
 #[test]
-fn http_refuses_okta_mode_until_token_validation_exists() {
+fn http_refuses_okta_mode_without_its_configuration() {
+    // Nothing configured: the first missing piece is named.
     let (ok, stderr) = run_to_exit(|command| {
         command
             .env("TRANSPORT_MODE", "http")
@@ -71,6 +72,205 @@ fn http_refuses_okta_mode_until_token_validation_exists() {
     });
     assert!(!ok, "must refuse to start; stderr:\n{stderr}");
     assert!(stderr.contains("MCP_AUTH_MODE=okta"), "stderr:\n{stderr}");
+    assert!(stderr.contains("MCP_OKTA_ISSUER"), "stderr:\n{stderr}");
+
+    // Identity configured but no policy: still refused — authenticated and
+    // allow-everything is the "temporarily permissive" mode the plan forbids.
+    let journal = tempfile::tempdir().unwrap();
+    let (ok, stderr) = run_to_exit(|command| {
+        command
+            .env("TRANSPORT_MODE", "http")
+            .env("PORT", "0")
+            .env("MCP_AUTH_MODE", "okta")
+            .env("MCP_OKTA_ISSUER", "https://acme.okta.com/oauth2/default")
+            .env("MCP_OKTA_AUDIENCE", "api://mcp-devtools")
+            .env("MCP_PUBLIC_URL", "https://mcp.acme.example")
+            .env("MCP_AUDIT_JOURNAL_DIR", journal.path());
+    });
+    assert!(!ok, "must refuse to start; stderr:\n{stderr}");
+    assert!(stderr.contains("MCP_POLICY_FILE"), "stderr:\n{stderr}");
+
+    // Everything but the journal: refused, because evidence is not optional.
+    let (ok, stderr) = run_to_exit(|command| {
+        command
+            .env("TRANSPORT_MODE", "http")
+            .env("PORT", "0")
+            .env("MCP_AUTH_MODE", "okta")
+            .env("MCP_OKTA_ISSUER", "https://acme.okta.com/oauth2/default")
+            .env("MCP_OKTA_AUDIENCE", "api://mcp-devtools")
+            .env("MCP_PUBLIC_URL", "https://mcp.acme.example")
+            .env(
+                "MCP_POLICY_FILE",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/policy/phase-a.yaml"
+                ),
+            );
+    });
+    assert!(!ok, "must refuse to start; stderr:\n{stderr}");
+    assert!(
+        stderr.contains("MCP_AUDIT_JOURNAL_DIR"),
+        "stderr:\n{stderr}"
+    );
+}
+
+/// The binary boundary of the Phase A slice: fully configured, the server
+/// starts in Okta mode, challenges anonymous callers, publishes the RFC
+/// 9728 document, and accepts a token signed by the test key served from
+/// a loopback JWKS.
+// One scenario, start to finish, at the binary boundary; splitting it
+// into helpers would hide the sequence the test exists to show.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn http_starts_in_okta_mode_when_fully_configured() {
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode, get_current_timestamp};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let jwks = MockServer::start().await;
+    let jwk: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/okta_test_jwk.json")).unwrap();
+    Mock::given(method("GET"))
+        .and(path("/oauth2/default/v1/keys"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "keys": [jwk] })),
+        )
+        .mount(&jwks)
+        .await;
+    let issuer = format!("{}/oauth2/default", jwks.uri());
+    let journal = tempfile::tempdir().unwrap();
+    if cfg!(windows) {
+        std::fs::File::create(journal.path().join("audit-journal.jsonl")).unwrap();
+    }
+
+    let mut command = tokio::process::Command::new(cargo_bin(BIN));
+    command
+        .env_remove("RUST_LOG")
+        .env_remove("MCP_BIND_ADDR")
+        .env("TRANSPORT_MODE", "http")
+        .env("PORT", "0")
+        .env("MCP_AUTH_MODE", "okta")
+        .env("MCP_OKTA_ISSUER", &issuer)
+        .env("MCP_OKTA_AUDIENCE", "api://mcp-devtools")
+        .env("MCP_PUBLIC_URL", "http://127.0.0.1:3000")
+        .env(
+            "MCP_POLICY_FILE",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/policy/phase-a.yaml"
+            ),
+        )
+        .env("MCP_AUDIT_JOURNAL_DIR", journal.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().expect("spawn binary");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let collected = {
+        use tokio::io::AsyncReadExt as _;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut collected = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            if String::from_utf8_lossy(&collected).contains(STARTUP_MARKER) {
+                break String::from_utf8_lossy(&collected).into_owned();
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out; stderr:\n{}",
+                String::from_utf8_lossy(&collected)
+            );
+            match tokio::time::timeout(remaining, stderr.read(&mut buf)).await {
+                Ok(Ok(0)) => panic!(
+                    "binary exited before startup; stderr:\n{}",
+                    String::from_utf8_lossy(&collected)
+                ),
+                Ok(Ok(read)) => collected.extend_from_slice(&buf[..read]),
+                Ok(Err(error)) => panic!("reading stderr failed: {error}"),
+                Err(_) => {}
+            }
+        }
+    };
+    let (_, rest) = collected.split_once("127.0.0.1:").expect("bound address");
+    let port: u16 = rest
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+
+    let health = client.get(format!("{base}/")).send().await.unwrap();
+    assert_eq!(health.status(), 200);
+
+    let metadata: serde_json::Value = client
+        .get(format!("{base}/.well-known/oauth-protected-resource"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(metadata["resource"], "http://127.0.0.1:3000");
+    assert_eq!(
+        metadata["authorization_servers"],
+        serde_json::json!([issuer])
+    );
+
+    let tools_list = |token: Option<String>| {
+        let mut request = client
+            .post(format!("{base}/mcp"))
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "tools/list")
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                    "params": { "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                        "io.modelcontextprotocol/clientInfo": { "name": "t", "version": "0" }
+                    } }
+                })
+                .to_string(),
+            );
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        request.send()
+    };
+    let anonymous = tools_list(None).await.unwrap();
+    assert_eq!(anonymous.status(), 401);
+    assert!(
+        anonymous
+            .headers()
+            .get("www-authenticate")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains(
+                "resource_metadata=\"http://127.0.0.1:3000/.well-known/oauth-protected-resource\""
+            )),
+        "{:?}",
+        anonymous.headers()
+    );
+
+    let now = get_current_timestamp();
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some("test-key-1".to_owned());
+    let token = encode(
+        &header,
+        &serde_json::json!({
+            "sub": "alice@acme.example", "iss": issuer, "aud": "api://mcp-devtools",
+            "iat": now, "exp": now + 300, "scp": ["mcp:tools"], "groups": ["SRE"]
+        }),
+        &EncodingKey::from_rsa_der(include_bytes!("fixtures/okta_test_rsa_pkcs1.der")),
+    )
+    .unwrap();
+    let authenticated = tools_list(Some(token)).await.unwrap();
+    assert_eq!(authenticated.status(), 200);
+    assert!(authenticated.text().await.unwrap().contains("\"tools\""));
 }
 
 #[test]

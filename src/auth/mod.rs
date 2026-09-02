@@ -21,6 +21,7 @@ use crate::config::Config;
 use crate::error::{McpError, auth_invalid, auth_missing};
 
 pub mod keychain;
+pub mod okta;
 pub mod secrets;
 
 pub use keychain::{InMemoryKeychain, KeychainBackend, KeychainError, OsKeychain, SecretKind};

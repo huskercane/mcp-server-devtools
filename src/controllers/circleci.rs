@@ -24,10 +24,10 @@ use crate::controllers::api::{ControllerResponse, HandleContext, dispatch_with_c
 use crate::error::{McpError, OriginalError, api_error};
 use crate::format::OutputFormat;
 use crate::tools::args::{CircleCiLogsArgs, QueryParams, ReadArgs, WriteArgs};
-use crate::transport::HttpMethod;
 use crate::transport::raw_response;
+use crate::transport::{HttpMethod, RequestOptions, ResponseBody, fetch};
+use crate::vendor::Vendor;
 use crate::vendor::circleci::CircleCiVendor;
-use crate::vendor::circleci::error;
 
 static OUTPUT_DOWNLOADS: OnceLock<Semaphore> = OnceLock::new();
 
@@ -256,48 +256,81 @@ struct LogAction {
     output_fetch_error: Option<String>,
 }
 
+/// CircleCI's older build-details API surface as a [`Vendor`], so the one
+/// request the logs tool makes to it takes the shared transport path —
+/// canonicalized, policy-checked at egress, error-classified — like every
+/// other upstream request (plan §1.3). It used to be a direct `reqwest`
+/// call with the token in the query string, which a tool-level allow let
+/// out unexamined.
+struct LegacyBuildApi<'a>(&'a CircleCiVendor);
+
+impl Vendor for LegacyBuildApi<'_> {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+
+    fn base_url(&self, _config: &Config) -> Result<String, McpError> {
+        Ok(self.0.log_base_url())
+    }
+
+    fn normalize_path(&self, path: &str) -> String {
+        self.0.normalize_path(path)
+    }
+
+    fn classify_error(&self, status: reqwest::StatusCode, body: &str) -> McpError {
+        self.0.classify_error(status, body)
+    }
+}
+
+/// `GET /project/{vcs}/{org}/{repo}/{job}` on the build-details API. The
+/// token travels in the `Circle-Token` header (accepted by both API
+/// generations) rather than the query string, so it is never part of a URL
+/// that reaches a log line, a cache key, or an audit record.
 async fn fetch_build_details(
     ctx: &CircleCiContext<'_>,
     token: &str,
     project: &LogProject<'_>,
     job_number: u64,
 ) -> Result<Value, McpError> {
-    let base = ctx.vendor.log_base_url();
-    let mut url = reqwest::Url::parse(&format!(
-        "{}/project/{}/{}/{}/{}",
-        base.trim_end_matches('/'),
-        project.vcs,
-        project.org,
-        project.repo,
-        job_number
-    ))
-    .map_err(|err| api_error(format!("Invalid CircleCI log API URL: {err}"), None, None))?;
-    url.query_pairs_mut().append_pair("circle-token", token);
-
-    let call = crate::transport::HttpCallLog::new("circleci", "GET", url.as_str());
-    let response = ctx.client.get(url.clone()).send().await.map_err(|err| {
-        crate::transport::log_http_transport_failure(call, &err, false);
-        api_error(
-            format!("CircleCI log API request failed: {err}"),
-            None,
-            None,
-        )
-    })?;
-    let status = response.status();
-    let body_text = response.text().await.unwrap_or_default();
-
-    if !status.is_success() {
-        crate::transport::log_http_status_failure(call, status, false);
-        return Err(error::classify(status, &body_text));
+    let path = format!(
+        "/project/{}/{}/{}/{job_number}",
+        project.vcs, project.org, project.repo
+    );
+    let creds = Credentials::ApiKeyHeader {
+        header_name: "Circle-Token".to_owned(),
+        key: token.to_owned(),
+    };
+    let legacy = LegacyBuildApi(ctx.vendor);
+    let response = fetch(
+        ctx.client,
+        &legacy,
+        &creds,
+        ctx.config,
+        &path,
+        RequestOptions {
+            method: Some(HttpMethod::Get),
+            ..RequestOptions::default()
+        },
+    )
+    .await?;
+    // The build details are an index into the per-action outputs, which
+    // are what gets kept; the index itself is not an artifact.
+    if let Some(raw) = response.raw_response_path {
+        let _ = raw_response::remove_artifact(&raw).await;
     }
-
-    serde_json::from_str(&body_text).map_err(|err| {
-        api_error(
-            format!("CircleCI log API returned invalid JSON: {err}"),
+    match response.data {
+        ResponseBody::Json(value) => Ok(value),
+        ResponseBody::Text(text) => Err(api_error(
+            "CircleCI log API returned a non-JSON body",
             None,
-            Some(OriginalError::String(body_text)),
-        )
-    })
+            Some(OriginalError::String(text)),
+        )),
+        ResponseBody::Empty => Err(api_error(
+            "CircleCI log API returned an empty body",
+            None,
+            None,
+        )),
+    }
 }
 
 async fn collect_log_steps(

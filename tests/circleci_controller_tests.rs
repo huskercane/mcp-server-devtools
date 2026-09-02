@@ -157,7 +157,8 @@ async fn logs_fetches_build_details_and_flattens_action_output() {
 
     Mock::given(method("GET"))
         .and(path("/project/github/acme/web/123"))
-        .and(query_param("circle-token", "tok-123"))
+        // The token rides in the header, never the URL.
+        .and(header("circle-token", "tok-123"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "steps": [
                 {
@@ -220,6 +221,91 @@ async fn logs_fetches_build_details_and_flattens_action_output() {
             .contains("test redos_flag ... FAILED")
     );
     let _ = tokio::fs::remove_file(raw_path).await;
+}
+
+/// The build-details lookup is the logs tool's first upstream request. Under
+/// an enforcing call scope it must be decided at the egress chokepoint like
+/// any other request — a tool-level allow does not let it out unexamined.
+#[tokio::test]
+async fn logs_build_details_request_is_subject_to_egress_policy() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/project/github/acme/web/123"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "steps": [] })))
+        .mount(&server)
+        .await;
+
+    let client = build_client().unwrap();
+    let config = Config::from_map(creds());
+    let vendor = vendor(&server);
+    let ctx = CircleCiContext::new(&client, &config, &vendor);
+    let args = mcp_server_devtools::tools::args::CircleCiLogsArgs {
+        project_slug: "gh/acme/web".into(),
+        job_number: 123,
+        step_number: None,
+        failed_only: false,
+        condensed: false,
+        context_lines: None,
+        output_format: Some(mcp_server_devtools::tools::args::OutputFormatArg::Json),
+    };
+
+    let err = mcp_server_devtools::policy::CallScope::enter(
+        enforcement::deny_everything_scope("circleci", "circleci_logs"),
+        handle_logs(&ctx, &args),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.message.contains("Policy denied"),
+        "the build-details request must be refused by policy: {}",
+        err.message
+    );
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "a denied request must never reach CircleCI"
+    );
+}
+
+/// A call scope whose policy allows nothing, with a real audit sink and
+/// upstream identity — the minimum an egress decision needs.
+mod enforcement {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use mcp_server_devtools::policy::{
+        CallScope, ClientIdentity, CredentialLabel, Enforcement, EnvironmentClass, FilePolicy,
+        Principal, PrincipalAuthority, UpstreamAuthority, UpstreamIdentity,
+    };
+    use mcp_server_devtools::ports::{InMemoryAuditSink, PolicyDecisionPoint};
+
+    pub fn deny_everything_scope(vendor: &'static str, tool: &str) -> Arc<CallScope> {
+        let policy: Arc<dyn PolicyDecisionPoint> =
+            FilePolicy::from_bytes(b"version: 1\nrules: []\n").expect("empty policy compiles");
+        let slot = mcp_server_devtools::auth::secrets::for_vendor(vendor)
+            .next()
+            .expect("registered secret");
+        let principal = Principal {
+            tenant: "acme".to_owned(),
+            subject: "alice@acme.example".to_owned(),
+            groups: vec!["SRE".to_owned()],
+            scopes: vec!["mcp:tools".to_owned()],
+            authority: PrincipalAuthority::Okta,
+        };
+        Arc::new(
+            CallScope::new(principal, ClientIdentity::default(), tool, "sha256:test")
+                .with_enforcement(Enforcement {
+                    policy,
+                    audit: Arc::new(InMemoryAuditSink::new()),
+                    upstream: UpstreamIdentity {
+                        label: CredentialLabel::slot(slot),
+                        vendor: vendor.to_owned(),
+                        environment: EnvironmentClass::Qa,
+                        authority: UpstreamAuthority::Shared,
+                    },
+                    append_timeout: Duration::from_secs(1),
+                }),
+        )
+    }
 }
 
 #[tokio::test]

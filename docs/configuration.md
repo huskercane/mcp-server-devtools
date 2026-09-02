@@ -99,6 +99,42 @@ These settings use the same three-source cascade. When placed in `configs.json`,
 | `STREAMING_ARTIFACT_RETENTION_SECONDS` | `3600`; clamped to `300`–`604800` | How long completed download artifacts remain readable. |
 | `STREAMING_ARTIFACT_SWEEP_INTERVAL_SECONDS` | `60`; clamped to `5`–`3600` | Interval between expired-artifact sweeps. |
 
+## Enterprise mode (opt-in)
+
+Everything in this section is off by default, and with it off the server
+behaves byte-for-byte as before it existed (`tests/auth_mode_tests.rs` locks
+that). It is the configuration surface of the enterprise plan
+(`docs/enterprise-product-plan.md`, Phase A). Startup is **fail-closed**: an
+incomplete or contradictory enterprise configuration refuses to start with a
+reason, never falls back to local mode.
+
+Unless noted, these settings use the same three-source cascade as the
+integration settings, so they may live in the environment, `.env`, or a
+`configs.json` section.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `MCP_ROLE` | `all` | Process env only (or `serve --role`). `all`, `gateway`, or `control` (plan ADR-010). `control` serves only the health banner in Phase A. |
+| `MCP_AUTH_MODE` | `off` | `off` or `okta`. `okta` requires an HTTP transport, a non-loopback-safe configuration below, a policy, and a journal. Any other value is refused. |
+| `MCP_BIND_ADDR` | `127.0.0.1` | Process env only. IP or `ip:port`. A non-loopback bind is refused unless `MCP_AUTH_MODE=okta`. |
+| `MCP_PUBLIC_URL` | — (required for `okta`) | The URL clients reach the server at through the ingress: the RFC 9728 `resource` identifier and the base of the `resource_metadata` URL in every `WWW-Authenticate` challenge. Must be `https` (or `http` on loopback). |
+| `MCP_OKTA_ISSUER` | — (required for `okta`) | The Okta authorization-server issuer URL; tokens must carry it as `iss`. Must be `https` (or `http` on loopback). |
+| `MCP_OKTA_AUDIENCE` | — (required for `okta`) | The audience tokens must carry in `aud`. |
+| `MCP_OKTA_JWKS_URL` | `{issuer}/v1/keys` | Where signing keys are fetched. Keys are cached, refreshed in the background every 10 minutes, and refetched (rate-limited to one per 30 s) when a token names an unknown `kid`. Only RSA signing keys with a `kid` are admitted (`use` must be `sig` and `alg` must be `RS256` when present); two admissible keys under one `kid` admit neither. The document is limited to 256 KiB, enforced while it is read. A key that disappears from the set, or is republished under the same `kid` with different material, evicts the tokens it validated from the token cache. |
+| `MCP_OKTA_GROUPS_CLAIM` | `groups` | The claim holding group memberships; non-string members are ignored. |
+| `MCP_OKTA_CLOCK_SKEW_SECONDS` | `60`; at most `300` | Leeway applied to `exp` and `nbf`. |
+| `MCP_REQUIRED_SCOPE` | `mcp:tools` | The scope a token must carry to reach `/mcp`; missing it is a `403 insufficient_scope`. |
+| `MCP_TENANT` | issuer host | Tenant label stamped on every principal, audit record, and artifact owner. |
+| `MCP_POLICY_FILE` | — (required for `okta`) | YAML policy document (`src/policy/engine.rs` documents the schema; `tests/fixtures/policy/phase-a.yaml` is a worked example). Compiled at startup and hot-reloaded on change; a document that does not compile is refused at startup and ignored on reload. A file that vanishes or becomes unreadable is treated the same way: the last good policy stays in force, the health banner reports that reloads are failing (the reason itself goes to the operator log, not the public banner) (deleting the file is **not** an emergency deny — publish `rules: []` to deny everything). Validate with `mcp-devtools policy check <file>`. Setting it with `MCP_AUTH_MODE=off` enforces the policy against the `local` principal — a dry run. |
+| `MCP_VENDOR_ENVIRONMENT` | unclassified | `prod`, `staging`, `qa`, or `dev`. Vendor-scoped: put it in a vendor's `configs.json` section to classify that account. An unclassified environment matches no environment-scoped rule. |
+| `MCP_AUDIT_JOURNAL_DIR` | — (required for `okta`) | Directory for the durable, sequence-numbered audit journal. Every tool call's intent is written and synced **before** dispatch; a journal that cannot accept a record refuses the call, and the health banner answers 503. Operational CLI subcommands refuse to run while this is set (they would bypass the journal). |
+| `MCP_AUDIT_APPEND_TIMEOUT_MS` | `5000`; clamped to `100`–`60000` | Bound on the wait for durable acknowledgement. Before dispatch, a timeout refuses the call. After dispatch, the outcome record is not abandoned: the caller stops waiting at the bound, the write continues on a tracked task, and a graceful shutdown drains such writes for up to 30 s; see `src/policy/egress.rs` for what an intent without an outcome then means. |
+
+Validated tokens are cached for `min(exp, 5 min)` keyed by the token's
+SHA-256, so a revoked group membership takes effect when the client's next
+token is issued (plan §3.6; the deny-list and `revoke-all` arrive in Phase
+B).
+
 ## Process-only runtime settings
 
 These are read directly from the process environment during startup. They do **not** take effect in `.env` or `~/.mcp/configs.json`; set them in the shell, service definition, or MCP client's `env` object.

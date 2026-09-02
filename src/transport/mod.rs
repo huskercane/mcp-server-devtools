@@ -1013,8 +1013,16 @@ pub async fn fetch_streamed_artifact_with_policy(
     policy: StreamingPolicy,
 ) -> Result<raw_response::StreamedArtifact, McpError> {
     let base = vendor.base_url(config)?;
-    let url = normalize_url_with_base(&base, path);
+    let target = canonical_target(path)?;
     let method = options.method.unwrap_or(HttpMethod::Get);
+    // Plan §1.3: the request about to go on the wire is the fact policy is
+    // evaluated on. Outside an enforcing call scope this is one lookup.
+    let ticket =
+        crate::policy::authorize_egress(vendor.name(), method, &target, options.body.as_ref())
+            .await?;
+    // Each wire attempt, and how the last one ended, for the egress record.
+    let report = |status, failure| report_attempt(ticket.as_ref(), status, failure);
+    let url = target.url_under(&base);
     let (auth_name, auth_header) = validate_auth(credentials)?;
     let client = streaming_client()?;
     let attempts = policy.max_attempts.max(1);
@@ -1037,30 +1045,39 @@ pub async fn fetch_streamed_artifact_with_policy(
         let call =
             HttpCallLog::new(vendor.name(), method.as_str(), &url).for_attempt(attempt, attempts);
         let response = tokio::select! {
-            () = policy.cancellation.cancelled() => return Err(api_error("streaming request cancelled", Some(499), None)),
+            () = policy.cancellation.cancelled() => {
+                // The send was in flight: the vendor may have observed it.
+                report(None, Some("cancelled"));
+                return Err(api_error("streaming request cancelled", Some(499), None));
+            }
             result = tokio::time::timeout(remaining, request.send()) => match result {
                 Ok(Ok(response)) => response,
                 Ok(Err(error)) if attempt < attempts && is_retryable_stream_request_error(&error) => {
+                    report(None, Some("transport_error"));
                     log_http_transport_failure(call, &error, true);
                     retry_stream_attempt(attempt, &policy, deadline).await?;
                     continue;
                 }
                 Ok(Err(error)) => {
+                    report(None, Some("transport_error"));
                     log_http_transport_failure(call, &error, false);
                     return Err(map_reqwest_error(&error, &url));
                 }
                 Err(_) if attempt < attempts => {
+                    report(None, Some("timeout"));
                     log_http_timeout_failure(call, true);
                     retry_stream_attempt(attempt, &policy, deadline).await?;
                     continue;
                 }
                 Err(_) => {
+                    report(None, Some("timeout"));
                     log_http_timeout_failure(call, false);
                     return Err(api_error("streaming request exceeded total deadline", Some(408), None));
                 }
             }
         };
         let status = response.status();
+        report(Some(status.as_u16()), None);
         if !status.is_success() {
             let will_retry = attempt < attempts && matches!(status.as_u16(), 429 | 502 | 503 | 504);
             log_http_status_failure(call, status, will_retry);
@@ -1071,16 +1088,7 @@ pub async fn fetch_streamed_artifact_with_policy(
             let body = response.text().await.unwrap_or_default();
             return Err(vendor.classify_error(status, &body));
         }
-        if response
-            .content_length()
-            .is_some_and(|length| length > policy.max_encoded_bytes)
-        {
-            return Err(api_error(
-                "encoded response exceeds streamed artifact limit",
-                Some(413),
-                None,
-            ));
-        }
+        enforce_streamed_length_cap(&response, &policy)?;
         let artifact = tokio::time::timeout(
             remaining_until(deadline)?,
             persist_decoded_response(response, filename_prefix, extension, content_type, &policy),
@@ -1503,19 +1511,29 @@ pub async fn fetch(
     options: RequestOptions,
 ) -> Result<TransportResponse, McpError> {
     let base = vendor.base_url(config)?;
-    let url = normalize_url_with_base(&base, path);
+    let target = canonical_target(path)?;
     let method = options.method.unwrap_or(HttpMethod::Get);
+    // Plan §1.3: the request about to go on the wire is the fact policy is
+    // evaluated on. Outside an enforcing call scope this is one lookup.
+    let ticket =
+        crate::policy::authorize_egress(vendor.name(), method, &target, options.body.as_ref())
+            .await?;
+    let url = target.url_under(&base);
 
     let (auth_name, auth_header) = validate_auth(credentials)?;
     let timeout = resolve_timeout(config, options.timeout);
 
     let cache_config = response_cache::CacheConfig::from_config(config);
+    // Partitioned by the acting principal (WP A.5). `OwnerKey::current`
+    // allocates only inside an enterprise call scope; local mode hashes a
+    // constant.
     let cache_key = response_cache::CacheKey::new(
         vendor.name(),
         &url,
         &auth_name,
         &auth_header,
         &options.headers,
+        &crate::policy::OwnerKey::current(),
     );
     if method != HttpMethod::Get {
         response_cache::invalidate_namespace(vendor.name(), &base);
@@ -1523,6 +1541,7 @@ pub async fn fetch(
         && response_cache::request_is_cacheable(&url, &auth_name, &options)
         && let Some(body) = response_cache::get(&cache_key)
     {
+        report_cache_hit(ticket.as_ref());
         debug!(vendor = vendor.name(), %url, "HTTP response cache hit");
         return Ok(TransportResponse {
             data: body,
@@ -1530,12 +1549,7 @@ pub async fn fetch(
         });
     }
 
-    let request_body_for_log = options.body.clone().or_else(|| {
-        options
-            .form
-            .as_ref()
-            .and_then(|form| serde_json::to_value(form).ok())
-    });
+    let request_body_for_log = request_body_for_log(&options);
     let req = build_request(
         client,
         method,
@@ -1557,12 +1571,14 @@ pub async fn fetch(
     let call = HttpCallLog::new(vendor.name(), method.as_str(), &url);
     let start = call.started;
     let response = req.send().await.map_err(|error| {
+        report_attempt(ticket.as_ref(), None, Some("transport_error"));
         log_http_transport_failure(call, &error, false);
         map_reqwest_error(&error, &url)
     })?;
     let duration = start.elapsed();
 
     let status = response.status();
+    report_attempt(ticket.as_ref(), Some(status.as_u16()), None);
     if !status.is_success() {
         log_http_status_failure(call, status, false);
     }
@@ -1688,14 +1704,63 @@ fn streaming_client() -> Result<&'static Client, McpError> {
 
 // ---- helpers ----
 
-fn normalize_url_with_base(base: &str, path: &str) -> String {
-    let base = base.trim_end_matches('/');
-    let suffix = if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("/{path}")
-    };
-    format!("{base}{suffix}")
+/// Refuse a streamed response whose declared length already exceeds the
+/// encoded-bytes cap, before a byte of the body is read.
+fn enforce_streamed_length_cap(
+    response: &reqwest::Response,
+    policy: &StreamingPolicy,
+) -> Result<(), McpError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > policy.max_encoded_bytes)
+    {
+        return Err(api_error(
+            "encoded response exceeds streamed artifact limit",
+            Some(413),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Report one wire attempt on the request's egress record, when the call
+/// runs inside an enforcing scope (outside one there is no ticket).
+fn report_attempt(
+    ticket: Option<&crate::policy::EgressTicket>,
+    status: Option<u16>,
+    failure: Option<&'static str>,
+) {
+    if let Some(ticket) = ticket {
+        ticket.attempted(status, failure);
+    }
+}
+
+/// Report that the request was answered from the response cache.
+fn report_cache_hit(ticket: Option<&crate::policy::EgressTicket>) {
+    if let Some(ticket) = ticket {
+        ticket.cache_hit();
+    }
+}
+
+/// The request body as the diagnostic log and raw-response record show it:
+/// the JSON body, or the form encoded as JSON.
+fn request_body_for_log(options: &RequestOptions) -> Option<Value> {
+    options.body.clone().or_else(|| {
+        options
+            .form
+            .as_ref()
+            .and_then(|form| serde_json::to_value(form).ok())
+    })
+}
+
+/// Canonicalize the caller's path-and-query (plan §3.5) before it is joined
+/// onto the configured base. This is the one place an upstream URL is
+/// built from request data, so the form policy evaluates is the form sent.
+/// A path with no canonical form — an absolute URL, an invalid escape, a
+/// control byte — is refused with a 400-shaped error rather than sent.
+fn canonical_target(path: &str) -> Result<crate::policy::CanonicalTarget, McpError> {
+    crate::policy::CanonicalTarget::parse(path)
+        .map_err(|error| api_error(format!("Invalid request path: {error}"), Some(400), None))
 }
 
 fn validate_auth(credentials: &Credentials) -> Result<(HeaderName, HeaderValue), McpError> {

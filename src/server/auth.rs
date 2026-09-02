@@ -1,0 +1,388 @@
+//! Inbound bearer authentication for the HTTP transport (plan §3.7, WPs A.2
+//! and A.3).
+//!
+//! An axum middleware that turns `Authorization: Bearer …` into a validated
+//! [`Principal`](crate::policy::Principal) in the request extensions — which rmcp carries into
+//! `call_tool` (`docs/spikes/rmcp-extensions.md`) — and the RFC 9728
+//! protected-resource metadata document that tells a client *where* to get
+//! such a token.
+//!
+//! ## Responses
+//!
+//! | Situation | Status | `WWW-Authenticate` |
+//! |---|---|---|
+//! | No bearer, or not a bearer scheme | 401 | `Bearer realm=…, resource_metadata=…` |
+//! | Token rejected by the validator | 401 | `… error="invalid_token", error_description="<category>"` |
+//! | Validator has no signing keys | 503 | — (the token may be fine) |
+//! | Token valid but lacks the required scope | 403 | `… error="insufficient_scope", scope="<required>"` |
+//!
+//! `resource_metadata` points at `/.well-known/oauth-protected-resource` on
+//! the configured public URL, as RFC 9728 §5.1 specifies, so an MCP client
+//! that receives the 401 can discover the authorization server.
+//!
+//! ## Nothing about the token in logs
+//!
+//! The token is read from the header, handed to the validator, and dropped.
+//! Rejections are logged as their category only. Error bodies carry the
+//! category, never the token or any claim value.
+
+use std::sync::Arc;
+
+use axum::extract::{Request, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use tracing::warn;
+
+use crate::ports::{TokenRejection, TokenValidator};
+
+/// RFC 9728 well-known path.
+pub const PROTECTED_RESOURCE_METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
+
+/// Config key: the URL clients reach this server at, through the ingress.
+/// It is the RFC 9728 `resource` identifier and the base of the
+/// `resource_metadata` URL in every challenge. Required in enterprise mode.
+pub const PUBLIC_URL_KEY: &str = "MCP_PUBLIC_URL";
+
+/// Config key: the scope a token must carry to call tools. Defaults to
+/// [`DEFAULT_REQUIRED_SCOPE`].
+pub const REQUIRED_SCOPE_KEY: &str = "MCP_REQUIRED_SCOPE";
+
+/// The scope required for `/mcp` unless configured otherwise.
+pub const DEFAULT_REQUIRED_SCOPE: &str = "mcp:tools";
+
+/// The realm named in every challenge.
+const REALM: &str = "mcp-devtools";
+
+/// Everything the middleware and the metadata document need.
+#[derive(Debug, Clone)]
+pub struct InboundAuthSettings {
+    /// The resource identifier (RFC 9728 `resource`), no trailing slash.
+    pub public_url: String,
+    /// Issuer URLs of the authorization servers that mint accepted tokens.
+    pub authorization_servers: Vec<String>,
+    /// The scope every tool call needs.
+    pub required_scope: String,
+}
+
+impl InboundAuthSettings {
+    /// Read the public URL and required scope from configuration.
+    ///
+    /// # Errors
+    ///
+    /// When `MCP_PUBLIC_URL` is absent or not an `https` (or loopback
+    /// `http`) URL. A challenge that points clients at an unreachable or
+    /// plaintext metadata URL is worse than no challenge.
+    pub fn from_config(
+        config: &crate::config::Config,
+        authorization_servers: Vec<String>,
+    ) -> Result<Self, String> {
+        let public_url = config
+            .get(PUBLIC_URL_KEY)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "{PUBLIC_URL_KEY} is required when MCP_AUTH_MODE=okta: it is the RFC 9728 \
+                     resource identifier clients are told to obtain a token for"
+                )
+            })?
+            .trim_end_matches('/')
+            .to_owned();
+        let parsed = url::Url::parse(&public_url)
+            .map_err(|error| format!("{PUBLIC_URL_KEY} is not a URL: {error}"))?;
+        let loopback = match parsed.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+            None => false,
+        };
+        if !(parsed.scheme() == "https" || (parsed.scheme() == "http" && loopback)) {
+            return Err(format!(
+                "{PUBLIC_URL_KEY} must be an https URL (or http on loopback)"
+            ));
+        }
+        let required_scope = config
+            .get(REQUIRED_SCOPE_KEY)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(DEFAULT_REQUIRED_SCOPE)
+            .to_owned();
+        Ok(Self {
+            public_url,
+            authorization_servers,
+            required_scope,
+        })
+    }
+
+    fn metadata_url(&self) -> String {
+        format!("{}{PROTECTED_RESOURCE_METADATA_PATH}", self.public_url)
+    }
+}
+
+/// The middleware's state: a validator and the settings.
+pub struct InboundAuth {
+    validator: Arc<dyn TokenValidator>,
+    settings: InboundAuthSettings,
+}
+
+impl InboundAuth {
+    #[must_use]
+    pub fn new(validator: Arc<dyn TokenValidator>, settings: InboundAuthSettings) -> Self {
+        Self {
+            validator,
+            settings,
+        }
+    }
+
+    #[must_use]
+    pub fn settings(&self) -> &InboundAuthSettings {
+        &self.settings
+    }
+
+    /// The RFC 9728 document, as JSON.
+    #[must_use]
+    pub fn protected_resource_metadata(&self) -> serde_json::Value {
+        serde_json::json!({
+            "resource": self.settings.public_url,
+            "authorization_servers": self.settings.authorization_servers,
+            "scopes_supported": [self.settings.required_scope],
+            "bearer_methods_supported": ["header"],
+            "resource_name": REALM,
+        })
+    }
+}
+
+/// Serve the RFC 9728 metadata. Unauthenticated by design: it is how a
+/// client without a token learns where to get one.
+pub async fn protected_resource_metadata(State(auth): State<Arc<InboundAuth>>) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=300"),
+            ),
+        ],
+        auth.protected_resource_metadata().to_string(),
+    )
+        .into_response()
+}
+
+/// Require a valid bearer token with the configured scope; on success the
+/// [`Principal`](crate::policy::Principal) is in the request extensions for
+/// everything downstream.
+pub async fn require_bearer(
+    State(auth): State<Arc<InboundAuth>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let token = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(bearer_token);
+    let Some(token) = token else {
+        return auth.challenge(
+            StatusCode::UNAUTHORIZED,
+            None,
+            "unauthorized",
+            "a bearer token is required",
+        );
+    };
+
+    let principal = match auth.validator.validate(token).await {
+        Ok(principal) => principal,
+        Err(rejection) if rejection.is_server_side() => {
+            warn!(rejection = %rejection, "cannot validate bearer tokens; refusing (503)");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                )],
+                r#"{"error":"authentication_unavailable","error_description":"signing keys unavailable"}"#,
+            )
+                .into_response();
+        }
+        Err(rejection) => {
+            warn!(rejection = %rejection, "rejected bearer token");
+            let description = rejection_description(&rejection);
+            return auth.challenge(
+                StatusCode::UNAUTHORIZED,
+                Some(("invalid_token", rejection)),
+                "invalid_token",
+                description,
+            );
+        }
+    };
+
+    if !principal
+        .scopes
+        .iter()
+        .any(|scope| scope == &auth.settings.required_scope)
+    {
+        // Category only. The subject is a validated claim and belongs in the
+        // audit journal, which is the evidence pipeline; the operator log is
+        // not, so no token-derived value goes here.
+        warn!(
+            rejection = "insufficient_scope",
+            "bearer token lacks the required scope (403)"
+        );
+        return auth.insufficient_scope();
+    }
+
+    request.extensions_mut().insert(principal);
+    next.run(request).await
+}
+
+impl InboundAuth {
+    fn base_challenge(&self) -> String {
+        format!(
+            "Bearer realm=\"{REALM}\", resource_metadata=\"{}\"",
+            self.settings.metadata_url()
+        )
+    }
+
+    fn challenge(
+        &self,
+        status: StatusCode,
+        error: Option<(&str, TokenRejection)>,
+        body_error: &str,
+        body_description: &str,
+    ) -> Response {
+        let mut challenge = self.base_challenge();
+        if let Some((code, rejection)) = error {
+            use std::fmt::Write as _;
+            let _ = write!(
+                challenge,
+                ", error=\"{code}\", error_description=\"{}\"",
+                rejection.category()
+            );
+        }
+        error_response(status, &challenge, body_error, body_description)
+    }
+
+    fn insufficient_scope(&self) -> Response {
+        let challenge = format!(
+            "{}, error=\"insufficient_scope\", scope=\"{}\"",
+            self.base_challenge(),
+            self.settings.required_scope
+        );
+        error_response(
+            StatusCode::FORBIDDEN,
+            &challenge,
+            "insufficient_scope",
+            "the token does not carry the scope required for this resource",
+        )
+    }
+}
+
+fn error_response(status: StatusCode, challenge: &str, error: &str, description: &str) -> Response {
+    let body = serde_json::json!({
+        "error": error,
+        "error_description": description,
+    })
+    .to_string();
+    let challenge = HeaderValue::from_str(challenge)
+        .unwrap_or_else(|_| HeaderValue::from_static("Bearer realm=\"mcp-devtools\""));
+    (
+        status,
+        [
+            (header::WWW_AUTHENTICATE, challenge),
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// A human-readable description that names the category, and nothing else.
+fn rejection_description(rejection: &TokenRejection) -> &'static str {
+    match rejection {
+        TokenRejection::Expired => "the token has expired",
+        TokenRejection::NotYetValid => "the token is not yet valid",
+        TokenRejection::WrongIssuer => "the token was not issued by the configured issuer",
+        TokenRejection::WrongAudience => "the token is not intended for this resource",
+        TokenRejection::UnknownKey => "the token is signed with a key this server does not know",
+        TokenRejection::UnsupportedAlgorithm => "the token uses an unsupported algorithm",
+        TokenRejection::InvalidSignature => "the token signature did not verify",
+        TokenRejection::MissingClaim(_) => "the token is missing a required claim",
+        _ => "the token was not accepted",
+    }
+}
+
+/// `Bearer <token>` → `<token>`. Scheme matching is case-insensitive per RFC
+/// 6750; an empty token is treated as absent.
+fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, rest) = value.trim().split_once(char::is_whitespace)?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = rest.trim();
+    (!token.is_empty()).then_some(token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive_and_empty_tokens_are_absent() {
+        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("bearer   abc  "), Some("abc"));
+        assert_eq!(bearer_token("BEARER abc"), Some("abc"));
+        assert_eq!(bearer_token("Basic abc"), None);
+        assert_eq!(bearer_token("Bearer"), None);
+        assert_eq!(bearer_token("Bearer "), None);
+        assert_eq!(bearer_token(""), None);
+    }
+
+    #[test]
+    fn settings_require_a_public_https_url_and_default_the_scope() {
+        let config = |pairs: &[(&str, &str)]| {
+            crate::config::Config::from_map(
+                pairs
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .collect(),
+            )
+        };
+        let settings = InboundAuthSettings::from_config(
+            &config(&[("MCP_PUBLIC_URL", "https://mcp.acme.example/")]),
+            vec!["https://acme.okta.com/oauth2/default".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(settings.public_url, "https://mcp.acme.example");
+        assert_eq!(settings.required_scope, DEFAULT_REQUIRED_SCOPE);
+        assert_eq!(
+            settings.metadata_url(),
+            "https://mcp.acme.example/.well-known/oauth-protected-resource"
+        );
+
+        assert!(InboundAuthSettings::from_config(&config(&[]), Vec::new()).is_err());
+        assert!(
+            InboundAuthSettings::from_config(
+                &config(&[("MCP_PUBLIC_URL", "http://mcp.acme.example")]),
+                Vec::new()
+            )
+            .is_err()
+        );
+        let loopback = InboundAuthSettings::from_config(
+            &config(&[
+                ("MCP_PUBLIC_URL", "http://127.0.0.1:3000"),
+                ("MCP_REQUIRED_SCOPE", "mcp:read"),
+            ]),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(loopback.required_scope, "mcp:read");
+    }
+}

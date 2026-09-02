@@ -21,7 +21,13 @@ use mcp_server_devtools::config::Config;
 use mcp_server_devtools::format::jmespath::apply_jq_filter;
 use mcp_server_devtools::format::truncation::truncate_for_ai;
 use mcp_server_devtools::format::{OutputFormat, render, to_pretty_json};
-use mcp_server_devtools::policy::extractors::{grafana, jira};
+use mcp_server_devtools::policy::extractors::{for_tool, grafana, jira};
+use mcp_server_devtools::policy::{
+    ActionContext, CanonicalPath, CanonicalTarget, ClientIdentity, CredentialLabel,
+    EnvironmentClass, FilePolicy, Principal, PrincipalAuthority, RequestRisk, UpstreamAuthority,
+    UpstreamIdentity,
+};
+use mcp_server_devtools::ports::PolicyDecisionPoint;
 use mcp_server_devtools::transport::HttpMethod;
 use serde_json::{Value, json};
 
@@ -177,28 +183,265 @@ fn extractor_stage() {
         ("expand", "changelog"),
     ];
 
+    // §3.5 canonicalization runs on every outbound request, before any
+    // extractor — its allocation is paid by local mode too.
+    let search_target = format!(
+        "/rest/api/3/search/jql?jql={}&maxResults=100&fields=summary%2Cstatus&expand=changelog",
+        url::form_urlencoded::byte_serialize(long_jql.as_bytes()).collect::<String>()
+    );
+    probe("canonical: short path", 2000, || {
+        CanonicalTarget::parse("/rest/api/3/issue/PLAT-12345?fields=summary").ok()
+    });
+    probe("canonical: dot-segments + escapes", 2000, || {
+        CanonicalTarget::parse("/a/./b/../c/%2e%2e/rest/api/3/issue/PLAT%2D1/").ok()
+    });
+    probe("canonical: search URL (long JQL)", 2000, || {
+        CanonicalTarget::parse(&search_target).ok()
+    });
+
+    let issue_path = || CanonicalPath::parse("/rest/api/3/issue/PLAT-12345").unwrap();
+    let search_path = || CanonicalPath::parse("/rest/api/3/search/jql").unwrap();
+    let create_path = || CanonicalPath::parse("/rest/api/3/issue").unwrap();
     probe("jira::extract GET /issue/{key}", 2000, || {
         jira::extract(
             HttpMethod::Get,
-            "/rest/api/3/issue/PLAT-12345",
+            issue_path(),
             &[("fields", "summary")],
             None,
         )
     });
     probe("jira::extract GET /search/jql (long JQL)", 2000, || {
-        jira::extract(HttpMethod::Get, "/rest/api/3/search/jql", query, None)
+        jira::extract(HttpMethod::Get, search_path(), query, None)
     });
     probe("jira::project_keys_from_jql (long JQL)", 2000, || {
         jira::project_keys_from_jql(&long_jql)
     });
     probe("jira::extract unmapped (default arm)", 2000, || {
-        jira::extract(HttpMethod::Post, "/rest/api/3/issue", &[], None)
+        jira::extract(HttpMethod::Post, create_path(), &[], None)
     });
     probe("grafana::query_logs", 2000, || {
         grafana::query_logs(
             "loki-prod",
             &[("query", "{app=\"api\"}"), ("limit", "500"), ("start", "0")],
         )
+    });
+}
+
+/// The enterprise decision path, per tool call (plan §8 budgets: context
+/// build + canonicalization < 30 µs, policy decision < 20 µs for 500 rules).
+/// Measured against a 500-rule document so the matcher's cost is visible,
+/// not a three-rule best case.
+fn policy_stage() {
+    let mut document = String::from("version: 1\nrules:\n");
+    for index in 0..500 {
+        let env = ["qa", "prod", "staging", "dev"][index % 4];
+        let group = ["SRE", "Developers", "Contractors", "Auditors"][index % 4];
+        document.push_str(&format!(
+            "  - id: rule-{index}\n    effect: allow\n    subjects: {{groups: [{group}]}}\n    match:\n      vendor: grafana\n      environment: {env}\n      request_risk: read\n      resource_type: datasource\n      resource_id: [\"ds-{index}\", \"loki-{env}-*\"]\n"
+        ));
+    }
+    let policy = FilePolicy::from_bytes(document.as_bytes()).expect("bench policy compiles");
+    let principal = Principal {
+        tenant: "acme".to_owned(),
+        subject: "sre@acme.example".to_owned(),
+        groups: vec!["SRE".to_owned(), "Developers".to_owned()],
+        scopes: vec!["mcp:tools".to_owned()],
+        authority: PrincipalAuthority::Okta,
+    };
+    let upstream = UpstreamIdentity {
+        label: CredentialLabel::slot(
+            mcp_server_devtools::auth::secrets::for_vendor("grafana")
+                .next()
+                .expect("grafana slot"),
+        ),
+        vendor: "grafana".to_owned(),
+        environment: EnvironmentClass::Qa,
+        authority: UpstreamAuthority::Shared,
+    };
+    let arguments =
+        json!({ "datasourceUid": "loki-qa-main", "query": "{app=\"api\"}", "limit": 100 });
+    let arguments = arguments.as_object().unwrap();
+
+    let context = probe("ActionContext via for_tool (grafana)", 2000, || {
+        ActionContext::assemble(
+            principal.clone(),
+            ClientIdentity::default(),
+            None,
+            "grafana_query_logs",
+            for_tool("grafana_query_logs", Some(arguments), RequestRisk::Read),
+            None,
+            upstream.clone(),
+        )
+    });
+    // The last rule that matches an SRE/qa/loki-qa-* call is late in the
+    // document, so this walks most of the 500 rules.
+    probe("FilePolicy::evaluate @ 500 rules", 2000, || {
+        policy.evaluate(&context)
+    });
+}
+
+/// Like [`probe`], for a stage that has to `.await`. Same counters; the
+/// closure's future is driven to completion on the current runtime.
+async fn probe_async<F, Fut, T>(label: &str, iters: u32, mut f: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let (b0, c0) = (BYTES.load(Relaxed), COUNT.load(Relaxed));
+    let t0 = std::time::Instant::now();
+    let mut out = f().await;
+    for _ in 1..iters {
+        out = f().await;
+    }
+    let dt = t0.elapsed();
+    let n = u64::from(iters);
+    println!(
+        "  {label:<40} {:>9} KB {:>10} allocs {:>8.2} µs",
+        (BYTES.load(Relaxed) - b0) / 1024 / n,
+        (COUNT.load(Relaxed) - c0) / n,
+        dt.as_secs_f64() * 1_000_000.0 / f64::from(iters)
+    );
+    out
+}
+
+/// The two §8 budgets on the enterprise request path that nothing above
+/// probes: the validated-token cache hit (< 50 µs) and the durable audit
+/// append (< 200 µs p99 on local NVMe, with batched fsync). Both run
+/// against the production components — the Okta validator primed from a
+/// JWKS on wiremock, and the journal adapter on a temp directory — so the
+/// numbers are the real path, not a model of it.
+///
+/// The append here is sequential, one record at a time, which is the
+/// *worst* case for the journal's group commit: every record pays its own
+/// `sync_data`. Under concurrent calls the writer batches, and the per-record
+/// cost falls; read the p99 as "one call on an idle gateway".
+fn enterprise_request_path_stage() {
+    use std::sync::Arc;
+
+    use mcp_server_devtools::audit::journal::{JOURNAL_FILE_NAME, JournalAuditSink};
+    use mcp_server_devtools::auth::okta::{OktaJwksValidator, OktaSettings};
+    use mcp_server_devtools::ports::{AuditEvent, AuditEventKind, AuditSink, TokenValidator};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const ISSUER: &str = "https://acme.okta.com/oauth2/default";
+    const AUDIENCE: &str = "api://mcp-devtools";
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        // -- JWT validation, cache hit --
+        let jwks = MockServer::start().await;
+        let jwk: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/okta_test_jwk.json")).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [jwk] })))
+            .mount(&jwks)
+            .await;
+        let validator = Arc::new(OktaJwksValidator::new(
+            OktaSettings {
+                issuer: ISSUER.to_owned(),
+                audience: AUDIENCE.to_owned(),
+                jwks_url: format!("{}/keys", jwks.uri()),
+                groups_claim: "groups".to_owned(),
+                clock_skew: std::time::Duration::from_secs(60),
+                tenant: "acme".to_owned(),
+                jwks_refresh: std::time::Duration::from_secs(600),
+                jwks_min_refetch_interval: std::time::Duration::from_secs(30),
+            },
+            reqwest::Client::new(),
+        ));
+        let now = jsonwebtoken::get_current_timestamp();
+        let claims = json!({
+            "sub": "alice@acme.example", "iss": ISSUER, "aud": AUDIENCE,
+            "iat": now, "exp": now + 300, "scp": ["mcp:tools"], "groups": ["SRE", "Developers"],
+        });
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some("test-key-1".to_owned());
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_rsa_der(include_bytes!(
+                "../tests/fixtures/okta_test_rsa_pkcs1.der"
+            )),
+        )
+        .unwrap();
+        // Prime: the first validation fetches the JWKS and verifies the
+        // signature; every one after it is the cache hit under budget.
+        validator.validate(&token).await.expect("token validates");
+        probe_async("JWT validate: cache hit (budget 50 µs)", 2000, || {
+            validator.validate(&token)
+        })
+        .await
+        .expect("cached token validates");
+
+        // -- Durable audit append --
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_dir = dir.path().join("journal");
+        if cfg!(windows) {
+            std::fs::create_dir_all(&journal_dir).unwrap();
+            std::fs::File::create(journal_dir.join(JOURNAL_FILE_NAME)).unwrap();
+        }
+        let sink = JournalAuditSink::open(&journal_dir).expect("open journal");
+        let event = AuditEvent {
+            timestamp: "2026-09-02T00:00:00.000Z".to_owned(),
+            kind: AuditEventKind::ToolCallIntent,
+            request_id: "sha256:0123456789abcdef".to_owned(),
+            tool_name: "grafana_query_logs".to_owned(),
+            vendor: "grafana".to_owned(),
+            principal: Principal {
+                tenant: "acme".to_owned(),
+                subject: "sre@acme.example".to_owned(),
+                groups: vec!["SRE".to_owned()],
+                scopes: vec!["mcp:tools".to_owned()],
+                authority: PrincipalAuthority::Okta,
+            },
+            client: ClientIdentity::default(),
+            decision: mcp_server_devtools::policy::PolicyDecision::by_rule(
+                mcp_server_devtools::policy::PolicyEffect::Allow,
+                "sre-read-qa-datasources",
+                "v1+sha256:0123456789abcdef",
+            ),
+            upstream_identity: UpstreamIdentity {
+                label: CredentialLabel::slot(
+                    mcp_server_devtools::auth::secrets::for_vendor("grafana")
+                        .next()
+                        .expect("grafana slot"),
+                ),
+                vendor: "grafana".to_owned(),
+                environment: EnvironmentClass::Qa,
+                authority: UpstreamAuthority::Shared,
+            },
+            action: None,
+            outcome: None,
+            duration_ms: None,
+            egress: None,
+        };
+        const APPENDS: usize = 1000;
+        let mut latencies = Vec::with_capacity(APPENDS);
+        let (b0, c0) = (BYTES.load(Relaxed), COUNT.load(Relaxed));
+        for _ in 0..APPENDS {
+            let started = std::time::Instant::now();
+            sink.append(&event).await.expect("append");
+            latencies.push(started.elapsed());
+        }
+        let (bytes, allocs) = (
+            (BYTES.load(Relaxed) - b0) / 1024 / APPENDS as u64,
+            (COUNT.load(Relaxed) - c0) / APPENDS as u64,
+        );
+        latencies.sort_unstable();
+        let at = |quantile: f64| latencies[((APPENDS - 1) as f64 * quantile) as usize];
+        println!(
+            "  {:<40} {bytes:>9} KB {allocs:>10} allocs  p50 {:>7.0} µs  p99 {:>7.0} µs  max {:>7.0} µs",
+            "journal append, sequential (budget p99 200 µs)",
+            at(0.50).as_secs_f64() * 1_000_000.0,
+            at(0.99).as_secs_f64() * 1_000_000.0,
+            latencies[APPENDS - 1].as_secs_f64() * 1_000_000.0,
+        );
+        drop(sink);
     });
 }
 
@@ -210,6 +453,12 @@ fn main() {
     // response pipeline below and so is invisible to every probe in it.
     println!("\n=== stage -1: policy extractors, per tool call (mean of 2000) ===");
     extractor_stage();
+    println!("\n=== stage -1b: policy decision, per tool call (mean of 2000) ===");
+    policy_stage();
+    println!(
+        "\n=== stage -1c: enterprise request path, production components (mean of 2000 / 1000) ==="
+    );
+    enterprise_request_path_stage();
 
     // Stage 0 runs once per *tool call*, before any payload work — so unlike the
     // stages below it is paid even by a request that returns two bytes.

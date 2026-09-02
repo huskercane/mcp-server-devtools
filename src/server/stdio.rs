@@ -32,6 +32,7 @@ pub async fn run_stdio() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     // HTTP transport: see `shutdown::install`.
     let shutdown_signal = shutdown::install();
     let handler = DevtoolsServer::new().map_err(boxed_err)?;
+    let pending_audit = handler.pending_audit();
     let transport = stdio();
     let service = handler.serve(transport).await?;
 
@@ -48,6 +49,7 @@ pub async fn run_stdio() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     // Natural exit (peer closed stdio): abort the signal task so it doesn't
     // linger for a signal that will never come.
     shutdown_task.abort();
+    crate::tools::drain_pending_audit(&pending_audit).await;
     crate::transport::raw_response::shutdown_and_cleanup().await;
     waited?;
     Ok(())

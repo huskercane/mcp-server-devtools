@@ -18,10 +18,13 @@
 //! - **No regex on the hot path**: hand-rolled scanning only, and no
 //!   allocation beyond the ids and the canonical path that actually leave
 //!   the function.
-//! - Canonicalization here is the tool-level minimum (leading slash,
-//!   trailing-slash trim, duplicate-slash collapse). The full §3.5
-//!   canonicalizer (percent-decoding, dot-segments, fuzzing) is Phase A
-//!   work (A.6) and slots in before these run in production.
+//! - **Canonical input only.** Extractors take a [`CanonicalPath`], which
+//!   only [`super::canonical`] can construct, so the §3.5 normalization
+//!   (single unreserved decode, dot-segment removal, slash collapse,
+//!   re-encoding) has always happened before a route is classified. A
+//!   segment that still carries a percent-escape after canonicalization is
+//!   never claimed as a resource id: it is an escape of a reserved or
+//!   non-path character, and no id vocabulary here contains one.
 //!
 //! ## What "sound" cost us, and why it is the right trade
 //!
@@ -34,30 +37,11 @@
 
 use crate::transport::HttpMethod;
 
-use super::{ActionDetails, ApprovedReadDowngrade, NormalizedAction, ResourceScope, ResourceType};
-
-/// Minimal tool-level path normalization shared by extractors. See module
-/// docs for what this deliberately does not do yet.
-fn normalize_path(path: &str) -> String {
-    let mut out = String::with_capacity(path.len() + 1);
-    out.push('/');
-    let mut last_was_slash = true;
-    for ch in path.chars() {
-        if ch == '/' {
-            if !last_was_slash {
-                out.push('/');
-            }
-            last_was_slash = true;
-        } else {
-            out.push(ch);
-            last_was_slash = false;
-        }
-    }
-    if out.len() > 1 && out.ends_with('/') {
-        out.pop();
-    }
-    out
-}
+use super::canonical::{CanonicalPath, CanonicalTarget};
+use super::{
+    ActionDetails, ApprovedReadDowngrade, NormalizedAction, RequestRisk, ResourceConstraint,
+    ResourceScope, ResourceType,
+};
 
 /// How an allowlisted query value is retained in `query_attributes`.
 ///
@@ -184,8 +168,8 @@ fn expression_digest(value: &str) -> String {
 /// not derived from the HTTP method.
 pub mod grafana {
     use super::{
-        ActionDetails, HttpMethod, NormalizedAction, ResourceScope, ResourceType, Retention,
-        allowlisted_attributes,
+        ActionDetails, CanonicalPath, HttpMethod, NormalizedAction, ResourceScope, ResourceType,
+        Retention, allowlisted_attributes,
     };
 
     /// Query params of `grafana_query_logs` that are policy-relevant.
@@ -203,8 +187,10 @@ pub mod grafana {
         ("step", Retention::Digest),
     ];
 
-    /// Path prefix of the datasource proxy, without the UID.
-    const PROXY_PREFIX: &str = "/api/datasources/proxy/uid";
+    /// Path segments of the datasource proxy prefix, without the UID.
+    const PROXY_PREFIX: [&str; 4] = ["api", "datasources", "proxy", "uid"];
+    /// Path segments of Loki's range query, after the UID.
+    const LOKI_QUERY_RANGE: [&str; 4] = ["loki", "api", "v1", "query_range"];
 
     /// Grafana UIDs are at most 40 characters; 64 leaves headroom without
     /// letting an unbounded string into a path.
@@ -239,20 +225,48 @@ pub mod grafana {
     /// dressed up as a legitimate path.
     #[must_use]
     pub fn query_logs(datasource_uid: &str, params: &[(&str, &str)]) -> ActionDetails {
-        if !is_valid_datasource_uid(datasource_uid) {
-            return ActionDetails::unclassified_with_attributes(
-                HttpMethod::Get,
-                PROXY_PREFIX.to_owned(),
+        // A valid UID is unreserved-only and never `.`/`..`, so the plain
+        // path always builds; the fallback arm exists so this stays total
+        // rather than panicking if the alphabet and the builder ever drift.
+        let proxy_path = is_valid_datasource_uid(datasource_uid)
+            .then(|| {
+                let [prefix0, prefix1, prefix2, prefix3] = PROXY_PREFIX;
+                let [loki0, loki1, loki2, loki3] = LOKI_QUERY_RANGE;
+                CanonicalPath::from_plain_segments(&[
+                    prefix0,
+                    prefix1,
+                    prefix2,
+                    prefix3,
+                    datasource_uid,
+                    loki0,
+                    loki1,
+                    loki2,
+                    loki3,
+                ])
+            })
+            .flatten();
+        match proxy_path {
+            Some(path) => ActionDetails::read(
+                NormalizedAction::QueryLogs,
+                path,
                 allowlisted_attributes(params, QUERY_LOGS_ALLOWLIST),
-            );
+                ResourceType::Datasource,
+                ResourceScope::id(datasource_uid),
+            ),
+            None => ActionDetails::unclassified_with_attributes(
+                HttpMethod::Get,
+                proxy_prefix_path(),
+                allowlisted_attributes(params, QUERY_LOGS_ALLOWLIST),
+            ),
         }
-        ActionDetails::read(
-            NormalizedAction::QueryLogs,
-            format!("{PROXY_PREFIX}/{datasource_uid}/loki/api/v1/query_range"),
-            allowlisted_attributes(params, QUERY_LOGS_ALLOWLIST),
-            ResourceType::Datasource,
-            ResourceScope::id(datasource_uid),
-        )
+    }
+
+    /// The proxy prefix as a canonical path — where a hostile UID is
+    /// reported *without* echoing the UID itself. The segments are plain
+    /// literals, so the fallback to `/` is unreachable; it keeps the
+    /// function total without an `expect`.
+    fn proxy_prefix_path() -> CanonicalPath {
+        CanonicalPath::from_plain_segments(&PROXY_PREFIX).unwrap_or_else(CanonicalPath::root)
     }
 
     /// `grafana_list_datasources`: enumerates datasources. Addresses the
@@ -263,11 +277,57 @@ pub mod grafana {
     pub fn list_datasources() -> ActionDetails {
         ActionDetails::read(
             NormalizedAction::ListDatasources,
-            "/api/datasources".to_owned(),
+            CanonicalPath::from_plain_segments(&["api", "datasources"])
+                .unwrap_or_else(CanonicalPath::root),
             Vec::new(),
             ResourceType::Datasource,
             ResourceScope::collection(),
         )
+    }
+
+    /// Classify a Grafana HTTP call by its canonical path, for the egress
+    /// chokepoint: the request the vendor client is about to send, mapped
+    /// back onto the same vocabulary the purpose-built tools declare.
+    ///
+    /// Only the two purpose-built read endpoints are mapped. Everything else
+    /// is `Passthrough`/`Unknown`, which default-deny denies — including a
+    /// proxy path whose UID segment is not a valid UID.
+    #[must_use]
+    pub fn extract(
+        method: HttpMethod,
+        path: CanonicalPath,
+        query: &[(&str, &str)],
+    ) -> ActionDetails {
+        // Segment buffer sized for the longest mapped route (nine segments)
+        // plus one so a longer path is detectably longer, not truncated.
+        const MAX_SEGMENTS: usize = 10;
+        if method != HttpMethod::Get {
+            return ActionDetails::unclassified(method, path);
+        }
+        let mut buffer: [&str; MAX_SEGMENTS] = [""; MAX_SEGMENTS];
+        let mut count = 0usize;
+        for segment in path.as_str().split('/').filter(|part| !part.is_empty()) {
+            if count == MAX_SEGMENTS {
+                return ActionDetails::unclassified(method, path);
+            }
+            buffer[count] = segment;
+            count += 1;
+        }
+        match &buffer[..count] {
+            ["api", "datasources"] => list_datasources(),
+            [
+                "api",
+                "datasources",
+                "proxy",
+                "uid",
+                uid,
+                "loki",
+                "api",
+                "v1",
+                "query_range",
+            ] if is_valid_datasource_uid(uid) => query_logs(uid, query),
+            _ => ActionDetails::unclassified(method, path),
+        }
     }
 }
 
@@ -275,8 +335,8 @@ pub mod grafana {
 /// generic `jira_*` verb tools onto normalized actions.
 pub mod jira {
     use super::{
-        ActionDetails, ApprovedReadDowngrade, HttpMethod, NormalizedAction, ResourceScope,
-        ResourceType, Retention, allowlisted_attributes, normalize_path,
+        ActionDetails, ApprovedReadDowngrade, CanonicalPath, HttpMethod, NormalizedAction,
+        ResourceConstraint, ResourceScope, ResourceType, Retention, allowlisted_attributes,
     };
 
     /// Query keys retained for the GET search endpoint. The scope claim is
@@ -326,11 +386,11 @@ pub mod jira {
         }
 
         match (method, &buffer[..count]) {
-            (HttpMethod::Get, ["rest", "api", "3", "issue", key]) => {
+            (HttpMethod::Get, ["rest", "api", "3", "issue", key]) if is_plain_id(key) => {
                 Route::ReadIssue((*key).to_owned())
             }
             (HttpMethod::Get, ["rest", "api", "3", "project"]) => Route::ListProjects,
-            (HttpMethod::Get, ["rest", "api", "3", "project", key]) => {
+            (HttpMethod::Get, ["rest", "api", "3", "project", key]) if is_plain_id(key) => {
                 Route::ReadProject((*key).to_owned())
             }
             (HttpMethod::Get | HttpMethod::Post, ["rest", "api", "3", "search", "jql"]) => {
@@ -338,6 +398,14 @@ pub mod jira {
             }
             _ => Route::Unmapped,
         }
+    }
+
+    /// A segment that can be claimed as an issue or project key. After
+    /// canonicalization the only `%` left in a segment escapes a reserved
+    /// or non-path byte, and no Jira key contains one — so a segment still
+    /// carrying an escape is not something this extractor can vouch for.
+    fn is_plain_id(segment: &str) -> bool {
+        !segment.is_empty() && !segment.contains('%')
     }
 
     /// Classify a Jira REST call. Everything this function cannot prove is
@@ -349,13 +417,11 @@ pub mod jira {
     #[must_use]
     pub fn extract(
         method: HttpMethod,
-        path: &str,
+        canonical_path: CanonicalPath,
         query: &[(&str, &str)],
         body: Option<&serde_json::Value>,
     ) -> ActionDetails {
-        let canonical_path = normalize_path(path);
-
-        match classify(method, &canonical_path) {
+        match classify(method, canonical_path.as_str()) {
             Route::ReadIssue(key) => ActionDetails::read(
                 NormalizedAction::ReadIssue,
                 canonical_path,
@@ -403,13 +469,16 @@ pub mod jira {
     /// `Write` to `Read` **for this endpoint only**.
     fn search_details(
         method: HttpMethod,
-        canonical_path: String,
+        canonical_path: CanonicalPath,
         query_attributes: Vec<(String, String)>,
         jql: Option<&str>,
     ) -> ActionDetails {
-        let resource_scope = jql
+        // CF-2: a search returns *issues* — which ones is not provable, so
+        // the issue scope is unscoped — and is bounded by *projects*, which
+        // is a constraint in the project namespace, never an issue id.
+        let constraint = jql
             .and_then(project_keys_from_jql)
-            .map_or(ResourceScope::unscoped(), ResourceScope::ids);
+            .and_then(|keys| ResourceConstraint::ids(ResourceType::Project, keys));
         // GET is an ordinary read; POST is the module's one downgrade, and
         // it can only be spelled by naming the approved endpoint — which
         // binds its own action, path, and resource type, so only the
@@ -420,14 +489,16 @@ pub mod jira {
                 canonical_path,
                 query_attributes,
                 ResourceType::Issue,
-                resource_scope,
-            );
+                ResourceScope::unscoped(),
+            )
+            .constrained_by(constraint);
         }
         ActionDetails::read_downgrade(
             ApprovedReadDowngrade::JIRA_SEARCH_JQL,
             query_attributes,
-            resource_scope,
+            ResourceScope::unscoped(),
         )
+        .constrained_by(constraint)
     }
 
     /// Longest JQL this scanner will look at. Beyond it the answer is "no
@@ -658,6 +729,119 @@ pub mod jira {
     }
 }
 
+/// The wire request a vendor client is about to send, classified for the
+/// egress chokepoint (plan §1.3). Vendors without an extractor are
+/// `Passthrough`/`Unknown`, which default-deny denies: in enterprise mode a
+/// vendor is reachable only once it has a read-endpoint inventory.
+#[must_use]
+pub fn for_vendor(
+    vendor: &str,
+    method: HttpMethod,
+    target: &CanonicalTarget,
+    body: Option<&serde_json::Value>,
+) -> ActionDetails {
+    let query = target.query_pairs();
+    match vendor {
+        crate::config::VENDOR_GRAFANA => grafana::extract(method, target.path().clone(), &query),
+        crate::config::VENDOR_JIRA => jira::extract(method, target.path().clone(), &query, body),
+        _ => ActionDetails::unclassified(method, target.path().clone()),
+    }
+}
+
+/// What a tool call *asks for*, from its JSON arguments, for the tool-level
+/// decision that runs before dispatch (plan §1.3: layered on top of egress,
+/// never the only guard). Purpose-built tools map from their typed
+/// arguments; passthrough tools canonicalize their `path` and `queryParams`
+/// exactly as the transport will; anything else is
+/// [`ActionDetails::unmapped_tool`] with the risk the server's own tool
+/// annotations declare.
+#[must_use]
+pub fn for_tool(
+    tool: &str,
+    arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+    declared_risk: RequestRisk,
+) -> ActionDetails {
+    let text = |key: &str| {
+        arguments
+            .and_then(|args| args.get(key))
+            .and_then(serde_json::Value::as_str)
+    };
+    match tool {
+        "grafana_list_datasources" => grafana::list_datasources(),
+        "grafana_query_logs" => {
+            let uid = text("datasourceUid").unwrap_or_default();
+            let limit = arguments
+                .and_then(|args| args.get("limit"))
+                .map(serde_json::Value::to_string);
+            let mut params: Vec<(&str, &str)> = Vec::with_capacity(6);
+            for key in ["query", "start", "end", "direction", "step"] {
+                if let Some(value) = text(key) {
+                    params.push((key, value));
+                }
+            }
+            if let Some(limit) = limit.as_deref() {
+                params.push(("limit", limit));
+            }
+            grafana::query_logs(uid, &params)
+        }
+        "jira_get" | "jira_post" | "jira_put" | "jira_patch" | "jira_delete" => {
+            let method = match tool {
+                "jira_get" => HttpMethod::Get,
+                "jira_post" => HttpMethod::Post,
+                "jira_put" => HttpMethod::Put,
+                "jira_patch" => HttpMethod::Patch,
+                _ => HttpMethod::Delete,
+            };
+            passthrough_details(method, arguments, |target, query, body| {
+                jira::extract(method, target.path().clone(), query, body)
+            })
+        }
+        _ => ActionDetails::unmapped_tool(declared_risk),
+    }
+}
+
+/// Canonicalize a passthrough tool's `path` + `queryParams` the way the
+/// controller and transport will, then hand the result to the vendor's
+/// extractor. A path with no canonical form is `Unknown` (the transport
+/// will refuse it too).
+fn passthrough_details(
+    method: HttpMethod,
+    arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+    extract: impl FnOnce(&CanonicalTarget, &[(&str, &str)], Option<&serde_json::Value>) -> ActionDetails,
+) -> ActionDetails {
+    let path = arguments
+        .and_then(|args| args.get("path"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let mut path_and_query = path.to_owned();
+    if let Some(query) = arguments
+        .and_then(|args| args.get("queryParams"))
+        .and_then(serde_json::Value::as_object)
+    {
+        let encoded = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(
+                query
+                    .iter()
+                    .filter_map(|(key, value)| Some((key.as_str(), value.as_str()?))),
+            )
+            .finish();
+        if !encoded.is_empty() {
+            path_and_query.push(if path_and_query.contains('?') {
+                '&'
+            } else {
+                '?'
+            });
+            path_and_query.push_str(&encoded);
+        }
+    }
+    let Ok(target) = CanonicalTarget::parse(&path_and_query) else {
+        return ActionDetails::unclassified(method, CanonicalPath::root());
+    };
+    let query = target.query_pairs();
+    let body = arguments.and_then(|args| args.get("body"));
+    extract(&target, &query, body)
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -665,7 +849,94 @@ mod tests {
     use super::*;
     use crate::policy::RequestRisk;
 
+    /// Tests supply raw paths; production supplies a [`CanonicalPath`]
+    /// minted by the transport. Canonicalizing here is the same step the
+    /// transport performs before an extractor ever runs.
+    fn extract_jira(
+        method: HttpMethod,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<&serde_json::Value>,
+    ) -> ActionDetails {
+        jira::extract(method, CanonicalPath::parse(path).unwrap(), query, body)
+    }
+
     // ---- Grafana (purpose-built) ----
+
+    /// The egress classifier maps the wire request back onto the same
+    /// vocabulary the typed tool declares, so a tool-level decision and an
+    /// egress decision about the same call are about the same facts.
+    #[test]
+    fn grafana_egress_extractor_agrees_with_the_typed_tool() {
+        let query: &[(&str, &str)] = &[("query", "{app=\"api\"}"), ("limit", "10")];
+        let via_wire = grafana::extract(
+            HttpMethod::Get,
+            CanonicalPath::parse("/api/datasources/proxy/uid/loki-prod/loki/api/v1/query_range")
+                .unwrap(),
+            query,
+        );
+        assert_eq!(via_wire, grafana::query_logs("loki-prod", query));
+
+        assert_eq!(
+            grafana::extract(
+                HttpMethod::Get,
+                CanonicalPath::parse("/api/datasources").unwrap(),
+                &[]
+            ),
+            grafana::list_datasources()
+        );
+
+        // Anything else on the Grafana API is unmapped: a POST to the same
+        // proxy, a write endpoint, a proxy path whose UID segment is not a
+        // UID, or a longer path that merely starts like the mapped one.
+        for (method, path) in [
+            (
+                HttpMethod::Post,
+                "/api/datasources/proxy/uid/loki-prod/loki/api/v1/query_range",
+            ),
+            (
+                HttpMethod::Get,
+                "/api/datasources/proxy/uid/loki-prod/loki/api/v1/push",
+            ),
+            (
+                HttpMethod::Get,
+                "/api/datasources/proxy/uid/a%2Fb/loki/api/v1/query_range",
+            ),
+            (
+                HttpMethod::Get,
+                "/api/datasources/proxy/uid/loki-prod/loki/api/v1/query_range/extra",
+            ),
+            (HttpMethod::Delete, "/api/datasources"),
+            (HttpMethod::Get, "/api/admin/settings"),
+        ] {
+            let details = grafana::extract(method, CanonicalPath::parse(path).unwrap(), &[]);
+            assert_eq!(
+                details.resource_type,
+                ResourceType::Unknown,
+                "{method:?} {path} must not classify"
+            );
+            assert_eq!(details.normalized_action, NormalizedAction::Passthrough);
+        }
+    }
+
+    /// An id segment that still carries an escape after canonicalization
+    /// is not a Jira key and must not be claimed as one.
+    #[test]
+    fn jira_never_claims_an_escaped_segment_as_an_id() {
+        for path in [
+            "/rest/api/3/issue/PLAT-1%2Fcomment",
+            "/rest/api/3/issue/PLAT%201",
+            "/rest/api/3/project/W%2FEB",
+        ] {
+            let details = extract_jira(HttpMethod::Get, path, &[], None);
+            assert_eq!(details.resource_type, ResourceType::Unknown, "{path}");
+            assert_eq!(details.resource_scope, ResourceScope::unscoped(), "{path}");
+        }
+        // Whereas an encoded *unreserved* character decodes into a plain
+        // key and is fine.
+        let details = extract_jira(HttpMethod::Get, "/rest/api/3/issue/PLAT%2D1", &[], None);
+        assert_eq!(details.resource_scope, ResourceScope::id("PLAT-1"));
+    }
 
     #[test]
     fn grafana_query_logs_is_a_datasource_read_with_allowlisted_sorted_attributes() {
@@ -761,7 +1032,7 @@ mod tests {
     // ---- Jira passthrough: the POST search endpoint ----
 
     fn post_search(body: &serde_json::Value) -> ActionDetails {
-        jira::extract(HttpMethod::Post, "/rest/api/3/search/jql", &[], Some(body))
+        extract_jira(HttpMethod::Post, "/rest/api/3/search/jql", &[], Some(body))
     }
 
     #[test]
@@ -778,17 +1049,23 @@ mod tests {
             "explicit downgrade"
         );
         assert_eq!(details.resource_type, ResourceType::Issue);
-        assert_eq!(details.resource_scope, ResourceScope::id("PLAT"));
+        // CF-2: the issues are unscoped; the *projects* are the constraint.
+        assert!(details.resource_scope.is_unscoped());
+        assert_eq!(details.constraint(), project_constraint(["PLAT"]).as_ref());
+    }
+
+    fn project_constraint<const N: usize>(keys: [&str; N]) -> Option<ResourceConstraint> {
+        ResourceConstraint::ids(ResourceType::Project, keys)
     }
 
     #[test]
-    fn post_search_keeps_every_project_of_an_in_list_as_a_structured_scope() {
+    fn post_search_keeps_every_project_of_an_in_list_as_a_structured_constraint() {
         let details = post_search(&serde_json::json!({
             "jql": "project in (WEB, PLAT, WEB) AND status = Open",
         }));
         assert_eq!(
-            details.resource_scope,
-            ResourceScope::ids(["PLAT", "WEB"]),
+            details.constraint(),
+            project_constraint(["PLAT", "WEB"]).as_ref(),
             "both projects stay separately addressable — never comma-joined \
              into one opaque id"
         );
@@ -805,14 +1082,15 @@ mod tests {
             "jql": "project = SECRET",
         }));
         assert_eq!(
-            details.resource_scope,
-            ResourceScope::id("SECRET"),
-            "scope must come from the JQL Jira actually executes"
+            details.constraint(),
+            project_constraint(["SECRET"]).as_ref(),
+            "the constraint must come from the JQL Jira actually executes"
         );
 
         // And with no JQL at all, a body `project` buys no claim either.
         let decoy_only = post_search(&serde_json::json!({ "project": "PUBLIC" }));
-        assert_eq!(decoy_only.resource_scope, ResourceScope::unscoped());
+        assert_eq!(decoy_only.constraint(), None);
+        assert!(decoy_only.resource_scope.is_unscoped());
     }
 
     #[test]
@@ -827,10 +1105,11 @@ mod tests {
         ] {
             let details = post_search(&serde_json::json!({ "jql": jql }));
             assert_eq!(
-                details.resource_scope,
-                ResourceScope::unscoped(),
-                "jql {jql:?} must not be claimed as project-scoped"
+                details.constraint(),
+                None,
+                "jql {jql:?} must not be claimed as project-constrained"
             );
+            assert!(details.resource_scope.is_unscoped());
             // Still a classified read of issues — just unscoped.
             assert_eq!(details.resource_type, ResourceType::Issue);
             assert_eq!(details.request_risk, RequestRisk::Read);
@@ -939,14 +1218,17 @@ mod tests {
             Some(vec!["A,B".to_owned(), "C".to_owned()])
         );
         let details = post_search(&serde_json::json!({ "jql": "project in (\"A,B\", C)" }));
-        assert_eq!(details.resource_scope, ResourceScope::ids(["A,B", "C"]));
+        assert_eq!(
+            details.constraint(),
+            project_constraint(["A,B", "C"]).as_ref()
+        );
     }
 
     // ---- The confusion the brief warns about: same verb, different risk ----
 
     #[test]
     fn post_issue_creation_stays_write_and_unknown_never_a_read() {
-        let details = jira::extract(
+        let details = extract_jira(
             HttpMethod::Post,
             "/rest/api/3/issue",
             &[],
@@ -959,17 +1241,17 @@ mod tests {
 
     #[test]
     fn unmapped_paths_are_passthrough_unknown_with_method_derived_risk() {
-        let get = jira::extract(HttpMethod::Get, "/rest/api/3/somethingelse", &[], None);
+        let get = extract_jira(HttpMethod::Get, "/rest/api/3/somethingelse", &[], None);
         assert_eq!(get.resource_type, ResourceType::Unknown);
         assert_eq!(get.request_risk, RequestRisk::Read);
 
-        let delete = jira::extract(HttpMethod::Delete, "/rest/api/3/issue/PLAT-1", &[], None);
+        let delete = extract_jira(HttpMethod::Delete, "/rest/api/3/issue/PLAT-1", &[], None);
         assert_eq!(delete.normalized_action, NormalizedAction::Passthrough);
         assert_eq!(delete.request_risk, RequestRisk::Destructive);
 
         // Deeper than the classifier looks: still unmapped, never a partial
         // match against a shorter route.
-        let deep = jira::extract(
+        let deep = extract_jira(
             HttpMethod::Get,
             "/rest/api/3/issue/PLAT-1/a/b/c/d/e/f/g",
             &[],
@@ -983,25 +1265,27 @@ mod tests {
 
     #[test]
     fn issue_and_project_reads_extract_their_resource_ids() {
-        let issue = jira::extract(
+        let issue = extract_jira(
             HttpMethod::Get,
             "//rest/api/3//issue/PLAT-123/",
             &[("fields", "summary"), ("expand", "changelog")],
             None,
         );
         assert_eq!(issue.normalized_action, NormalizedAction::ReadIssue);
-        assert_eq!(issue.canonical_path, "/rest/api/3/issue/PLAT-123");
+        // Duplicate slashes collapse; the trailing slash is kept (Django-style
+        // APIs distinguish it) and does not affect the classification.
+        assert_eq!(issue.canonical_path, "/rest/api/3/issue/PLAT-123/");
         assert_eq!(issue.resource_scope, ResourceScope::id("PLAT-123"));
         assert_eq!(issue.query_attributes().len(), 1);
         assert_eq!(issue.query_attributes()[0].0, "fields");
         assert!(issue.query_attributes()[0].1.starts_with("sha256:"));
 
-        let project = jira::extract(HttpMethod::Get, "/rest/api/3/project/WEB", &[], None);
+        let project = extract_jira(HttpMethod::Get, "/rest/api/3/project/WEB", &[], None);
         assert_eq!(project.normalized_action, NormalizedAction::ReadProject);
         assert_eq!(project.resource_type, ResourceType::Project);
         assert_eq!(project.resource_scope, ResourceScope::id("WEB"));
 
-        let list = jira::extract(HttpMethod::Get, "/rest/api/3/project", &[], None);
+        let list = extract_jira(HttpMethod::Get, "/rest/api/3/project", &[], None);
         assert_eq!(list.resource_scope, ResourceScope::collection());
     }
 
@@ -1010,7 +1294,7 @@ mod tests {
     #[test]
     fn search_expressions_never_reach_query_attributes_as_text() {
         let secret_jql = "project = PLAT AND text ~ \"Bearer sk-live-abcdef0123456789\"";
-        let details = jira::extract(
+        let details = extract_jira(
             HttpMethod::Get,
             "/rest/api/3/search/jql",
             &[("jql", secret_jql), ("fields", "summary")],
@@ -1030,7 +1314,7 @@ mod tests {
             .expect("jql attribute retained");
         assert!(jql.1.starts_with("sha256:"), "digest retained: {}", jql.1);
         // Same expression, same handle — correlation still works.
-        let again = jira::extract(
+        let again = extract_jira(
             HttpMethod::Get,
             "/rest/api/3/search/jql",
             &[("jql", secret_jql)],
@@ -1044,8 +1328,8 @@ mod tests {
                 .map(|(_, value)| value),
             Some(&jql.1)
         );
-        // The scope claim is still extracted from the real expression.
-        assert_eq!(details.resource_scope, ResourceScope::id("PLAT"));
+        // The constraint is still extracted from the real expression.
+        assert_eq!(details.constraint(), project_constraint(["PLAT"]).as_ref());
     }
 
     /// Bounding a caller-controlled string is not redacting it. Every
@@ -1055,7 +1339,7 @@ mod tests {
     #[test]
     fn caller_supplied_attribute_values_must_parse_or_become_a_digest() {
         let token = "Bearer sk-live-abcdef0123456789";
-        let details = jira::extract(
+        let details = extract_jira(
             HttpMethod::Get,
             "/rest/api/3/search/jql",
             &[
@@ -1098,7 +1382,7 @@ mod tests {
     /// real Jira field name. `fields` no longer has a verbatim shape at all.
     #[test]
     fn bare_tokens_in_fields_are_digested_not_passed_through() {
-        let details = jira::extract(
+        let details = extract_jira(
             HttpMethod::Get,
             "/rest/api/3/issue/PLAT-1",
             &[("fields", "xoxb-secret-token")],
@@ -1114,7 +1398,7 @@ mod tests {
 
         // A genuinely ordinary field list digests too — there is no
         // shape-based carve-out any more.
-        let ordinary = jira::extract(
+        let ordinary = extract_jira(
             HttpMethod::Get,
             "/rest/api/3/issue/PLAT-1",
             &[("fields", "summary,status,customfield_10001")],
@@ -1124,7 +1408,7 @@ mod tests {
         // Same list, same handle — correlation still works.
         assert_eq!(
             ordinary.query_attributes()[0].1,
-            jira::extract(
+            extract_jira(
                 HttpMethod::Get,
                 "/rest/api/3/issue/PLAT-1",
                 &[("fields", "summary,status,customfield_10001")],
@@ -1196,7 +1480,7 @@ mod tests {
     #[test]
     fn over_long_attribute_values_are_digested_not_truncated() {
         let long = "x".repeat(5000);
-        let details = jira::extract(
+        let details = extract_jira(
             HttpMethod::Get,
             "/rest/api/3/issue/PLAT-1",
             &[("fields", long.as_str())],
@@ -1212,14 +1496,91 @@ mod tests {
 
     #[test]
     fn get_search_reads_jql_from_query_params() {
-        let details = jira::extract(
+        let details = extract_jira(
             HttpMethod::Get,
             "/rest/api/3/search/jql",
             &[("jql", "project = PLAT"), ("maxResults", "5")],
             None,
         );
         assert_eq!(details.normalized_action, NormalizedAction::SearchIssues);
-        assert_eq!(details.resource_scope, ResourceScope::id("PLAT"));
+        assert_eq!(details.constraint(), project_constraint(["PLAT"]).as_ref());
         assert_eq!(details.request_risk, RequestRisk::Read);
+    }
+
+    // ---- The dispatch tables the enforcement points use ----
+
+    #[test]
+    fn for_tool_maps_typed_and_passthrough_arguments_and_denies_the_rest() {
+        let grafana = for_tool(
+            "grafana_query_logs",
+            serde_json::json!({
+                "datasourceUid": "loki-qa", "query": "{app=\"api\"}", "limit": 50
+            })
+            .as_object(),
+            RequestRisk::Read,
+        );
+        assert_eq!(
+            grafana,
+            grafana::query_logs("loki-qa", &[("query", "{app=\"api\"}"), ("limit", "50")])
+        );
+
+        let list = for_tool("grafana_list_datasources", None, RequestRisk::Read);
+        assert_eq!(list, grafana::list_datasources());
+
+        let search = for_tool(
+            "jira_get",
+            serde_json::json!({
+                "path": "/rest/api/3/search/jql",
+                "queryParams": { "jql": "project = PLAT", "maxResults": "5" }
+            })
+            .as_object(),
+            RequestRisk::Read,
+        );
+        assert_eq!(search.normalized_action(), NormalizedAction::SearchIssues);
+        assert_eq!(search.constraint(), project_constraint(["PLAT"]).as_ref());
+
+        let create = for_tool(
+            "jira_post",
+            serde_json::json!({ "path": "/rest/api/3/issue", "body": {"fields": {}} }).as_object(),
+            RequestRisk::Write,
+        );
+        assert_eq!(create.resource_type(), ResourceType::Unknown);
+        assert_eq!(create.request_risk(), RequestRisk::Write);
+
+        // A path with no canonical form is unknown, like the transport will
+        // refuse it.
+        let hostile = for_tool(
+            "jira_get",
+            serde_json::json!({ "path": "https://evil.example/x" }).as_object(),
+            RequestRisk::Read,
+        );
+        assert_eq!(hostile.resource_type(), ResourceType::Unknown);
+
+        // No extractor: the server's own annotation decides the risk, and
+        // the resource is unknown either way.
+        let slack = for_tool("slack_post_message", None, RequestRisk::Write);
+        assert_eq!(slack.resource_type(), ResourceType::Unknown);
+        assert_eq!(slack.request_risk(), RequestRisk::Write);
+        assert_eq!(slack.method(), HttpMethod::Post);
+        let read_only = for_tool("some_read_tool", None, RequestRisk::Read);
+        assert_eq!(read_only.request_risk(), RequestRisk::Read);
+    }
+
+    #[test]
+    fn for_vendor_classifies_only_inventoried_vendors() {
+        let target = CanonicalTarget::parse("/api/datasources").unwrap();
+        assert_eq!(
+            for_vendor("grafana", HttpMethod::Get, &target, None),
+            grafana::list_datasources()
+        );
+        let target = CanonicalTarget::parse("/rest/api/3/issue/PLAT-1").unwrap();
+        assert_eq!(
+            for_vendor("jira", HttpMethod::Get, &target, None).normalized_action(),
+            NormalizedAction::ReadIssue
+        );
+        let target = CanonicalTarget::parse("/api/chat.postMessage").unwrap();
+        let slack = for_vendor("slack", HttpMethod::Post, &target, None);
+        assert_eq!(slack.resource_type(), ResourceType::Unknown);
+        assert_eq!(slack.request_risk(), RequestRisk::Write);
     }
 }

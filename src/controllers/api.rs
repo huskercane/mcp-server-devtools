@@ -257,7 +257,7 @@ pub fn handle_write<'a>(
     )
 }
 
-fn normalize_and_append(
+pub(crate) fn normalize_and_append(
     vendor: &dyn Vendor,
     path: &str,
     query_params: Option<&QueryParams>,

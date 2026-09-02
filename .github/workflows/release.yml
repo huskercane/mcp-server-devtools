@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -114,9 +115,77 @@ jobs:
             ${{ matrix.asset }}.${{ matrix.archive }}.sha256
           if-no-files-found: error
 
+  container:
+    # One image, every role (plan ADR-010, WP A.9). Built from the same
+    # Dockerfile an operator can build locally, published to GHCR, and its
+    # digest becomes a release asset so a deployment can pin by digest.
+    name: Build and publish container
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/mcp-devtools
+          tags: |
+            type=raw,value=${{ steps.tag.outputs.name }}
+            type=raw,value=latest
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Record digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          {
+            echo "image: ghcr.io/${{ github.repository_owner }}/mcp-devtools:${{ steps.tag.outputs.name }}"
+            echo "digest: ${{ steps.push.outputs.digest }}"
+            echo "pin: ghcr.io/${{ github.repository_owner }}/mcp-devtools@${{ steps.push.outputs.digest }}"
+          } > artifacts/mcp-devtools-container-digest.txt
+          cat artifacts/mcp-devtools-container-digest.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcp-devtools-container-digest
+          path: artifacts/mcp-devtools-container-digest.txt
+          if-no-files-found: error
+
   release:
     name: Publish release
-    needs: build
+    needs: [build, container]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -140,4 +209,6 @@ jobs:
           tag_name: ${{ steps.tag.outputs.name }}
           name: ${{ steps.tag.outputs.name }}
           generate_release_notes: true
+          body: |
+            Container image: `ghcr.io/${{ github.repository_owner }}/mcp-devtools@${{ needs.container.outputs.digest }}`
           files: artifacts/*

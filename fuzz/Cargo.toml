@@ -1,0 +1,34 @@
+[package]
+name         = "mcp-server-devtools-fuzz"
+version      = "0.0.0"
+edition      = "2024"
+rust-version = "1.96"
+publish      = false
+description  = "libFuzzer targets for mcp-server-devtools (plan §3.5: canonicalization). Run with `cargo +nightly fuzz run canonicalize` from this directory; the targets are stable code, only the libFuzzer runtime needs nightly."
+
+# Self-rooted: this crate is deliberately not a member of the parent package's
+# build. Nightly is required to *run* libFuzzer, and the parent's CI stays on
+# the pinned stable toolchain. `tests/canonicalization_tests.rs` in the parent
+# runs the same invariants over a seeded corpus on stable.
+[workspace]
+members = ["."]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+
+[dependencies.mcp-server-devtools]
+path = ".."
+default-features = false
+
+[[bin]]
+name  = "canonicalize"
+path  = "fuzz_targets/canonicalize.rs"
+test  = false
+doc   = false
+bench = false
+
+[profile.release]
+debug = 1

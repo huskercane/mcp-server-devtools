@@ -1,0 +1,41 @@
+# ingress-nginx in front of the gateway. TLS terminates here (ADR-004);
+# cert-manager issues the certificate.
+#
+# No session affinity is configured, on purpose. The example runs one
+# gateway replica (gateway.yaml), so every request reaches the pod that
+# holds every session. Scaling past one replica needs an affinity
+# mechanism that binds a session to the pod that *created* it, and hashing
+# the Mcp-Session-Id request header cannot do that: the initialize request
+# carries no session id, the id is generated in the response, and the next
+# request's hash of that id lands on an unrelated pod. It also sends every
+# stateless request (no header, so the same empty key) to one pod. The
+# options are ingress cookie affinity, if the MCP clients in use keep
+# cookies, or a shared session store (plan §3.4, CF-16); neither is part
+# of Phase A.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mcp-devtools
+  namespace: mcp-devtools
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # Matches the server's own 1 MB body cap on /mcp.
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    # Streamable HTTP holds SSE responses open.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["mcp.example.com"]
+      secretName: mcp-devtools-tls
+  rules:
+    - host: mcp.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: mcp-devtools-gateway
+                port: { name: http }

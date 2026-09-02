@@ -34,7 +34,10 @@ pub use vendors::Vendors;
 
 use crate::config::Config;
 use crate::error::McpError;
-use crate::ports::{AuditSink, ConfigCredentialBroker, CredentialBroker, NoopUsageSink, UsageSink};
+use crate::ports::{
+    AllowAll, AuditSink, ConfigCredentialBroker, CredentialBroker, NoopUsageSink,
+    PolicyDecisionPoint, UsageSink,
+};
 use crate::tools::DevtoolsServer;
 use crate::transport::build_client;
 use crate::workspace::WorkspaceCache;
@@ -63,6 +66,21 @@ pub struct Components {
     pub audit_sink: Option<Arc<dyn AuditSink>>,
     /// Lossy usage telemetry (WP 0.7). Defaults to no-op in local mode.
     pub usage_sink: Arc<dyn UsageSink>,
+    /// Whether every tool call must carry a validated inbound principal
+    /// (`MCP_AUTH_MODE=okta`). When true, a call that reaches `call_tool`
+    /// without one — which the bearer middleware should make impossible —
+    /// is refused rather than treated as local (WP A.2, fail closed).
+    pub auth_required: bool,
+    /// The policy decision point (WP A.7). [`AllowAll`] in local mode; the
+    /// compiled `MCP_POLICY_FILE` otherwise. `dyn` for the same reason as
+    /// the broker: consulted twice per call on a path that does file I/O.
+    pub policy: Arc<dyn PolicyDecisionPoint>,
+    /// Bound on how long an audit append may wait for durable
+    /// acknowledgement before the call is refused (CF-14).
+    pub audit_append_timeout: std::time::Duration,
+    /// Outcome appends that outlived their caller's wait, so a shutdown can
+    /// drain them (`DevtoolsServer::pending_audit`).
+    pub pending_audit: tokio_util::task::TaskTracker,
 }
 
 impl Components {
@@ -87,6 +105,8 @@ pub struct ServerBuilder {
     credential_broker: Option<Arc<dyn CredentialBroker>>,
     audit_sink: Option<Arc<dyn AuditSink>>,
     usage_sink: Option<Arc<dyn UsageSink>>,
+    auth_required: bool,
+    policy: Option<Arc<dyn PolicyDecisionPoint>>,
 }
 
 impl ServerBuilder {
@@ -150,6 +170,24 @@ impl ServerBuilder {
         self
     }
 
+    /// Require a validated inbound principal on every tool call (enterprise
+    /// mode). The HTTP transport sets this when it installs the bearer
+    /// middleware; a `call_tool` without a principal is then refused.
+    #[must_use]
+    pub fn require_inbound_auth(mut self, required: bool) -> Self {
+        self.auth_required = required;
+        self
+    }
+
+    /// Use an explicit policy decision point instead of (not in addition
+    /// to) the `MCP_POLICY_FILE`-configured one. Tests pass a
+    /// [`crate::policy::FilePolicy`] compiled from bytes.
+    #[must_use]
+    pub fn policy(mut self, policy: Arc<dyn PolicyDecisionPoint>) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
     /// Assemble the server.
     ///
     /// # Errors
@@ -180,6 +218,11 @@ impl ServerBuilder {
             Some(sink) => Some(sink),
             None => open_configured_journal(&config)?,
         };
+        let policy = match self.policy {
+            Some(policy) => policy,
+            None => load_configured_policy(&config)?,
+        };
+        let audit_append_timeout = crate::policy::egress::audit_append_timeout(&config);
 
         let components = Arc::new(Components {
             config: ConfigHandle::new(config),
@@ -191,6 +234,10 @@ impl ServerBuilder {
                 .unwrap_or_else(|| Arc::new(ConfigCredentialBroker)),
             audit_sink,
             usage_sink: self.usage_sink.unwrap_or_else(|| Arc::new(NoopUsageSink)),
+            auth_required: self.auth_required,
+            policy,
+            audit_append_timeout,
+            pending_audit: tokio_util::task::TaskTracker::new(),
         });
 
         if let Some(pending) = watched {
@@ -231,6 +278,32 @@ fn open_configured_journal(config: &Config) -> Result<Option<Arc<dyn AuditSink>>
         },
     )?;
     Ok(Some(Arc::new(sink)))
+}
+
+/// Load and start watching the policy named by `MCP_POLICY_FILE`, or
+/// [`AllowAll`] when none is configured. A configured policy that does not
+/// compile is a hard startup error — enterprise mode never runs on a
+/// guess, and local mode with a broken dry-run policy should say so.
+fn load_configured_policy(config: &Config) -> Result<Arc<dyn PolicyDecisionPoint>, McpError> {
+    let Some(path) = config
+        .get(crate::policy::engine::POLICY_FILE_KEY)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    else {
+        return Ok(Arc::new(AllowAll));
+    };
+    let policy = crate::policy::FilePolicy::load(std::path::Path::new(path)).map_err(|error| {
+        crate::error::unexpected(
+            format!(
+                "cannot load the policy in {}={path}: {error}; refusing to start (fail closed, \
+                 plan §1.2)",
+                crate::policy::engine::POLICY_FILE_KEY
+            ),
+            None,
+        )
+    })?;
+    policy.spawn_watcher();
+    Ok(Arc::new(policy))
 }
 
 /// Dependencies for a one-shot CLI subcommand.

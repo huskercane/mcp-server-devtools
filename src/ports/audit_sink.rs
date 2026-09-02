@@ -33,7 +33,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 
-use crate::policy::{ClientIdentity, PolicyDecision, Principal, UpstreamIdentity};
+use crate::policy::{
+    ActionContext, ClientIdentity, EgressSummary, PolicyDecision, Principal, UpstreamIdentity,
+};
 
 /// Lifecycle stage an audit event records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -44,6 +46,11 @@ pub enum AuditEventKind {
     ToolCallIntent,
     /// Written after the dispatch completes, with the outcome.
     ToolCallOutcome,
+    /// Written when the egress chokepoint **denies** an upstream request
+    /// the tool was about to send (WP A.7). Every egress decision, allow or
+    /// deny, is also listed on the call's outcome record
+    /// ([`AuditEvent::egress`]).
+    EgressDecision,
 }
 
 /// One enterprise audit event. Metadata and §3.2 identity/decision types
@@ -65,11 +72,21 @@ pub struct AuditEvent {
     /// The identity that acts (or would act) upstream. Present in **every**
     /// event (WP 0.6).
     pub upstream_identity: UpstreamIdentity,
+    /// The canonical action the decision was about (WP A.7): on intent and
+    /// egress records; absent on outcome records, which the intent's
+    /// `request_id` already ties to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<ActionContext>,
     /// Outcome label for [`AuditEventKind::ToolCallOutcome`] events.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u128>,
+    /// Every upstream request the egress chokepoint decided on during the
+    /// call, in order, with the decision each received. On outcome records
+    /// of enforcing calls that reached the transport; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressSummary>,
 }
 
 /// Why an audit append failed, as a closed set of categories.
@@ -148,6 +165,15 @@ pub trait AuditSink: Send + Sync {
     /// Any error means the evidence was **not** durably recorded; callers on
     /// the dispatch path must fail closed (refuse the call), never proceed.
     fn append<'a>(&'a self, event: &'a AuditEvent) -> AppendFuture<'a>;
+
+    /// Whether the sink can currently accept records. A poisoned journal
+    /// answers `false`, and the HTTP health endpoint reports it: a gateway
+    /// that will refuse every tool call must not look healthy to the load
+    /// balancer that keeps sending it traffic. Cheap and non-blocking — it
+    /// is polled by health probes.
+    fn is_available(&self) -> bool {
+        true
+    }
 }
 
 /// A sequence-stamped event as a sink persists it.
@@ -223,6 +249,12 @@ impl AuditSink for InMemoryAuditSink {
         // No I/O to wait for: resolve immediately.
         Box::pin(std::future::ready(self.append_now(event)))
     }
+
+    /// The failing switch doubles as "unavailable", so health-endpoint
+    /// tests can drive it.
+    fn is_available(&self) -> bool {
+        !self.failing.load(Ordering::SeqCst)
+    }
 }
 
 #[cfg(test)]
@@ -251,8 +283,10 @@ mod tests {
                 environment: EnvironmentClass::Unclassified,
                 authority: UpstreamAuthority::Shared,
             },
+            action: None,
             outcome: None,
             duration_ms: None,
+            egress: None,
         }
     }
 

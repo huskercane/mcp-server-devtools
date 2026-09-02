@@ -1,0 +1,63 @@
+# The control role. Phase A: health only. Phases C/D add the admin API,
+# rollups, SIEM forwarding, and the console behind this same Service.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-devtools-control
+  namespace: mcp-devtools
+  labels: { app: mcp-devtools, role: control }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mcp-devtools, role: control }
+  template:
+    metadata:
+      labels: { app: mcp-devtools, role: control }
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: control
+          # Same release as the gateway; pin the digest where possible.
+          image: ghcr.io/huskercane/mcp-devtools:v0.15.0
+          args: ["--role", "control"]
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            # The control role holds no vendor credentials and serves no
+            # tool traffic; it runs in local auth mode until Phase C gives
+            # it an admin API of its own.
+            - { name: MCP_AUTH_MODE, value: "off" }
+            - { name: MCP_BIND_ADDR, value: "127.0.0.1" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+          readinessProbe:
+            exec: { command: ["/mcp-devtools", "health"] }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { memory: 256Mi }
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-devtools-control
+  namespace: mcp-devtools
+spec:
+  selector: { app: mcp-devtools, role: control }
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

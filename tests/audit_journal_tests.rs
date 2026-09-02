@@ -205,6 +205,164 @@ async fn intent_with_upstream_identity_is_journaled_before_dispatch_and_outcome_
     assert!(outcome["duration_ms"].is_u64());
 }
 
+/// A sink whose outcome appends wait on a gate the test holds. Intents go
+/// straight through, so the dispatch happens; the outcome is what stalls.
+struct StallingSink {
+    inner: InMemoryAuditSink,
+    released: tokio::sync::watch::Receiver<bool>,
+}
+
+impl mcp_server_devtools::ports::AuditSink for StallingSink {
+    fn append<'a>(
+        &'a self,
+        event: &'a mcp_server_devtools::ports::AuditEvent,
+    ) -> mcp_server_devtools::ports::audit_sink::AppendFuture<'a> {
+        Box::pin(async move {
+            if event.kind == mcp_server_devtools::ports::AuditEventKind::ToolCallOutcome {
+                let mut released = self.released.clone();
+                released
+                    .wait_for(|released| *released)
+                    .await
+                    .map_err(|_| std::io::Error::other("gate dropped"))?;
+            }
+            self.inner.append_now(event)
+        })
+    }
+}
+
+/// CF-14, the post-dispatch half: the outcome append is bounded in how long
+/// the *caller* waits, but the record is never abandoned. A journal that
+/// stalls past the bound after the vendor was contacted must still end up
+/// holding the outcome once it recovers — otherwise a dispatched call reads
+/// as "requested, not dispatched" forever.
+#[tokio::test]
+async fn a_stalled_outcome_append_is_not_cancelled_by_the_bound() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/myself"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"name": "alice"})))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let (release, released) = tokio::sync::watch::channel(false);
+    let sink = Arc::new(StallingSink {
+        inner: InMemoryAuditSink::new(),
+        released,
+    });
+    let config = Config::from_map(HashMap::from([
+        (
+            "ATLASSIAN_USER_EMAIL".to_owned(),
+            "alice@example.com".to_owned(),
+        ),
+        ("ATLASSIAN_API_TOKEN".to_owned(), "test-token".to_owned()),
+        ("MCP_AUDIT_APPEND_TIMEOUT_MS".to_owned(), "100".to_owned()),
+    ]));
+    let server = ServerBuilder::new()
+        .config(config)
+        .vendors(Vendors {
+            jira: JiraVendor::with_base_url(mock.uri()),
+            ..Vendors::default()
+        })
+        .audit_sink(Arc::<StallingSink>::clone(&sink))
+        .build()
+        .expect("build server");
+    let base = spawn(server).await;
+
+    // The call completes: the caller waits for the bound, not for the disk.
+    let started = std::time::Instant::now();
+    let body = call_jira_get(&base).await;
+    assert_ne!(body["result"]["isError"], true, "{body}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the caller must not be parked behind a stalled outcome append"
+    );
+    let kinds = |events: &[serde_json::Value]| {
+        events
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        kinds(&sink.inner.events()),
+        ["tool_call_intent"],
+        "the outcome is still waiting on the journal"
+    );
+
+    // The journal recovers. The outcome that was pending lands — it was
+    // never cancelled.
+    release.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while sink.inner.events().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the stalled outcome must be written once the journal recovers");
+    let events = sink.inner.events();
+    assert_eq!(kinds(&events), ["tool_call_intent", "tool_call_outcome"]);
+    assert_eq!(events[1]["outcome"], "success");
+    assert_eq!(events[1]["request_id"], events[0]["request_id"]);
+}
+
+/// The other half of the outcome guarantee: an append that outlived its
+/// caller is tracked, and a shutdown drains it instead of dropping it with
+/// the runtime. `pending_audit()` is what the transports drain.
+#[tokio::test]
+async fn pending_outcome_appends_are_tracked_for_shutdown_to_drain() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/myself"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"name": "alice"})))
+        .mount(&mock)
+        .await;
+
+    let (release, released) = tokio::sync::watch::channel(false);
+    let sink = Arc::new(StallingSink {
+        inner: InMemoryAuditSink::new(),
+        released,
+    });
+    let server = ServerBuilder::new()
+        .config(Config::from_map(HashMap::from([
+            (
+                "ATLASSIAN_USER_EMAIL".to_owned(),
+                "alice@example.com".to_owned(),
+            ),
+            ("ATLASSIAN_API_TOKEN".to_owned(), "test-token".to_owned()),
+            ("MCP_AUDIT_APPEND_TIMEOUT_MS".to_owned(), "100".to_owned()),
+        ])))
+        .vendors(Vendors {
+            jira: JiraVendor::with_base_url(mock.uri()),
+            ..Vendors::default()
+        })
+        .audit_sink(Arc::<StallingSink>::clone(&sink))
+        .build()
+        .expect("build server");
+    let pending = server.pending_audit();
+    let base = spawn(server).await;
+
+    let body = call_jira_get(&base).await;
+    assert_ne!(body["result"]["isError"], true, "{body}");
+    assert_eq!(sink.inner.events().len(), 1, "outcome still pending");
+
+    // A drain that starts now must wait: the append is in flight.
+    pending.close();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), pending.wait())
+            .await
+            .is_err(),
+        "the tracker must hold the pending append"
+    );
+    // The journal recovers; the drain completes and the outcome is there.
+    release.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), pending.wait())
+        .await
+        .expect("drain completes once the journal acknowledges");
+    let events = sink.inner.events();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1]["kind"], "tool_call_outcome");
+}
+
 #[tokio::test]
 async fn journal_configured_via_config_is_written_through_and_fails_startup_when_unusable() {
     // End-to-end through MCP_AUDIT_JOURNAL_DIR (the production wiring, no

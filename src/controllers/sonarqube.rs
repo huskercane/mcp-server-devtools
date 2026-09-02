@@ -28,16 +28,17 @@ use serde_json::Value;
 
 use crate::auth::Credentials;
 use crate::config::Config;
-use crate::controllers::api::{ControllerResponse, HandleContext, dispatch_with_creds};
+use crate::controllers::api::{
+    ControllerResponse, HandleContext, dispatch_with_creds, normalize_and_append,
+};
 use crate::error::{McpError, OriginalError, api_error};
 use crate::format::OutputFormat;
 use crate::tools::args::{
     QueryParams, ReadArgs, SonarqubeQualityGateArgs, SonarqubeSearchIssuesArgs,
 };
-use crate::transport::HttpMethod;
-use crate::vendor::Vendor;
+use crate::transport::{HttpMethod, RequestOptions, ResponseBody, fetch, raw_response};
 use crate::vendor::sonarqube::{
-    CE_TASK_PATH, ISSUES_SEARCH_PATH, QUALITY_GATE_PATH, SonarqubeVendor, error,
+    CE_TASK_PATH, ISSUES_SEARCH_PATH, QUALITY_GATE_PATH, SonarqubeVendor,
 };
 
 /// SonarQube-specific request context. Carries the concrete [`SonarqubeVendor`]
@@ -223,46 +224,45 @@ pub async fn get(
 /// The `analysisId` only exists once the task reaches `SUCCESS`; a task still
 /// `PENDING`/`IN_PROGRESS`, or one that `FAILED`/`CANCELED` before producing an
 /// analysis, has none — we surface the task status so the caller understands why.
+///
+/// Sent through the shared transport like every other upstream request, so
+/// it is canonicalized and passes the egress policy chokepoint (plan §1.3).
+/// It used to be a direct `reqwest` call, which meant a tool-level allow
+/// let this second request out unexamined.
 async fn resolve_analysis_id(
     ctx: &SonarqubeContext<'_>,
     token: &str,
     ce_task_id: &str,
 ) -> Result<String, McpError> {
-    let base = ctx.vendor.base_url(ctx.config)?;
-    let mut url = reqwest::Url::parse(&format!("{base}{CE_TASK_PATH}"))
-        .map_err(|err| api_error(format!("Invalid SonarQube ce/task URL: {err}"), None, None))?;
-    url.query_pairs_mut().append_pair("id", ce_task_id);
-
-    let call = crate::transport::HttpCallLog::new("sonarqube", "GET", url.as_str());
-    let response = ctx
-        .client
-        .get(url.clone())
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|err| {
-            crate::transport::log_http_transport_failure(call, &err, false);
-            api_error(
-                format!("SonarQube ce/task request failed: {err}"),
-                None,
-                None,
-            )
-        })?;
-    let status = response.status();
-    let body_text = response.text().await.unwrap_or_default();
-
-    if !status.is_success() {
-        crate::transport::log_http_status_failure(call, status, false);
-        return Err(error::classify(status, &body_text));
+    let mut query = QueryParams::new();
+    query.insert("id".into(), ce_task_id.to_owned());
+    let path = normalize_and_append(ctx.vendor, CE_TASK_PATH, Some(&query));
+    let creds = Credentials::Bearer {
+        token: token.to_owned(),
+    };
+    let response = fetch(
+        ctx.client,
+        ctx.vendor,
+        &creds,
+        ctx.config,
+        &path,
+        RequestOptions {
+            method: Some(HttpMethod::Get),
+            ..RequestOptions::default()
+        },
+    )
+    .await?;
+    // An intermediate lookup, not a result the caller asked to keep.
+    if let Some(raw) = response.raw_response_path {
+        let _ = raw_response::remove_artifact(&raw).await;
     }
-
-    let value: Value = serde_json::from_str(&body_text).map_err(|err| {
-        api_error(
-            format!("SonarQube ce/task returned invalid JSON: {err}"),
+    let ResponseBody::Json(value) = response.data else {
+        return Err(api_error(
+            "SonarQube ce/task returned a non-JSON body",
             None,
-            Some(OriginalError::String(body_text.clone())),
-        )
-    })?;
+            None,
+        ));
+    };
 
     let task = value.get("task");
     if let Some(analysis_id) = task

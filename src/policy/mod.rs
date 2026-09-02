@@ -25,9 +25,21 @@
 //! legacy `AUDIT_LOG` JSONL keeps its camelCase shape untouched — that
 //! surface is parity-locked; this one is new.)
 
+pub mod canonical;
+pub mod egress;
+pub mod engine;
 pub mod extractors;
+pub mod scope;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+pub use canonical::{CanonicalPath, CanonicalTarget, CanonicalizeError};
+pub use egress::{Enforcement, authorize_egress};
+pub use engine::{FilePolicy, PolicyError};
+pub use scope::{
+    CallScope, EgressDispatch, EgressRecord, EgressSummary, EgressTicket, MAX_EGRESS_RECORDS,
+    OwnerKey,
+};
 
 use crate::transport::HttpMethod;
 
@@ -151,7 +163,7 @@ fn digest_caller_text(value: &str) -> Option<String> {
 /// Deployment environment classification of a vendor account.
 ///
 /// Always sourced from **configuration**, never from the request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum EnvironmentClass {
@@ -183,7 +195,7 @@ impl EnvironmentClass {
 
 /// Whether an upstream call runs under shared or delegated authority
 /// (ADR-006).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpstreamAuthority {
     /// A service credential configured on the gateway. May exceed the
@@ -397,7 +409,7 @@ pub struct UpstreamIdentity {
 /// inventories land (WP 0.8+). [`Self::Unknown`] is a **distinct variant**,
 /// not a string: anything an extractor cannot classify lands there, and
 /// default-deny policy denies it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ResourceType {
@@ -415,7 +427,7 @@ pub enum ResourceType {
 /// Purpose-built tools set this from their identity; passthrough tools map
 /// `(method, path)` through a per-vendor extractor table, and anything
 /// unmapped is [`Self::Passthrough`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum NormalizedAction {
@@ -431,7 +443,7 @@ pub enum NormalizedAction {
 }
 
 /// Risk class of a call. Derived — never client-supplied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestRisk {
     Read,
@@ -467,8 +479,8 @@ pub struct ActionDetails {
     normalized_action: NormalizedAction,
     #[serde(serialize_with = "serialize_method")]
     method: HttpMethod,
-    /// Canonicalized request path (§3.5; full canonicalization lands in
-    /// Phase A — until then this is the normalized tool-level path).
+    /// Canonicalized request path (§3.5). Only a [`CanonicalPath`] can be
+    /// supplied to the constructors, so this is canonical by construction.
     canonical_path: String,
     /// Allowlisted query keys/values, sorted by key. Search expressions are
     /// retained as digests, not text — see `policy::extractors`.
@@ -477,6 +489,8 @@ pub struct ActionDetails {
     /// Which resources of that type the call addresses. See
     /// [`ResourceScope`] — the three cases are deliberately distinct.
     resource_scope: ResourceScope,
+    /// Which resources of *another* type bound the call (CF-2).
+    constrained_by: Option<ResourceConstraint>,
     request_risk: RequestRisk,
 }
 
@@ -492,7 +506,7 @@ impl ActionDetails {
     #[must_use]
     pub fn read(
         normalized_action: NormalizedAction,
-        canonical_path: String,
+        canonical_path: CanonicalPath,
         query_attributes: Vec<(String, String)>,
         resource_type: ResourceType,
         resource_scope: ResourceScope,
@@ -500,10 +514,11 @@ impl ActionDetails {
         Self {
             normalized_action,
             method: HttpMethod::Get,
-            canonical_path,
+            canonical_path: canonical_path.into_string(),
             query_attributes,
             resource_type,
             resource_scope,
+            constrained_by: None,
             request_risk: RequestRisk::Read,
         }
     }
@@ -539,6 +554,7 @@ impl ActionDetails {
             query_attributes,
             resource_type: downgrade.resource_type,
             resource_scope,
+            constrained_by: None,
             request_risk: RequestRisk::Read,
         }
     }
@@ -546,23 +562,55 @@ impl ActionDetails {
     /// Anything the extractor could not classify: `Passthrough`/`Unknown`/
     /// unscoped, with the risk derived conservatively from the method.
     #[must_use]
-    pub fn unclassified(method: HttpMethod, canonical_path: String) -> Self {
+    pub fn unclassified(method: HttpMethod, canonical_path: CanonicalPath) -> Self {
         Self {
             normalized_action: NormalizedAction::Passthrough,
             method,
-            canonical_path,
+            canonical_path: canonical_path.into_string(),
             query_attributes: Vec::new(),
             resource_type: ResourceType::Unknown,
             resource_scope: ResourceScope::unscoped(),
+            constrained_by: None,
             request_risk: RequestRisk::from_method(method),
         }
+    }
+
+    /// A tool with no extractor at all: nothing is known about what it
+    /// reaches, so it is `Passthrough`/`Unknown`/unscoped with the risk the
+    /// server's own tool annotations declare (never the client's). Denied
+    /// by default-deny like any other unclassified call.
+    #[must_use]
+    pub fn unmapped_tool(risk: RequestRisk) -> Self {
+        let method = match risk {
+            RequestRisk::Read => HttpMethod::Get,
+            RequestRisk::Write => HttpMethod::Post,
+            RequestRisk::Destructive => HttpMethod::Delete,
+        };
+        Self {
+            normalized_action: NormalizedAction::Passthrough,
+            method,
+            canonical_path: "/".to_owned(),
+            query_attributes: Vec::new(),
+            resource_type: ResourceType::Unknown,
+            resource_scope: ResourceScope::unscoped(),
+            constrained_by: None,
+            request_risk: risk,
+        }
+    }
+
+    /// Attach the constraint an extractor proved (CF-2). Builder-style so
+    /// the read constructors stay closed over their own fields.
+    #[must_use]
+    pub fn constrained_by(mut self, constraint: Option<ResourceConstraint>) -> Self {
+        self.constrained_by = constraint;
+        self
     }
 
     /// Like [`Self::unclassified`], keeping attributes already extracted.
     #[must_use]
     pub fn unclassified_with_attributes(
         method: HttpMethod,
-        canonical_path: String,
+        canonical_path: CanonicalPath,
         query_attributes: Vec<(String, String)>,
     ) -> Self {
         Self {
@@ -599,6 +647,11 @@ impl ActionDetails {
     #[must_use]
     pub const fn resource_scope(&self) -> &ResourceScope {
         &self.resource_scope
+    }
+
+    #[must_use]
+    pub const fn constraint(&self) -> Option<&ResourceConstraint> {
+        self.constrained_by.as_ref()
     }
 
     #[must_use]
@@ -767,6 +820,54 @@ impl ResourceScope {
     }
 }
 
+/// A constraint on which resources of *another* type a call reaches
+/// (carry-forward CF-2, §3.2 freeze).
+///
+/// Jira issue search returns *issues* but is restricted by *projects*:
+/// `resource_type: issue, resource_scope: unscoped` says nothing about which
+/// issues come back, while `constrained_by: project[PLAT, WEB]` says exactly
+/// which permission namespace bounds them. Before this dimension existed the
+/// project keys travelled in the issue-id slot, and a generic engine could
+/// look project keys up in an issue allowlist — or match an issue rule's id
+/// against a project — and reach a confident wrong answer. The two
+/// namespaces are now separate fields with separate rule keys.
+///
+/// The scope is always a non-empty id list: a constraint that names no ids
+/// is not a constraint, so [`Self::ids`] answers `None` for one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResourceConstraint {
+    resource_type: ResourceType,
+    scope: ResourceScope,
+}
+
+impl ResourceConstraint {
+    /// Constrained to exactly these ids of `resource_type`. `None` when the
+    /// list is empty or all-blank — no claim, rather than a vacuous one.
+    #[must_use]
+    pub fn ids<I, S>(resource_type: ResourceType, ids: I) -> Option<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let scope = ResourceScope::ids(ids);
+        (scope.id_count() > 0).then_some(Self {
+            resource_type,
+            scope,
+        })
+    }
+
+    #[must_use]
+    pub const fn resource_type(&self) -> ResourceType {
+        self.resource_type
+    }
+
+    /// The bounding ids; all-of matching only, like [`ResourceScope`].
+    #[must_use]
+    pub const fn scope(&self) -> &ResourceScope {
+        &self.scope
+    }
+}
+
 /// The canonical object every policy decision and audit record is built
 /// from. Constructed before evaluation; never mutated after.
 ///
@@ -797,6 +898,8 @@ pub struct ActionContext {
     query_attributes: Vec<(String, String)>,
     resource_type: ResourceType,
     resource_scope: ResourceScope,
+    /// Which resources of another type bound the call (CF-2).
+    constrained_by: Option<ResourceConstraint>,
     /// Optional classification from configuration (e.g. `"restricted"`).
     resource_class: Option<String>,
     upstream_identity: UpstreamIdentity,
@@ -833,6 +936,7 @@ impl ActionContext {
             query_attributes: details.query_attributes,
             resource_type: details.resource_type,
             resource_scope: details.resource_scope,
+            constrained_by: details.constrained_by,
             resource_class,
             upstream_identity,
             request_risk: details.request_risk,
@@ -900,6 +1004,11 @@ impl ActionContext {
     }
 
     #[must_use]
+    pub const fn constraint(&self) -> Option<&ResourceConstraint> {
+        self.constrained_by.as_ref()
+    }
+
+    #[must_use]
     pub fn resource_class(&self) -> Option<&str> {
         self.resource_class.as_deref()
     }
@@ -916,7 +1025,7 @@ impl ActionContext {
 }
 
 /// Outcome of a policy evaluation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyEffect {
     Allow,
@@ -962,12 +1071,43 @@ impl PolicyDecision {
             reason: reason.into(),
         }
     }
+
+    /// A decision a named rule of a versioned policy produced.
+    #[must_use]
+    pub fn by_rule(effect: PolicyEffect, rule_id: &str, policy_version: &str) -> Self {
+        let verb = match effect {
+            PolicyEffect::Allow => "allowed",
+            PolicyEffect::Deny => "denied",
+        };
+        Self {
+            effect,
+            rule_id: Some(rule_id.to_owned()),
+            policy_version: Some(policy_version.to_owned()),
+            reason: format!("{verb} by rule {rule_id}"),
+        }
+    }
+
+    /// The versioned policy's default: nothing matched, so deny.
+    #[must_use]
+    pub fn default_deny_under(policy_version: &str, reason: impl Into<String>) -> Self {
+        Self {
+            effect: PolicyEffect::Deny,
+            rule_id: None,
+            policy_version: Some(policy_version.to_owned()),
+            reason: reason.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_allow(&self) -> bool {
+        matches!(self.effect, PolicyEffect::Allow)
+    }
 }
 
 // serde's `serialize_with` contract passes the field by reference; the
 // trivially-copy lint does not apply to a signature serde fixes.
 #[allow(clippy::trivially_copy_pass_by_ref)]
-fn serialize_method<S: serde::Serializer>(
+pub(crate) fn serialize_method<S: serde::Serializer>(
     method: &HttpMethod,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
@@ -1004,6 +1144,7 @@ mod tests {
                 query_attributes: vec![("query".to_owned(), "{app=\"api\"}".to_owned())],
                 resource_type: ResourceType::Datasource,
                 resource_scope: ResourceScope::id("loki-prod"),
+                constrained_by: None,
                 request_risk: RequestRisk::Read,
             },
             None,
@@ -1048,6 +1189,7 @@ mod tests {
                 "query_attributes": [["query", "{app=\"api\"}"]],
                 "resource_type": "datasource",
                 "resource_scope": { "kind": "ids", "ids": ["loki-prod"] },
+                "constrained_by": null,
                 "resource_class": null,
                 "upstream_identity": {
                     "label": "grafana/GRAFANA_TOKEN",
@@ -1057,6 +1199,47 @@ mod tests {
                 },
                 "request_risk": "read",
             })
+        );
+    }
+
+    /// CF-2: the constraint is its own dimension with its own namespace,
+    /// serialized alongside — never inside — the primary scope.
+    #[test]
+    fn constrained_by_is_a_separate_typed_dimension() {
+        let constraint = ResourceConstraint::ids(ResourceType::Project, ["WEB", "PLAT", "WEB"])
+            .expect("non-empty");
+        assert_eq!(constraint.resource_type(), ResourceType::Project);
+        assert_eq!(constraint.scope(), &ResourceScope::ids(["PLAT", "WEB"]));
+        assert_eq!(
+            serde_json::to_value(&constraint).unwrap(),
+            json!({
+                "resource_type": "project",
+                "scope": { "kind": "ids", "ids": ["PLAT", "WEB"] },
+            })
+        );
+        // A constraint with nothing in it is not a constraint.
+        assert_eq!(
+            ResourceConstraint::ids(ResourceType::Project, ["", " "]),
+            None
+        );
+        assert_eq!(
+            ResourceConstraint::ids::<[&str; 0], &str>(ResourceType::Project, []),
+            None
+        );
+
+        let details = ActionDetails::read_downgrade(
+            ApprovedReadDowngrade::JIRA_SEARCH_JQL,
+            Vec::new(),
+            ResourceScope::unscoped(),
+        )
+        .constrained_by(Some(constraint));
+        assert!(
+            details.resource_scope().is_unscoped(),
+            "issues stay unscoped"
+        );
+        assert_eq!(
+            details.constraint().map(ResourceConstraint::resource_type),
+            Some(ResourceType::Project)
         );
     }
 
@@ -1309,7 +1492,7 @@ mod tests {
     fn read_downgrades_are_limited_to_approved_endpoints() {
         let get = ActionDetails::read(
             NormalizedAction::ReadIssue,
-            "/rest/api/3/issue/PLAT-1".to_owned(),
+            CanonicalPath::parse("/rest/api/3/issue/PLAT-1").unwrap(),
             Vec::new(),
             ResourceType::Issue,
             ResourceScope::id("PLAT-1"),
@@ -1331,8 +1514,11 @@ mod tests {
 
         // An unclassified call keeps the conservative method-derived risk.
         assert_eq!(
-            ActionDetails::unclassified(HttpMethod::Post, "/rest/api/3/issue".to_owned())
-                .request_risk(),
+            ActionDetails::unclassified(
+                HttpMethod::Post,
+                CanonicalPath::parse("/rest/api/3/issue").unwrap()
+            )
+            .request_risk(),
             RequestRisk::Write
         );
     }

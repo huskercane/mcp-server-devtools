@@ -60,6 +60,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -90,6 +91,10 @@ pub struct JournalAuditSink {
     requests: Option<mpsc::Sender<WriteRequest>>,
     writer: Option<std::thread::JoinHandle<()>>,
     path: PathBuf,
+    /// Set by the writer on the first failed write or sync. Read by
+    /// [`AuditSink::is_available`] so the HTTP health endpoint can report
+    /// a gateway that will refuse every call.
+    poisoned: Arc<AtomicBool>,
 }
 
 impl JournalAuditSink {
@@ -217,14 +222,17 @@ impl JournalAuditSink {
         let last_seq = recover(&file, &path)?;
 
         let (requests, receiver) = mpsc::channel(WRITE_QUEUE_DEPTH);
+        let poisoned = Arc::new(AtomicBool::new(false));
+        let poison_flag = Arc::clone(&poisoned);
         let writer = std::thread::Builder::new()
             .name("audit-journal".to_owned())
-            .spawn(move || writer_loop(file, last_seq, receiver))?;
+            .spawn(move || writer_loop(file, last_seq, receiver, &poison_flag))?;
 
         Ok(Self {
             requests: Some(requests),
             writer: Some(writer),
             path,
+            poisoned,
         })
     }
 
@@ -281,11 +289,20 @@ impl AuditSink for JournalAuditSink {
             }
         })
     }
+
+    fn is_available(&self) -> bool {
+        self.requests.is_some() && !self.poisoned.load(Ordering::Acquire)
+    }
 }
 
 /// The writer thread: the only place a sequence number is assigned and the
 /// only place the file is touched after `open`.
-fn writer_loop(mut file: File, mut last_seq: u64, mut receiver: mpsc::Receiver<WriteRequest>) {
+fn writer_loop(
+    mut file: File,
+    mut last_seq: u64,
+    mut receiver: mpsc::Receiver<WriteRequest>,
+    poisoned: &AtomicBool,
+) {
     let mut batch: Vec<WriteRequest> = Vec::with_capacity(MAX_BATCH);
     let mut buffer: Vec<u8> = Vec::new();
     // Set by the first failed write or sync; every later record is refused.
@@ -311,7 +328,7 @@ fn writer_loop(mut file: File, mut last_seq: u64, mut receiver: mpsc::Receiver<W
         // Checked throughout: at `u64::MAX` an unchecked increment would
         // wrap and start re-issuing numbers that are already on disk.
         let Some(mut seq) = last_seq.checked_add(1) else {
-            fail_batch(&mut batch, &mut poison, &sequence_exhausted());
+            fail_batch(&mut batch, &mut poison, poisoned, &sequence_exhausted());
             continue;
         };
         let first_seq = seq;
@@ -345,7 +362,7 @@ fn writer_loop(mut file: File, mut last_seq: u64, mut receiver: mpsc::Receiver<W
                 }
                 last_seq = acked - 1;
             }
-            Err(error) => fail_batch(&mut batch, &mut poison, &error),
+            Err(error) => fail_batch(&mut batch, &mut poison, poisoned, &error),
         }
     }
 
@@ -365,6 +382,7 @@ fn writer_loop(mut file: File, mut last_seq: u64, mut receiver: mpsc::Receiver<W
 fn fail_batch(
     batch: &mut Vec<WriteRequest>,
     poison: &mut Option<Arc<io::Error>>,
+    poisoned: &AtomicBool,
     error: &io::Error,
 ) {
     let error = Arc::new(io::Error::new(error.kind(), error.to_string()));
@@ -374,6 +392,7 @@ fn fail_batch(
         "audit journal write failed; journal poisoned, all further calls refused"
     );
     *poison = Some(Arc::clone(&error));
+    poisoned.store(true, Ordering::Release);
     for request in batch.drain(..) {
         let _ = request.ack.send(Err(Arc::clone(&error)));
     }
@@ -577,8 +596,10 @@ mod tests {
                 environment: EnvironmentClass::Unclassified,
                 authority: UpstreamAuthority::Shared,
             },
+            action: None,
             outcome: None,
             duration_ms: None,
+            egress: None,
         }
     }
 
