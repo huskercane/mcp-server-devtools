@@ -84,6 +84,49 @@ mod override_url {
 
 // ---- Tests ----
 
+/// The bytes that go on the wire are the canonical form (plan §3.5), in
+/// every auth mode — what policy evaluates is what is sent. This locks the
+/// exact wire bytes for the inputs where canonicalization is *visible* to
+/// the upstream, so a change in any of these choices is a deliberate diff:
+///
+/// - dot-segments resolved and duplicate slashes collapsed in the path;
+/// - unreserved escapes decoded (`%2D` → `-`), reserved ones kept and
+///   uppercased (`%2f` → `%2F`; a slash inside a segment stays one segment);
+/// - query keys sorted (stable), values decoded once and re-encoded as
+///   `application/x-www-form-urlencoded`: a space is `+` whether the tool
+///   wrote `+` or `%20`, and `~` is `%7E` whether or not it was escaped.
+///
+/// Every upstream this server talks to parses its query string with those
+/// semantics; the tool-supplied spelling was never a contract. Kept under
+/// review as CF-19.
+#[tokio::test]
+async fn wire_bytes_are_the_canonical_form() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&server)
+        .await;
+
+    let cases = [
+        (
+            "/2.0/repos//acme/./web/../api/x%2Dy/refs%2fheads?z=1&a=x+y&a=%7E&m=p%20q",
+            "/2.0/repos/acme/api/x-y/refs%2Fheads",
+            "a=x+y&a=%7E&m=p+q&z=1",
+        ),
+        ("/2.0/plain", "/2.0/plain", ""),
+        ("/2.0/keep/trailing/", "/2.0/keep/trailing/", ""),
+    ];
+    for (input, expected_path, expected_query) in cases {
+        call_mock(&server, input, RequestOptions::default())
+            .await
+            .unwrap();
+        let received = server.received_requests().await.unwrap();
+        let last = received.last().unwrap();
+        assert_eq!(last.url.path(), expected_path, "{input}");
+        assert_eq!(last.url.query().unwrap_or(""), expected_query, "{input}");
+    }
+}
+
 #[tokio::test]
 async fn enabled_cache_reuses_a_successful_get() {
     let server = MockServer::start().await;

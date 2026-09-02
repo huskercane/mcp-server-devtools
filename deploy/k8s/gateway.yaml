@@ -36,8 +36,10 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: gateway
-          # Pin to the digest release.yml prints, not a tag.
-          image: ghcr.io/huskercane/mcp-devtools:latest
+          # A release tag, never `latest`: a moving tag makes "which build
+          # is running" unanswerable. Better still, pin the digest the
+          # release workflow prints (`image@sha256:...`).
+          image: ghcr.io/huskercane/mcp-devtools:v0.15.0
           args: ["--role", "gateway"]
           ports:
             - name: http

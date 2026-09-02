@@ -41,6 +41,15 @@ pub trait PolicyDecisionPoint: Send + Sync {
     fn enforces(&self) -> bool {
         true
     }
+
+    /// Why the decision point is running on stale policy, if it is: a
+    /// file-backed policy whose source can no longer be read or compiled
+    /// keeps its last good document in force and reports the reason here.
+    /// Health reports it; decisions are unaffected. `None` when the policy
+    /// in force is the current one.
+    fn degraded(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Everything is allowed — the community trust boundary, made explicit.

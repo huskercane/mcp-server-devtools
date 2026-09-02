@@ -55,7 +55,10 @@
 //!   match. `*` is a wildcard in any of them.
 //! - **Patterns** (`tool_name`, `canonical_path`, `resource_id`, and the
 //!   constraint's ids) are globs with `*` only. No regex, on the request
-//!   path or off it.
+//!   path or off it. **`*` matches any run of bytes, including `/`**: in a
+//!   `canonical_path` pattern, `/api/*/query` matches `/api/a/b/query` as
+//!   well as `/api/a/query`. There is no single-segment wildcard; write the
+//!   segments you mean, and scope broad path patterns with a resource key.
 //! - **Unknown keys are load errors.** A misspelt `resource_typ:` must not
 //!   silently widen a rule, so every mapping is `deny_unknown_fields`.
 //!
@@ -69,9 +72,20 @@
 //! logged and the last good policy stays in force — a reload never fails
 //! open. The policy version is `v<version>+sha256:<16 hex>` of the exact
 //! bytes, so an audit record names the document that decided it.
+//!
+//! **A file that disappears or becomes unreadable is treated the same way:
+//! the last good policy stays in force**, indefinitely. Deleting the file is
+//! therefore *not* an emergency deny — a gateway keeps serving under the
+//! document it last compiled, which is the same posture the plan gives a
+//! gateway whose control plane is down (§3.4, "last signed policy bundle").
+//! The state is not silent: [`FilePolicy::degraded`] reports the last
+//! reload failure, and the HTTP health banner prints it. To stop traffic,
+//! publish a document that denies (`version: N, rules: []` denies
+//! everything) or take the gateway out of rotation; the deny-list and
+//! `revoke-all` controls arrive in Phase B (CF-16).
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -640,6 +654,10 @@ pub struct FilePolicy {
     current: RwLock<Arc<CompiledPolicy>>,
     /// The bytes the current snapshot was compiled from, for the watcher.
     loaded_bytes: RwLock<Vec<u8>>,
+    /// Why the last reload failed, while the last good document stays in
+    /// force. Cleared by the next successful reload. Off the request path:
+    /// written by the watcher, read by health.
+    last_reload_error: Mutex<Option<String>>,
 }
 
 impl FilePolicy {
@@ -659,6 +677,7 @@ impl FilePolicy {
             path: path.to_owned(),
             current: RwLock::new(Arc::new(compiled)),
             loaded_bytes: RwLock::new(bytes),
+            last_reload_error: Mutex::new(None),
         }))
     }
 
@@ -674,7 +693,27 @@ impl FilePolicy {
             path: PathBuf::new(),
             current: RwLock::new(Arc::new(compiled)),
             loaded_bytes: RwLock::new(bytes.to_vec()),
+            last_reload_error: Mutex::new(None),
         }))
+    }
+
+    /// Why the last reload failed — the file vanished, became unreadable,
+    /// or does not compile — while the last good document stays in force.
+    /// `None` when the document in force is the one on disk.
+    #[must_use]
+    pub fn degraded(&self) -> Option<String> {
+        self.last_reload_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn note_reload(&self, outcome: &Result<bool, PolicyError>) {
+        let mut last = self
+            .last_reload_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *last = outcome.as_ref().err().map(ToString::to_string);
     }
 
     #[must_use]
@@ -696,13 +735,20 @@ impl FilePolicy {
         )
     }
 
-    /// Re-read the file. A document that does not compile leaves the current
-    /// policy in force and returns the error.
+    /// Re-read the file. A document that does not compile — or a file that
+    /// cannot be read — leaves the current policy in force, records the
+    /// failure for [`Self::degraded`], and returns the error.
     ///
     /// # Errors
     ///
     /// When the file cannot be read or does not compile.
     pub fn reload(&self) -> Result<bool, PolicyError> {
+        let outcome = self.reload_inner();
+        self.note_reload(&outcome);
+        outcome
+    }
+
+    fn reload_inner(&self) -> Result<bool, PolicyError> {
         let bytes = std::fs::read(&self.path).map_err(|error| {
             PolicyError::new(format!(
                 "cannot read policy {}: {error}",
@@ -756,7 +802,7 @@ impl FilePolicy {
                     Ok(Err(error)) => tracing::warn!(
                         path = %path.display(),
                         %error,
-                        "policy changed but does not compile; keeping the previous policy"
+                        "policy cannot be reloaded; keeping the previous policy in force"
                     ),
                     Err(error) => tracing::warn!(%error, "policy reload task failed"),
                 }
@@ -802,6 +848,10 @@ impl PolicyDecisionPoint for FilePolicy {
     fn version(&self) -> Option<String> {
         Some(self.snapshot().version.clone())
     }
+
+    fn degraded(&self) -> Option<String> {
+        FilePolicy::degraded(self)
+    }
 }
 
 impl PolicyDecisionPoint for Arc<FilePolicy> {
@@ -811,6 +861,10 @@ impl PolicyDecisionPoint for Arc<FilePolicy> {
 
     fn version(&self) -> Option<String> {
         FilePolicy::version(self)
+    }
+
+    fn degraded(&self) -> Option<String> {
+        FilePolicy::degraded(self)
     }
 }
 
@@ -830,6 +884,10 @@ mod tests {
             ("PLAT", "PLAT-1", false),
             ("*/query_range", "/api/x/query_range", true),
             ("/api/*/proxy/*", "/api/datasources/proxy/uid/x", true),
+            // `*` is not segment-bounded: it crosses `/` (module docs). A
+            // pattern meant for one segment matches deeper paths too.
+            ("/api/*/query", "/api/a/query", true),
+            ("/api/*/query", "/api/a/b/c/query", true),
             ("a*b*c", "aXXbYYc", true),
             ("a*b*c", "aXXbYY", false),
             ("[a]", "a", false),

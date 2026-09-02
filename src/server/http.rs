@@ -489,18 +489,24 @@ pub fn build_app(idle_ttl: Duration, sweep_interval: Duration) -> Result<Router,
 /// local mode. When a durable audit journal is configured and can no longer
 /// accept records, the gateway will refuse every tool call, so it answers
 /// 503 here rather than telling a load balancer it is fine (CF-6).
+///
+/// A policy that can no longer be reloaded is different: the gateway keeps
+/// enforcing the last good document, which is a serving state, so the
+/// banner stays 200 and says so — a probe that took every replica out of
+/// rotation because one file went missing would turn a stale policy into
+/// an outage.
 fn health(server: &DevtoolsServer) -> Response {
     let content_type = (
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     if server.audit_available() {
-        (
-            StatusCode::OK,
-            [content_type],
-            format!("mcp-server-devtools v{VERSION} is running"),
-        )
-            .into_response()
+        let mut banner = format!("mcp-server-devtools v{VERSION} is running");
+        if let Some(reason) = server.policy_degraded() {
+            banner.push_str("; policy reload is failing, last good policy in force: ");
+            banner.push_str(&reason);
+        }
+        (StatusCode::OK, [content_type], banner).into_response()
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,

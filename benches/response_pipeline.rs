@@ -280,6 +280,171 @@ fn policy_stage() {
     });
 }
 
+/// Like [`probe`], for a stage that has to `.await`. Same counters; the
+/// closure's future is driven to completion on the current runtime.
+async fn probe_async<F, Fut, T>(label: &str, iters: u32, mut f: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let (b0, c0) = (BYTES.load(Relaxed), COUNT.load(Relaxed));
+    let t0 = std::time::Instant::now();
+    let mut out = f().await;
+    for _ in 1..iters {
+        out = f().await;
+    }
+    let dt = t0.elapsed();
+    let n = u64::from(iters);
+    println!(
+        "  {label:<40} {:>9} KB {:>10} allocs {:>8.2} µs",
+        (BYTES.load(Relaxed) - b0) / 1024 / n,
+        (COUNT.load(Relaxed) - c0) / n,
+        dt.as_secs_f64() * 1_000_000.0 / f64::from(iters)
+    );
+    out
+}
+
+/// The two §8 budgets on the enterprise request path that nothing above
+/// probes: the validated-token cache hit (< 50 µs) and the durable audit
+/// append (< 200 µs p99 on local NVMe, with batched fsync). Both run
+/// against the production components — the Okta validator primed from a
+/// JWKS on wiremock, and the journal adapter on a temp directory — so the
+/// numbers are the real path, not a model of it.
+///
+/// The append here is sequential, one record at a time, which is the
+/// *worst* case for the journal's group commit: every record pays its own
+/// `sync_data`. Under concurrent calls the writer batches, and the per-record
+/// cost falls; read the p99 as "one call on an idle gateway".
+fn enterprise_request_path_stage() {
+    use std::sync::Arc;
+
+    use mcp_server_devtools::audit::journal::{JOURNAL_FILE_NAME, JournalAuditSink};
+    use mcp_server_devtools::auth::okta::{OktaJwksValidator, OktaSettings};
+    use mcp_server_devtools::ports::{AuditEvent, AuditEventKind, AuditSink, TokenValidator};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const ISSUER: &str = "https://acme.okta.com/oauth2/default";
+    const AUDIENCE: &str = "api://mcp-devtools";
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        // -- JWT validation, cache hit --
+        let jwks = MockServer::start().await;
+        let jwk: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/okta_test_jwk.json")).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [jwk] })))
+            .mount(&jwks)
+            .await;
+        let validator = Arc::new(OktaJwksValidator::new(
+            OktaSettings {
+                issuer: ISSUER.to_owned(),
+                audience: AUDIENCE.to_owned(),
+                jwks_url: format!("{}/keys", jwks.uri()),
+                groups_claim: "groups".to_owned(),
+                clock_skew: std::time::Duration::from_secs(60),
+                tenant: "acme".to_owned(),
+                jwks_refresh: std::time::Duration::from_secs(600),
+                jwks_min_refetch_interval: std::time::Duration::from_secs(30),
+            },
+            reqwest::Client::new(),
+        ));
+        let now = jsonwebtoken::get_current_timestamp();
+        let claims = json!({
+            "sub": "alice@acme.example", "iss": ISSUER, "aud": AUDIENCE,
+            "iat": now, "exp": now + 300, "scp": ["mcp:tools"], "groups": ["SRE", "Developers"],
+        });
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some("test-key-1".to_owned());
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_rsa_der(include_bytes!(
+                "../tests/fixtures/okta_test_rsa_pkcs1.der"
+            )),
+        )
+        .unwrap();
+        // Prime: the first validation fetches the JWKS and verifies the
+        // signature; every one after it is the cache hit under budget.
+        validator.validate(&token).await.expect("token validates");
+        probe_async("JWT validate: cache hit (budget 50 µs)", 2000, || {
+            validator.validate(&token)
+        })
+        .await
+        .expect("cached token validates");
+
+        // -- Durable audit append --
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_dir = dir.path().join("journal");
+        if cfg!(windows) {
+            std::fs::create_dir_all(&journal_dir).unwrap();
+            std::fs::File::create(journal_dir.join(JOURNAL_FILE_NAME)).unwrap();
+        }
+        let sink = JournalAuditSink::open(&journal_dir).expect("open journal");
+        let event = AuditEvent {
+            timestamp: "2026-09-02T00:00:00.000Z".to_owned(),
+            kind: AuditEventKind::ToolCallIntent,
+            request_id: "sha256:0123456789abcdef".to_owned(),
+            tool_name: "grafana_query_logs".to_owned(),
+            vendor: "grafana".to_owned(),
+            principal: Principal {
+                tenant: "acme".to_owned(),
+                subject: "sre@acme.example".to_owned(),
+                groups: vec!["SRE".to_owned()],
+                scopes: vec!["mcp:tools".to_owned()],
+                authority: PrincipalAuthority::Okta,
+            },
+            client: ClientIdentity::default(),
+            decision: mcp_server_devtools::policy::PolicyDecision::by_rule(
+                mcp_server_devtools::policy::PolicyEffect::Allow,
+                "sre-read-qa-datasources",
+                "v1+sha256:0123456789abcdef",
+            ),
+            upstream_identity: UpstreamIdentity {
+                label: CredentialLabel::slot(
+                    mcp_server_devtools::auth::secrets::for_vendor("grafana")
+                        .next()
+                        .expect("grafana slot"),
+                ),
+                vendor: "grafana".to_owned(),
+                environment: EnvironmentClass::Qa,
+                authority: UpstreamAuthority::Shared,
+            },
+            action: None,
+            outcome: None,
+            duration_ms: None,
+            egress: None,
+        };
+        const APPENDS: usize = 1000;
+        let mut latencies = Vec::with_capacity(APPENDS);
+        let (b0, c0) = (BYTES.load(Relaxed), COUNT.load(Relaxed));
+        for _ in 0..APPENDS {
+            let started = std::time::Instant::now();
+            sink.append(&event).await.expect("append");
+            latencies.push(started.elapsed());
+        }
+        let (bytes, allocs) = (
+            (BYTES.load(Relaxed) - b0) / 1024 / APPENDS as u64,
+            (COUNT.load(Relaxed) - c0) / APPENDS as u64,
+        );
+        latencies.sort_unstable();
+        let at = |quantile: f64| latencies[((APPENDS - 1) as f64 * quantile) as usize];
+        println!(
+            "  {:<40} {bytes:>9} KB {allocs:>10} allocs  p50 {:>7.0} µs  p99 {:>7.0} µs  max {:>7.0} µs",
+            "journal append, sequential (budget p99 200 µs)",
+            at(0.50).as_secs_f64() * 1_000_000.0,
+            at(0.99).as_secs_f64() * 1_000_000.0,
+            latencies[APPENDS - 1].as_secs_f64() * 1_000_000.0,
+        );
+        drop(sink);
+    });
+}
+
 fn main() {
     println!("=== output size: is TOON earning its CPU? ===");
     output_size_comparison();
@@ -290,6 +455,10 @@ fn main() {
     extractor_stage();
     println!("\n=== stage -1b: policy decision, per tool call (mean of 2000) ===");
     policy_stage();
+    println!(
+        "\n=== stage -1c: enterprise request path, production components (mean of 2000 / 1000) ==="
+    );
+    enterprise_request_path_stage();
 
     // Stage 0 runs once per *tool call*, before any payload work — so unlike the
     // stages below it is paid even by a request that returns two bytes.

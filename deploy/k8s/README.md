@@ -14,7 +14,7 @@ Files:
 | `config.yaml` | ConfigMap with the non-secret enterprise settings and the policy document; Secret template for the vendor credentials. **Fill in the issuer, audience, public URL, and credentials.** |
 | `gateway.yaml` | Deployment (non-root, read-only root filesystem, `/tmp` on `emptyDir`, journal on a PVC), Service, PodDisruptionBudget. |
 | `control.yaml` | Deployment + Service for the control role. |
-| `ingress-nginx.yaml` | ingress-nginx Ingress with TLS via cert-manager, `Mcp-Session-Id` stickiness, and the body limit. |
+| `ingress-nginx.yaml` | ingress-nginx Ingress with TLS via cert-manager and the body limit. No session affinity: see "Sessions" below. |
 
 Apply in order:
 
@@ -56,16 +56,20 @@ curl -sS -H "Authorization: Bearer $TOKEN" \
   of the same guarantee.
 - **Read-only root filesystem.** The only writable paths are `/tmp`
   (response artifacts, diagnostic logs — `HOME=/tmp`) and the journal.
-- **Session stickiness.** Legacy MCP sessions live in the pod that created
-  them; the ingress hashes on `Mcp-Session-Id` so a session's requests
-  reach the same replica. Stateless (2026-07-28) requests carry no session
-  and balance freely. A miss returns MCP's "session not found" and the
-  client re-initialises.
+- **Sessions.** Legacy MCP sessions live in the pod that created them,
+  and the example runs **one** gateway replica, so nothing more is needed.
+  Scaling past one replica needs an affinity mechanism that binds a
+  session to the pod that created it. Hashing the `Mcp-Session-Id` header
+  at the ingress cannot do that (the initialize request has no id; the id
+  is generated in the response), and it would send every stateless request
+  to a single pod. Use ingress cookie affinity if your MCP clients keep
+  cookies, or a shared session store (plan §3.4; tracked as CF-16). A miss
+  returns MCP's "session not found" and the client re-initialises.
 - **TLS terminates at the ingress** (ADR-004). The pod listens on plain
   HTTP inside the cluster.
 
 ## Not in this example
 
-Horizontal gateway scaling with a shared artifact volume, the control
-plane's admin API, Prometheus metrics, and Helm packaging are Phase C
-(plan §4).
+Horizontal gateway scaling (session affinity, a shared artifact volume),
+the control plane's admin API, Prometheus metrics, and Helm packaging are
+Phase C (plan §4).

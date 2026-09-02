@@ -303,6 +303,14 @@ impl DevtoolsServer {
             .is_none_or(|sink| sink.is_available())
     }
 
+    /// Why the policy in force is stale, if it is (the policy file vanished
+    /// or stopped compiling). The gateway keeps serving under the last good
+    /// document; the health banner says so.
+    #[must_use]
+    pub fn policy_degraded(&self) -> Option<String> {
+        self.components.policy.degraded()
+    }
+
     /// The principal a request was made under.
     ///
     /// The bearer middleware inserts the validated [`Principal`] into the

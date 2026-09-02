@@ -22,7 +22,8 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: control
-          image: ghcr.io/huskercane/mcp-devtools:latest
+          # Same release as the gateway; pin the digest where possible.
+          image: ghcr.io/huskercane/mcp-devtools:v0.15.0
           args: ["--role", "control"]
           ports:
             - name: http

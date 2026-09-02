@@ -212,6 +212,82 @@ async fn a_changed_document_is_picked_up_and_a_broken_one_is_ignored() {
     assert_eq!(sre(&policy).effect, PolicyEffect::Deny);
 }
 
+/// A policy file that vanishes is not an emergency deny: the last good
+/// document stays in force (the same posture as a gateway whose control
+/// plane is down). The state must be visible, though — on the policy and on
+/// the health banner — and must clear when the file is back.
+#[tokio::test]
+async fn a_vanished_policy_file_keeps_the_last_policy_and_reports_degraded_health() {
+    use mcp_server_devtools::bootstrap::ServerBuilder;
+    use mcp_server_devtools::config::Config;
+    use mcp_server_devtools::server::http::build_app_with_server;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("policy.yaml");
+    let document = "version: 7\nrules:\n  - id: sre\n    effect: allow\n    subjects: {groups: [SRE]}\n    match: {vendor: grafana}\n";
+    std::fs::write(&path, document).unwrap();
+    let policy = FilePolicy::load(&path).unwrap();
+    policy.spawn_watcher();
+    let version = policy.version().unwrap();
+    assert_eq!(policy.degraded(), None);
+
+    let server = ServerBuilder::new()
+        .config(Config::from_map(HashMap::new()))
+        .policy(Arc::clone(&policy) as Arc<dyn PolicyDecisionPoint>)
+        .build()
+        .unwrap();
+    let app = build_app_with_server(
+        server,
+        Duration::from_mins(5),
+        Duration::from_mins(5),
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let banner = reqwest::get(format!("{base}/")).await.unwrap();
+    assert_eq!(banner.status(), 200);
+    assert!(banner.text().await.unwrap().ends_with(" is running"));
+
+    // The file goes away. Decisions continue under the last good document;
+    // the policy and the banner both say the reload is failing.
+    std::fs::remove_file(&path).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while policy.degraded().is_none() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the watcher reports the missing file");
+    assert_eq!(policy.version().unwrap(), version, "last good policy stays");
+    assert!(
+        policy.degraded().unwrap().contains("cannot read policy"),
+        "{:?}",
+        policy.degraded()
+    );
+    let banner = reqwest::get(format!("{base}/")).await.unwrap();
+    assert_eq!(banner.status(), 200, "stale policy is a serving state");
+    let text = banner.text().await.unwrap();
+    assert!(text.contains("policy reload is failing"), "{text}");
+    assert!(text.contains("last good policy in force"), "{text}");
+
+    // The file is back, unchanged: no longer degraded, same version.
+    std::fs::write(&path, document).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while policy.degraded().is_some() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the watcher clears the degraded state");
+    assert_eq!(policy.version().unwrap(), version);
+    let banner = reqwest::get(format!("{base}/")).await.unwrap();
+    assert!(banner.text().await.unwrap().ends_with(" is running"));
+}
+
 #[test]
 fn policy_check_command_reports_compiling_and_broken_documents() {
     let good = Command::new(cargo_bin("mcp-devtools"))
