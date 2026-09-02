@@ -411,6 +411,7 @@ written before dispatch.
 - [ ] CF-18 — decide, with counsel, whether the Okta validator and file
   policy engine move to the private repository or ADR-001 is amended.
 - [ ] Gate A — owner-led: a partner, their IdP, their non-production upstream.
+  Steps, what is under test, and the exit are in `docs/gate-a-runbook.md`.
 - [ ] `SECURITY.md` + disclosure process (security track, before Gate A).
 
 > **Gate A — problem validation.** One partner runs Phase A against their real
