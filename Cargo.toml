@@ -86,6 +86,15 @@ rpassword           = "=7.5.4"
 httpdate            = "=1.0.3"
 zstd                = "=0.13.3"
 chrono              = { version = "=0.4.45", default-features = false, features = ["std"] }
+# Inbound bearer-token validation (plan §3.1 `TokenValidator`, WP A.1). The
+# `aws_lc_rs` backend is the same provider rustls already links through
+# `reqwest`, so this adds JWT parsing and JWK handling but no second crypto
+# stack. `use_pem` is off: keys arrive as JWKs from the IdP, never as PEM.
+jsonwebtoken        = { version = "=11.0.0", default-features = false, features = ["aws_lc_rs"] }
+# YAML policy documents (plan ADR-003, WP A.7). `serde_yaml` itself is
+# archived upstream and flagged unmaintained by cargo-deny; this is the
+# maintained fork with the same API and licence.
+serde_norway        = "=0.9.42"
 
 # --- WRDS (feature = "wrds") --------------------------------------------------
 # WRDS is PostgreSQL-only; these back the `wrds_*` tools. `with-serde_json-1`
