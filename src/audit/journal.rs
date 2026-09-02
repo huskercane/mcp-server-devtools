@@ -492,6 +492,17 @@ fn recover(file: &File, path: &Path) -> io::Result<u64> {
                 "truncating a torn trailing record from the audit journal"
             );
             file.set_len(complete_len)?;
+            // `set_len` only changes what the file reports; without a sync
+            // the shorter length can itself be lost to a second crash before
+            // the next batch's `sync_data`, and recovery would replay the
+            // same torn bytes again. `sync_all`, not `sync_data`: this
+            // changes the file's length, which is metadata, and `sync_data`
+            // is not required to persist metadata that isn't needed to
+            // retrieve the data — length is exactly that case, so don't rely
+            // on the platform treating it as such. This runs once at
+            // startup, not on the hot append path, so the extra cost is
+            // fine.
+            file.sync_all()?;
             break;
         }
 

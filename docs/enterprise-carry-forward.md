@@ -10,7 +10,9 @@ removed only when it is done, not when it is explained.
 
 Status legend: **open** · **blocked** (needs a decision) · **done**.
 
-Last updated: 2026-09-01, after the third WP 0.8 review pass.
+Last updated: 2026-09-02, after a sixth review pass (journal backpressure
+timing, fsync-after-truncate fixed directly — see CF-14 and the journal
+durability fix in the same commit).
 
 ---
 
@@ -118,6 +120,15 @@ Every audit event currently carries `Principal::local()`. Phase A replaces it
 with the validated principal from `context.extensions`
 (`docs/spikes/rmcp-extensions.md`).
 
+Sub-point from a review pass: today both transports refuse `AuthMode::Okta`
+outright (`src/server/stdio.rs`, `src/server/http.rs:489`), so there is no
+live path where a client is told "healthy" while the journal it needs is
+unwritable — `/health` always answers before any Okta-gated call could exist.
+Once this item lands and `/health` on the HTTP transport can mean something
+under real auth, `health()` (`src/server/http.rs:285`) should reflect journal
+availability rather than always returning 200; do it as part of this item,
+not before Okta is real.
+
 ### CF-7 · Route CLI subcommands through the audited boundary
 **Open · Phase A/B**
 
@@ -135,6 +146,26 @@ The journal is durable (`sync_data` per batch; the journal directory and
 every ancestor it creates synced at startup) and tamper-*evident* by
 contiguous sequence, but not tamper-*proof*. Signed checkpoints every N
 records or T seconds are B.6.
+
+### CF-14 · Journal append has no bound on how long a call can wait
+**Open · Phase A/B · needs a design decision, not a one-line fix**
+
+`AuditSink::append` (`src/audit/journal.rs:257-280`) has no timeout on either
+the bounded-channel `send().await` or the ack `acked.await`. A sustained
+stall on the underlying disk (the module's own doc already calls
+`sync_data` "unbounded in practice" — full disk, page reclaim, FUSE, network
+storage) parks every in-flight `tools/call` on that wait instead of
+returning `AUDIT_UNAVAILABLE_MESSAGE`; the caller sees whatever the
+transport's own timeout produces instead of a clean fail-closed refusal.
+
+Not a quick fix: a naive `tokio::time::timeout` around `send().await` is
+safe (nothing was enqueued, refuse cleanly), but the same wrapper around
+`acked.await` is not — the record can already be queued and later written by
+the dedicated writer thread after the caller has been told the call was
+refused. That is still fail-closed (the vendor is never called), but it
+changes what "the journal has a record for a refused call" means and needs
+to be a reviewed decision, not an incidental one, given the module's stated
+RPO = 0 / no-degraded-mode invariant.
 
 ### CF-9 · `POST /rest/api/3/issue/bulkfetch`
 **Blocked · needs its own review**
