@@ -69,29 +69,32 @@ fn normalize_path(path: &str) -> String {
 /// else is a digest, so an attribute can never carry text nobody validated.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Retention {
-    /// A non-negative integer (`limit`, `maxResults`). Retained as the
-    /// parsed number, so nothing but digits can survive.
-    Integer,
     /// One of a fixed set of literals (`direction`). Retained only on an
     /// exact, case-insensitive match against the set.
+    ///
+    /// This is the one shape exempt from the "no verbatim option" rule
+    /// below, because it is not really a shape check on caller text at
+    /// all: the value only survives by exact match against a small,
+    /// server-owned vocabulary the caller does not control the membership
+    /// of. A credential cannot coincidentally equal `"backward"`.
     Enumerated(&'static [&'static str]),
-    /// A time bound: an integer epoch, a duration literal like `5m`, or an
-    /// RFC 3339 timestamp. Retained only in one of those shapes.
-    TimeBound,
     /// A **caller-authored value with no closed shape** — a comma-separated
-    /// field list (`fields`) as much as a search expression (`jql`,
+    /// field list (`fields`), a numeric bound (`limit`, `maxResults`), a
+    /// time bound (`start`, `end`, `step`), or a search expression (`jql`,
     /// `LogQL`). Kept as a digest and a length, never as text.
     ///
-    /// An earlier revision gave field lists their own "parses as
-    /// `[A-Za-z0-9_.*-]+`" shape and kept the value verbatim when it
-    /// matched. That alphabet is also every popular credential format's
-    /// alphabet (`sk-live-…`, `xoxb-…`, a JWT's dot-separated base64url
-    /// segments), so `fields=xoxb-secret-token` parsed as a one-element list
-    /// and passed through unchanged. Unlike [`Retention::Integer`] or
-    /// [`Retention::TimeBound`], whose accepted alphabets are narrow enough
-    /// that no real credential format matches them, there is no shape this
-    /// endpoint's caller-supplied identifiers could take that would exclude
-    /// a token — so nothing here is retained by shape at all.
+    /// There is deliberately no per-shape verbatim option for any of these.
+    /// Two earlier revisions each tried one: field lists were retained
+    /// verbatim when every element matched `[A-Za-z0-9_.*-]+`, and numeric
+    /// bounds when the value parsed as `u64`. Both alphabets are also real
+    /// credential formats — `sk-live-…`/`xoxb-…` for the first, and this
+    /// repository's own six-digit `NinjaOne` TOTP/MFA codes
+    /// (`tests/ninjaone_session_tests.rs`) for the second — so
+    /// `fields=xoxb-secret-token` and `limit=381164` each parsed as their
+    /// declared shape and passed through unchanged. There is no caller-
+    /// supplied shape here narrow enough to exclude every real credential
+    /// format, unlike [`Retention::Enumerated`]'s closed vocabulary — so
+    /// nothing in this variant is retained by shape at all.
     ///
     /// `docs/read-endpoint-inventory.md` decision 5 says raw query text does
     /// not enter audit, and it says so for a concrete reason: an expression
@@ -135,18 +138,10 @@ fn retain(value: &str, retention: Retention) -> String {
         return expression_digest(value);
     }
     let parsed = match retention {
-        Retention::Integer => parse_integer(value),
         Retention::Enumerated(allowed) => parse_enumerated(value, allowed),
-        Retention::TimeBound => parse_time_bound(value),
         Retention::Digest => None,
     };
     parsed.unwrap_or_else(|| expression_digest(value))
-}
-
-fn parse_integer(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    // Parsed and re-rendered, so `+007` and `1_0` cannot pass through.
-    trimmed.parse::<u64>().ok().map(|number| number.to_string())
 }
 
 fn parse_enumerated(value: &str, allowed: &[&'static str]) -> Option<String> {
@@ -155,23 +150,6 @@ fn parse_enumerated(value: &str, allowed: &[&'static str]) -> Option<String> {
         .iter()
         .find(|candidate| candidate.eq_ignore_ascii_case(trimmed))
         .map(|candidate| (*candidate).to_owned())
-}
-
-/// Epoch seconds/nanos, a duration literal (`5m`, `1h30m`), or RFC 3339.
-/// Each is checked by shape, not merely by length.
-fn parse_time_bound(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.len() > 64 {
-        return None;
-    }
-    let all = |predicate: fn(char) -> bool| trimmed.chars().all(predicate);
-    let numeric = all(|ch| ch.is_ascii_digit());
-    let duration = all(|ch| ch.is_ascii_digit() || matches!(ch, 'n' | 'u' | 'm' | 's' | 'h' | 'd'))
-        && trimmed.starts_with(|ch: char| ch.is_ascii_digit());
-    let rfc3339 = all(|ch| {
-        ch.is_ascii_digit() || matches!(ch, '-' | ':' | 'T' | 'Z' | '.' | '+' | 't' | 'z')
-    }) && trimmed.starts_with(|ch: char| ch.is_ascii_digit());
-    (numeric || duration || rfc3339).then(|| trimmed.to_owned())
 }
 
 /// `sha256:<16 hex chars>/<byte length>` — enough to correlate two identical
@@ -218,11 +196,11 @@ pub mod grafana {
     /// nothing about policy depends on having the expression.
     const QUERY_LOGS_ALLOWLIST: &[(&str, Retention)] = &[
         ("direction", Retention::Enumerated(&["backward", "forward"])),
-        ("end", Retention::TimeBound),
-        ("limit", Retention::Integer),
+        ("end", Retention::Digest),
+        ("limit", Retention::Digest),
         ("query", Retention::Digest),
-        ("start", Retention::TimeBound),
-        ("step", Retention::TimeBound),
+        ("start", Retention::Digest),
+        ("step", Retention::Digest),
     ];
 
     /// Path prefix of the datasource proxy, without the UID.
@@ -307,7 +285,7 @@ pub mod jira {
     const SEARCH_QUERY_ALLOWLIST: &[(&str, Retention)] = &[
         ("fields", Retention::Digest),
         ("jql", Retention::Digest),
-        ("maxResults", Retention::Integer),
+        ("maxResults", Retention::Digest),
     ];
 
     /// The **only** body field the POST search extractor reads.
@@ -707,9 +685,12 @@ mod tests {
             details.canonical_path,
             "/api/datasources/proxy/uid/loki-prod/loki/api/v1/query_range"
         );
-        assert_eq!(
-            details.query_attributes()[0],
-            ("limit".to_owned(), "100".to_owned())
+        let (limit_key, limit_value) = &details.query_attributes()[0];
+        assert_eq!(limit_key, "limit");
+        assert!(
+            limit_value.starts_with("sha256:"),
+            "limit has no numeric shape any more — a real credential can be \
+             all digits too: {limit_value}"
         );
         let (key, value) = &details.query_attributes()[1];
         assert_eq!(key, "query");
@@ -1154,8 +1135,16 @@ mod tests {
         );
     }
 
+    /// `direction` is the one attribute backed by a closed, server-owned
+    /// vocabulary (`Retention::Enumerated`), so it is the one that survives
+    /// verbatim — normalised to the known literal. Everything else here is
+    /// caller-authored text with no shape narrow enough to exclude a
+    /// credential, so even a well-formed value is retained only as a
+    /// digest; see `numeric_values_including_mfa_shaped_codes_are_always_digested`
+    /// for why `limit`/`start`/`step`/`end` no longer have a numeric or
+    /// time-bound shape of their own.
     #[test]
-    fn well_formed_attribute_values_survive_in_their_parsed_shape() {
+    fn well_formed_attribute_values_survive_only_when_enumerated() {
         let details = grafana::query_logs(
             "loki-prod",
             &[
@@ -1166,39 +1155,41 @@ mod tests {
                 ("end", "2026-09-01T00:00:00Z"),
             ],
         );
-        let attributes: Vec<(&str, &str)> = details
+        let attributes: std::collections::HashMap<&str, &str> = details
             .query_attributes()
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
-        assert_eq!(
-            attributes,
-            vec![
-                ("direction", "backward"), // normalised to the known literal
-                ("end", "2026-09-01T00:00:00Z"),
-                ("limit", "500"),
-                ("start", "1735689600"),
-                ("step", "5m"),
-            ]
-        );
+        assert_eq!(attributes["direction"], "backward");
+        for key in ["end", "limit", "start", "step"] {
+            assert!(
+                attributes[key].starts_with("sha256:"),
+                "{key} was well-formed but must still be a digest, got {}",
+                attributes[key]
+            );
+        }
     }
 
+    /// `limit`/`maxResults` once had their own numeric shape: parsed and
+    /// re-rendered as a `u64`, which stopped `+007`-style tricks but not a
+    /// genuine number — and a real credential can be exactly that shape.
+    /// This repository's own `NinjaOne` TOTP/MFA codes
+    /// (`tests/ninjaone_session_tests.rs`) are six ASCII digits, identical
+    /// in shape to a page size. A caller setting `limit=381164` must not
+    /// have that code end up in durable evidence merely because it also
+    /// parses as a `u64`.
     #[test]
-    fn integers_are_reparsed_rather_than_pattern_matched() {
-        // `+007` and `1_0` parse as text that "looks numeric" to a naive
-        // check; re-rendering the parsed number is what stops them.
-        for odd in ["+007", "1_0", "0x10", " 12 ", "-1", "12.0"] {
-            let details = grafana::query_logs("loki-prod", &[("limit", odd)]);
-            let (_, value) = &details.query_attributes()[0];
-            let canonical_number = value.chars().all(|ch| ch.is_ascii_digit())
-                && value.parse::<u64>().is_ok_and(|n| n.to_string() == *value);
+    fn numeric_values_including_mfa_shaped_codes_are_always_digested() {
+        for value in [
+            "500", "381164", "999999", "424242", "+007", "1_0", "0x10", " 12 ", "-1", "12.0",
+        ] {
+            let details = grafana::query_logs("loki-prod", &[("limit", value)]);
+            let (_, retained) = &details.query_attributes()[0];
             assert!(
-                canonical_number || value.starts_with("sha256:"),
-                "limit {odd:?} retained as {value}: neither a canonical \
-                 number nor a digest"
+                retained.starts_with("sha256:"),
+                "limit {value:?} retained as {retained}: must be a digest, \
+                 not the caller's number"
             );
-            // Whatever survives, none of the caller's own characters do.
-            assert!(!value.contains('+') && !value.contains('_') && !value.contains('x'));
         }
     }
 

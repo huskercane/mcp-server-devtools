@@ -193,23 +193,29 @@ and holds the §3.2 freeze open — see `docs/enterprise-carry-forward.md` CF-2.
 
    The decision covers **every** retained attribute, not only the search
    expressions. `query_attributes` has no verbatim option: each key declares
-   a shape (`Integer`, `Enumerated`, `TimeBound`, `Digest`), the value is
-   retained only if it *parses* as that shape, and anything else — including
-   anything over-long — becomes `sha256:<64 bits>/<length>`. Bounding a
-   caller-controlled string is not redacting it: a token supplied as Jira's
-   `fields` or Grafana's `direction` previously reached the serialized
-   `ActionContext` intact, merely shorter.
+   a shape (`Enumerated` or `Digest`), the value is retained only if it
+   *parses* as that shape, and anything else — including anything over-long
+   — becomes `sha256:<64 bits>/<length>`. Bounding a caller-controlled
+   string is not redacting it: a token supplied as Jira's `fields` or
+   Grafana's `direction` previously reached the serialized `ActionContext`
+   intact, merely shorter.
 
-   `fields` was originally its own shape (`IdentifierList`): retained
-   verbatim when every comma-separated element matched `[A-Za-z0-9_.*-]+`.
-   That alphabet is also every popular credential format's alphabet
-   (`sk-live-…`, `xoxb-…`, a JWT), so a bare token — no `Bearer ` prefix, so
-   no space to trip the existing tests — parsed as a one-element list and
-   reached durable evidence unchanged. `fields` is `Digest` now, with no
-   shape-based carve-out; `Integer` and `TimeBound` keep theirs because
-   their accepted alphabets (digits; digits plus a handful of duration/RFC
-   3339 punctuation) are narrow enough that no real credential format
-   matches them.
+   `fields` (`limit`/`maxResults`, `start`/`end`/`step` too) was originally
+   its own shape — `IdentifierList` for `fields` (retained verbatim when
+   every comma-separated element matched `[A-Za-z0-9_.*-]+`), `Integer` for
+   the numeric bounds (retained as the re-rendered `u64`), `TimeBound` for
+   the time bounds. Each alphabet is also a real credential format's
+   alphabet: `sk-live-…`/`xoxb-…`/a JWT for the first, and this repository's
+   own six-digit NinjaOne TOTP/MFA codes
+   (`tests/ninjaone_session_tests.rs`) for the second and third — a bare
+   token or a code, with no space or letters to trip a shape check, parsed
+   as the declared shape and reached durable evidence unchanged. All three
+   are `Digest` now, with no shape-based carve-out for any of them.
+   `Enumerated` is the one shape that still survives verbatim, and safely:
+   it is not a check on caller text at all, only an exact match against a
+   small, server-owned vocabulary (`direction`'s `backward`/`forward`) whose
+   membership the caller does not control, so a credential cannot
+   coincidentally equal a member of it.
 
    The same rule now governs the other caller-controlled strings that reach
    durable evidence: the JSON-RPC request id (`policy::correlation_id`) and
@@ -223,9 +229,14 @@ and holds the §3.2 freeze open — see `docs/enterprise-carry-forward.md` CF-2.
    The first revision of this decision was documented and then contradicted
    by the implementation, which cloned the expression whole and unbounded.
    A second revision closed that gap for values containing a space but left
-   the bare-token shape open. `search_expressions_never_reach_query_attributes_as_text`,
+   the bare-token shape open for `fields`, and left `limit`/`maxResults`/
+   `start`/`end`/`step` on their numeric and time-bound shapes entirely — a
+   third revision closed the former, a fourth the latter.
+   `search_expressions_never_reach_query_attributes_as_text`,
    `caller_supplied_attribute_values_must_parse_or_become_a_digest`,
    `bare_tokens_in_fields_are_digested_not_passed_through`,
+   `numeric_values_including_mfa_shaped_codes_are_always_digested`,
+   `well_formed_attribute_values_survive_only_when_enumerated`,
    `client_reported_values_are_always_digested`, and
    `correlation_ids_are_digested_but_still_correlate` fail if any of that
    returns.
