@@ -291,6 +291,41 @@ impl DevtoolsServer {
     fn wrds_ctx<'a>(&'a self, config: &'a Config) -> WrdsContext<'a> {
         WrdsContext::new(config, &self.components.vendors.wrds)
     }
+
+    /// Whether the durable audit journal can accept records. `true` in
+    /// local mode (no journal); the HTTP health endpoint reports `false` as
+    /// 503, because a gateway that refuses every call is not healthy.
+    #[must_use]
+    pub fn audit_available(&self) -> bool {
+        self.components
+            .audit_sink
+            .as_ref()
+            .is_none_or(|sink| sink.is_available())
+    }
+
+    /// The principal a request was made under.
+    ///
+    /// The bearer middleware inserts the validated [`Principal`] into the
+    /// HTTP request's extensions, and rmcp carries those `Parts` into the
+    /// tool-call context (`docs/spikes/rmcp-extensions.md`). Stdio has no
+    /// `Parts`, and loopback HTTP without auth has `Parts` without a
+    /// principal; both are local mode. When inbound auth is required, a
+    /// missing principal is a refusal, never a fallback to local.
+    fn principal_for(
+        &self,
+        context: &rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Option<Principal> {
+        let validated = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<Principal>())
+            .cloned();
+        match validated {
+            Some(principal) => Some(principal),
+            None if self.components.auth_required => None,
+            None => Some(Principal::local()),
+        }
+    }
 }
 
 // ============================================================================
@@ -358,6 +393,67 @@ impl DevtoolsServer {
 const AUDIT_UNAVAILABLE_MESSAGE: &str = "Audit journal unavailable; call refused (fail closed). \
      See the server log for the cause.";
 
+/// What a caller is told when inbound authentication is required but the
+/// call carries no validated principal. The bearer middleware makes this
+/// unreachable over HTTP; it exists so a transport wired without the
+/// middleware fails closed instead of running as `local`.
+const UNAUTHENTICATED_MESSAGE: &str =
+    "Unauthenticated; call refused (fail closed). This server requires a validated bearer token.";
+
+impl DevtoolsServer {
+    /// Journal the outcome of a dispatched call and emit its usage event.
+    /// The dispatch already happened, so a journal failure here is loud
+    /// (guiding constraint 5) but refuses nothing.
+    #[allow(clippy::too_many_arguments)] // One outcome, all of its facts; a struct would only rename them.
+    async fn record_outcome(
+        &self,
+        sink: &dyn crate::ports::AuditSink,
+        vendor: &str,
+        upstream: crate::policy::UpstreamIdentity,
+        client: ClientIdentity,
+        principal: Principal,
+        audit: &crate::audit::AuditCall,
+        outcome: &str,
+        duration_ms: u128,
+    ) {
+        let tool_name = audit.tool_name().to_owned();
+        let request_id = crate::policy::correlation_id(audit.request_id());
+        // One timestamp for the outcome event and the usage event
+        // (CLAUDE.md perf guidelines: no repeated formatting work).
+        let completed_at = crate::logger::iso_timestamp();
+        let outcome_event = AuditEvent {
+            timestamp: completed_at.clone(),
+            kind: AuditEventKind::ToolCallOutcome,
+            request_id,
+            tool_name: tool_name.clone(),
+            vendor: vendor.to_owned(),
+            principal,
+            client,
+            decision: PolicyDecision::local_allow(),
+            upstream_identity: upstream,
+            outcome: Some(outcome.to_owned()),
+            duration_ms: Some(duration_ms),
+        };
+        if let Err(error) = sink.append(&outcome_event).await {
+            // Category only: an HTTP audit sink's error can quote a request
+            // header, and this line is not covered by the logger's
+            // redaction patterns.
+            tracing::error!(
+                failure = %crate::ports::audit_sink::AuditFailure::classify(&error),
+                tool = %tool_name,
+                "failed to journal audit outcome"
+            );
+        }
+        self.components.usage_sink.record(UsageEvent {
+            timestamp: completed_at,
+            tool_name,
+            vendor: vendor.to_owned(),
+            outcome: outcome.to_owned(),
+            duration_ms,
+        });
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for DevtoolsServer {
     async fn call_tool(
@@ -376,6 +472,19 @@ impl ServerHandler for DevtoolsServer {
             client.as_ref().map(|value| value.name.clone()),
             client.as_ref().map(|value| value.version.clone()),
         );
+
+        // WP A.2 / CF-6: the validated principal, or `local`. A required
+        // principal that is absent is a refusal before anything else runs.
+        let Some(principal) = self.principal_for(&context) else {
+            tracing::error!(
+                tool = %request.name.as_ref(),
+                "tool call reached dispatch without a validated principal; refusing"
+            );
+            audit.complete("unauthenticated");
+            return Ok(CallToolResponse::Complete(CallToolResult::error(vec![
+                Content::text(UNAUTHENTICATED_MESSAGE),
+            ])));
+        };
 
         // WP 0.7: durable write-before-dispatch. Only active when an audit
         // journal is configured; local mode takes the `None` branch and the
@@ -412,9 +521,7 @@ impl ServerHandler for DevtoolsServer {
                 request_id: crate::policy::correlation_id(audit.request_id()),
                 tool_name: request.name.as_ref().to_owned(),
                 vendor: (*vendor).to_owned(),
-                // Phase A replaces this with the validated principal from
-                // `context.extensions` (see docs/spikes/rmcp-extensions.md).
-                principal: Principal::local(),
+                principal: principal.clone(),
                 client: client.clone(),
                 decision: PolicyDecision::local_allow(),
                 upstream_identity: upstream.clone(),
@@ -459,43 +566,17 @@ impl ServerHandler for DevtoolsServer {
         };
 
         if let Some((sink, vendor, upstream, client)) = enterprise {
-            let duration_ms = started.elapsed().as_millis();
-            let tool_name = audit.tool_name().to_owned();
-            let request_id = crate::policy::correlation_id(audit.request_id());
-            // One timestamp for the outcome event and the usage event
-            // (CLAUDE.md perf guidelines: no repeated formatting work).
-            let completed_at = crate::logger::iso_timestamp();
-            let outcome_event = AuditEvent {
-                timestamp: completed_at.clone(),
-                kind: AuditEventKind::ToolCallOutcome,
-                request_id,
-                tool_name: tool_name.clone(),
-                vendor: vendor.to_owned(),
-                principal: Principal::local(),
+            self.record_outcome(
+                sink.as_ref(),
+                vendor,
+                upstream,
                 client,
-                decision: PolicyDecision::local_allow(),
-                upstream_identity: upstream,
-                outcome: Some(outcome.to_owned()),
-                duration_ms: Some(duration_ms),
-            };
-            if let Err(error) = sink.append(&outcome_event).await {
-                // The dispatch already happened; nothing to refuse. Loud,
-                // not silent (guiding constraint 5) — and the legacy
-                // AUDIT_LOG record below still lands. Category only, for the
-                // same reason as the intent branch above.
-                tracing::error!(
-                    failure = %crate::ports::audit_sink::AuditFailure::classify(&error),
-                    tool = %tool_name,
-                    "failed to journal audit outcome"
-                );
-            }
-            self.components.usage_sink.record(UsageEvent {
-                timestamp: completed_at,
-                tool_name,
-                vendor: vendor.to_owned(),
-                outcome: outcome.to_owned(),
-                duration_ms,
-            });
+                principal,
+                &audit,
+                outcome,
+                started.elapsed().as_millis(),
+            )
+            .await;
         }
 
         audit.complete(outcome);

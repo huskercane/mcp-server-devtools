@@ -63,6 +63,11 @@ pub struct Components {
     pub audit_sink: Option<Arc<dyn AuditSink>>,
     /// Lossy usage telemetry (WP 0.7). Defaults to no-op in local mode.
     pub usage_sink: Arc<dyn UsageSink>,
+    /// Whether every tool call must carry a validated inbound principal
+    /// (`MCP_AUTH_MODE=okta`). When true, a call that reaches `call_tool`
+    /// without one — which the bearer middleware should make impossible —
+    /// is refused rather than treated as local (WP A.2, fail closed).
+    pub auth_required: bool,
 }
 
 impl Components {
@@ -87,6 +92,7 @@ pub struct ServerBuilder {
     credential_broker: Option<Arc<dyn CredentialBroker>>,
     audit_sink: Option<Arc<dyn AuditSink>>,
     usage_sink: Option<Arc<dyn UsageSink>>,
+    auth_required: bool,
 }
 
 impl ServerBuilder {
@@ -150,6 +156,15 @@ impl ServerBuilder {
         self
     }
 
+    /// Require a validated inbound principal on every tool call (enterprise
+    /// mode). The HTTP transport sets this when it installs the bearer
+    /// middleware; a `call_tool` without a principal is then refused.
+    #[must_use]
+    pub fn require_inbound_auth(mut self, required: bool) -> Self {
+        self.auth_required = required;
+        self
+    }
+
     /// Assemble the server.
     ///
     /// # Errors
@@ -191,6 +206,7 @@ impl ServerBuilder {
                 .unwrap_or_else(|| Arc::new(ConfigCredentialBroker)),
             audit_sink,
             usage_sink: self.usage_sink.unwrap_or_else(|| Arc::new(NoopUsageSink)),
+            auth_required: self.auth_required,
         });
 
         if let Some(pending) = watched {

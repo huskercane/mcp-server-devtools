@@ -118,20 +118,20 @@ Follow-up recorded as CF-15: CircleCI's signed log-output download
 response and bypasses this path entirely.
 
 ### CF-6 · Validated `Principal` from token claims
-**Open · Phase A**
+**Done · 2026-09-02 (Phase A, WPs A.1–A.3)**
 
-Every audit event currently carries `Principal::local()`. Phase A replaces it
-with the validated principal from `context.extensions`
-(`docs/spikes/rmcp-extensions.md`).
+`call_tool` reads the validated principal the bearer middleware placed in
+the request extensions (`DevtoolsServer::principal_for`); stdio and
+loopback-without-auth are `local`, and a server built with
+`require_inbound_auth` refuses a call that arrives without a principal
+instead of running it as `local`. Both audit records carry the validated
+subject, tenant, groups, scopes, and authority
+(`tests/inbound_auth_tests.rs`).
 
-Sub-point from a review pass: today both transports refuse `AuthMode::Okta`
-outright (`src/server/stdio.rs`, `src/server/http.rs:489`), so there is no
-live path where a client is told "healthy" while the journal it needs is
-unwritable — `/health` always answers before any Okta-gated call could exist.
-Once this item lands and `/health` on the HTTP transport can mean something
-under real auth, `health()` (`src/server/http.rs:285`) should reflect journal
-availability rather than always returning 200; do it as part of this item,
-not before Okta is real.
+The sub-point landed with it: `AuditSink::is_available` (the journal answers
+`false` once poisoned) and the HTTP health banner answers 503 when the
+journal cannot accept records, so a gateway that will refuse every call is
+not reported healthy. Local mode without a journal is byte-identical.
 
 ### CF-7 · Route CLI subcommands through the audited boundary
 **Open · Phase A/B**

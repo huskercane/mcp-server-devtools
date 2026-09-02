@@ -148,6 +148,15 @@ pub trait AuditSink: Send + Sync {
     /// Any error means the evidence was **not** durably recorded; callers on
     /// the dispatch path must fail closed (refuse the call), never proceed.
     fn append<'a>(&'a self, event: &'a AuditEvent) -> AppendFuture<'a>;
+
+    /// Whether the sink can currently accept records. A poisoned journal
+    /// answers `false`, and the HTTP health endpoint reports it: a gateway
+    /// that will refuse every tool call must not look healthy to the load
+    /// balancer that keeps sending it traffic. Cheap and non-blocking — it
+    /// is polled by health probes.
+    fn is_available(&self) -> bool {
+        true
+    }
 }
 
 /// A sequence-stamped event as a sink persists it.
@@ -222,6 +231,12 @@ impl AuditSink for InMemoryAuditSink {
     fn append<'a>(&'a self, event: &'a AuditEvent) -> AppendFuture<'a> {
         // No I/O to wait for: resolve immediately.
         Box::pin(std::future::ready(self.append_now(event)))
+    }
+
+    /// The failing switch doubles as "unavailable", so health-endpoint
+    /// tests can drive it.
+    fn is_available(&self) -> bool {
+        !self.failing.load(Ordering::SeqCst)
     }
 }
 

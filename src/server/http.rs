@@ -34,9 +34,13 @@ use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{info, warn};
 
-use crate::config::AuthMode;
+use crate::config::{AuthMode, Config};
 use crate::constants::VERSION;
 use crate::error::McpError;
+use crate::server::auth::{
+    InboundAuth, InboundAuthSettings, PROTECTED_RESOURCE_METADATA_PATH,
+    protected_resource_metadata, require_bearer,
+};
 use crate::server::session::{DEFAULT_IDLE_TTL, DEFAULT_SWEEP_INTERVAL, ReapingSessionManager};
 use crate::server::shutdown;
 use crate::tools::DevtoolsServer;
@@ -59,9 +63,19 @@ pub async fn run_http() -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
     // it outright instead of draining. See `shutdown::install`.
     let shutdown_signal = shutdown::install();
 
-    let auth_mode = AuthMode::parse(std::env::var("MCP_AUTH_MODE").ok().as_deref())?;
+    // One config load for the transport's own settings; the server below
+    // loads (and watches) its own copy through the composition root. The
+    // auth mode is read through the cascade rather than the bare process
+    // environment so `.env` and the global config can set it too — the same
+    // trust level as the credentials they already hold.
+    let config = crate::config::load();
+    let auth_mode = AuthMode::parse(config.get("MCP_AUTH_MODE"))?;
     let addr = resolve_bind_addr(std::env::var("MCP_BIND_ADDR").ok().as_deref(), port)?;
     validate_startup_security(auth_mode, &addr)?;
+    let inbound_auth = match auth_mode {
+        AuthMode::Off => None,
+        AuthMode::Okta => Some(Arc::new(enterprise_inbound_auth(&config)?)),
+    };
 
     // Shared across rmcp (drops in-flight SSE on cancel) and axum (stops
     // accepting new connections + drains existing ones on cancel).
@@ -72,12 +86,22 @@ pub async fn run_http() -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
     // "listening", held the port, and failed every call while a health check
     // marked it ready. Constructing first means a startup failure never
     // reaches the point of being reachable at all.
-    let app = build_app_with_cancel(DEFAULT_IDLE_TTL, DEFAULT_SWEEP_INTERVAL, cancel.clone())?;
+    let server = crate::bootstrap::ServerBuilder::new()
+        .watch_config(true)
+        .require_inbound_auth(inbound_auth.is_some())
+        .build()?;
+    let app = build_app_inner(
+        server,
+        inbound_auth,
+        DEFAULT_IDLE_TTL,
+        DEFAULT_SWEEP_INTERVAL,
+        cancel.clone(),
+    );
 
     let listener = TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
 
-    info!(%bound, "mcp-server-devtools listening on streamable-HTTP transport");
+    info!(%bound, auth = ?auth_mode, "mcp-server-devtools listening on streamable-HTTP transport");
     let shutdown_cancel = cancel;
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -89,6 +113,39 @@ pub async fn run_http() -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
     crate::transport::raw_response::shutdown_and_cleanup().await;
     result?;
     Ok(())
+}
+
+/// Assemble the enterprise inbound-auth stack from configuration, refusing
+/// anything incomplete (plan §1.2: no "temporarily permissive" mode).
+///
+/// Required together: the Okta issuer and audience, the public URL clients
+/// are told to obtain a token for, and the durable audit journal — evidence
+/// is the product, so enterprise mode without a journal is not a mode.
+fn enterprise_inbound_auth(config: &Config) -> Result<InboundAuth, String> {
+    let okta = crate::auth::okta::OktaSettings::from_config(config)?;
+    let settings = InboundAuthSettings::from_config(config, vec![okta.issuer.clone()])?;
+    if config
+        .get(crate::bootstrap::AUDIT_JOURNAL_DIR_KEY)
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        return Err(format!(
+            "refusing to start: MCP_AUTH_MODE=okta requires {} — enterprise mode without a              durable audit journal would authorize calls it cannot evidence (fail-closed;              see docs/enterprise-product-plan.md §1.2)",
+            crate::bootstrap::AUDIT_JOURNAL_DIR_KEY
+        ));
+    }
+    // The policy engine (WP A.7) is the last piece of the enterprise chain.
+    // Until it lands, enterprise mode would authenticate every caller and
+    // then allow everything — exactly the "temporarily permissive" state
+    // the plan forbids — so startup is refused here, after every other
+    // check, so that a deployment being prepared learns about *all* of its
+    // configuration gaps at once.
+    let _ = settings;
+    let _ = okta;
+    Err(
+        "refusing to start: MCP_AUTH_MODE=okta is not available yet — the policy engine          lands in Phase A (A.7) of docs/enterprise-product-plan.md. Unset MCP_AUTH_MODE          (or set it to \"off\") to run in local mode"
+            .to_owned(),
+    )
 }
 
 /// Build the full Axum app with a caller-owned cancellation token. Tests use
@@ -111,6 +168,7 @@ pub fn build_app_with_cancel(
     let shared_server = DevtoolsServer::new()?;
     Ok(build_app_inner(
         shared_server,
+        None,
         idle_ttl,
         sweep_interval,
         cancel,
@@ -126,17 +184,34 @@ pub fn build_app_with_server(
     sweep_interval: Duration,
     cancel: CancellationToken,
 ) -> Router {
-    build_app_inner(server, idle_ttl, sweep_interval, cancel)
+    build_app_inner(server, None, idle_ttl, sweep_interval, cancel)
+}
+
+/// Like [`build_app_with_server`], with inbound bearer authentication in
+/// front of `/mcp` and `/artifacts/{id}` and the RFC 9728 metadata route
+/// mounted. The seam for enterprise-mode integration tests: a
+/// [`crate::ports::StaticValidator`] or an Okta validator against a mock
+/// JWKS, over the real router.
+pub fn build_app_with_server_and_auth(
+    server: DevtoolsServer,
+    auth: Arc<InboundAuth>,
+    idle_ttl: Duration,
+    sweep_interval: Duration,
+    cancel: CancellationToken,
+) -> Router {
+    build_app_inner(server, Some(auth), idle_ttl, sweep_interval, cancel)
 }
 
 fn build_app_inner(
     shared_server: DevtoolsServer,
+    auth: Option<Arc<InboundAuth>>,
     idle_ttl: Duration,
     sweep_interval: Duration,
     cancel: CancellationToken,
 ) -> Router {
     let manager = Arc::new(ReapingSessionManager::new(idle_ttl));
     manager.spawn_reaper(sweep_interval);
+    let health_server = shared_server.clone();
     let streamable = StreamableHttpService::new(
         move || Ok(shared_server.clone()),
         Arc::clone(&manager),
@@ -170,13 +245,40 @@ fn build_app_inner(
         .route("/mcp", any_service(streamable))
         .layer(RequestBodyLimitLayer::new(BODY_LIMIT_BYTES));
 
+    // Everything a principal acts through. In enterprise mode the bearer
+    // middleware wraps exactly this set; the health banner and the RFC 9728
+    // metadata stay reachable without a token, because they are how a
+    // client (and a load balancer) learns whether and how to authenticate.
+    let mut protected = Router::new()
+        .route("/artifacts/{id}", get(download_artifact))
+        .merge(mcp_routes);
+    let mut public = Router::new().route(
+        "/",
+        get(move || {
+            let server = health_server.clone();
+            async move { health(&server) }
+        }),
+    );
+    if let Some(auth) = auth {
+        protected = protected.layer(middleware::from_fn_with_state(
+            Arc::clone(&auth),
+            require_bearer,
+        ));
+        public = public.merge(
+            Router::new()
+                .route(
+                    PROTECTED_RESOURCE_METADATA_PATH,
+                    get(protected_resource_metadata),
+                )
+                .with_state(auth),
+        );
+    }
+
     // Origin guard + CORS apply globally — TS applies them via `app.use` before
     // registering the `/mcp` routes, so both cover the `GET /` health endpoint
     // as well.
-    Router::new()
-        .route("/", get(health))
-        .route("/artifacts/{id}", get(download_artifact))
-        .merge(mcp_routes)
+    public
+        .merge(protected)
         .layer(middleware::from_fn(origin_allowlist))
         .layer(cors)
 }
@@ -282,15 +384,30 @@ pub fn build_app(idle_ttl: Duration, sweep_interval: Duration) -> Result<Router,
     build_app_with_cancel(idle_ttl, sweep_interval, CancellationToken::new())
 }
 
-async fn health() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/plain; charset=utf-8"),
-        )],
-        format!("mcp-server-devtools v{VERSION} is running"),
-    )
+/// Plaintext health banner. Byte-identical to the pre-enterprise banner in
+/// local mode. When a durable audit journal is configured and can no longer
+/// accept records, the gateway will refuse every tool call, so it answers
+/// 503 here rather than telling a load balancer it is fine (CF-6).
+fn health(server: &DevtoolsServer) -> Response {
+    let content_type = (
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    if server.audit_available() {
+        (
+            StatusCode::OK,
+            [content_type],
+            format!("mcp-server-devtools v{VERSION} is running"),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [content_type],
+            format!("mcp-server-devtools v{VERSION} is running but its audit journal is unavailable; tool calls are refused"),
+        )
+            .into_response()
+    }
 }
 
 /// Reject requests whose `Origin` is not a loopback scheme/host pair.
