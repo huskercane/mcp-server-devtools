@@ -10,12 +10,35 @@ removed only when it is done, not when it is explained.
 
 Status legend: **open** · **blocked** (needs a decision) · **done**.
 
-Last updated: 2026-09-02, at the Phase A exit. Phase A closed CF-2, CF-3,
-CF-4, CF-5, CF-6, and CF-14 (each entry says how) and opened CF-15. CF-1 /
-CF-13 (resolve-then-attribute) stay open: the Grafana slice's attribution is
-exact because Grafana's resolution is observable, so the slice did not need
-the general fix; the 14-vendor refactor is still owed. CF-7 (audited CLI),
-CF-8 (signed checkpoints), CF-9, CF-10, CF-11, CF-12 are unchanged.
+Last updated: 2026-09-02, after the independent review of the Phase A
+branch. Phase A closed CF-2, CF-3, CF-4, CF-5, CF-6, and CF-14 (each entry
+says how) and opened CF-15. The review amended CF-14 (the post-dispatch
+half), and opened CF-16 through CF-20: two engineering items (CF-16 session
+affinity and emergency deny, CF-17 credential-bootstrap egress), two
+decisions owed (CF-18 the ADR-001 code boundary, CF-19 canonical wire bytes
+in local mode), and the §8 CI gate (CF-20). CF-1 / CF-13
+(resolve-then-attribute) stay open: the Grafana slice's attribution is exact
+because Grafana's resolution is observable, so the slice did not need the
+general fix; the 14-vendor refactor is still owed. CF-7 (audited CLI), CF-8
+(signed checkpoints), CF-9, CF-10, CF-11, CF-12 are unchanged.
+
+What the review changed in code, for the record (each with a test that
+fails on the previous commit): SonarQube's `ce/task` lookup and CircleCI's
+build-details request go through the transport chokepoint; the outcome
+append is cancellation-safe; every egress decision is listed on the
+outcome record; the JWKS body is bounded while it is read, only RSA signing
+keys with unambiguous `kid`s are admitted, and a withdrawn key evicts the
+tokens it validated; the insufficient-scope path logs a category, not the
+subject; a vanished policy file reports degraded health while the last good
+policy stays in force; the ingress example no longer hashes on
+`Mcp-Session-Id`; and the allocation probe gained the two §8 stages it had
+no entry for.
+
+One parity claim was narrowed: local mode is unchanged in **protocol
+behaviour, tool surface, and wire requests** (`tests/auth_mode_tests.rs`),
+not in every observable. The startup log line gained `auth=` and `role=`
+fields, and the in-memory response cache's identity digest now includes a
+fixed owner prefix. Neither is persisted or parsed by anything.
 
 ---
 
@@ -174,6 +197,59 @@ stays truthful without needing to cancel a queued write. The port contract
 (`AuditSink::append` = durable or error) is unchanged; the bound is the
 enforcement point's, not the sink's.
 
+**Amended after review (2026-09-02).** The reading above holds only for
+records written *before* dispatch. The outcome record was going through the
+same cancellable wait, so a journal that stalled past the bound *after* the
+vendor was contacted could drop the outcome entirely and leave a dispatched
+call reading as "requested, not dispatched". `DevtoolsServer::record_outcome`
+now gives the append its own task that owns the record: the caller stops
+waiting at the bound, the write is never cancelled, and a late
+acknowledgement or failure is logged. The pre-dispatch comment no longer
+claims the record "was queued" — it may or may not have been, and both
+states are truthful because nothing was dispatched.
+`tests/audit_journal_tests.rs::a_stalled_outcome_append_is_not_cancelled_by_the_bound`
+holds the outcome append behind a gate past the bound and proves the record
+lands once the gate opens.
+
+### CF-16 · Session affinity past one replica; emergency deny
+**Open · Phase C (scaling) / Phase B (revocation)**
+
+Two things the review showed the Phase A deployment example implied but
+could not deliver:
+
+- **Affinity.** The ingress example hashed upstream selection on the
+  `Mcp-Session-Id` header. That cannot pin a legacy session to the pod that
+  created it — the initialize request has no id, the id is generated in the
+  response, and the next request's hash of that id lands on an unrelated
+  pod — and it sent every stateless request (same empty key) to one pod.
+  The annotation is removed; the example runs one replica and says so.
+  Scaling needs an affinity mechanism established by the initialize
+  *response* (ingress cookie affinity, if the MCP clients in use keep
+  cookies) or a shared session store (plan §3.4). Decide when Phase C
+  scopes horizontal scaling; the plan's §3.4 "Sessions" row is corrected.
+- **Emergency deny.** Deleting the policy file keeps the last good policy
+  in force, indefinitely (documented in `policy::engine`; health reports
+  the degraded state). That is deliberate — a gateway must not fail open
+  or turn into an outage because a file went missing — but it means there
+  is no file-level "stop everything". Today's answer is to publish a
+  document that denies (`rules: []`) or drain the pod. The deny-list and
+  `revoke-all` (plan §3.6) are the real control and belong to Phase B.
+
+### CF-17 · Credential-provider bootstrap traffic is outside the egress policy
+**Open · Phase B (with the vendor read profiles)**
+
+Zoom's OAuth token exchange (`vendor::zoom::token`) and `NinjaOne`'s console
+login and MFA steps (`vendor::ninjaone::session`) send requests with a
+direct `reqwest` client. They are tool-triggered, so the review is right
+that "control plane" does not describe them; they are classified in
+`policy::egress` as *credential-provider bootstrap*: their origins come
+only from configuration, never from a request, and they carry no
+tool-supplied path. That is a documented exemption, not an oversight.
+Resolve by routing them through a separately classified chokepoint (an
+`egress` record of kind `credential_bootstrap`, origin checked against the
+configured host) when those vendors get read profiles. The JWKS fetch and
+health probes remain control-plane traffic and stay exempt.
+
 ### CF-15 · Response-provided absolute URLs bypass canonicalization
 **Open · Phase B (with the CircleCI read profile)**
 
@@ -211,6 +287,74 @@ carries a real SPDX `license` field.
 ### CF-11 · WP 0.2 and WP 0.3
 **Open** — still unstarted from the M0 work-package list.
 
+### CF-18 · Where the Okta validator and the file policy engine live (ADR-001)
+**Blocked · owner + counsel (with CF-10) · before any external contribution**
+
+ADR-001 says enterprise code lives in the private repository and "the
+community binary never links enterprise code". The Phase A branch ships
+`auth::okta::OktaJwksValidator`, `policy::engine::FilePolicy`, the bearer
+middleware, and the `MCP_AUTH_MODE=okta` composition in the public ISC
+crate, and the community binary runs them. The review is right that this
+contradicts the decision as written. The plan is not self-consistent here,
+though: its own §3.7 table places the bearer middleware and the
+`MCP_OKTA_*` / `MCP_POLICY_FILE` configuration in community files, and the
+Phase A work packages do not say which repository A.1 or A.7 land in.
+
+Two ways to make it consistent; the choice is a licensing decision, not an
+engineering one:
+
+1. **Move.** `auth::okta`, `policy::engine`, `server::auth`, and the
+   `okta` startup path go to `mcp-devtools-enterprise`; the community crate
+   keeps the ports (`TokenValidator`, `PolicyDecisionPoint`, `AuditSink`),
+   the core types, `StaticValidator`, `AllowAll`, canonicalization, the
+   call scope, and the journal. The enterprise binary composes them. Cost:
+   the vertical-slice tests move with the code, and the community binary
+   loses `MCP_AUTH_MODE=okta`.
+2. **Amend ADR-001.** Define "enterprise code" as the control plane (admin
+   API, console, SIEM forwarding, revocation, rollups) and keep the secure
+   remote slice — validating a token, enforcing a file policy — in the
+   community crate as the thing that makes remote deployment safe at all.
+
+Recommendation: decide with CF-10, since the answer depends on what the
+enterprise licence is meant to cover. Until then, nothing else should be
+added to the public crate that the private crate is supposed to own.
+
+### CF-19 · Canonical wire bytes in local mode
+**Blocked · owner decision · recommendation: keep**
+
+Since CF-5, the transport builds every outbound URL from the canonical
+target in every auth mode, so what policy evaluates is what is sent. The
+review notes that this changes the bytes local mode puts on the wire
+relative to `main` before Phase A: query keys are sorted, values are
+decoded once and re-encoded as `application/x-www-form-urlencoded` (a
+space is `+` whether the tool wrote `+` or `%20`; `~` is `%7E` either
+way), dot-segments and duplicate slashes are resolved, unreserved escapes
+are decoded. `tests/transport_tests.rs::wire_bytes_are_the_canonical_form`
+now locks those exact bytes so any further drift is a deliberate diff.
+
+The alternative — preserve the tool's spelling in local mode and
+canonicalize only when enforcing — would make the community suite stop
+testing the enterprise wire path and put two URL builders in the
+transport. Recommendation: keep one wire form. Every upstream this server
+talks to parses its query string with form-urlencoded semantics, and the
+tool-supplied spelling was never a contract with any of them. If the owner
+wants the byte-preserving mode anyway, it is a `RequestOptions` flag on
+the transport plus a second `url_under` — a day's work — and this entry is
+where that decision is recorded.
+
+### CF-20 · §8 budgets as a CI gate
+**Open · Phase B**
+
+§8 promises "a CI smoke run that fails on a > 20 % regression against the
+checked-in baseline". Phase A has the harness (`benches/response_pipeline`)
+and, after review, stages for every budget except the admin API; it does
+not have the CI comparison. The gate today is the per-phase rule in
+`CLAUDE.md`, run by hand and recorded in the table below. Building the
+comparison means committing a baseline file, a release-profile CI job that
+runs the probe, and a diff step with the 20 % threshold; the numbers must
+be allocation counts, not wall time, because the CI runners are not stable
+enough for a timing threshold.
+
 ### CF-12 · Expression digest strength
 **Open · revisit when a policy needs it**
 
@@ -242,6 +386,8 @@ apart from canonicalization, run only on enterprise paths.
 | −1 `grafana::query_logs` | <1 KB | 10 | 11 |
 | −1b `ActionContext` via `for_tool` (Grafana; enterprise only) | <1 KB | 21 | new |
 | −1b `FilePolicy::evaluate` @ 500 rules (enterprise only) | 0 | 5 | new |
+| −1c JWT validate, cache hit (enterprise only; §8 budget 50 µs) | 1 KB | 8 | new (review) — 3.5 µs |
+| −1c journal append, sequential (enterprise only; §8 budget p99 200 µs) | 1 KB | 6 | new (review) — p50 8 µs, p99 11 µs, max 65 µs on a local SSD |
 | 0 `ConfigHandle::snapshot()` | 0 | 0 | 0 |
 | 1 `apply_jq_filter(None)` | 0 | 0 | 0 |
 | 2 `render(Toon)` @ 500 issues | 1736 KB | 19 032 | 19 032 |
@@ -256,7 +402,14 @@ Notes for the Phase B comparison:
   request is the price of that and is accepted.
 - The 500-rule decision allocates only for the `PolicyDecision` it returns
   (rule id, version, reason). Rule matching itself is allocation-free.
-- Not yet probed: the validated-token cache hit (§8: < 50 µs). The Okta
-  validator's cache is exercised by `tests/token_validator_tests.rs` but
-  has no harness entry because building a validator needs a JWKS; add one
-  in Phase B alongside the revocation work that changes that table.
+- The −1c stages run the production components (the Okta validator primed
+  from a JWKS on wiremock; the journal adapter on a temp directory). The
+  append is sequential, one record at a time, which is the journal's worst
+  case — every record pays its own `sync_data`; under concurrent calls the
+  writer batches. Read the p99 as "one call on an idle gateway", and
+  re-measure on the partner's storage class before quoting it (Gate A).
+- The review added the egress list to the outcome record and a per-call
+  `EgressRecord` on the scope. Both are enterprise-only (no scope, no
+  record), so no stage in this table moved; the cost is two or three
+  allocations per outbound request inside an enforcing scope.
+- The §8 CI comparison itself is CF-20.

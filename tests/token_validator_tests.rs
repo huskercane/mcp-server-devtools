@@ -367,6 +367,93 @@ async fn stale_keys_keep_serving_while_a_background_refresh_fails() {
     assert_eq!(principal.subject, "bob@acme.example");
 }
 
+/// The positive edges of the matrix: an `aud` array that contains us, and
+/// `exp` / `nbf` inside the configured leeway (60 s) but not outside it.
+#[tokio::test]
+async fn audience_arrays_and_leeway_boundaries_are_accepted_exactly_as_configured() {
+    let server = MockServer::start().await;
+    mount_jwks(&server, &["test-key-1"], None).await;
+    let validator = validator(settings(&server));
+    let now = get_current_timestamp();
+
+    let mut aud_list_with_us = base_claims();
+    aud_list_with_us["aud"] = json!(["api://a", AUDIENCE, "api://b"]);
+    assert!(validator.validate(&sign(&aud_list_with_us)).await.is_ok());
+
+    let mut just_expired = base_claims();
+    just_expired["exp"] = json!(now - 30);
+    assert!(
+        validator.validate(&sign(&just_expired)).await.is_ok(),
+        "30 s past exp is inside the 60 s leeway"
+    );
+    let mut too_expired = base_claims();
+    too_expired["exp"] = json!(now - 90);
+    assert_eq!(
+        validator.validate(&sign(&too_expired)).await.unwrap_err(),
+        TokenRejection::Expired
+    );
+
+    let mut nearly_valid = base_claims();
+    nearly_valid["nbf"] = json!(now + 30);
+    assert!(
+        validator.validate(&sign(&nearly_valid)).await.is_ok(),
+        "30 s before nbf is inside the 60 s leeway"
+    );
+    let mut too_early = base_claims();
+    too_early["nbf"] = json!(now + 90);
+    assert_eq!(
+        validator.validate(&sign(&too_early)).await.unwrap_err(),
+        TokenRejection::NotYetValid
+    );
+}
+
+/// `jku` and `x5u` in a token header name where *the token* says its keys
+/// live. They are ignored: only the configured JWKS URL is ever fetched, so
+/// a token cannot direct the validator to a key set of its own choosing.
+#[tokio::test]
+async fn jku_and_x5u_headers_are_ignored_in_favour_of_the_configured_jwks() {
+    let server = MockServer::start().await;
+    mount_jwks(&server, &["test-key-1"], None).await;
+    let mut settings = settings(&server);
+    settings.jwks_min_refetch_interval = Duration::ZERO;
+    let validator = validator(settings);
+
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some("test-key-1".to_owned());
+    header.jku = Some("https://attacker.example/keys".to_owned());
+    header.x5u = Some("https://attacker.example/cert.pem".to_owned());
+    let token = encode(
+        &header,
+        &base_claims(),
+        &EncodingKey::from_rsa_der(PRIVATE_KEY_DER),
+    )
+    .unwrap();
+    // Validates against the configured JWKS; the header's URLs are never
+    // contacted (there is nothing there to contact).
+    assert!(validator.validate(&token).await.is_ok());
+
+    let mut foreign_kid = Header::new(Algorithm::RS256);
+    foreign_kid.kid = Some("attacker-key".to_owned());
+    foreign_kid.jku = Some("https://attacker.example/keys".to_owned());
+    let token = encode(
+        &foreign_kid,
+        &base_claims(),
+        &EncodingKey::from_rsa_der(PRIVATE_KEY_DER),
+    )
+    .unwrap();
+    // An unknown kid refetches — the *configured* JWKS, not the header's.
+    assert_eq!(
+        validator.validate(&token).await.unwrap_err(),
+        TokenRejection::UnknownKey
+    );
+    let fetched = server.received_requests().await.unwrap();
+    assert_eq!(fetched.len(), 2, "initial fetch + unknown-kid refetch");
+    assert!(
+        fetched.iter().all(|request| request.url.path() == "/keys"),
+        "every key fetch went to the configured JWKS URL"
+    );
+}
+
 /// A key the identity provider withdraws must stop vouching for tokens at
 /// the next JWKS fetch — not when the validated-token cache entry ages out
 /// five minutes later.
