@@ -1045,7 +1045,11 @@ pub async fn fetch_streamed_artifact_with_policy(
         let call =
             HttpCallLog::new(vendor.name(), method.as_str(), &url).for_attempt(attempt, attempts);
         let response = tokio::select! {
-            () = policy.cancellation.cancelled() => return Err(api_error("streaming request cancelled", Some(499), None)),
+            () = policy.cancellation.cancelled() => {
+                // The send was in flight: the vendor may have observed it.
+                report(None, Some("cancelled"));
+                return Err(api_error("streaming request cancelled", Some(499), None));
+            }
             result = tokio::time::timeout(remaining, request.send()) => match result {
                 Ok(Ok(response)) => response,
                 Ok(Err(error)) if attempt < attempts && is_retryable_stream_request_error(&error) => {
@@ -1084,16 +1088,7 @@ pub async fn fetch_streamed_artifact_with_policy(
             let body = response.text().await.unwrap_or_default();
             return Err(vendor.classify_error(status, &body));
         }
-        if response
-            .content_length()
-            .is_some_and(|length| length > policy.max_encoded_bytes)
-        {
-            return Err(api_error(
-                "encoded response exceeds streamed artifact limit",
-                Some(413),
-                None,
-            ));
-        }
+        enforce_streamed_length_cap(&response, &policy)?;
         let artifact = tokio::time::timeout(
             remaining_until(deadline)?,
             persist_decoded_response(response, filename_prefix, extension, content_type, &policy),
@@ -1708,6 +1703,25 @@ fn streaming_client() -> Result<&'static Client, McpError> {
 }
 
 // ---- helpers ----
+
+/// Refuse a streamed response whose declared length already exceeds the
+/// encoded-bytes cap, before a byte of the body is read.
+fn enforce_streamed_length_cap(
+    response: &reqwest::Response,
+    policy: &StreamingPolicy,
+) -> Result<(), McpError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > policy.max_encoded_bytes)
+    {
+        return Err(api_error(
+            "encoded response exceeds streamed artifact limit",
+            Some(413),
+            None,
+        ));
+    }
+    Ok(())
+}
 
 /// Report one wire attempt on the request's egress record, when the call
 /// runs inside an enforcing scope (outside one there is no ticket).

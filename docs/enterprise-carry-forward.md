@@ -32,7 +32,12 @@ tokens it validated; the insufficient-scope path logs a category, not the
 subject; a vanished policy file reports degraded health while the last good
 policy stays in force; the ingress example no longer hashes on
 `Mcp-Session-Id`; and the allocation probe gained the two §8 stages it had
-no entry for.
+no entry for. Two further rounds tightened the same items: the validated
+cache is gated on a key generation and evicted on kid *or material* change;
+egress records carry a dispatch state (denied / not attempted / cache hit /
+attempted with count and result, `cancelled` when a send was in flight);
+pending outcome appends are tracked and drained at shutdown; the health
+banner shows a fixed category for a failing policy reload.
 
 One parity claim was narrowed: what `tests/auth_mode_tests.rs` proves is
 that unset and explicit-`off` modes are **identical to each other** in

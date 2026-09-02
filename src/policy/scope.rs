@@ -85,7 +85,10 @@ pub enum EgressDispatch {
     /// Allowed and sent. `attempts` counts wire attempts (a streamed
     /// request retries on 429/502/503/504 and transport errors);
     /// `last_status` is the final attempt's HTTP status, `None` when it
-    /// failed before a response, in which case `failure` says how.
+    /// failed before a response, in which case `failure` says how:
+    /// `transport_error`, `timeout`, or `cancelled` — the last meaning the
+    /// send was in flight when the call was cancelled, so the vendor may
+    /// have observed the request even though no response was read.
     Attempted {
         attempts: u32,
         last_status: Option<u16>,

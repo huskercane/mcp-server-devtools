@@ -488,6 +488,43 @@ async fn withdrawing_a_key_evicts_tokens_it_validated_from_the_cache() {
     );
 }
 
+/// A `kid` is a label, not the key. When the identity provider publishes
+/// new material under a kid it used before, tokens verified against the old
+/// material must not keep being served from the cache.
+#[tokio::test]
+async fn republishing_a_kid_with_new_material_evicts_tokens_it_validated() {
+    let server = MockServer::start().await;
+    mount_jwks(&server, &["test-key-1"], None).await;
+    let mut settings = settings(&server);
+    settings.jwks_min_refetch_interval = Duration::ZERO;
+    let validator = validator(settings);
+
+    let token = sign(&base_claims());
+    assert!(validator.validate(&token).await.is_ok());
+    assert!(validator.validate(&token).await.is_ok(), "cached");
+
+    // Same kid, different modulus.
+    let mut rotated = jwk_with_kid("test-key-1");
+    let modulus = rotated["n"].as_str().unwrap().to_owned();
+    rotated["n"] = json!(format!("AAAAAAAA{}", &modulus[8..]));
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/keys"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [rotated] })))
+        .mount(&server)
+        .await;
+    // An unknown kid triggers the refetch that observes the rotation.
+    let _ = validator
+        .validate(&sign_with_kid(&base_claims(), "test-key-2"))
+        .await;
+
+    assert!(
+        validator.validate(&token).await.is_err(),
+        "a token verified against the old material must be re-verified — and \
+         fail — against the new material, not served from the cache"
+    );
+}
+
 /// Only RSA signing keys are admitted, and an ambiguous `kid` admits nothing.
 #[tokio::test]
 async fn jwks_admission_is_rsa_signing_keys_with_unambiguous_kids() {

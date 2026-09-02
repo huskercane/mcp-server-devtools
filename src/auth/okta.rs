@@ -218,9 +218,17 @@ struct Claims {
     rest: serde_json::Map<String, serde_json::Value>,
 }
 
+/// An admitted RSA signing key and a fingerprint of its material, so a
+/// rotation that reuses a `kid` for new material is still a change.
+struct AdmittedKey {
+    key: DecodingKey,
+    /// SHA-256 over the JWK's `n` and `e`.
+    fingerprint: [u8; 32],
+}
+
 struct KeyCache {
     /// `kid` → key. Keys without a `kid` are unusable: rotation is keyed on it.
-    keys: Arc<HashMap<String, DecodingKey>>,
+    keys: Arc<HashMap<String, AdmittedKey>>,
     fetched_at: Option<Instant>,
     /// Bumped on every key installation. A validation remembers the
     /// generation of the keys it verified against and is cached only if
@@ -230,7 +238,7 @@ struct KeyCache {
 
 /// What a validation reads: the keys, their age, and their generation.
 struct KeySnapshot {
-    keys: Arc<HashMap<String, DecodingKey>>,
+    keys: Arc<HashMap<String, AdmittedKey>>,
     fetched_at: Option<Instant>,
     generation: u64,
 }
@@ -238,9 +246,20 @@ struct KeySnapshot {
 struct Validated {
     principal: Principal,
     expires_at: Instant,
-    /// The `kid` whose key verified this token. A fetch that no longer
-    /// publishes it evicts the entry.
+    /// The `kid` whose key verified this token, and that key's material. A
+    /// fetch that no longer publishes the kid — or publishes it with other
+    /// material — evicts the entry.
     kid: String,
+    fingerprint: [u8; 32],
+}
+
+/// What a full validation established, for the caller and for the cache.
+struct Verified {
+    principal: Principal,
+    exp: u64,
+    kid: String,
+    fingerprint: [u8; 32],
+    generation: u64,
 }
 
 /// RS256 JWT validation against an Okta JWKS.
@@ -351,7 +370,7 @@ impl OktaJwksValidator {
     /// takes, so no lookup can observe the new keys with the old cache and
     /// no validation that read the old keys can be inserted after the prune
     /// (its generation is stale by then). Returns the number of usable keys.
-    fn install_keys(&self, keys: HashMap<String, DecodingKey>) -> usize {
+    fn install_keys(&self, keys: HashMap<String, AdmittedKey>) -> usize {
         let count = keys.len();
         let keys = Arc::new(keys);
         let mut validated = self
@@ -368,8 +387,12 @@ impl OktaJwksValidator {
             cache.generation += 1;
         }
         // A token verified by a key the identity provider no longer
-        // publishes must not keep being served from the validated cache.
-        validated.retain(|_, entry| keys.contains_key(&entry.kid));
+        // publishes — or publishes under the same kid with new material —
+        // must not keep being served from the validated cache.
+        validated.retain(|_, entry| {
+            keys.get(&entry.kid)
+                .is_some_and(|admitted| admitted.fingerprint == entry.fingerprint)
+        });
         count
     }
 
@@ -446,16 +469,9 @@ impl OktaJwksValidator {
     /// under the same lock [`Self::install_keys`] prunes under, so the
     /// interleaving "snapshot old keys → install and prune → insert" cannot
     /// leave an entry behind.
-    fn remember(
-        &self,
-        key: [u8; 32],
-        principal: &Principal,
-        exp: u64,
-        kid: String,
-        generation: u64,
-    ) {
+    fn remember(&self, key: [u8; 32], verified: &Verified) {
         let now_unix = jsonwebtoken::get_current_timestamp();
-        let until_exp = Duration::from_secs(exp.saturating_sub(now_unix));
+        let until_exp = Duration::from_secs(verified.exp.saturating_sub(now_unix));
         let ttl = until_exp.min(VALIDATED_TTL);
         if ttl.is_zero() {
             return;
@@ -470,7 +486,7 @@ impl OktaJwksValidator {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .generation;
-        if generation != current {
+        if verified.generation != current {
             return;
         }
         if cache.len() >= VALIDATED_CAPACITY {
@@ -482,9 +498,10 @@ impl OktaJwksValidator {
         cache.insert(
             key,
             Validated {
-                principal: principal.clone(),
+                principal: verified.principal.clone(),
                 expires_at: now + ttl,
-                kid,
+                kid: verified.kid.clone(),
+                fingerprint: verified.fingerprint,
             },
         );
     }
@@ -535,13 +552,10 @@ impl OktaJwksValidator {
         ))
     }
 
-    /// Full validation: returns the principal, its `exp`, the `kid` that
-    /// verified it, and the key generation used (the cache entry is keyed on
-    /// the first for eviction and gated on the second for insertion).
-    async fn validate_uncached(
-        self: &Arc<Self>,
-        token: &str,
-    ) -> Result<(Principal, u64, String, u64), TokenRejection> {
+    /// Full validation: the principal, its `exp`, the key that verified it
+    /// (`kid` and material fingerprint, for eviction), and the key
+    /// generation used (for the insertion gate).
+    async fn validate_uncached(self: &Arc<Self>, token: &str) -> Result<Verified, TokenRejection> {
         let header = decode_header(token).map_err(|_| TokenRejection::Malformed)?;
         if header.alg != Algorithm::RS256 {
             return Err(TokenRejection::UnsupportedAlgorithm);
@@ -566,31 +580,39 @@ impl OktaJwksValidator {
         if !snapshot.keys.contains_key(&kid) {
             snapshot = self.refetch_for_unknown_kid().await;
         }
-        let key = snapshot.keys.get(&kid).ok_or(TokenRejection::UnknownKey)?;
+        let admitted = snapshot.keys.get(&kid).ok_or(TokenRejection::UnknownKey)?;
 
         let data =
-            decode::<Claims>(token, key, &self.validation).map_err(|error| match error.kind() {
-                ErrorKind::ExpiredSignature => TokenRejection::Expired,
-                ErrorKind::ImmatureSignature => TokenRejection::NotYetValid,
-                ErrorKind::InvalidIssuer => TokenRejection::WrongIssuer,
-                ErrorKind::InvalidAudience => TokenRejection::WrongAudience,
-                ErrorKind::InvalidSignature => TokenRejection::InvalidSignature,
-                ErrorKind::InvalidAlgorithm | ErrorKind::InvalidAlgorithmName => {
-                    TokenRejection::UnsupportedAlgorithm
-                }
-                ErrorKind::MissingRequiredClaim(claim) => {
-                    TokenRejection::MissingClaim(match claim.as_str() {
-                        "iss" => "iss",
-                        "aud" => "aud",
-                        "sub" => "sub",
-                        "exp" => "exp",
-                        _ => "claim",
-                    })
-                }
-                _ => TokenRejection::Malformed,
-            })?;
+            decode::<Claims>(token, &admitted.key, &self.validation).map_err(
+                |error| match error.kind() {
+                    ErrorKind::ExpiredSignature => TokenRejection::Expired,
+                    ErrorKind::ImmatureSignature => TokenRejection::NotYetValid,
+                    ErrorKind::InvalidIssuer => TokenRejection::WrongIssuer,
+                    ErrorKind::InvalidAudience => TokenRejection::WrongAudience,
+                    ErrorKind::InvalidSignature => TokenRejection::InvalidSignature,
+                    ErrorKind::InvalidAlgorithm | ErrorKind::InvalidAlgorithmName => {
+                        TokenRejection::UnsupportedAlgorithm
+                    }
+                    ErrorKind::MissingRequiredClaim(claim) => {
+                        TokenRejection::MissingClaim(match claim.as_str() {
+                            "iss" => "iss",
+                            "aud" => "aud",
+                            "sub" => "sub",
+                            "exp" => "exp",
+                            _ => "claim",
+                        })
+                    }
+                    _ => TokenRejection::Malformed,
+                },
+            )?;
         let (principal, exp) = self.principal_from(data.claims)?;
-        Ok((principal, exp, kid, snapshot.generation))
+        Ok(Verified {
+            principal,
+            exp,
+            kid,
+            fingerprint: admitted.fingerprint,
+            generation: snapshot.generation,
+        })
     }
 }
 
@@ -601,9 +623,9 @@ impl TokenValidator for Arc<OktaJwksValidator> {
             if let Some(principal) = self.cached_principal(&key) {
                 return Ok(principal);
             }
-            let (principal, exp, kid, generation) = self.validate_uncached(token).await?;
-            self.remember(key, &principal, exp, kid, generation);
-            Ok(principal)
+            let verified = self.validate_uncached(token).await?;
+            self.remember(key, &verified);
+            Ok(verified.principal)
         })
     }
 }
@@ -615,8 +637,8 @@ impl TokenValidator for Arc<OktaJwksValidator> {
 /// whose parameters do not parse is skipped; and a `kid` shared by two
 /// admissible entries is dropped altogether rather than resolved by
 /// document order.
-fn admit_keys(set: &JwkSet) -> HashMap<String, DecodingKey> {
-    let mut keys: HashMap<String, DecodingKey> = HashMap::with_capacity(set.keys.len());
+fn admit_keys(set: &JwkSet) -> HashMap<String, AdmittedKey> {
+    let mut keys: HashMap<String, AdmittedKey> = HashMap::with_capacity(set.keys.len());
     let mut ambiguous: Vec<String> = Vec::new();
     for jwk in &set.keys {
         let Some(kid) = jwk.common.key_id.as_deref() else {
@@ -625,10 +647,11 @@ fn admit_keys(set: &JwkSet) -> HashMap<String, DecodingKey> {
         if !is_rs256_signing_key(jwk) {
             continue;
         }
-        let Ok(key) = DecodingKey::from_jwk(jwk) else {
+        let (Ok(key), Some(fingerprint)) = (DecodingKey::from_jwk(jwk), fingerprint_of(jwk)) else {
             continue;
         };
-        if keys.insert(kid.to_owned(), key).is_some() {
+        let admitted = AdmittedKey { key, fingerprint };
+        if keys.insert(kid.to_owned(), admitted).is_some() {
             ambiguous.push(kid.to_owned());
         }
     }
@@ -640,6 +663,20 @@ fn admit_keys(set: &JwkSet) -> HashMap<String, DecodingKey> {
         keys.remove(&kid);
     }
     keys
+}
+
+/// SHA-256 over the RSA public components, so two keys are "the same" only
+/// when their material is.
+fn fingerprint_of(jwk: &Jwk) -> Option<[u8; 32]> {
+    use sha2::{Digest as _, Sha256};
+    let AlgorithmParameters::RSA(params) = &jwk.algorithm else {
+        return None;
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(params.n.as_bytes());
+    hasher.update([0]);
+    hasher.update(params.e.as_bytes());
+    Some(hasher.finalize().into())
 }
 
 fn is_rs256_signing_key(jwk: &Jwk) -> bool {
@@ -729,33 +766,38 @@ mod tests {
             .unwrap(),
             reqwest::Client::new(),
         );
-        let key_named = |kid: &str| {
-            HashMap::from([(kid.to_owned(), DecodingKey::from_secret(b"not-a-real-key"))])
+        let key_named = |kid: &str, material: u8| {
+            HashMap::from([(
+                kid.to_owned(),
+                AdmittedKey {
+                    key: DecodingKey::from_secret(b"not-a-real-key"),
+                    fingerprint: [material; 32],
+                },
+            )])
         };
-        let principal = Principal {
-            tenant: "acme".to_owned(),
-            subject: "alice@acme.example".to_owned(),
-            groups: Vec::new(),
-            scopes: Vec::new(),
-            authority: PrincipalAuthority::Okta,
+        let verified = |kid: &str, material: u8, generation: u64| Verified {
+            principal: Principal {
+                tenant: "acme".to_owned(),
+                subject: "alice@acme.example".to_owned(),
+                groups: Vec::new(),
+                scopes: Vec::new(),
+                authority: PrincipalAuthority::Okta,
+            },
+            exp: jsonwebtoken::get_current_timestamp() + 300,
+            kid: kid.to_owned(),
+            fingerprint: [material; 32],
+            generation,
         };
-        let exp = jsonwebtoken::get_current_timestamp() + 300;
         let token = digest("token-under-old");
 
-        validator.install_keys(key_named("old"));
+        validator.install_keys(key_named("old", 1));
         // Request A reads the keys (generation 1) …
         let seen_by_a = validator.snapshot();
         assert!(seen_by_a.keys.contains_key("old"));
         // … refresh B withdraws `old` and prunes (generation 2) …
-        validator.install_keys(key_named("new"));
+        validator.install_keys(key_named("new", 2));
         // … and A, having verified against `old`, tries to cache.
-        validator.remember(
-            token,
-            &principal,
-            exp,
-            "old".to_owned(),
-            seen_by_a.generation,
-        );
+        validator.remember(token, &verified("old", 1, seen_by_a.generation));
         assert!(
             validator.cached_principal(&token).is_none(),
             "a result verified against replaced keys must not be cached"
@@ -764,9 +806,19 @@ mod tests {
         // The same insert with the current generation is cached — the
         // gate is on staleness, not on the kid alone.
         let current = validator.snapshot();
-        validator.remember(token, &principal, exp, "new".to_owned(), current.generation);
+        validator.remember(token, &verified("new", 2, current.generation));
         assert!(validator.cached_principal(&token).is_some());
-        // And a later withdrawal of `new` evicts it.
+        // The same kid republished with other material evicts it: the kid
+        // is a label, the material is the key.
+        validator.install_keys(key_named("new", 3));
+        assert!(
+            validator.cached_principal(&token).is_none(),
+            "same kid, new material: the cached verification is void"
+        );
+        let current = validator.snapshot();
+        validator.remember(token, &verified("new", 3, current.generation));
+        assert!(validator.cached_principal(&token).is_some());
+        // And a withdrawal of `new` evicts it too.
         validator.install_keys(HashMap::new());
         assert!(validator.cached_principal(&token).is_none());
     }

@@ -487,6 +487,77 @@ async fn egress_records_count_wire_attempts_under_one_authorization() {
     );
 }
 
+/// Answers the first request with a non-retryable 500 at once and stalls
+/// every later one, so the first partition's failure cancels the others
+/// while their sends are in flight at the vendor.
+struct FailFirstStallRest {
+    seen: AtomicUsize,
+}
+
+impl Respond for FailFirstStallRest {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        if self.seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            ResponseTemplate::new(500)
+        } else {
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(2))
+                .set_body_json(json!({ "status": "success", "data": { "resultType": "streams", "result": [] } }))
+        }
+    }
+}
+
+/// A send that is cancelled while in flight is not "not attempted": the
+/// vendor may have observed it. The record says `attempted` with
+/// `cancelled` as the failure.
+#[tokio::test]
+async fn a_send_cancelled_in_flight_is_recorded_as_an_attempt() {
+    let slice = spawn_slice(phase_a_policy()).await;
+    let alice = token_for("alice@acme.example", &["SRE"]);
+    Mock::given(method("GET"))
+        .and(path(LOKI_QA_PATH))
+        .respond_with(FailFirstStallRest {
+            seen: AtomicUsize::new(0),
+        })
+        .with_priority(1)
+        .mount(&slice.grafana)
+        .await;
+
+    let body = query_logs_with(
+        &slice.base,
+        &alice,
+        json!({
+            "datasourceUid": "loki-qa", "query": "{app=\"api\"}", "limit": 10,
+            "start": "1700000000000000000", "end": "1700000600000000000",
+            "timePartitions": 3,
+        }),
+    )
+    .await;
+    assert_eq!(body["result"]["isError"], true, "{body}");
+
+    let outcome = journal_lines(&slice.journal)
+        .into_iter()
+        .find(|line| line["kind"] == "tool_call_outcome")
+        .expect("outcome");
+    let requests = outcome["egress"]["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 3, "{requests:#?}");
+    let mut failed = 0;
+    let mut cancelled = 0;
+    for request in requests {
+        let dispatch = &request["dispatch"];
+        assert_eq!(dispatch["state"], "attempted", "{dispatch}");
+        assert_eq!(dispatch["attempts"], 1);
+        match (
+            dispatch["last_status"].as_u64(),
+            dispatch["failure"].as_str(),
+        ) {
+            (Some(500), None) => failed += 1,
+            (None, Some("cancelled")) => cancelled += 1,
+            other => panic!("unexpected dispatch {other:?}: {dispatch}"),
+        }
+    }
+    assert_eq!((failed, cancelled), (1, 2));
+}
+
 /// The other way an authorized request stays off the wire: the response
 /// cache. The second of two identical allowed GETs is answered locally and
 /// its egress record says so.
