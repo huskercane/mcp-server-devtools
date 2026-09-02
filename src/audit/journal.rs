@@ -596,6 +596,7 @@ mod tests {
                 environment: EnvironmentClass::Unclassified,
                 authority: UpstreamAuthority::Shared,
             },
+            action: None,
             outcome: None,
             duration_ms: None,
         }

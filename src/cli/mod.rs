@@ -26,6 +26,7 @@ pub mod bb;
 pub mod conf;
 pub mod creds;
 pub mod jira;
+pub mod policy;
 
 use std::process::ExitCode;
 
@@ -69,6 +70,11 @@ pub enum TopCommand {
         #[command(subcommand)]
         action: creds::Command,
     },
+    /// Validate an enterprise policy document (`policy check <file>`).
+    Policy {
+        #[command(subcommand)]
+        action: policy::Command,
+    },
 
     // ----------------------------------------------------------------------
     // Deprecated top-level Bitbucket verbs.
@@ -111,6 +117,7 @@ where
         TopCommand::Jira { action } => jira::dispatch(action).await,
         TopCommand::Conf { action } => conf::dispatch(action).await,
         TopCommand::Creds { action } => creds::dispatch(action).await,
+        TopCommand::Policy { action } => policy::dispatch(action),
         legacy => dispatch_legacy(legacy).await,
     };
 
@@ -152,11 +159,12 @@ async fn dispatch_legacy(legacy: TopCommand) -> Result<(), crate::error::McpErro
             warn_deprecated("clone");
             bb::Command::Clone(opts)
         }
-        // Bb / Jira / Conf / Creds are handled by the caller; reaching here is a logic bug.
+        // Bb / Jira / Conf / Creds / Policy are handled by the caller; reaching here is a logic bug.
         TopCommand::Bb { .. }
         | TopCommand::Jira { .. }
         | TopCommand::Conf { .. }
-        | TopCommand::Creds { .. } => unreachable!(
+        | TopCommand::Creds { .. }
+        | TopCommand::Policy { .. } => unreachable!(
             "vendor groups are dispatched directly; legacy path receives only flat verbs"
         ),
     };

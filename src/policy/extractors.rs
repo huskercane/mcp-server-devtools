@@ -37,8 +37,11 @@
 
 use crate::transport::HttpMethod;
 
-use super::canonical::CanonicalPath;
-use super::{ActionDetails, ApprovedReadDowngrade, NormalizedAction, ResourceScope, ResourceType};
+use super::canonical::{CanonicalPath, CanonicalTarget};
+use super::{
+    ActionDetails, ApprovedReadDowngrade, NormalizedAction, RequestRisk, ResourceConstraint,
+    ResourceScope, ResourceType,
+};
 
 /// How an allowlisted query value is retained in `query_attributes`.
 ///
@@ -333,7 +336,7 @@ pub mod grafana {
 pub mod jira {
     use super::{
         ActionDetails, ApprovedReadDowngrade, CanonicalPath, HttpMethod, NormalizedAction,
-        ResourceScope, ResourceType, Retention, allowlisted_attributes,
+        ResourceConstraint, ResourceScope, ResourceType, Retention, allowlisted_attributes,
     };
 
     /// Query keys retained for the GET search endpoint. The scope claim is
@@ -470,9 +473,12 @@ pub mod jira {
         query_attributes: Vec<(String, String)>,
         jql: Option<&str>,
     ) -> ActionDetails {
-        let resource_scope = jql
+        // CF-2: a search returns *issues* — which ones is not provable, so
+        // the issue scope is unscoped — and is bounded by *projects*, which
+        // is a constraint in the project namespace, never an issue id.
+        let constraint = jql
             .and_then(project_keys_from_jql)
-            .map_or(ResourceScope::unscoped(), ResourceScope::ids);
+            .and_then(|keys| ResourceConstraint::ids(ResourceType::Project, keys));
         // GET is an ordinary read; POST is the module's one downgrade, and
         // it can only be spelled by naming the approved endpoint — which
         // binds its own action, path, and resource type, so only the
@@ -483,14 +489,16 @@ pub mod jira {
                 canonical_path,
                 query_attributes,
                 ResourceType::Issue,
-                resource_scope,
-            );
+                ResourceScope::unscoped(),
+            )
+            .constrained_by(constraint);
         }
         ActionDetails::read_downgrade(
             ApprovedReadDowngrade::JIRA_SEARCH_JQL,
             query_attributes,
-            resource_scope,
+            ResourceScope::unscoped(),
         )
+        .constrained_by(constraint)
     }
 
     /// Longest JQL this scanner will look at. Beyond it the answer is "no
@@ -721,6 +729,119 @@ pub mod jira {
     }
 }
 
+/// The wire request a vendor client is about to send, classified for the
+/// egress chokepoint (plan §1.3). Vendors without an extractor are
+/// `Passthrough`/`Unknown`, which default-deny denies: in enterprise mode a
+/// vendor is reachable only once it has a read-endpoint inventory.
+#[must_use]
+pub fn for_vendor(
+    vendor: &str,
+    method: HttpMethod,
+    target: &CanonicalTarget,
+    body: Option<&serde_json::Value>,
+) -> ActionDetails {
+    let query = target.query_pairs();
+    match vendor {
+        crate::config::VENDOR_GRAFANA => grafana::extract(method, target.path().clone(), &query),
+        crate::config::VENDOR_JIRA => jira::extract(method, target.path().clone(), &query, body),
+        _ => ActionDetails::unclassified(method, target.path().clone()),
+    }
+}
+
+/// What a tool call *asks for*, from its JSON arguments, for the tool-level
+/// decision that runs before dispatch (plan §1.3: layered on top of egress,
+/// never the only guard). Purpose-built tools map from their typed
+/// arguments; passthrough tools canonicalize their `path` and `queryParams`
+/// exactly as the transport will; anything else is
+/// [`ActionDetails::unmapped_tool`] with the risk the server's own tool
+/// annotations declare.
+#[must_use]
+pub fn for_tool(
+    tool: &str,
+    arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+    declared_risk: RequestRisk,
+) -> ActionDetails {
+    let text = |key: &str| {
+        arguments
+            .and_then(|args| args.get(key))
+            .and_then(serde_json::Value::as_str)
+    };
+    match tool {
+        "grafana_list_datasources" => grafana::list_datasources(),
+        "grafana_query_logs" => {
+            let uid = text("datasourceUid").unwrap_or_default();
+            let limit = arguments
+                .and_then(|args| args.get("limit"))
+                .map(serde_json::Value::to_string);
+            let mut params: Vec<(&str, &str)> = Vec::with_capacity(6);
+            for key in ["query", "start", "end", "direction", "step"] {
+                if let Some(value) = text(key) {
+                    params.push((key, value));
+                }
+            }
+            if let Some(limit) = limit.as_deref() {
+                params.push(("limit", limit));
+            }
+            grafana::query_logs(uid, &params)
+        }
+        "jira_get" | "jira_post" | "jira_put" | "jira_patch" | "jira_delete" => {
+            let method = match tool {
+                "jira_get" => HttpMethod::Get,
+                "jira_post" => HttpMethod::Post,
+                "jira_put" => HttpMethod::Put,
+                "jira_patch" => HttpMethod::Patch,
+                _ => HttpMethod::Delete,
+            };
+            passthrough_details(method, arguments, |target, query, body| {
+                jira::extract(method, target.path().clone(), query, body)
+            })
+        }
+        _ => ActionDetails::unmapped_tool(declared_risk),
+    }
+}
+
+/// Canonicalize a passthrough tool's `path` + `queryParams` the way the
+/// controller and transport will, then hand the result to the vendor's
+/// extractor. A path with no canonical form is `Unknown` (the transport
+/// will refuse it too).
+fn passthrough_details(
+    method: HttpMethod,
+    arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+    extract: impl FnOnce(&CanonicalTarget, &[(&str, &str)], Option<&serde_json::Value>) -> ActionDetails,
+) -> ActionDetails {
+    let path = arguments
+        .and_then(|args| args.get("path"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let mut path_and_query = path.to_owned();
+    if let Some(query) = arguments
+        .and_then(|args| args.get("queryParams"))
+        .and_then(serde_json::Value::as_object)
+    {
+        let encoded = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(
+                query
+                    .iter()
+                    .filter_map(|(key, value)| Some((key.as_str(), value.as_str()?))),
+            )
+            .finish();
+        if !encoded.is_empty() {
+            path_and_query.push(if path_and_query.contains('?') {
+                '&'
+            } else {
+                '?'
+            });
+            path_and_query.push_str(&encoded);
+        }
+    }
+    let Ok(target) = CanonicalTarget::parse(&path_and_query) else {
+        return ActionDetails::unclassified(method, CanonicalPath::root());
+    };
+    let query = target.query_pairs();
+    let body = arguments.and_then(|args| args.get("body"));
+    extract(&target, &query, body)
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -928,17 +1049,23 @@ mod tests {
             "explicit downgrade"
         );
         assert_eq!(details.resource_type, ResourceType::Issue);
-        assert_eq!(details.resource_scope, ResourceScope::id("PLAT"));
+        // CF-2: the issues are unscoped; the *projects* are the constraint.
+        assert!(details.resource_scope.is_unscoped());
+        assert_eq!(details.constraint(), project_constraint(["PLAT"]).as_ref());
+    }
+
+    fn project_constraint<const N: usize>(keys: [&str; N]) -> Option<ResourceConstraint> {
+        ResourceConstraint::ids(ResourceType::Project, keys)
     }
 
     #[test]
-    fn post_search_keeps_every_project_of_an_in_list_as_a_structured_scope() {
+    fn post_search_keeps_every_project_of_an_in_list_as_a_structured_constraint() {
         let details = post_search(&serde_json::json!({
             "jql": "project in (WEB, PLAT, WEB) AND status = Open",
         }));
         assert_eq!(
-            details.resource_scope,
-            ResourceScope::ids(["PLAT", "WEB"]),
+            details.constraint(),
+            project_constraint(["PLAT", "WEB"]).as_ref(),
             "both projects stay separately addressable — never comma-joined \
              into one opaque id"
         );
@@ -955,14 +1082,15 @@ mod tests {
             "jql": "project = SECRET",
         }));
         assert_eq!(
-            details.resource_scope,
-            ResourceScope::id("SECRET"),
-            "scope must come from the JQL Jira actually executes"
+            details.constraint(),
+            project_constraint(["SECRET"]).as_ref(),
+            "the constraint must come from the JQL Jira actually executes"
         );
 
         // And with no JQL at all, a body `project` buys no claim either.
         let decoy_only = post_search(&serde_json::json!({ "project": "PUBLIC" }));
-        assert_eq!(decoy_only.resource_scope, ResourceScope::unscoped());
+        assert_eq!(decoy_only.constraint(), None);
+        assert!(decoy_only.resource_scope.is_unscoped());
     }
 
     #[test]
@@ -977,10 +1105,11 @@ mod tests {
         ] {
             let details = post_search(&serde_json::json!({ "jql": jql }));
             assert_eq!(
-                details.resource_scope,
-                ResourceScope::unscoped(),
-                "jql {jql:?} must not be claimed as project-scoped"
+                details.constraint(),
+                None,
+                "jql {jql:?} must not be claimed as project-constrained"
             );
+            assert!(details.resource_scope.is_unscoped());
             // Still a classified read of issues — just unscoped.
             assert_eq!(details.resource_type, ResourceType::Issue);
             assert_eq!(details.request_risk, RequestRisk::Read);
@@ -1089,7 +1218,10 @@ mod tests {
             Some(vec!["A,B".to_owned(), "C".to_owned()])
         );
         let details = post_search(&serde_json::json!({ "jql": "project in (\"A,B\", C)" }));
-        assert_eq!(details.resource_scope, ResourceScope::ids(["A,B", "C"]));
+        assert_eq!(
+            details.constraint(),
+            project_constraint(["A,B", "C"]).as_ref()
+        );
     }
 
     // ---- The confusion the brief warns about: same verb, different risk ----
@@ -1196,8 +1328,8 @@ mod tests {
                 .map(|(_, value)| value),
             Some(&jql.1)
         );
-        // The scope claim is still extracted from the real expression.
-        assert_eq!(details.resource_scope, ResourceScope::id("PLAT"));
+        // The constraint is still extracted from the real expression.
+        assert_eq!(details.constraint(), project_constraint(["PLAT"]).as_ref());
     }
 
     /// Bounding a caller-controlled string is not redacting it. Every
@@ -1371,7 +1503,84 @@ mod tests {
             None,
         );
         assert_eq!(details.normalized_action, NormalizedAction::SearchIssues);
-        assert_eq!(details.resource_scope, ResourceScope::id("PLAT"));
+        assert_eq!(details.constraint(), project_constraint(["PLAT"]).as_ref());
         assert_eq!(details.request_risk, RequestRisk::Read);
+    }
+
+    // ---- The dispatch tables the enforcement points use ----
+
+    #[test]
+    fn for_tool_maps_typed_and_passthrough_arguments_and_denies_the_rest() {
+        let grafana = for_tool(
+            "grafana_query_logs",
+            serde_json::json!({
+                "datasourceUid": "loki-qa", "query": "{app=\"api\"}", "limit": 50
+            })
+            .as_object(),
+            RequestRisk::Read,
+        );
+        assert_eq!(
+            grafana,
+            grafana::query_logs("loki-qa", &[("query", "{app=\"api\"}"), ("limit", "50")])
+        );
+
+        let list = for_tool("grafana_list_datasources", None, RequestRisk::Read);
+        assert_eq!(list, grafana::list_datasources());
+
+        let search = for_tool(
+            "jira_get",
+            serde_json::json!({
+                "path": "/rest/api/3/search/jql",
+                "queryParams": { "jql": "project = PLAT", "maxResults": "5" }
+            })
+            .as_object(),
+            RequestRisk::Read,
+        );
+        assert_eq!(search.normalized_action(), NormalizedAction::SearchIssues);
+        assert_eq!(search.constraint(), project_constraint(["PLAT"]).as_ref());
+
+        let create = for_tool(
+            "jira_post",
+            serde_json::json!({ "path": "/rest/api/3/issue", "body": {"fields": {}} }).as_object(),
+            RequestRisk::Write,
+        );
+        assert_eq!(create.resource_type(), ResourceType::Unknown);
+        assert_eq!(create.request_risk(), RequestRisk::Write);
+
+        // A path with no canonical form is unknown, like the transport will
+        // refuse it.
+        let hostile = for_tool(
+            "jira_get",
+            serde_json::json!({ "path": "https://evil.example/x" }).as_object(),
+            RequestRisk::Read,
+        );
+        assert_eq!(hostile.resource_type(), ResourceType::Unknown);
+
+        // No extractor: the server's own annotation decides the risk, and
+        // the resource is unknown either way.
+        let slack = for_tool("slack_post_message", None, RequestRisk::Write);
+        assert_eq!(slack.resource_type(), ResourceType::Unknown);
+        assert_eq!(slack.request_risk(), RequestRisk::Write);
+        assert_eq!(slack.method(), HttpMethod::Post);
+        let read_only = for_tool("some_read_tool", None, RequestRisk::Read);
+        assert_eq!(read_only.request_risk(), RequestRisk::Read);
+    }
+
+    #[test]
+    fn for_vendor_classifies_only_inventoried_vendors() {
+        let target = CanonicalTarget::parse("/api/datasources").unwrap();
+        assert_eq!(
+            for_vendor("grafana", HttpMethod::Get, &target, None),
+            grafana::list_datasources()
+        );
+        let target = CanonicalTarget::parse("/rest/api/3/issue/PLAT-1").unwrap();
+        assert_eq!(
+            for_vendor("jira", HttpMethod::Get, &target, None).normalized_action(),
+            NormalizedAction::ReadIssue
+        );
+        let target = CanonicalTarget::parse("/api/chat.postMessage").unwrap();
+        let slack = for_vendor("slack", HttpMethod::Post, &target, None);
+        assert_eq!(slack.resource_type(), ResourceType::Unknown);
+        assert_eq!(slack.request_risk(), RequestRisk::Write);
     }
 }

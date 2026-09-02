@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 
-use crate::policy::{ClientIdentity, PolicyDecision, Principal, UpstreamIdentity};
+use crate::policy::{ActionContext, ClientIdentity, PolicyDecision, Principal, UpstreamIdentity};
 
 /// Lifecycle stage an audit event records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -44,6 +44,10 @@ pub enum AuditEventKind {
     ToolCallIntent,
     /// Written after the dispatch completes, with the outcome.
     ToolCallOutcome,
+    /// Written when the egress chokepoint **denies** an upstream request
+    /// the tool was about to send (WP A.7). An egress allow is implied by
+    /// the intent's allow and the outcome record.
+    EgressDecision,
 }
 
 /// One enterprise audit event. Metadata and §3.2 identity/decision types
@@ -65,6 +69,11 @@ pub struct AuditEvent {
     /// The identity that acts (or would act) upstream. Present in **every**
     /// event (WP 0.6).
     pub upstream_identity: UpstreamIdentity,
+    /// The canonical action the decision was about (WP A.7): on intent and
+    /// egress records; absent on outcome records, which the intent's
+    /// `request_id` already ties to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<ActionContext>,
     /// Outcome label for [`AuditEventKind::ToolCallOutcome`] events.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
@@ -266,6 +275,7 @@ mod tests {
                 environment: EnvironmentClass::Unclassified,
                 authority: UpstreamAuthority::Shared,
             },
+            action: None,
             outcome: None,
             duration_ms: None,
         }

@@ -134,18 +134,21 @@ fn enterprise_inbound_auth(config: &Config) -> Result<InboundAuth, String> {
             crate::bootstrap::AUDIT_JOURNAL_DIR_KEY
         ));
     }
-    // The policy engine (WP A.7) is the last piece of the enterprise chain.
-    // Until it lands, enterprise mode would authenticate every caller and
-    // then allow everything — exactly the "temporarily permissive" state
-    // the plan forbids — so startup is refused here, after every other
-    // check, so that a deployment being prepared learns about *all* of its
-    // configuration gaps at once.
-    let _ = settings;
-    let _ = okta;
-    Err(
-        "refusing to start: MCP_AUTH_MODE=okta is not available yet — the policy engine          lands in Phase A (A.7) of docs/enterprise-product-plan.md. Unset MCP_AUTH_MODE          (or set it to \"off\") to run in local mode"
-            .to_owned(),
-    )
+    if config
+        .get(crate::policy::engine::POLICY_FILE_KEY)
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        return Err(format!(
+            "refusing to start: MCP_AUTH_MODE=okta requires {} — enterprise mode with no \
+             policy loaded would authenticate every caller and then allow everything \
+             (fail-closed; see docs/enterprise-product-plan.md §1.2)",
+            crate::policy::engine::POLICY_FILE_KEY
+        ));
+    }
+    let client = crate::transport::build_client().map_err(|error| error.message)?;
+    let validator = Arc::new(crate::auth::okta::OktaJwksValidator::new(okta, client));
+    Ok(InboundAuth::new(Arc::new(validator), settings))
 }
 
 /// Build the full Axum app with a caller-owned cancellation token. Tests use

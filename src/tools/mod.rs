@@ -406,17 +406,23 @@ struct EnterpriseCall {
     sink: Arc<dyn crate::ports::AuditSink>,
     vendor: &'static str,
     upstream: crate::policy::UpstreamIdentity,
+    /// The tool-level decision (WP A.7), repeated on the outcome record.
+    decision: PolicyDecision,
     /// The call scope the dispatch runs inside (WP A.4/A.5): it carries the
-    /// principal and the digested client identity and request id.
+    /// principal, the digested client identity and request id, and the
+    /// egress enforcement (WP A.7).
     scope: Arc<crate::policy::CallScope>,
+    append_timeout: std::time::Duration,
 }
 
-/// Why a call was refused before dispatch. Each maps to a fixed,
-/// detail-free message for the model and an outcome label for the legacy
-/// audit log.
+/// Why a call was refused before dispatch. Each maps to a fixed message for
+/// the model and an outcome label for the legacy audit log. A policy denial
+/// carries its reason — rule id and policy version are operator-authored
+/// and are what the caller needs in order to ask for access.
 enum Refusal {
     Unauthenticated,
     AuditUnavailable,
+    PolicyDenied(PolicyDecision),
 }
 
 impl Refusal {
@@ -424,18 +430,19 @@ impl Refusal {
         match self {
             Self::Unauthenticated => "unauthenticated",
             Self::AuditUnavailable => "audit_unavailable",
-        }
-    }
-
-    const fn message(&self) -> &'static str {
-        match self {
-            Self::Unauthenticated => UNAUTHENTICATED_MESSAGE,
-            Self::AuditUnavailable => AUDIT_UNAVAILABLE_MESSAGE,
+            Self::PolicyDenied(_) => "policy_denied",
         }
     }
 
     fn into_response(self) -> CallToolResponse {
-        CallToolResponse::Complete(CallToolResult::error(vec![Content::text(self.message())]))
+        let text = match self {
+            Self::Unauthenticated => Content::text(UNAUTHENTICATED_MESSAGE),
+            Self::AuditUnavailable => Content::text(AUDIT_UNAVAILABLE_MESSAGE),
+            Self::PolicyDenied(decision) => {
+                Content::text(crate::policy::egress::policy_denied(&decision).message)
+            }
+        };
+        CallToolResponse::Complete(CallToolResult::error(vec![text]))
     }
 }
 
@@ -451,6 +458,7 @@ impl DevtoolsServer {
     async fn begin_enterprise_call(
         &self,
         tool: &str,
+        arguments: Option<&rmcp::model::JsonObject>,
         audit: &crate::audit::AuditCall,
         principal: &Principal,
         client_info: Option<&Implementation>,
@@ -478,6 +486,25 @@ impl DevtoolsServer {
         // JSON-RPC id is an arbitrary string.
         let request_id = crate::policy::correlation_id(audit.request_id());
 
+        // WP A.7 / CF-4: the tool-level decision, on the canonical action
+        // built from what the call *asks for*. Layered on top of the egress
+        // check, never the only guard (plan §1.3). Under `AllowAll` the
+        // context is still built so the journal carries it.
+        let policy = &self.components.policy;
+        let details =
+            crate::policy::extractors::for_tool(tool, arguments, self.declared_risk(tool));
+        let action = crate::policy::ActionContext::assemble(
+            principal.clone(),
+            client.clone(),
+            None,
+            tool,
+            details,
+            None,
+            upstream.clone(),
+        );
+        let decision = policy.evaluate(&action);
+        let append_timeout = self.components.audit_append_timeout;
+
         let intent = AuditEvent {
             timestamp: crate::logger::iso_timestamp(),
             kind: AuditEventKind::ToolCallIntent,
@@ -486,12 +513,17 @@ impl DevtoolsServer {
             vendor: vendor.to_owned(),
             principal: principal.clone(),
             client: client.clone(),
-            decision: PolicyDecision::local_allow(),
+            decision: decision.clone(),
             upstream_identity: upstream.clone(),
+            action: Some(action),
             outcome: None,
             duration_ms: None,
         };
-        if let Err(error) = sink.append(&intent).await {
+        // Bounded (CF-14): a stalled disk refuses the call instead of
+        // parking it. See `policy::egress` for what a timeout means.
+        if let Err(error) =
+            crate::policy::egress::append_bounded(sink.as_ref(), &intent, append_timeout).await
+        {
             // The sink's own error goes to the operator log, never to the
             // model: a sink is free to be an HTTP client, and its errors can
             // quote request headers. A *category*, never the adapter's error
@@ -505,18 +537,54 @@ impl DevtoolsServer {
             );
             return Err(Refusal::AuditUnavailable);
         }
+        // The denial is in the journal (above, with the action, rule, and
+        // policy version) before the caller hears about it.
+        if !decision.is_allow() {
+            tracing::warn!(
+                tool,
+                rule = decision.rule_id.as_deref().unwrap_or("-"),
+                "tool call denied by policy"
+            );
+            return Err(Refusal::PolicyDenied(decision));
+        }
 
+        let mut scope = crate::policy::CallScope::new(principal.clone(), client, tool, request_id);
+        if policy.enforces() {
+            scope = scope.with_enforcement(crate::policy::Enforcement {
+                policy: Arc::clone(policy),
+                audit: Arc::clone(sink),
+                upstream: upstream.clone(),
+                append_timeout,
+            });
+        }
         Ok(Some(EnterpriseCall {
             sink: Arc::clone(sink),
             vendor,
             upstream,
-            scope: Arc::new(crate::policy::CallScope::new(
-                principal.clone(),
-                client,
-                tool,
-                request_id,
-            )),
+            decision,
+            scope: Arc::new(scope),
+            append_timeout,
         }))
+    }
+
+    /// The risk class the server itself declares for a tool through its
+    /// annotations — the input `for_tool` uses for tools with no extractor.
+    /// Server-owned, so never a client-supplied risk.
+    fn declared_risk(&self, tool: &str) -> crate::policy::RequestRisk {
+        let annotations = self
+            .tool_router
+            .map
+            .get(tool)
+            .and_then(|route| route.attr.annotations.as_ref());
+        match annotations {
+            Some(annotations) if annotations.read_only_hint == Some(true) => {
+                crate::policy::RequestRisk::Read
+            }
+            Some(annotations) if annotations.destructive_hint == Some(true) => {
+                crate::policy::RequestRisk::Destructive
+            }
+            _ => crate::policy::RequestRisk::Write,
+        }
     }
 
     /// Journal the outcome of a dispatched call and emit its usage event.
@@ -535,12 +603,19 @@ impl DevtoolsServer {
             vendor: call.vendor.to_owned(),
             principal: call.scope.principal().clone(),
             client: call.scope.client().clone(),
-            decision: PolicyDecision::local_allow(),
+            decision: call.decision,
             upstream_identity: call.upstream,
+            action: None,
             outcome: Some(outcome.to_owned()),
             duration_ms: Some(duration_ms),
         };
-        if let Err(error) = call.sink.append(&outcome_event).await {
+        if let Err(error) = crate::policy::egress::append_bounded(
+            call.sink.as_ref(),
+            &outcome_event,
+            call.append_timeout,
+        )
+        .await
+        {
             // Category only, for the same reason as the intent branch.
             tracing::error!(
                 failure = %crate::ports::audit_sink::AuditFailure::classify(&error),
@@ -593,7 +668,13 @@ impl ServerHandler for DevtoolsServer {
         // the call path is byte-for-byte what it was before enterprise
         // types existed (one `Option` check).
         let enterprise = match self
-            .begin_enterprise_call(request.name.as_ref(), &audit, &principal, client.as_ref())
+            .begin_enterprise_call(
+                request.name.as_ref(),
+                request.arguments.as_ref(),
+                &audit,
+                &principal,
+                client.as_ref(),
+            )
             .await
         {
             Ok(enterprise) => enterprise,

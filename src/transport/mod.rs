@@ -1013,8 +1013,12 @@ pub async fn fetch_streamed_artifact_with_policy(
     policy: StreamingPolicy,
 ) -> Result<raw_response::StreamedArtifact, McpError> {
     let base = vendor.base_url(config)?;
-    let url = canonical_target(path)?.url_under(&base);
+    let target = canonical_target(path)?;
     let method = options.method.unwrap_or(HttpMethod::Get);
+    // Plan §1.3: the request about to go on the wire is the fact policy is
+    // evaluated on. Outside an enforcing call scope this is one lookup.
+    crate::policy::authorize_egress(vendor.name(), method, &target, options.body.as_ref()).await?;
+    let url = target.url_under(&base);
     let (auth_name, auth_header) = validate_auth(credentials)?;
     let client = streaming_client()?;
     let attempts = policy.max_attempts.max(1);
@@ -1503,8 +1507,12 @@ pub async fn fetch(
     options: RequestOptions,
 ) -> Result<TransportResponse, McpError> {
     let base = vendor.base_url(config)?;
-    let url = canonical_target(path)?.url_under(&base);
+    let target = canonical_target(path)?;
     let method = options.method.unwrap_or(HttpMethod::Get);
+    // Plan §1.3: the request about to go on the wire is the fact policy is
+    // evaluated on. Outside an enforcing call scope this is one lookup.
+    crate::policy::authorize_egress(vendor.name(), method, &target, options.body.as_ref()).await?;
+    let url = target.url_under(&base);
 
     let (auth_name, auth_header) = validate_auth(credentials)?;
     let timeout = resolve_timeout(config, options.timeout);

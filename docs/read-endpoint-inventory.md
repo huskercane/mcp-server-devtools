@@ -83,8 +83,8 @@ and is denied by default-deny.
 | `GET /rest/api/3/issue/{key}` | `read_issue` | `issue` | `{key}` path segment | query: `fields` | read | **Extractor implemented + tested** |
 | `GET /rest/api/3/project` | `read_project` | `project` | `scope: collection` | — | read | **Extractor implemented + tested** |
 | `GET /rest/api/3/project/{key}` | `read_project` | `project` | `{key}` path segment | — | read | **Extractor implemented + tested** |
-| `GET /rest/api/3/search/jql` | `search_issues` | `issue` | JQL project clause (see below) | query: `fields`, `jql`, `maxResults` | read | **Extractor implemented + tested** |
-| `POST /rest/api/3/search/jql` | `search_issues` | `issue` | JQL project clause only (see below) | body: `jql` **only** | read (explicit downgrade from POST) | **Extractor implemented + tested** |
+| `GET /rest/api/3/search/jql` | `search_issues` | `issue` | `scope: unscoped`; `constrained_by: project[...]` from the JQL project clause (see below) | query: `fields`, `jql`, `maxResults` | read | **Extractor implemented + tested** |
+| `POST /rest/api/3/search/jql` | `search_issues` | `issue` | `scope: unscoped`; `constrained_by: project[...]` from the JQL project clause only (see below) | body: `jql` **only** | read (explicit downgrade from POST) | **Extractor implemented + tested** |
 | `GET /rest/api/3/myself` | passthrough (candidate `read_self`) | none | `scope: unscoped` | — | read | Spec only |
 | `GET /rest/api/3/issue/{key}/comment` | candidate `read_issue` (comments) | `issue` | `{key}` path segment | query: `maxResults`, `startAt` | read | Spec only |
 | `POST /rest/api/3/issue` | passthrough | `unknown` | — | — (never read) | **write** | **Extractor implemented + tested** — must never classify as read |
@@ -162,18 +162,14 @@ and holds the §3.2 freeze open — see `docs/enterprise-carry-forward.md` CF-2.
    indistinguishable from "we could not tell what this call reaches", and
    they must authorize differently. Neither is matched by an id-scoped
    rule; each needs its own permission.
-3. **Resource semantics — PROVISIONAL; blocks the §3.2 freeze.** Jira search returns *issues*, constrained
-   by *projects*, so `resource_type: issue` with a project-derived scope is
-   not the contradiction it first looks like — but only because scope is
-   now a separate, named concept rather than an `issue` id field holding a
-   project key. A future `constrained_by` dimension (issues within
-   projects `[PLAT, WEB]` as a first-class pair) is **required before the
-   schema freezes**, not merely explanatory. Without it a generic policy
-   engine cannot tell which permission namespace the ids belong to: it can
-   look project keys up in an issue-id allowlist, or collide an issue-rule id
-   with a project identifier, and reach a confident wrong decision. It may be
-   implemented in Phase A, but it stays an unresolved schema requirement
-   until then (`docs/enterprise-carry-forward.md` CF-2).
+3. **Resource semantics — decided (Phase A, WP A.7): `constrained_by` is
+   its own dimension.** Jira search returns *issues*, constrained by
+   *projects*. The context now says exactly that: `resource_type: issue`,
+   `resource_scope: unscoped` (which issues come back is not provable), and
+   `constrained_by: { resource_type: project, ids: [PLAT, WEB] }`. A policy
+   rule matches the constraint with its own key, all-of over the ids, and an
+   issue-id rule can no longer match a project key or vice versa. §3.2 is
+   frozen with this field (carry-forward CF-2 closed).
 4. **POST-as-read downgrades — decided: exact endpoints only, one at a
    time.** `POST /rest/api/3/search/jql` is approved as a read downgrade
    now that the fictitious `project` body field is gone and the JQL gate is

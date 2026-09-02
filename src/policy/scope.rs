@@ -33,6 +33,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
+use super::egress::Enforcement;
 use super::{ClientIdentity, Principal};
 
 tokio::task_local! {
@@ -48,6 +49,9 @@ pub struct CallScope {
     tool_name: String,
     /// The digested JSON-RPC request id (see [`super::correlation_id`]).
     request_id: String,
+    /// What the egress chokepoint needs to decide and record. `None` under
+    /// a decision point that does not enforce (local mode with a journal).
+    enforcement: Option<Enforcement>,
 }
 
 impl CallScope {
@@ -63,7 +67,20 @@ impl CallScope {
             client,
             tool_name: tool_name.into(),
             request_id: request_id.into(),
+            enforcement: None,
         }
+    }
+
+    /// Attach the egress enforcement for this call.
+    #[must_use]
+    pub fn with_enforcement(mut self, enforcement: Enforcement) -> Self {
+        self.enforcement = Some(enforcement);
+        self
+    }
+
+    #[must_use]
+    pub fn enforcement(&self) -> Option<&Enforcement> {
+        self.enforcement.as_ref()
     }
 
     #[must_use]

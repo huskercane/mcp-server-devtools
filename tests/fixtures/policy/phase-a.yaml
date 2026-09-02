@@ -1,0 +1,70 @@
+# Phase A fixture policy: the rule shapes the golden decision table
+# (tests/golden/policy_decisions.json) exercises. Also a worked example of
+# the v1 schema (src/policy/engine.rs).
+version: 1
+default: deny
+rules:
+  - id: sre-read-qa-loki
+    description: SRE may query the QA Loki and any QA Prometheus datasource.
+    effect: allow
+    subjects: { groups: [SRE] }
+    match:
+      vendor: grafana
+      environment: qa
+      request_risk: read
+      resource_type: datasource
+      resource_id: ["loki-qa", "prom-*"]
+
+  - id: sre-read-prod-loki
+    effect: allow
+    subjects: { groups: [SRE] }
+    match:
+      vendor: grafana
+      environment: prod
+      normalized_action: query_logs
+      resource_type: datasource
+      resource_id: ["loki-prod"]
+
+  - id: sre-list-datasources
+    description: Listing the collection is its own permission.
+    effect: allow
+    subjects: { groups: [SRE] }
+    match:
+      vendor: grafana
+      environment: [qa, prod]
+      normalized_action: list_datasources
+      resource_scope: collection
+
+  - id: dev-jira-search-plat
+    description: Developers may search issues, but only searches provably restricted to PLAT.
+    effect: allow
+    subjects: { groups: [Developers] }
+    match:
+      vendor: jira
+      normalized_action: [search_issues, read_issue]
+      resource_type: issue
+      constrained_by: { resource_type: project, resource_id: ["PLAT"] }
+      upstream_authority: shared
+
+  - id: dev-jira-read-plat-issues
+    effect: allow
+    subjects: { groups: [Developers] }
+    match:
+      vendor: jira
+      normalized_action: read_issue
+      resource_type: issue
+      resource_id: ["PLAT-*"]
+
+  - id: contractors-never-prod
+    description: A deny wins over any allow, whatever other groups the caller has.
+    effect: deny
+    subjects: { groups: [Contractors] }
+    match:
+      environment: prod
+
+  - id: auditors-any-unscoped-read
+    effect: allow
+    subjects: { subjects: ["auditor@acme.example"] }
+    match:
+      request_risk: read
+      resource_scope: unscoped

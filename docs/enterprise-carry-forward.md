@@ -55,21 +55,18 @@ the record — the broker reports `ninjaone/indeterminate`, which is honest but
 is not "which credential acted". Closed by CF-1.
 
 ### CF-2 · `constrained_by` for resource semantics
-**Open · Phase A · blocks the §3.2 freeze**
+**Done · 2026-09-02 (Phase A, WP A.7) — §3.2 is frozen**
 
-Jira search emits `resource_type: issue` with a scope built from *project*
-keys. That is coherent for a human reading it, but a generic policy engine
-has no way to know which permission namespace the ids belong to — it can
-look project keys up in an issue-id allowlist and reach a confident wrong
-answer, or collide an issue-rule id with a project identifier.
-
-*The fix*: model the constraint as its own dimension —
-`resource_type: issue, constrained_by: project[PLAT, WEB]` — rather than
-leaving the reader to infer it.
-
-`docs/read-endpoint-inventory.md` decision 3 records the current
-representation as **provisional for this reason**. §3.2 must not be declared
-frozen until this lands.
+`ActionDetails`/`ActionContext` carry `constrained_by: Option<ResourceConstraint>`
+— a typed `(resource_type, ids)` pair in its own namespace. Jira search is
+now `resource_type: issue, resource_scope: unscoped,
+constrained_by: project[PLAT, WEB]`; the project keys no longer travel in the
+issue-id slot. The policy engine matches it with its own rule key
+(`constrained_by: { resource_type: project, resource_id: [...] }`, all-of),
+so an issue-id rule cannot match a project key and vice versa. The
+serialized shape test (`action_context_serialized_shape_is_the_section_3_2_field_list`)
+locks the frozen field list; `docs/read-endpoint-inventory.md` decision 3 is
+recorded as decided.
 
 ### CF-3 · Exact-pin the five range dependencies
 **Done · 2026-09-02 (Phase A, first commit)**
@@ -87,12 +84,17 @@ exit check (its build is what verifies the library surface anyway).
 ## Deferred by phase
 
 ### CF-4 · Wire extractors into the dispatch path
-**Open · Phase A**
+**Done · 2026-09-02 (Phase A, WP A.7)**
 
-`policy::extractors` is exercised by tests and the allocation bench, but
-`call_tool` does not build an `ActionContext` from it yet. Until it does, the
-Grafana UID validation that protects dispatch lives in
-`controllers::grafana`, not in policy.
+`call_tool` builds the `ActionContext` from the tool's JSON arguments
+(`extractors::for_tool`), evaluates it against the configured
+`PolicyDecisionPoint`, journals the intent with the decision, the policy
+version, and the canonical action, and refuses a denial before dispatch.
+The transport evaluates the request it is about to send
+(`extractors::for_vendor` + `policy::authorize_egress`) inside the call
+scope, and journals an egress denial. The Grafana UID validation in the
+controller stays as belt-and-braces; the policy path now sees the same
+predicate through the extractor.
 
 ### CF-5 · Full §3.5 request canonicalization (A.6)
 **Done · 2026-09-02 (Phase A, WP A.6)**
@@ -152,24 +154,22 @@ contiguous sequence, but not tamper-*proof*. Signed checkpoints every N
 records or T seconds are B.6.
 
 ### CF-14 · Journal append has no bound on how long a call can wait
-**Open · Phase A/B · needs a design decision, not a one-line fix**
+**Done · 2026-09-02 (Phase A, WP A.7) — decision recorded**
 
-`AuditSink::append` (`src/audit/journal.rs:257-280`) has no timeout on either
-the bounded-channel `send().await` or the ack `acked.await`. A sustained
-stall on the underlying disk (the module's own doc already calls
-`sync_data` "unbounded in practice" — full disk, page reclaim, FUSE, network
-storage) parks every in-flight `tools/call` on that wait instead of
-returning `AUDIT_UNAVAILABLE_MESSAGE`; the caller sees whatever the
-transport's own timeout produces instead of a clean fail-closed refusal.
-
-Not a quick fix: a naive `tokio::time::timeout` around `send().await` is
-safe (nothing was enqueued, refuse cleanly), but the same wrapper around
-`acked.await` is not — the record can already be queued and later written by
-the dedicated writer thread after the caller has been told the call was
-refused. That is still fail-closed (the vendor is never called), but it
-changes what "the journal has a record for a refused call" means and needs
-to be a reviewed decision, not an incidental one, given the module's stated
-RPO = 0 / no-degraded-mode invariant.
+Every enforcement-path append goes through `policy::egress::append_bounded`,
+capped by `MCP_AUDIT_APPEND_TIMEOUT_MS` (default 5000, clamped to
+100–60000). **Decision:** on timeout the call is refused (fail closed; the
+vendor is never contacted) and the caller receives the fixed
+audit-unavailable refusal, not the transport's own timeout. The record that
+was already queued may still be written by the journal's writer thread
+afterwards. That is acceptable because of what the record kinds mean, and
+the meaning is now written down in the module docs: an **intent** record
+proves a call was requested and authorized; only the **outcome** record
+proves it was dispatched. An intent with no outcome is "requested, not
+dispatched" — exactly the state a timed-out call is in — so the journal
+stays truthful without needing to cancel a queued write. The port contract
+(`AuditSink::append` = durable or error) is unchanged; the bound is the
+enforcement point's, not the sink's.
 
 ### CF-15 · Response-provided absolute URLs bypass canonicalization
 **Open · Phase B (with the CircleCI read profile)**

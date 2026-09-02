@@ -139,6 +139,8 @@ mod tests {
             audit_sink: None,
             usage_sink: Arc::new(crate::ports::NoopUsageSink),
             auth_required: false,
+            policy: Arc::new(crate::ports::AllowAll),
+            audit_append_timeout: crate::policy::egress::DEFAULT_AUDIT_APPEND_TIMEOUT,
         })
     }
 

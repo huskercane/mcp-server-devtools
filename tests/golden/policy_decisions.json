@@ -1,0 +1,137 @@
+{
+  "policy": "tests/fixtures/policy/phase-a.yaml",
+  "rows": [
+    {
+      "case": "SRE reads the QA Loki datasource",
+      "principal": { "subject": "sre@acme.example", "groups": ["SRE"] },
+      "call": { "tool": "grafana_query_logs", "arguments": { "datasourceUid": "loki-qa", "query": "{app=\"api\"}" }, "environment": "qa" },
+      "expect": { "effect": "allow", "rule_id": "sre-read-qa-loki" }
+    },
+    {
+      "case": "SRE reads a QA datasource no rule names",
+      "principal": { "subject": "sre@acme.example", "groups": ["SRE"] },
+      "call": { "tool": "grafana_query_logs", "arguments": { "datasourceUid": "loki-secret", "query": "{}" }, "environment": "qa" },
+      "expect": { "effect": "deny", "rule_id": null }
+    },
+    {
+      "case": "SRE reads a QA Prometheus datasource matched by glob",
+      "principal": { "subject": "sre@acme.example", "groups": ["SRE"] },
+      "call": { "tool": "grafana_query_logs", "arguments": { "datasourceUid": "prom-qa-1", "query": "up" }, "environment": "qa" },
+      "expect": { "effect": "allow", "rule_id": "sre-read-qa-loki" }
+    },
+    {
+      "case": "environment comes from configuration: the same call against prod is not the QA rule",
+      "principal": { "subject": "sre@acme.example", "groups": ["SRE"] },
+      "call": { "tool": "grafana_query_logs", "arguments": { "datasourceUid": "loki-qa", "query": "{}" }, "environment": "prod" },
+      "expect": { "effect": "deny", "rule_id": null }
+    },
+    {
+      "case": "SRE reads the prod Loki through the prod rule",
+      "principal": { "subject": "sre@acme.example", "groups": ["SRE"] },
+      "call": { "tool": "grafana_query_logs", "arguments": { "datasourceUid": "loki-prod", "query": "{}" }, "environment": "prod" },
+      "expect": { "effect": "allow", "rule_id": "sre-read-prod-loki" }
+    },
+    {
+      "case": "a Contractor who is also SRE is denied prod: deny overrides allow",
+      "principal": { "subject": "temp@acme.example", "groups": ["SRE", "Contractors"] },
+      "call": { "tool": "grafana_query_logs", "arguments": { "datasourceUid": "loki-prod", "query": "{}" }, "environment": "prod" },
+      "expect": { "effect": "deny", "rule_id": "contractors-never-prod" }
+    },
+    {
+      "case": "the same Contractor is fine in QA",
+      "principal": { "subject": "temp@acme.example", "groups": ["SRE", "Contractors"] },
+      "call": { "tool": "grafana_query_logs", "arguments": { "datasourceUid": "loki-qa", "query": "{}" }, "environment": "qa" },
+      "expect": { "effect": "allow", "rule_id": "sre-read-qa-loki" }
+    },
+    {
+      "case": "a Developer has no Grafana rule",
+      "principal": { "subject": "dev@acme.example", "groups": ["Developers"] },
+      "call": { "tool": "grafana_query_logs", "arguments": { "datasourceUid": "loki-qa", "query": "{}" }, "environment": "qa" },
+      "expect": { "effect": "deny", "rule_id": null }
+    },
+    {
+      "case": "listing datasources is a collection read with its own rule",
+      "principal": { "subject": "sre@acme.example", "groups": ["SRE"] },
+      "call": { "tool": "grafana_list_datasources", "arguments": {}, "environment": "qa" },
+      "expect": { "effect": "allow", "rule_id": "sre-list-datasources" }
+    },
+    {
+      "case": "an id-scoped rule never matches a collection read",
+      "principal": { "subject": "dev@acme.example", "groups": ["Developers"] },
+      "call": { "tool": "grafana_list_datasources", "arguments": {}, "environment": "qa" },
+      "expect": { "effect": "deny", "rule_id": null }
+    },
+    {
+      "case": "a hostile datasource UID is unclassified and denied before any rule",
+      "principal": { "subject": "sre@acme.example", "groups": ["SRE"] },
+      "call": { "tool": "grafana_query_logs", "arguments": { "datasourceUid": "loki-qa/../../admin", "query": "{}" }, "environment": "qa" },
+      "expect": { "effect": "deny", "rule_id": null, "reason_contains": "could not be classified" }
+    },
+    {
+      "case": "Developer search provably restricted to PLAT",
+      "principal": { "subject": "dev@acme.example", "groups": ["Developers"] },
+      "call": { "tool": "jira_get", "arguments": { "path": "/rest/api/3/search/jql", "queryParams": { "jql": "project = PLAT AND status = Open" } }, "environment": "prod" },
+      "expect": { "effect": "allow", "rule_id": "dev-jira-search-plat" }
+    },
+    {
+      "case": "a search spanning PLAT and WEB is denied: constraint ids are all-of",
+      "principal": { "subject": "dev@acme.example", "groups": ["Developers"] },
+      "call": { "tool": "jira_get", "arguments": { "path": "/rest/api/3/search/jql", "queryParams": { "jql": "project in (PLAT, WEB)" } }, "environment": "prod" },
+      "expect": { "effect": "deny", "rule_id": null }
+    },
+    {
+      "case": "an unconstrained search is denied for Developers",
+      "principal": { "subject": "dev@acme.example", "groups": ["Developers"] },
+      "call": { "tool": "jira_get", "arguments": { "path": "/rest/api/3/search/jql", "queryParams": { "jql": "assignee = bob" } }, "environment": "prod" },
+      "expect": { "effect": "deny", "rule_id": null }
+    },
+    {
+      "case": "NOT (project = PLAT) proves nothing and is denied",
+      "principal": { "subject": "dev@acme.example", "groups": ["Developers"] },
+      "call": { "tool": "jira_get", "arguments": { "path": "/rest/api/3/search/jql", "queryParams": { "jql": "NOT (project = PLAT)" } }, "environment": "prod" },
+      "expect": { "effect": "deny", "rule_id": null }
+    },
+    {
+      "case": "Developer reads a PLAT issue by key",
+      "principal": { "subject": "dev@acme.example", "groups": ["Developers"] },
+      "call": { "tool": "jira_get", "arguments": { "path": "/rest/api/3/issue/PLAT-42" }, "environment": "prod" },
+      "expect": { "effect": "allow", "rule_id": "dev-jira-read-plat-issues" }
+    },
+    {
+      "case": "Developer reads a WEB issue: no rule",
+      "principal": { "subject": "dev@acme.example", "groups": ["Developers"] },
+      "call": { "tool": "jira_get", "arguments": { "path": "/rest/api/3/issue/WEB-1" }, "environment": "prod" },
+      "expect": { "effect": "deny", "rule_id": null }
+    },
+    {
+      "case": "path tricks do not reach a PLAT rule: dot segments resolve before classification",
+      "principal": { "subject": "dev@acme.example", "groups": ["Developers"] },
+      "call": { "tool": "jira_get", "arguments": { "path": "/rest/api/3/issue/PLAT-1/../WEB-9" }, "environment": "prod" },
+      "expect": { "effect": "deny", "rule_id": null }
+    },
+    {
+      "case": "issue creation is a write on an unclassified resource",
+      "principal": { "subject": "dev@acme.example", "groups": ["Developers"] },
+      "call": { "tool": "jira_post", "arguments": { "path": "/rest/api/3/issue", "body": { "fields": {} } }, "environment": "prod" },
+      "expect": { "effect": "deny", "rule_id": null, "reason_contains": "could not be classified" }
+    },
+    {
+      "case": "the auditor may run any unscoped read",
+      "principal": { "subject": "auditor@acme.example", "groups": [] },
+      "call": { "tool": "jira_get", "arguments": { "path": "/rest/api/3/search/jql", "queryParams": { "jql": "assignee = bob" } }, "environment": "prod" },
+      "expect": { "effect": "allow", "rule_id": "auditors-any-unscoped-read" }
+    },
+    {
+      "case": "the auditor rule is unscoped-only: an id-scoped read is not matched by it",
+      "principal": { "subject": "auditor@acme.example", "groups": [] },
+      "call": { "tool": "jira_get", "arguments": { "path": "/rest/api/3/issue/PLAT-1" }, "environment": "prod" },
+      "expect": { "effect": "deny", "rule_id": null }
+    },
+    {
+      "case": "a tool with no extractor is unclassified whatever the group",
+      "principal": { "subject": "sre@acme.example", "groups": ["SRE"] },
+      "call": { "tool": "slack_post_message", "arguments": { "channel": "C1", "text": "hi" }, "environment": "qa" },
+      "expect": { "effect": "deny", "rule_id": null, "reason_contains": "could not be classified" }
+    }
+  ]
+}
