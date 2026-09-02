@@ -599,6 +599,7 @@ mod tests {
             action: None,
             outcome: None,
             duration_ms: None,
+            egress: None,
         }
     }
 

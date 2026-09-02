@@ -13,24 +13,54 @@
 //! request is not sent. Outside a call scope, or under a decision point that
 //! does not enforce, this is one task-local lookup and a return.
 //!
-//! An egress *allow* is not journaled separately: the tool-level intent
-//! record already carries the allow decision and policy version, and the
-//! outcome record proves the dispatch happened. Journaling every egress
-//! allow would double the fsync cost of a call for no new fact.
+//! An egress *allow* is not journaled as its own record — that would add a
+//! durable write per outbound request — but it is not lost either: every
+//! egress decision, allow or deny, is noted on the [`CallScope`] as an
+//! [`EgressRecord`](super::EgressRecord) and carried by the call's
+//! **outcome** record. One tool call can send several requests (a
+//! partitioned Grafana query, a secondary lookup a controller performs), so
+//! the intent's tool-level action alone cannot say which URLs were
+//! individually authorized and sent; the outcome's egress list can. The
+//! trade: that list is written after dispatch, so a process that dies
+//! between dispatch and outcome loses it — which is exactly the "intent
+//! without outcome" state described below, and nothing more.
+//!
+//! ## What is *not* an egress
+//!
+//! Two classes of outbound traffic do not pass this chokepoint, on purpose:
+//!
+//! - **Control-plane traffic** the gateway sends for itself: the JWKS fetch
+//!   (`auth::okta`) and health probes. Their origins come from operator
+//!   configuration and are validated at startup (`https`, or loopback).
+//! - **Credential-provider bootstrap** a vendor client performs to obtain
+//!   the credential it will then act with: Zoom's OAuth token exchange and
+//!   `NinjaOne`'s console login. Their origins likewise come only from
+//!   configuration, never from a request, and they carry no tool-supplied
+//!   path. They are tool-triggered, though, so this exemption is a
+//!   documented classification rather than an oversight; routing them
+//!   through a separately classified chokepoint is CF-17.
 //!
 //! ## Bounded append (CF-14)
 //!
 //! `AuditSink::append` waits for durable acknowledgement, which on a
-//! stalled disk is unbounded. [`append_bounded`] caps that wait. The
-//! decision, recorded here because it is a semantic one and not a
-//! one-liner: on timeout the **call is refused** (fail closed; the vendor
-//! is never contacted), and the record that was already queued may still be
-//! written later by the journal's writer thread. That is acceptable because
-//! of what the two record kinds mean — an intent record proves a call was
-//! requested and authorized; only the *outcome* record proves it was
-//! dispatched. An intent with no outcome is therefore "requested, not
-//! dispatched", which is exactly the state a timed-out call is in. The
-//! caller sees a fixed refusal, not the transport's own timeout.
+//! stalled disk is unbounded. [`append_bounded`] caps that wait for the
+//! records written **before** dispatch. The decision, recorded here because
+//! it is a semantic one and not a one-liner: on timeout the **call is
+//! refused** (fail closed; the vendor is never contacted). The record may
+//! or may not have entered the journal's queue when the wait was abandoned
+//! — a queued one is still written later by the writer thread — and either
+//! state is truthful, because of what the two record kinds mean: an intent
+//! record proves a call was requested and authorized; only the *outcome*
+//! record proves it was dispatched. An intent with no outcome is
+//! "requested, not dispatched", which is exactly the state a refused call
+//! is in. The caller sees a fixed refusal, not the transport's own timeout.
+//!
+//! The outcome record is the other way round: the dispatch has already
+//! happened, so abandoning its append would make a dispatched call look
+//! undispatched. It is therefore **not** appended through this function.
+//! `DevtoolsServer::record_outcome` gives the append its own task that owns
+//! the record and runs to completion; the caller stops *waiting* at the
+//! bound but never cancels the write.
 
 use std::io;
 use std::sync::Arc;
@@ -151,6 +181,13 @@ pub async fn authorize_egress(
         enforcement.upstream.clone(),
     );
     let decision = enforcement.policy.evaluate(&context);
+    scope.note_egress(super::EgressRecord {
+        vendor: vendor.to_owned(),
+        method,
+        canonical_target: target.url_under(""),
+        effect: decision.effect,
+        rule_id: decision.rule_id.clone(),
+    });
     if decision.is_allow() {
         return Ok(());
     }
@@ -168,6 +205,7 @@ pub async fn authorize_egress(
         action: Some(context),
         outcome: Some("egress_denied".to_owned()),
         duration_ms: None,
+        egress: None,
     };
     if let Err(error) = append_bounded(
         enforcement.audit.as_ref(),

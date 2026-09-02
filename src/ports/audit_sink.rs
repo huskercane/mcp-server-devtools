@@ -33,7 +33,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 
-use crate::policy::{ActionContext, ClientIdentity, PolicyDecision, Principal, UpstreamIdentity};
+use crate::policy::{
+    ActionContext, ClientIdentity, EgressSummary, PolicyDecision, Principal, UpstreamIdentity,
+};
 
 /// Lifecycle stage an audit event records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -45,8 +47,9 @@ pub enum AuditEventKind {
     /// Written after the dispatch completes, with the outcome.
     ToolCallOutcome,
     /// Written when the egress chokepoint **denies** an upstream request
-    /// the tool was about to send (WP A.7). An egress allow is implied by
-    /// the intent's allow and the outcome record.
+    /// the tool was about to send (WP A.7). Every egress decision, allow or
+    /// deny, is also listed on the call's outcome record
+    /// ([`AuditEvent::egress`]).
     EgressDecision,
 }
 
@@ -79,6 +82,11 @@ pub struct AuditEvent {
     pub outcome: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u128>,
+    /// Every upstream request the egress chokepoint decided on during the
+    /// call, in order, with the decision each received. On outcome records
+    /// of enforcing calls that reached the transport; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressSummary>,
 }
 
 /// Why an audit append failed, as a closed set of categories.
@@ -278,6 +286,7 @@ mod tests {
             action: None,
             outcome: None,
             duration_ms: None,
+            egress: None,
         }
     }
 

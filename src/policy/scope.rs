@@ -29,15 +29,56 @@
 //! refuses a call without a validated principal — so "no scope" cannot mean
 //! "a remote caller whose identity was lost".
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
 use super::egress::Enforcement;
-use super::{ClientIdentity, Principal};
+use super::{ClientIdentity, PolicyEffect, Principal};
+use crate::transport::HttpMethod;
 
 tokio::task_local! {
     static CALL_SCOPE: Arc<CallScope>;
+}
+
+/// Most egress records one outcome record carries verbatim. A tool that
+/// sends more (a very wide partitioned query) still has every decision
+/// counted in [`EgressSummary::omitted`], so the evidence is bounded
+/// without being silently truncated.
+pub const MAX_EGRESS_RECORDS: usize = 64;
+
+/// One upstream request the egress chokepoint decided on inside a call
+/// scope: what was about to go on the wire, and what policy said about it.
+///
+/// Recorded at the moment of the decision, which the transport makes
+/// immediately before the send — so an `allow` here means the request was
+/// dispatched (or its dispatch was attempted), not merely that it would
+/// have been allowed. Retries of the same request are one decision, not
+/// several.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EgressRecord {
+    pub vendor: String,
+    #[serde(serialize_with = "super::serialize_method")]
+    pub method: HttpMethod,
+    /// Canonical path and query (§3.5), exactly as evaluated and sent.
+    pub canonical_target: String,
+    pub effect: PolicyEffect,
+    pub rule_id: Option<String>,
+}
+
+/// Every egress decision a call made, in order, for its outcome record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EgressSummary {
+    pub requests: Vec<EgressRecord>,
+    /// Decisions beyond [`MAX_EGRESS_RECORDS`] that were made but not
+    /// carried verbatim.
+    pub omitted: usize,
+}
+
+#[derive(Debug, Default)]
+struct EgressLog {
+    records: Vec<EgressRecord>,
+    omitted: usize,
 }
 
 /// The identity a tool call runs as, plus the facts every downstream
@@ -52,6 +93,9 @@ pub struct CallScope {
     /// What the egress chokepoint needs to decide and record. `None` under
     /// a decision point that does not enforce (local mode with a journal).
     enforcement: Option<Enforcement>,
+    /// Egress decisions made so far. A `std::sync::Mutex`: held for a push
+    /// or a swap, never across an `.await`.
+    egress: Mutex<EgressLog>,
 }
 
 impl CallScope {
@@ -68,7 +112,38 @@ impl CallScope {
             tool_name: tool_name.into(),
             request_id: request_id.into(),
             enforcement: None,
+            egress: Mutex::new(EgressLog::default()),
         }
+    }
+
+    /// Record an egress decision for this call's outcome record.
+    pub fn note_egress(&self, record: EgressRecord) {
+        let mut log = self
+            .egress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if log.records.len() < MAX_EGRESS_RECORDS {
+            log.records.push(record);
+        } else {
+            log.omitted += 1;
+        }
+    }
+
+    /// Everything [`Self::note_egress`] recorded, leaving the log empty.
+    /// `None` when no egress decision was made (the call never reached the
+    /// transport, or nothing was enforcing).
+    #[must_use]
+    pub fn take_egress(&self) -> Option<EgressSummary> {
+        let log = std::mem::take(
+            &mut *self
+                .egress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        (!log.records.is_empty() || log.omitted > 0).then_some(EgressSummary {
+            requests: log.records,
+            omitted: log.omitted,
+        })
     }
 
     /// Attach the egress enforcement for this call.

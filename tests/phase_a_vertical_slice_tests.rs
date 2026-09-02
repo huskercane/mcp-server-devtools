@@ -202,6 +202,15 @@ async fn spawn_slice(policy: Arc<dyn PolicyDecisionPoint>) -> Slice {
 }
 
 async fn query_logs(base: &str, token: &str, uid: &str) -> Value {
+    query_logs_with(
+        base,
+        token,
+        json!({ "datasourceUid": uid, "query": "{app=\"api\"}", "limit": 10 }),
+    )
+    .await
+}
+
+async fn query_logs_with(base: &str, token: &str, arguments: Value) -> Value {
     let response = reqwest::Client::new()
         .post(format!("{base}/mcp"))
         .header("accept", "application/json, text/event-stream")
@@ -214,7 +223,7 @@ async fn query_logs(base: &str, token: &str, uid: &str) -> Value {
             "jsonrpc": "2.0", "id": "req-1", "method": "tools/call",
             "params": {
                 "name": "grafana_query_logs",
-                "arguments": { "datasourceUid": uid, "query": "{app=\"api\"}", "limit": 10 },
+                "arguments": arguments,
                 "_meta": {
                     "io.modelcontextprotocol/protocolVersion": "2026-07-28",
                     "io.modelcontextprotocol/clientCapabilities": {},
@@ -243,6 +252,9 @@ fn journal_lines(journal: &Path) -> Vec<Value> {
         .collect()
 }
 
+// One end-to-end walk of the "done when": splitting it would hide the
+// sequence it exists to show.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn group_a_is_allowed_group_b_is_denied_and_both_are_in_the_journal_first() {
     let policy = phase_a_policy();
@@ -321,6 +333,27 @@ async fn group_a_is_allowed_group_b_is_denied_and_both_are_in_the_journal_first(
     assert_eq!(allow_outcome["outcome"], "success");
     assert_eq!(allow_outcome["request_id"], allow_intent["request_id"]);
     assert_eq!(allow_outcome["decision"]["policy_version"], policy_version);
+    // The outcome names the request that actually went on the wire and the
+    // egress decision it received — the per-request half of the evidence.
+    let egress = &allow_outcome["egress"];
+    assert_eq!(egress["omitted"], 0, "{egress}");
+    assert_eq!(egress["requests"].as_array().map(Vec::len), Some(1));
+    let sent = &egress["requests"][0];
+    assert_eq!(sent["vendor"], "grafana");
+    assert_eq!(sent["method"], "GET");
+    assert!(
+        sent["canonical_target"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("{LOKI_QA_PATH}?")),
+        "{sent}"
+    );
+    assert_eq!(sent["effect"], "allow");
+    assert_eq!(sent["rule_id"], "sre-read-qa-datasources");
+    assert!(
+        allow_intent["egress"].is_null(),
+        "egress is decided after the intent is written"
+    );
 
     assert_eq!(deny_intent["seq"], 3);
     assert_eq!(deny_intent["kind"], "tool_call_intent");
@@ -408,6 +441,64 @@ async fn an_egress_denial_stops_the_request_and_is_journaled() {
     assert_eq!(egress["action"]["canonical_path"], LOKI_QA_PATH);
     assert_eq!(egress["action"]["method"], "GET");
     assert_eq!(lines[2]["outcome"], "error");
+    // The outcome lists the denied request too, so the outcome alone says
+    // what the call tried to send and that nothing was allowed out.
+    let listed = &lines[2]["egress"]["requests"];
+    assert_eq!(listed.as_array().map(Vec::len), Some(1), "{listed}");
+    assert_eq!(listed[0]["effect"], "deny");
+    assert_eq!(listed[0]["rule_id"], "egress-deny");
+}
+
+/// One tool call, several upstream requests: a partitioned query sends one
+/// request per partition, and the outcome must list each of them as
+/// individually authorized. The intent alone cannot — it describes the tool
+/// call, not the requests it turned into.
+#[tokio::test]
+async fn a_multi_request_call_lists_every_authorized_egress_on_its_outcome() {
+    let slice = spawn_slice(phase_a_policy()).await;
+    let alice = token_for("alice@acme.example", &["SRE"]);
+
+    let body = query_logs_with(
+        &slice.base,
+        &alice,
+        json!({
+            "datasourceUid": "loki-qa", "query": "{app=\"api\"}", "limit": 10,
+            "start": "1700000000000000000", "end": "1700000600000000000",
+            "timePartitions": 3,
+        }),
+    )
+    .await;
+    assert_ne!(body["result"]["isError"], true, "{body}");
+    assert_eq!(
+        slice.hits.load(Ordering::SeqCst),
+        3,
+        "one request per partition"
+    );
+
+    let lines = journal_lines(&slice.journal);
+    let outcome = lines
+        .iter()
+        .find(|line| line["kind"] == "tool_call_outcome")
+        .expect("outcome record");
+    let requests = outcome["egress"]["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 3, "{requests:#?}");
+    assert_eq!(outcome["egress"]["omitted"], 0);
+    let mut windows: Vec<&str> = requests
+        .iter()
+        .map(|request| {
+            assert_eq!(request["effect"], "allow");
+            assert_eq!(request["rule_id"], "sre-read-qa-datasources");
+            request["canonical_target"].as_str().unwrap()
+        })
+        .collect();
+    windows.sort_unstable();
+    windows.dedup();
+    assert_eq!(windows.len(), 3, "each partition is a distinct request");
+    assert!(
+        windows
+            .iter()
+            .all(|target| target.starts_with(LOKI_QA_PATH))
+    );
 }
 
 /// `AllowAll` plus a journal is local mode with evidence: no scope

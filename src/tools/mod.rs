@@ -518,9 +518,12 @@ impl DevtoolsServer {
             action: Some(action),
             outcome: None,
             duration_ms: None,
+            egress: None,
         };
         // Bounded (CF-14): a stalled disk refuses the call instead of
-        // parking it. See `policy::egress` for what a timeout means.
+        // parking it. See `policy::egress` for what a timeout means; in
+        // short, nothing has been dispatched yet, so abandoning this wait
+        // leaves the journal truthful whether or not the record was queued.
         if let Err(error) =
             crate::policy::egress::append_bounded(sink.as_ref(), &intent, append_timeout).await
         {
@@ -590,6 +593,14 @@ impl DevtoolsServer {
     /// Journal the outcome of a dispatched call and emit its usage event.
     /// The dispatch already happened, so a journal failure here is loud
     /// (guiding constraint 5) but refuses nothing.
+    ///
+    /// The append is **cancellation-safe by construction**: it runs on its
+    /// own task that owns the record, so the bound below limits how long
+    /// the caller *waits*, never whether the record is written. Abandoning
+    /// the append itself would let a stalled journal turn a dispatched call
+    /// into one the journal shows as never dispatched (the intent-without-
+    /// outcome reading in `policy::egress`). One task per enterprise call,
+    /// on a path that is about to wait for a disk sync anyway.
     async fn record_outcome(&self, call: EnterpriseCall, outcome: &str, duration_ms: u128) {
         let tool_name = call.scope.tool_name().to_owned();
         // One timestamp for the outcome event and the usage event
@@ -608,20 +619,49 @@ impl DevtoolsServer {
             action: None,
             outcome: Some(outcome.to_owned()),
             duration_ms: Some(duration_ms),
+            // Every egress decision the dispatch made (WP A.7, review):
+            // which requests were individually authorized and sent.
+            egress: call.scope.take_egress(),
         };
-        if let Err(error) = crate::policy::egress::append_bounded(
-            call.sink.as_ref(),
-            &outcome_event,
-            call.append_timeout,
-        )
-        .await
-        {
+        let sink = Arc::clone(&call.sink);
+        let mut pending = tokio::spawn(async move { sink.append(&outcome_event).await });
+        match tokio::time::timeout(call.append_timeout, &mut pending).await {
+            Ok(Ok(Ok(_seq))) => {}
             // Category only, for the same reason as the intent branch.
-            tracing::error!(
+            Ok(Ok(Err(error))) => tracing::error!(
                 failure = %crate::ports::audit_sink::AuditFailure::classify(&error),
                 tool = %tool_name,
                 "failed to journal audit outcome"
-            );
+            ),
+            Ok(Err(_join_error)) => tracing::error!(
+                tool = %tool_name,
+                "audit outcome append task did not complete"
+            ),
+            Err(_elapsed) => {
+                tracing::error!(
+                    tool = %tool_name,
+                    "audit outcome not acknowledged within the bound; the record stays \
+                     queued until the journal acknowledges or fails it"
+                );
+                let tool = tool_name.clone();
+                tokio::spawn(async move {
+                    match pending.await {
+                        Ok(Ok(_seq)) => {
+                            tracing::warn!(tool = %tool, "late audit outcome acknowledged");
+                        }
+                        Ok(Err(error)) => tracing::error!(
+                            failure = %crate::ports::audit_sink::AuditFailure::classify(&error),
+                            tool = %tool,
+                            "late audit outcome failed; the journal shows this call as \
+                             dispatched without an outcome"
+                        ),
+                        Err(_join_error) => tracing::error!(
+                            tool = %tool,
+                            "late audit outcome append task did not complete"
+                        ),
+                    }
+                });
+            }
         }
         self.components.usage_sink.record(UsageEvent {
             timestamp: completed_at,

@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 pub use canonical::{CanonicalPath, CanonicalTarget, CanonicalizeError};
 pub use egress::{Enforcement, authorize_egress};
 pub use engine::{FilePolicy, PolicyError};
-pub use scope::{CallScope, OwnerKey};
+pub use scope::{CallScope, EgressRecord, EgressSummary, MAX_EGRESS_RECORDS, OwnerKey};
 
 use crate::transport::HttpMethod;
 
@@ -1104,7 +1104,7 @@ impl PolicyDecision {
 // serde's `serialize_with` contract passes the field by reference; the
 // trivially-copy lint does not apply to a signature serde fixes.
 #[allow(clippy::trivially_copy_pass_by_ref)]
-fn serialize_method<S: serde::Serializer>(
+pub(crate) fn serialize_method<S: serde::Serializer>(
     method: &HttpMethod,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
