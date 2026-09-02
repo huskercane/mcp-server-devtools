@@ -367,6 +367,168 @@ async fn stale_keys_keep_serving_while_a_background_refresh_fails() {
     assert_eq!(principal.subject, "bob@acme.example");
 }
 
+/// A key the identity provider withdraws must stop vouching for tokens at
+/// the next JWKS fetch — not when the validated-token cache entry ages out
+/// five minutes later.
+#[tokio::test]
+async fn withdrawing_a_key_evicts_tokens_it_validated_from_the_cache() {
+    let server = MockServer::start().await;
+    mount_jwks(&server, &["test-key-1"], None).await;
+    let mut settings = settings(&server);
+    settings.jwks_min_refetch_interval = Duration::ZERO;
+    let validator = validator(settings);
+
+    let under_old_key = sign_with_kid(&base_claims(), "test-key-1");
+    assert!(validator.validate(&under_old_key).await.is_ok());
+    // Cached now: served without a fetch.
+    assert!(validator.validate(&under_old_key).await.is_ok());
+
+    // The identity provider withdraws test-key-1 and publishes test-key-2.
+    // A token under the new kid triggers the refetch that observes it.
+    server.reset().await;
+    mount_jwks(&server, &["test-key-2"], None).await;
+    assert!(
+        validator
+            .validate(&sign_with_kid(&base_claims(), "test-key-2"))
+            .await
+            .is_ok()
+    );
+
+    assert_eq!(
+        validator.validate(&under_old_key).await.unwrap_err(),
+        TokenRejection::UnknownKey,
+        "a token verified by a withdrawn key must not be served from the cache"
+    );
+}
+
+/// Only RSA signing keys are admitted, and an ambiguous `kid` admits nothing.
+#[tokio::test]
+async fn jwks_admission_is_rsa_signing_keys_with_unambiguous_kids() {
+    let ec_under_same_kid = json!({
+        "kty": "EC", "crv": "P-256", "kid": "test-key-1", "use": "sig",
+        "x": "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+        "y": "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0",
+    });
+    let mut encryption_only = jwk_with_kid("test-key-1");
+    encryption_only["use"] = json!("enc");
+    let mut ps256 = jwk_with_kid("test-key-1");
+    ps256["alg"] = json!("PS256");
+
+    let cases: Vec<(&str, Vec<Value>, bool)> = vec![
+        (
+            "an EC entry after the RSA entry under the same kid does not replace it",
+            vec![jwk_with_kid("test-key-1"), ec_under_same_kid.clone()],
+            true,
+        ),
+        (
+            "an EC entry before the RSA entry under the same kid is not the one kept",
+            vec![ec_under_same_kid, jwk_with_kid("test-key-1")],
+            true,
+        ),
+        (
+            "an RSA key published for encryption is not a signing key",
+            vec![encryption_only],
+            false,
+        ),
+        (
+            "an RSA key published for PS256 is not an RS256 key",
+            vec![ps256],
+            false,
+        ),
+        (
+            "two RSA signing keys under one kid are ambiguous: neither is admitted",
+            vec![jwk_with_kid("test-key-1"), jwk_with_kid("test-key-1")],
+            false,
+        ),
+    ];
+    for (case, keys, accepted) in cases {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": keys })))
+            .mount(&server)
+            .await;
+        let validator = validator(settings(&server));
+        let result = validator.validate(&sign(&base_claims())).await;
+        if accepted {
+            assert!(result.is_ok(), "{case}: {result:?}");
+        } else {
+            assert_eq!(result.unwrap_err(), TokenRejection::UnknownKey, "{case}");
+        }
+    }
+}
+
+/// The JWKS size bound is enforced on the declared length *and* while a
+/// body with no declared length is being read — the process never buffers
+/// an oversized document before refusing it.
+#[tokio::test]
+async fn oversized_jwks_is_refused_whether_or_not_its_length_is_declared() {
+    // Declared: `Content-Length` is over the bound, refused before the body.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/keys"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b' '; 512 * 1024]))
+        .mount(&server)
+        .await;
+    let declared = validator(settings(&server));
+    assert_eq!(
+        declared.validate(&sign(&base_claims())).await.unwrap_err(),
+        TokenRejection::KeysUnavailable
+    );
+
+    // Undeclared: a chunked response that never ends. The validator must
+    // abort at the bound; the server records how much it managed to send.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sent_by_server = Arc::clone(&sent);
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut byte = [0u8; 1];
+        while !request.ends_with(b"\r\n\r\n") && socket.read(&mut byte).await.unwrap_or(0) > 0 {
+            request.push(byte[0]);
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                  Transfer-Encoding: chunked\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let chunk = vec![b' '; 64 * 1024];
+        // Up to 64 MiB, or until the client hangs up.
+        for _ in 0..1024 {
+            let framed = format!("{:x}\r\n", chunk.len());
+            if socket.write_all(framed.as_bytes()).await.is_err()
+                || socket.write_all(&chunk).await.is_err()
+                || socket.write_all(b"\r\n").await.is_err()
+            {
+                break;
+            }
+            sent_by_server.fetch_add(chunk.len(), std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    let mut chunked = settings(&server);
+    chunked.jwks_url = format!("http://{addr}/keys");
+    let undeclared = validator(chunked);
+    assert_eq!(
+        undeclared
+            .validate(&sign(&base_claims()))
+            .await
+            .unwrap_err(),
+        TokenRejection::KeysUnavailable
+    );
+    // Socket buffers absorb a little past the bound; megabytes would mean
+    // the body was being collected whole.
+    let sent = sent.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        sent < 4 * 1024 * 1024,
+        "the validator kept reading past the bound: {sent} bytes"
+    );
+}
+
 fn base64_url(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)

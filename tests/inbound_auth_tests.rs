@@ -233,7 +233,7 @@ async fn rejected_token_is_401_invalid_token_and_never_logged() {
 
 #[tokio::test]
 async fn token_without_the_required_scope_is_403_insufficient_scope() {
-    let _ = captured_logs();
+    let logs = captured_logs();
     let sink = Arc::new(InMemoryAuditSink::new());
     let base = spawn_protected("http://127.0.0.1:1", &sink).await;
 
@@ -252,6 +252,20 @@ async fn token_without_the_required_scope_is_403_insufficient_scope() {
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["error"], "insufficient_scope");
     assert!(sink.events().is_empty());
+
+    // The rejection is logged as a category. The validated subject is a
+    // claim value: it belongs in the audit journal, not the operator log,
+    // and the token itself belongs nowhere.
+    let logged = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
+    assert!(
+        logged.contains("insufficient_scope"),
+        "the 403 is logged as a category: {logged}"
+    );
+    assert!(
+        !logged.contains("bob@acme.example"),
+        "a claim value reached the operator log"
+    );
+    assert!(!logged.contains(BOB_TOKEN));
 }
 
 #[tokio::test]

@@ -29,9 +29,24 @@
 //!   fails closed with [`TokenRejection::KeysUnavailable`].
 //! - **Validated tokens** are cached by SHA-256 of the token for
 //!   `min(exp, 5 min)` (plan §3.6), so the steady state is one hash and one
-//!   map lookup per request (§8: cache hit < 50 µs). The cache is bounded;
-//!   revocation semantics (deny-list, `revoke-all`) arrive in Phase B and
-//!   operate on this table.
+//!   map lookup per request (§8: cache hit < 50 µs). The cache is bounded,
+//!   and every entry remembers the `kid` that verified it: when a JWKS
+//!   fetch no longer publishes that key, the entry is evicted, so a key the
+//!   identity provider withdrew stops vouching for tokens at the next fetch
+//!   rather than up to five minutes later. Revocation by subject or `jti`
+//!   (deny-list, `revoke-all`) arrives in Phase B and operates on this table.
+//!
+//! ## What a JWKS entry must look like to be admitted
+//!
+//! Only an RSA public key with a `kid` is usable for RS256. An entry of any
+//! other family (EC, OKP, symmetric) is skipped, and so is an RSA entry whose
+//! `use` is not `sig` or whose `alg` names something other than `RS256`. Two
+//! usable entries sharing a `kid` are ambiguous, and ambiguity is resolved
+//! by admitting **neither**: a later key silently replacing an earlier one
+//! would make which key verifies a token depend on document order. The
+//! document is bounded (`JWKS_MAX_BYTES`) while it is being read, not after,
+//! so a chunked response with no `Content-Length` cannot grow the process
+//! before it is refused.
 //!
 //! ## Nothing about the token in logs
 //!
@@ -44,7 +59,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::jwk::{AlgorithmParameters, Jwk, JwkSet, KeyAlgorithm, PublicKeyUse};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, errors::ErrorKind};
 use serde::Deserialize;
 
@@ -212,6 +227,9 @@ struct KeyCache {
 struct Validated {
     principal: Principal,
     expires_at: Instant,
+    /// The `kid` whose key verified this token. A fetch that no longer
+    /// publishes it evicts the entry.
+    kid: String,
 }
 
 /// RS256 JWT validation against an Okta JWKS.
@@ -271,9 +289,11 @@ impl OktaJwksValidator {
     }
 
     async fn fetch_and_store(&self) -> Result<usize, String> {
-        let response = self
+        let mut response = self
             .client
             .get(&self.settings.jwks_url)
+            // Covers the body read too, so a slow chunked stream is bounded
+            // in time as well as in bytes.
             .timeout(JWKS_FETCH_TIMEOUT)
             .send()
             .await
@@ -288,34 +308,45 @@ impl OktaJwksValidator {
         {
             return Err("JWKS document too large".to_owned());
         }
-        let body = response
-            .bytes()
+        // Read chunk by chunk and stop at the bound: `Content-Length` is
+        // optional, and a chunked response must not be buffered whole before
+        // it is measured.
+        let mut body: Vec<u8> = Vec::with_capacity(
+            response
+                .content_length()
+                .and_then(|length| usize::try_from(length).ok())
+                .unwrap_or(4096)
+                .min(JWKS_MAX_BYTES),
+        );
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|_| "JWKS body could not be read".to_owned())?;
-        if body.len() > JWKS_MAX_BYTES {
-            return Err("JWKS document too large".to_owned());
+            .map_err(|_| "JWKS body could not be read".to_owned())?
+        {
+            if body.len() + chunk.len() > JWKS_MAX_BYTES {
+                return Err("JWKS document too large".to_owned());
+            }
+            body.extend_from_slice(&chunk);
         }
         let set: JwkSet =
             serde_json::from_slice(&body).map_err(|_| "JWKS document is not valid".to_owned())?;
-        let mut keys = HashMap::with_capacity(set.keys.len());
-        for jwk in &set.keys {
-            let Some(kid) = jwk.common.key_id.clone() else {
-                continue;
-            };
-            // Only RSA keys are usable for RS256; anything else is skipped,
-            // and an RSA key that will not parse is skipped too rather than
-            // poisoning the whole set.
-            if let Ok(key) = DecodingKey::from_jwk(jwk) {
-                keys.insert(kid, key);
-            }
-        }
+        let keys = admit_keys(&set);
         let count = keys.len();
-        let mut cache = self
-            .keys
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.keys = Arc::new(keys);
-        cache.fetched_at = Some(Instant::now());
+        let keys = Arc::new(keys);
+        {
+            let mut cache = self
+                .keys
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.keys = Arc::clone(&keys);
+            cache.fetched_at = Some(Instant::now());
+        }
+        // A token verified by a key the identity provider no longer
+        // publishes must not keep being served from the validated cache.
+        self.validated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|_, entry| keys.contains_key(&entry.kid));
         Ok(count)
     }
 
@@ -381,7 +412,7 @@ impl OktaJwksValidator {
             .map(|entry| entry.principal.clone())
     }
 
-    fn remember(&self, key: [u8; 32], principal: &Principal, exp: u64) {
+    fn remember(&self, key: [u8; 32], principal: &Principal, exp: u64, kid: String) {
         let now_unix = jsonwebtoken::get_current_timestamp();
         let until_exp = Duration::from_secs(exp.saturating_sub(now_unix));
         let ttl = until_exp.min(VALIDATED_TTL);
@@ -404,6 +435,7 @@ impl OktaJwksValidator {
             Validated {
                 principal: principal.clone(),
                 expires_at: now + ttl,
+                kid,
             },
         );
     }
@@ -454,10 +486,12 @@ impl OktaJwksValidator {
         ))
     }
 
+    /// Full validation: returns the principal, its `exp`, and the `kid` that
+    /// verified it (the cache entry is keyed on that for eviction).
     async fn validate_uncached(
         self: &Arc<Self>,
         token: &str,
-    ) -> Result<(Principal, u64), TokenRejection> {
+    ) -> Result<(Principal, u64, String), TokenRejection> {
         let header = decode_header(token).map_err(|_| TokenRejection::Malformed)?;
         if header.alg != Algorithm::RS256 {
             return Err(TokenRejection::UnsupportedAlgorithm);
@@ -505,7 +539,8 @@ impl OktaJwksValidator {
                 }
                 _ => TokenRejection::Malformed,
             })?;
-        self.principal_from(data.claims)
+        let (principal, exp) = self.principal_from(data.claims)?;
+        Ok((principal, exp, kid))
     }
 }
 
@@ -516,11 +551,58 @@ impl TokenValidator for Arc<OktaJwksValidator> {
             if let Some(principal) = self.cached_principal(&key) {
                 return Ok(principal);
             }
-            let (principal, exp) = self.validate_uncached(token).await?;
-            self.remember(key, &principal, exp);
+            let (principal, exp, kid) = self.validate_uncached(token).await?;
+            self.remember(key, &principal, exp, kid);
             Ok(principal)
         })
     }
+}
+
+/// The keys a JWKS document actually offers for RS256, by `kid`.
+///
+/// Admission rules (module docs): RSA only; `use`, when present, must be
+/// `sig`; `alg`, when present, must be `RS256`; an entry without a `kid` or
+/// whose parameters do not parse is skipped; and a `kid` shared by two
+/// admissible entries is dropped altogether rather than resolved by
+/// document order.
+fn admit_keys(set: &JwkSet) -> HashMap<String, DecodingKey> {
+    let mut keys: HashMap<String, DecodingKey> = HashMap::with_capacity(set.keys.len());
+    let mut ambiguous: Vec<String> = Vec::new();
+    for jwk in &set.keys {
+        let Some(kid) = jwk.common.key_id.as_deref() else {
+            continue;
+        };
+        if !is_rs256_signing_key(jwk) {
+            continue;
+        }
+        let Ok(key) = DecodingKey::from_jwk(jwk) else {
+            continue;
+        };
+        if keys.insert(kid.to_owned(), key).is_some() {
+            ambiguous.push(kid.to_owned());
+        }
+    }
+    for kid in ambiguous {
+        tracing::warn!(
+            kid,
+            "JWKS publishes more than one RSA signing key under this kid; admitting neither"
+        );
+        keys.remove(&kid);
+    }
+    keys
+}
+
+fn is_rs256_signing_key(jwk: &Jwk) -> bool {
+    matches!(jwk.algorithm, AlgorithmParameters::RSA(_))
+        && jwk
+            .common
+            .public_key_use
+            .as_ref()
+            .is_none_or(|purpose| *purpose == PublicKeyUse::Signature)
+        && jwk
+            .common
+            .key_algorithm
+            .is_none_or(|algorithm| algorithm == KeyAlgorithm::RS256)
 }
 
 /// A reqwest error can quote the URL it was sent to (which is the JWKS

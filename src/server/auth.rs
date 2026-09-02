@@ -226,7 +226,13 @@ pub async fn require_bearer(
         .iter()
         .any(|scope| scope == &auth.settings.required_scope)
     {
-        warn!(subject = %principal.subject, "bearer token lacks the required scope (403)");
+        // Category only. The subject is a validated claim and belongs in the
+        // audit journal, which is the evidence pipeline; the operator log is
+        // not, so no token-derived value goes here.
+        warn!(
+            rejection = "insufficient_scope",
+            "bearer token lacks the required scope (403)"
+        );
         return auth.insufficient_scope();
     }
 
