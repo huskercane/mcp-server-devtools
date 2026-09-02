@@ -76,14 +76,22 @@ pub(super) struct CacheKey {
 }
 
 impl CacheKey {
+    /// `owner` partitions the cache by principal (WP A.5): the identity
+    /// digest already covers the upstream credential, and folding the owner
+    /// into the same fixed-width digest means one principal's cached
+    /// response is never a hit for another — with no per-request
+    /// allocation, and no change to the key for local mode, which hashes a
+    /// constant.
     pub fn new(
         vendor: &str,
         url: &str,
         auth_name: &HeaderName,
         auth_value: &HeaderValue,
         headers: &[(String, String)],
+        owner: &crate::policy::OwnerKey,
     ) -> Self {
         let mut identity = Sha256::new();
+        owner.hash_into(&mut identity);
         identity.update(auth_name.as_str().as_bytes());
         identity.update([0]);
         identity.update(auth_value.as_bytes());

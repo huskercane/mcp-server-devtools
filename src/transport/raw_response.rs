@@ -25,6 +25,7 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use tracing::debug;
 
 use crate::constants::UNSCOPED_PACKAGE_NAME;
+use crate::policy::OwnerKey;
 
 static SESSION_DIR: OnceLock<PathBuf> = OnceLock::new();
 static ARTIFACTS: OnceLock<RwLock<HashMap<String, RegisteredArtifact>>> = OnceLock::new();
@@ -56,6 +57,9 @@ struct RegisteredArtifact {
     lifecycle: ArtifactLifecycle,
     pins: u64,
     retention_eligible: bool,
+    /// Who created it (WP A.4). Captured from the call scope at
+    /// registration; only that owner can pin, read, or download it.
+    owner: OwnerKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +122,11 @@ pub struct ArtifactMetadata {
     pub content_type: String,
     pub size: u64,
     pub etag: String,
+    /// The principal that created the artifact (`local` in community mode).
+    /// Not serialized: the audit journal already attributes the call, and
+    /// the tool-facing metadata shape is parity-locked.
+    #[serde(skip)]
+    pub owner: OwnerKey,
 }
 
 /// Metadata produced while an artifact is written incrementally.
@@ -207,6 +216,8 @@ pub struct ArtifactWriter {
     path: PathBuf,
     partial_path: PathBuf,
     content_type: String,
+    /// Captured when the writer is opened, inside the call scope.
+    owner: OwnerKey,
     writer: Option<BufWriter<fs::File>>,
     size: u64,
     max_bytes: u64,
@@ -299,6 +310,7 @@ impl ArtifactWriter {
             content_type: self.content_type.clone(),
             size: self.size,
             etag: format!("\"{}-{}\"", self.id, self.size),
+            owner: self.owner.clone(),
         };
         artifacts()
             .write()
@@ -319,6 +331,7 @@ impl ArtifactWriter {
                     lifecycle: ArtifactLifecycle::Readable,
                     pins: 0,
                     retention_eligible: false,
+                    owner: self.owner.clone(),
                 },
             );
         self.committed = true;
@@ -390,6 +403,7 @@ pub async fn begin_artifact_in_operation(
         path,
         partial_path,
         content_type: content_type.to_owned(),
+        owner: OwnerKey::current(),
         writer: Some(BufWriter::with_capacity(
             crate::constants::data_limits::STREAM_WRITE_BUFFER_SIZE,
             file,
@@ -463,7 +477,11 @@ pub fn artifact_for_path(path: &Path) -> Option<ArtifactMetadata> {
 }
 
 /// Pin the current readable generation before a caller opens its file.
-pub fn pin_artifact(id: &str) -> Option<ArtifactReadPin> {
+///
+/// `requester` must be the artifact's owner (WP A.4). A mismatch is
+/// `None`, exactly like an unknown or expired id, so an artifact id cannot
+/// be used to discover that someone else's artifact exists.
+pub fn pin_artifact(id: &str, requester: &OwnerKey) -> Option<ArtifactReadPin> {
     if SHUTTING_DOWN.load(Ordering::Acquire) {
         return None;
     }
@@ -474,7 +492,7 @@ pub fn pin_artifact(id: &str) -> Option<ArtifactReadPin> {
         return None;
     }
     let registered = entries.get_mut(id)?;
-    if registered.lifecycle != ArtifactLifecycle::Readable {
+    if registered.lifecycle != ArtifactLifecycle::Readable || registered.owner != *requester {
         return None;
     }
     registered.pins = registered.pins.checked_add(1)?;
@@ -1097,6 +1115,7 @@ pub async fn save(
 /// Save a large, already-rendered tool artifact without wrapping it in the
 /// generic JSON API-response envelope.
 pub async fn save_artifact(filename_prefix: &str, content: &str) -> Option<PathBuf> {
+    let owner = OwnerKey::current();
     let dir = init();
     if fs::create_dir_all(&dir).await.is_err() {
         return None;
@@ -1140,6 +1159,7 @@ pub async fn save_artifact(filename_prefix: &str, content: &str) -> Option<PathB
                 content_type: "text/plain; charset=utf-8".to_owned(),
                 size,
                 etag: format!("\"{id}-{size}\""),
+                owner: owner.clone(),
             };
             artifacts()
                 .write()
@@ -1154,6 +1174,7 @@ pub async fn save_artifact(filename_prefix: &str, content: &str) -> Option<PathB
                         lifecycle: ArtifactLifecycle::Readable,
                         pins: 0,
                         retention_eligible: true,
+                        owner,
                     },
                 );
             debug!(path = %path.display(), bytes = content.len(), "saved tool artifact");
@@ -1174,7 +1195,9 @@ pub async fn read_artifact_chunk(
 ) -> std::io::Result<Option<(ArtifactMetadata, Vec<u8>, u64, bool)>> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-    let Some(pin) = pin_artifact(id) else {
+    // The `artifact_read` tool runs inside the caller's call scope, so the
+    // requester is whoever is making this tool call.
+    let Some(pin) = pin_artifact(id, &OwnerKey::current()) else {
         return Ok(None);
     };
     let metadata = pin.metadata().clone();
@@ -1530,13 +1553,13 @@ mod artifact_writer_fault_tests {
         let quota = std::sync::Arc::new(super::super::StreamingDiskQuota::new(16));
         let committed = reserved_success("circleci-retention-pinned", &quota).await;
         set_committed_at(&committed.artifact.id, Duration::ZERO);
-        let pin = pin_artifact(&committed.artifact.id).unwrap();
+        let pin = pin_artifact(&committed.artifact.id, &OwnerKey::Local).unwrap();
 
         let ids = vec![committed.artifact.id.clone()];
         let report = sweep_artifacts_at(&ids, Duration::from_secs(2), Duration::from_secs(1)).await;
         assert_eq!(report.attempted, 0);
         assert!(artifact(&committed.artifact.id).is_none());
-        assert!(pin_artifact(&committed.artifact.id).is_none());
+        assert!(pin_artifact(&committed.artifact.id, &OwnerKey::Local).is_none());
         assert!(committed.artifact.path.exists());
         assert_eq!(quota.reserved_bytes(), 4);
         cleanup_current_session();
@@ -1575,7 +1598,7 @@ mod artifact_writer_fault_tests {
         assert_eq!(failed.failed, 1);
         assert!(committed.artifact.path.exists());
         assert_eq!(quota.reserved_bytes(), 4);
-        assert!(pin_artifact(&committed.artifact.id).is_none());
+        assert!(pin_artifact(&committed.artifact.id, &OwnerKey::Local).is_none());
         assert!(
             artifacts()
                 .read()
@@ -1658,7 +1681,7 @@ mod artifact_writer_fault_tests {
         );
         let committed = reserved_success("retention-wake", &holder).await;
         set_committed_at(&committed.artifact.id, Duration::ZERO);
-        let pin = pin_artifact(&committed.artifact.id).unwrap();
+        let pin = pin_artifact(&committed.artifact.id, &OwnerKey::Local).unwrap();
         let waiting_lease = waiter.lease().unwrap();
         let waiting = tokio::spawn(async move {
             waiting_lease.grow(4).await.unwrap();
@@ -1722,7 +1745,7 @@ mod artifact_writer_fault_tests {
         let pins: Vec<_> = registered
             .iter()
             .take(crate::constants::data_limits::MAX_STREAMING_ARTIFACT_RECLAIMS_PER_SWEEP)
-            .map(|(id, _)| pin_artifact(id).unwrap())
+            .map(|(id, _)| pin_artifact(id, &OwnerKey::Local).unwrap())
             .collect();
         let ids: Vec<_> = registered.iter().map(|(id, _)| id.clone()).collect();
 

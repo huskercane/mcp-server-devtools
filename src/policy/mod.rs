@@ -27,10 +27,12 @@
 
 pub mod canonical;
 pub mod extractors;
+pub mod scope;
 
 use serde::Serialize;
 
 pub use canonical::{CanonicalPath, CanonicalTarget, CanonicalizeError};
+pub use scope::{CallScope, OwnerKey};
 
 use crate::transport::HttpMethod;
 

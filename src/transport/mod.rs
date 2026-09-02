@@ -1510,12 +1510,16 @@ pub async fn fetch(
     let timeout = resolve_timeout(config, options.timeout);
 
     let cache_config = response_cache::CacheConfig::from_config(config);
+    // Partitioned by the acting principal (WP A.5). `OwnerKey::current`
+    // allocates only inside an enterprise call scope; local mode hashes a
+    // constant.
     let cache_key = response_cache::CacheKey::new(
         vendor.name(),
         &url,
         &auth_name,
         &auth_header,
         &options.headers,
+        &crate::policy::OwnerKey::current(),
     );
     if method != HttpMethod::Get {
         response_cache::invalidate_namespace(vendor.name(), &base);

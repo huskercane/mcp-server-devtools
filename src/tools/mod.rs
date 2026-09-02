@@ -400,44 +400,148 @@ const AUDIT_UNAVAILABLE_MESSAGE: &str = "Audit journal unavailable; call refused
 const UNAUTHENTICATED_MESSAGE: &str =
     "Unauthenticated; call refused (fail closed). This server requires a validated bearer token.";
 
+/// Everything an enterprise-mode call carries from its intent record to its
+/// outcome record. Absent in local mode, where none of it is computed.
+struct EnterpriseCall {
+    sink: Arc<dyn crate::ports::AuditSink>,
+    vendor: &'static str,
+    upstream: crate::policy::UpstreamIdentity,
+    /// The call scope the dispatch runs inside (WP A.4/A.5): it carries the
+    /// principal and the digested client identity and request id.
+    scope: Arc<crate::policy::CallScope>,
+}
+
+/// Why a call was refused before dispatch. Each maps to a fixed,
+/// detail-free message for the model and an outcome label for the legacy
+/// audit log.
+enum Refusal {
+    Unauthenticated,
+    AuditUnavailable,
+}
+
+impl Refusal {
+    const fn outcome(&self) -> &'static str {
+        match self {
+            Self::Unauthenticated => "unauthenticated",
+            Self::AuditUnavailable => "audit_unavailable",
+        }
+    }
+
+    const fn message(&self) -> &'static str {
+        match self {
+            Self::Unauthenticated => UNAUTHENTICATED_MESSAGE,
+            Self::AuditUnavailable => AUDIT_UNAVAILABLE_MESSAGE,
+        }
+    }
+
+    fn into_response(self) -> CallToolResponse {
+        CallToolResponse::Complete(CallToolResult::error(vec![Content::text(self.message())]))
+    }
+}
+
 impl DevtoolsServer {
+    /// The enterprise half of a tool call, before dispatch: identify the
+    /// upstream credential, journal the intent, and open the call scope.
+    /// `Ok(None)` is local mode — no journal configured — and costs one
+    /// `Option` check.
+    ///
+    /// Fail closed: evidence first, dispatch second. An intent that cannot
+    /// be journaled refuses the call, and the vendor is never contacted
+    /// (`tests/audit_journal_tests.rs` proves wiremock sees zero requests).
+    async fn begin_enterprise_call(
+        &self,
+        tool: &str,
+        audit: &crate::audit::AuditCall,
+        principal: &Principal,
+        client_info: Option<&Implementation>,
+    ) -> Result<Option<EnterpriseCall>, Refusal> {
+        let Some(sink) = self.components.audit_sink.as_ref() else {
+            return Ok(None);
+        };
+        let config = self.config();
+        let vendor = vendor_for_tool(tool).unwrap_or("unknown");
+        // Awaited because answering can require a keychain probe. The
+        // broker still *predicts* which slot will act — the credential is
+        // resolved later, in the controller — but it predicts with the
+        // resolver's own rules, implicit keychain fallback included
+        // (WP 0.6; CF-1 is the resolve-then-attribute follow-up).
+        let upstream = self
+            .components
+            .credential_broker
+            .upstream_identity(&config, vendor)
+            .await;
+        let client = ClientIdentity::reported(
+            client_info.map(|value| value.name.as_str()),
+            client_info.map(|value| value.version.as_str()),
+        );
+        // Caller-chosen, so digested before it reaches durable evidence: a
+        // JSON-RPC id is an arbitrary string.
+        let request_id = crate::policy::correlation_id(audit.request_id());
+
+        let intent = AuditEvent {
+            timestamp: crate::logger::iso_timestamp(),
+            kind: AuditEventKind::ToolCallIntent,
+            request_id: request_id.clone(),
+            tool_name: tool.to_owned(),
+            vendor: vendor.to_owned(),
+            principal: principal.clone(),
+            client: client.clone(),
+            decision: PolicyDecision::local_allow(),
+            upstream_identity: upstream.clone(),
+            outcome: None,
+            duration_ms: None,
+        };
+        if let Err(error) = sink.append(&intent).await {
+            // The sink's own error goes to the operator log, never to the
+            // model: a sink is free to be an HTTP client, and its errors can
+            // quote request headers. A *category*, never the adapter's error
+            // text, because this line is not covered by the logger's
+            // redaction patterns; and the caller gets a fixed sentence, so
+            // no sink can turn a failure into an exfiltration channel.
+            tracing::error!(
+                failure = %crate::ports::audit_sink::AuditFailure::classify(&error),
+                tool = %tool,
+                "audit journal unavailable; refusing the call (fail closed)"
+            );
+            return Err(Refusal::AuditUnavailable);
+        }
+
+        Ok(Some(EnterpriseCall {
+            sink: Arc::clone(sink),
+            vendor,
+            upstream,
+            scope: Arc::new(crate::policy::CallScope::new(
+                principal.clone(),
+                client,
+                tool,
+                request_id,
+            )),
+        }))
+    }
+
     /// Journal the outcome of a dispatched call and emit its usage event.
     /// The dispatch already happened, so a journal failure here is loud
     /// (guiding constraint 5) but refuses nothing.
-    #[allow(clippy::too_many_arguments)] // One outcome, all of its facts; a struct would only rename them.
-    async fn record_outcome(
-        &self,
-        sink: &dyn crate::ports::AuditSink,
-        vendor: &str,
-        upstream: crate::policy::UpstreamIdentity,
-        client: ClientIdentity,
-        principal: Principal,
-        audit: &crate::audit::AuditCall,
-        outcome: &str,
-        duration_ms: u128,
-    ) {
-        let tool_name = audit.tool_name().to_owned();
-        let request_id = crate::policy::correlation_id(audit.request_id());
+    async fn record_outcome(&self, call: EnterpriseCall, outcome: &str, duration_ms: u128) {
+        let tool_name = call.scope.tool_name().to_owned();
         // One timestamp for the outcome event and the usage event
         // (CLAUDE.md perf guidelines: no repeated formatting work).
         let completed_at = crate::logger::iso_timestamp();
         let outcome_event = AuditEvent {
             timestamp: completed_at.clone(),
             kind: AuditEventKind::ToolCallOutcome,
-            request_id,
+            request_id: call.scope.request_id().to_owned(),
             tool_name: tool_name.clone(),
-            vendor: vendor.to_owned(),
-            principal,
-            client,
+            vendor: call.vendor.to_owned(),
+            principal: call.scope.principal().clone(),
+            client: call.scope.client().clone(),
             decision: PolicyDecision::local_allow(),
-            upstream_identity: upstream,
+            upstream_identity: call.upstream,
             outcome: Some(outcome.to_owned()),
             duration_ms: Some(duration_ms),
         };
-        if let Err(error) = sink.append(&outcome_event).await {
-            // Category only: an HTTP audit sink's error can quote a request
-            // header, and this line is not covered by the logger's
-            // redaction patterns.
+        if let Err(error) = call.sink.append(&outcome_event).await {
+            // Category only, for the same reason as the intent branch.
             tracing::error!(
                 failure = %crate::ports::audit_sink::AuditFailure::classify(&error),
                 tool = %tool_name,
@@ -447,7 +551,7 @@ impl DevtoolsServer {
         self.components.usage_sink.record(UsageEvent {
             timestamp: completed_at,
             tool_name,
-            vendor: vendor.to_owned(),
+            vendor: call.vendor.to_owned(),
             outcome: outcome.to_owned(),
             duration_ms,
         });
@@ -464,8 +568,8 @@ impl ServerHandler for DevtoolsServer {
         let started = std::time::Instant::now();
         let client = context.client_info();
         // One `to_string()`, no clone: local mode pays exactly what it paid
-        // before enterprise types existed. The enterprise branch below reads
-        // the id back off `audit` when it actually needs an owned copy.
+        // before enterprise types existed. The enterprise branch reads the
+        // id back off `audit` when it actually needs an owned copy.
         let audit = crate::audit::AuditCall::start(
             request.name.as_ref(),
             context.id.to_string(),
@@ -480,82 +584,41 @@ impl ServerHandler for DevtoolsServer {
                 tool = %request.name.as_ref(),
                 "tool call reached dispatch without a validated principal; refusing"
             );
-            audit.complete("unauthenticated");
-            return Ok(CallToolResponse::Complete(CallToolResult::error(vec![
-                Content::text(UNAUTHENTICATED_MESSAGE),
-            ])));
+            let refusal = Refusal::Unauthenticated;
+            audit.complete(refusal.outcome());
+            return Ok(refusal.into_response());
         };
 
-        // WP 0.7: durable write-before-dispatch. Only active when an audit
-        // journal is configured; local mode takes the `None` branch and the
-        // call path is byte-for-byte what it was before enterprise types
-        // existed (one `Option` check).
-        let enterprise = match self.components.audit_sink.as_ref() {
-            None => None,
-            Some(sink) => {
-                let config = self.config();
-                let vendor = vendor_for_tool(request.name.as_ref()).unwrap_or("unknown");
-                // Awaited because answering can require a keychain probe.
-                // The broker still *predicts* which slot will act — the
-                // credential is resolved later, in the controller — but it
-                // now predicts with the resolver's own rules, implicit
-                // keychain fallback included (WP 0.6).
-                let upstream = self
-                    .components
-                    .credential_broker
-                    .upstream_identity(&config, vendor)
-                    .await;
-                let client = ClientIdentity::reported(
-                    client.as_ref().map(|value| value.name.as_str()),
-                    client.as_ref().map(|value| value.version.as_str()),
-                );
-                Some((Arc::clone(sink), vendor, upstream, client))
+        // WP 0.7: durable write-before-dispatch. Local mode is `None` and
+        // the call path is byte-for-byte what it was before enterprise
+        // types existed (one `Option` check).
+        let enterprise = match self
+            .begin_enterprise_call(request.name.as_ref(), &audit, &principal, client.as_ref())
+            .await
+        {
+            Ok(enterprise) => enterprise,
+            Err(refusal) => {
+                audit.complete(refusal.outcome());
+                return Ok(refusal.into_response());
             }
         };
-        if let Some((sink, vendor, upstream, client)) = &enterprise {
-            let intent = AuditEvent {
-                timestamp: crate::logger::iso_timestamp(),
-                kind: AuditEventKind::ToolCallIntent,
-                // Caller-chosen, so sanitized before it reaches durable
-                // evidence: a JSON-RPC id is an arbitrary string.
-                request_id: crate::policy::correlation_id(audit.request_id()),
-                tool_name: request.name.as_ref().to_owned(),
-                vendor: (*vendor).to_owned(),
-                principal: principal.clone(),
-                client: client.clone(),
-                decision: PolicyDecision::local_allow(),
-                upstream_identity: upstream.clone(),
-                outcome: None,
-                duration_ms: None,
-            };
-            if let Err(error) = sink.append(&intent).await {
-                // Fail closed: evidence first, dispatch second. The vendor
-                // is never contacted (tests/audit_journal_tests.rs proves
-                // wiremock sees zero requests).
-                //
-                // The sink's own error goes to the operator log, never to
-                // the model: a sink is free to be an HTTP client, and its
-                // errors can quote request headers. What the caller gets is
-                // a fixed sentence, so no sink can turn a failure into an
-                // exfiltration channel.
-                // A *category*, never the adapter's error text: an HTTP
-                // audit sink's error can quote a request header, and this
-                // line is not covered by the logger's redaction patterns.
-                tracing::error!(
-                    failure = %crate::ports::audit_sink::AuditFailure::classify(&error),
-                    tool = %request.name.as_ref(),
-                    "audit journal unavailable; refusing the call (fail closed)"
-                );
-                audit.complete("audit_unavailable");
-                return Ok(CallToolResponse::Complete(CallToolResult::error(vec![
-                    Content::text(AUDIT_UNAVAILABLE_MESSAGE),
-                ])));
-            }
-        }
 
+        // WP A.4/A.5: everything the dispatch does — artifacts it registers,
+        // cache entries it stores, upstream requests it sends — runs inside
+        // the call scope, so those layers know the acting principal without
+        // being handed it. Local mode sets no scope and pays nothing.
         let tool_context =
             rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let result = self.tool_router.call(tool_context).await;
+        let result = match &enterprise {
+            Some(call) => {
+                crate::policy::CallScope::enter(
+                    Arc::clone(&call.scope),
+                    self.tool_router.call(tool_context),
+                )
+                .await
+            }
+            None => self.tool_router.call(tool_context).await,
+        };
         let outcome = match &result {
             Ok(CallToolResponse::Complete(value)) if value.is_error == Some(true) => "error",
             Ok(CallToolResponse::Complete(_)) => "success",
@@ -565,18 +628,9 @@ impl ServerHandler for DevtoolsServer {
             Err(_) => "protocol_error",
         };
 
-        if let Some((sink, vendor, upstream, client)) = enterprise {
-            self.record_outcome(
-                sink.as_ref(),
-                vendor,
-                upstream,
-                client,
-                principal,
-                &audit,
-                outcome,
-                started.elapsed().as_millis(),
-            )
-            .await;
+        if let Some(call) = enterprise {
+            self.record_outcome(call, outcome, started.elapsed().as_millis())
+                .await;
         }
 
         audit.complete(outcome);

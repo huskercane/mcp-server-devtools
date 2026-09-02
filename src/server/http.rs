@@ -260,10 +260,17 @@ fn build_app_inner(
         }),
     );
     if let Some(auth) = auth {
-        protected = protected.layer(middleware::from_fn_with_state(
-            Arc::clone(&auth),
-            require_bearer,
-        ));
+        // Inner layer first: the session binding runs after the bearer
+        // check has placed the principal in the extensions.
+        protected = protected
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&manager),
+                crate::server::session::enforce_session_owner,
+            ))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&auth),
+                require_bearer,
+            ));
         public = public.merge(
             Router::new()
                 .route(
@@ -284,7 +291,16 @@ fn build_app_inner(
 }
 
 async fn download_artifact(AxumPath(id): AxumPath<String>, request: Request) -> Response {
-    let Some(pin) = crate::transport::raw_response::pin_artifact(&id) else {
+    // WP A.4: only the principal that created an artifact may download it.
+    // Without inbound auth there is no principal and the requester is
+    // `local`, which is also what every locally created artifact is owned
+    // by — so local mode is unchanged. A cross-owner request is the same
+    // 404 as an unknown id.
+    let requester = request
+        .extensions()
+        .get::<crate::policy::Principal>()
+        .map_or(crate::policy::OwnerKey::Local, crate::policy::OwnerKey::of);
+    let Some(pin) = crate::transport::raw_response::pin_artifact(&id, &requester) else {
         return (StatusCode::NOT_FOUND, "Artifact not found or expired").into_response();
     };
     let artifact = pin.metadata().clone();

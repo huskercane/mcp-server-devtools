@@ -11,6 +11,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::extract::{Request, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use futures::Stream;
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
 use rmcp::transport::common::server_side_http::{ServerSseMessage, SessionId};
@@ -22,17 +26,32 @@ use tokio::sync::RwLock;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, warn};
 
+use crate::policy::{OwnerKey, Principal};
+
+/// The header rmcp uses to name a session.
+const SESSION_ID_HEADER: &str = "mcp-session-id";
+
 /// TS reference uses a 30-minute idle timeout. See `src/index.ts`.
 pub const DEFAULT_IDLE_TTL: Duration = Duration::from_mins(30);
 /// TS reference sweeps every 5 minutes.
 pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_mins(5);
+
+/// What the manager tracks per session beyond rmcp's own state.
+#[derive(Debug)]
+struct SessionState {
+    last_seen: Instant,
+    /// The principal that initialized the session (WP A.5). `None` until
+    /// the auth middleware binds it — which it does on the initialize
+    /// response — and always `None` in local mode, where nothing checks it.
+    owner: Option<OwnerKey>,
+}
 
 /// [`SessionManager`] that layers an idle-reap policy over
 /// [`LocalSessionManager`].
 #[derive(Debug, Clone)]
 pub struct ReapingSessionManager {
     inner: Arc<LocalSessionManager>,
-    last_seen: Arc<RwLock<HashMap<SessionId, Instant>>>,
+    sessions: Arc<RwLock<HashMap<SessionId, SessionState>>>,
     idle_ttl: Duration,
 }
 
@@ -42,7 +61,7 @@ impl ReapingSessionManager {
     pub fn new(idle_ttl: Duration) -> Self {
         Self {
             inner: Arc::new(LocalSessionManager::default()),
-            last_seen: Arc::new(RwLock::new(HashMap::new())),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
             idle_ttl,
         }
     }
@@ -73,9 +92,10 @@ impl ReapingSessionManager {
     pub async fn reap_once(&self) {
         let now = Instant::now();
         let expired: Vec<SessionId> = {
-            let seen = self.last_seen.read().await;
-            seen.iter()
-                .filter(|(_, last)| now.duration_since(**last) > self.idle_ttl)
+            let sessions = self.sessions.read().await;
+            sessions
+                .iter()
+                .filter(|(_, state)| now.duration_since(state.last_seen) > self.idle_ttl)
                 .map(|(id, _)| id.clone())
                 .collect()
         };
@@ -84,20 +104,121 @@ impl ReapingSessionManager {
             if let Err(err) = self.inner.close_session(&id).await {
                 warn!(session_id = %id, error = %err, "failed to close idle session");
             }
-            self.last_seen.write().await.remove(&id);
+            self.sessions.write().await.remove(&id);
         }
     }
 
     async fn bump(&self, id: &SessionId) {
-        self.last_seen
-            .write()
-            .await
-            .insert(id.clone(), Instant::now());
+        let mut sessions = self.sessions.write().await;
+        match sessions.get_mut(id) {
+            Some(state) => state.last_seen = Instant::now(),
+            None => {
+                sessions.insert(
+                    id.clone(),
+                    SessionState {
+                        last_seen: Instant::now(),
+                        owner: None,
+                    },
+                );
+            }
+        }
     }
 
     async fn forget(&self, id: &SessionId) {
-        self.last_seen.write().await.remove(id);
+        self.sessions.write().await.remove(id);
     }
+
+    /// Bind a freshly created session to the principal that initialized
+    /// it. Only the first binding sticks: a session's owner never changes.
+    pub async fn bind_owner(&self, id: &SessionId, owner: OwnerKey) {
+        let mut sessions = self.sessions.write().await;
+        let state = sessions.entry(id.clone()).or_insert_with(|| SessionState {
+            last_seen: Instant::now(),
+            owner: None,
+        });
+        if state.owner.is_none() {
+            state.owner = Some(owner);
+        }
+    }
+
+    /// Whether `requester` may use session `id`: the session exists, is
+    /// bound, and is bound to this owner. Unknown and unbound sessions are
+    /// both `false` — an unbound session under enforcement is a session
+    /// whose owner was never established, and nobody gets to be first.
+    pub async fn owner_matches(&self, id: &SessionId, requester: &OwnerKey) -> bool {
+        self.sessions
+            .read()
+            .await
+            .get(id)
+            .and_then(|state| state.owner.as_ref())
+            .is_some_and(|owner| owner == requester)
+    }
+
+    /// The owner a session is bound to, for tests and diagnostics.
+    pub async fn owner_of(&self, id: &SessionId) -> Option<OwnerKey> {
+        self.sessions
+            .read()
+            .await
+            .get(id)
+            .and_then(|state| state.owner.clone())
+    }
+}
+
+/// Bind sessions to the principal that created them and refuse any other
+/// principal's use of them (WP A.5, "session bound to subject").
+///
+/// Sits inside the bearer middleware, so the [`Principal`] is already in
+/// the request extensions. A request naming a session another principal
+/// owns — or one with no binding — gets the same `404` rmcp gives an
+/// unknown session, so a session id is not a capability. A request with
+/// no session id passes through; if its response *creates* a session (the
+/// initialize response carries `Mcp-Session-Id`), the session is bound to
+/// the requester before the response leaves.
+pub async fn enforce_session_owner(
+    State(manager): State<Arc<ReapingSessionManager>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let requester = request
+        .extensions()
+        .get::<Principal>()
+        .map_or(OwnerKey::Local, OwnerKey::of);
+    let named_session = request
+        .headers()
+        .get(SESSION_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(|id| SessionId::from(id.to_owned()));
+
+    if let Some(id) = named_session {
+        if !manager.owner_matches(&id, &requester).await {
+            debug!("session named by a request is not bound to its principal; answering 404");
+            return session_not_found();
+        }
+        return next.run(request).await;
+    }
+
+    let response = next.run(request).await;
+    if let Some(created) = response
+        .headers()
+        .get(SESSION_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(|id| SessionId::from(id.to_owned()))
+    {
+        manager.bind_owner(&created, requester).await;
+    }
+    response
+}
+
+fn session_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        )],
+        "Session not found",
+    )
+        .into_response()
 }
 
 impl SessionManager for ReapingSessionManager {
