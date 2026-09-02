@@ -1,0 +1,46 @@
+# Grafana read-only profile (Phase A, WP A.8).
+#
+# The first vendor profile: SRE may read the QA Loki and Prometheus
+# datasources through Grafana, and list datasources to discover their UIDs.
+# Nothing else is allowed — default deny covers every other tool, vendor,
+# environment, and datasource, including any call whose resource the
+# extractors could not classify.
+#
+# Edit the group name, environment, and datasource UIDs to match your Okta
+# groups and Grafana. Validate with:
+#
+#     mcp-devtools policy check deploy/policies/grafana-read-only.yaml
+#
+# Schema: src/policy/engine.rs. Matching keys are ANDed; a list is any-of,
+# except resource ids, which are all-of (every datasource a call addresses
+# must match). `*` is the only wildcard.
+version: 1
+default: deny
+rules:
+  - id: sre-read-qa-datasources
+    description: >-
+      Query the QA Loki datasource (and any QA Prometheus datasource) through
+      Grafana's datasource proxy. The proxy runs the query with the gateway's
+      service account, so the datasource UID is the resource that matters.
+    effect: allow
+    subjects:
+      groups: [SRE]
+    match:
+      vendor: grafana
+      environment: qa
+      request_risk: read
+      normalized_action: query_logs
+      resource_type: datasource
+      resource_id: ["loki-qa", "prom-qa-*"]
+
+  - id: sre-list-qa-datasources
+    description: Listing the datasource collection is its own permission.
+    effect: allow
+    subjects:
+      groups: [SRE]
+    match:
+      vendor: grafana
+      environment: qa
+      normalized_action: list_datasources
+      resource_type: datasource
+      resource_scope: collection

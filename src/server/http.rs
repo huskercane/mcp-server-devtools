@@ -609,9 +609,10 @@ fn resolve_bind_addr(raw: Option<&str>, default_port: u16) -> Result<SocketAddr,
 /// - Auth off + non-loopback bind: refuse. The loopback bind *is* the
 ///   community trust boundary; removing it without inbound authentication
 ///   would expose every configured credential to the network.
-/// - Auth okta: refuse until the inbound token-validation path (Phase A)
-///   exists. Starting "temporarily permissive" is exactly what the plan
-///   forbids.
+/// - Auth okta: any bind is acceptable *here* — the bearer middleware is the
+///   trust boundary — but the rest of the enterprise configuration (issuer,
+///   audience, public URL, policy, journal) is checked next, in
+///   [`enterprise_inbound_auth`], and any gap refuses startup.
 fn validate_startup_security(auth_mode: AuthMode, addr: &SocketAddr) -> Result<(), String> {
     match auth_mode {
         AuthMode::Off if addr.ip().is_loopback() => Ok(()),
@@ -622,12 +623,7 @@ fn validate_startup_security(auth_mode: AuthMode, addr: &SocketAddr) -> Result<(
              docs/enterprise-product-plan.md §1.2)",
             addr.ip()
         )),
-        AuthMode::Okta => Err(
-            "refusing to start: MCP_AUTH_MODE=okta is not available yet — inbound token \
-             validation lands in Phase A of docs/enterprise-product-plan.md. Unset \
-             MCP_AUTH_MODE (or set it to \"off\") to run in local mode"
-                .to_owned(),
-        ),
+        AuthMode::Okta => Ok(()),
     }
 }
 
@@ -691,11 +687,14 @@ mod startup_security_tests {
         }
     }
 
+    /// With inbound auth on, the bind address is no longer the trust
+    /// boundary, so a non-loopback bind is fine at this gate; the rest of
+    /// the enterprise configuration is checked by `enterprise_inbound_auth`.
     #[test]
-    fn okta_mode_is_refused_until_token_validation_exists() {
-        let addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
-        let reason = validate_startup_security(AuthMode::Okta, &addr).unwrap_err();
-        assert!(reason.contains("MCP_AUTH_MODE=okta"), "{reason}");
-        assert!(reason.contains("Phase A"), "{reason}");
+    fn okta_mode_accepts_any_bind_at_this_gate() {
+        for addr in ["127.0.0.1:3000", "0.0.0.0:8443", "[::]:3000"] {
+            let addr: SocketAddr = addr.parse().unwrap();
+            assert_eq!(validate_startup_security(AuthMode::Okta, &addr), Ok(()));
+        }
     }
 }
