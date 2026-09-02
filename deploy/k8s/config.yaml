@@ -1,0 +1,58 @@
+# Non-secret enterprise settings and the policy document. Edit before applying.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-devtools-config
+  namespace: mcp-devtools
+data:
+  MCP_AUTH_MODE: "okta"
+  MCP_OKTA_ISSUER: "https://YOUR-ORG.okta.com/oauth2/default"
+  MCP_OKTA_AUDIENCE: "api://mcp-devtools"
+  MCP_PUBLIC_URL: "https://mcp.example.com"
+  MCP_REQUIRED_SCOPE: "mcp:tools"
+  MCP_POLICY_FILE: "/policy/policy.yaml"
+  MCP_AUDIT_JOURNAL_DIR: "/journal"
+  MCP_VENDOR_ENVIRONMENT: "qa"
+  GRAFANA_URL: "https://grafana-qa.example.com"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-devtools-policy
+  namespace: mcp-devtools
+data:
+  # Validate before applying: mcp-devtools policy check policy.yaml
+  policy.yaml: |
+    version: 1
+    default: deny
+    rules:
+      - id: sre-read-qa-datasources
+        effect: allow
+        subjects: { groups: [SRE] }
+        match:
+          vendor: grafana
+          environment: qa
+          request_risk: read
+          normalized_action: query_logs
+          resource_type: datasource
+          resource_id: ["loki-qa", "prom-qa-*"]
+      - id: sre-list-qa-datasources
+        effect: allow
+        subjects: { groups: [SRE] }
+        match:
+          vendor: grafana
+          environment: qa
+          normalized_action: list_datasources
+          resource_type: datasource
+          resource_scope: collection
+---
+# Vendor credentials. Prefer an external secret store (Phase C.2); this is
+# the shape the pod expects.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mcp-devtools-vendor-credentials
+  namespace: mcp-devtools
+type: Opaque
+stringData:
+  GRAFANA_TOKEN: "REPLACE-WITH-A-READ-ONLY-SERVICE-ACCOUNT-TOKEN"

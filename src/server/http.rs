@@ -48,10 +48,64 @@ use crate::tools::DevtoolsServer;
 const BODY_LIMIT_BYTES: usize = 1_000_000;
 const DEFAULT_PORT: u16 = 3000;
 
+/// Config key selecting the process role (plan ADR-010, WP A.9).
+pub const ROLE_KEY: &str = "MCP_ROLE";
+
+/// What one process serves (plan §3.4). One image, one binary; the role is
+/// a runtime flag, not a second codebase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Role {
+    /// Data plane and control plane in one process — single-host deployments.
+    #[default]
+    All,
+    /// The data plane: `/mcp`, artifacts, token validation, policy, egress,
+    /// the local journal. Scaled horizontally behind the ingress.
+    Gateway,
+    /// The control plane: admin API, rollups, reports, console (Phases C
+    /// and D). In Phase A it serves only the health banner and refuses
+    /// tool traffic, so a misrouted request cannot be served by a replica
+    /// that was never meant to hold vendor credentials.
+    Control,
+}
+
+impl Role {
+    /// Parse `MCP_ROLE`. Absent or empty is [`Role::All`]; anything else
+    /// must be exactly one of the three names (case-insensitive) — a typo
+    /// must not silently become "everything".
+    ///
+    /// # Errors
+    ///
+    /// A human-readable reason for an unrecognised value.
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(str::trim) {
+            None | Some("") => Ok(Self::All),
+            Some(value) if value.eq_ignore_ascii_case("all") => Ok(Self::All),
+            Some(value) if value.eq_ignore_ascii_case("gateway") => Ok(Self::Gateway),
+            Some(value) if value.eq_ignore_ascii_case("control") => Ok(Self::Control),
+            Some(other) => Err(format!(
+                "unrecognised {ROLE_KEY} {other:?} (expected \"all\", \"gateway\", or \"control\")"
+            )),
+        }
+    }
+
+    /// Whether this role serves the MCP data plane.
+    #[must_use]
+    pub const fn serves_gateway(self) -> bool {
+        matches!(self, Self::All | Self::Gateway)
+    }
+}
+
 /// Boot the streamable-HTTP server on `127.0.0.1:${PORT:-3000}`.
 ///
 /// Matches TS `startServer('http')`.
 pub async fn run_http() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let role = Role::parse(std::env::var(ROLE_KEY).ok().as_deref())?;
+    run_http_as(role).await
+}
+
+/// Boot the streamable-HTTP server in an explicit [`Role`] (the `serve
+/// --role` subcommand); [`run_http`] reads the role from `MCP_ROLE`.
+pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     crate::transport::raw_response::start_retention_sweeper();
     let port = std::env::var("PORT")
         .ok()
@@ -90,7 +144,8 @@ pub async fn run_http() -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
         .watch_config(true)
         .require_inbound_auth(inbound_auth.is_some())
         .build()?;
-    let app = build_app_inner(
+    let app = build_app_for_role(
+        role,
         server,
         inbound_auth,
         DEFAULT_IDLE_TTL,
@@ -101,7 +156,7 @@ pub async fn run_http() -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
     let listener = TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
 
-    info!(%bound, auth = ?auth_mode, "mcp-server-devtools listening on streamable-HTTP transport");
+    info!(%bound, auth = ?auth_mode, role = ?role, "mcp-server-devtools listening on streamable-HTTP transport");
     let shutdown_cancel = cancel;
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -203,6 +258,33 @@ pub fn build_app_with_server_and_auth(
     cancel: CancellationToken,
 ) -> Router {
     build_app_inner(server, Some(auth), idle_ttl, sweep_interval, cancel)
+}
+
+/// The router for a [`Role`]. `All` and `Gateway` are the full data plane;
+/// `Control` serves only the health banner in Phase A (see [`Role`]).
+pub fn build_app_for_role(
+    role: Role,
+    server: DevtoolsServer,
+    auth: Option<Arc<InboundAuth>>,
+    idle_ttl: Duration,
+    sweep_interval: Duration,
+    cancel: CancellationToken,
+) -> Router {
+    if role.serves_gateway() {
+        return build_app_inner(server, auth, idle_ttl, sweep_interval, cancel);
+    }
+    // Control role: health only. Every other path is a 404 — there is no
+    // data plane here, and nothing to hand a caller who reached the wrong
+    // replica. The cross-cutting guards stay so the surface is uniform.
+    Router::new()
+        .route(
+            "/",
+            get(move || {
+                let server = server.clone();
+                async move { health(&server) }
+            }),
+        )
+        .layer(middleware::from_fn(origin_allowlist))
 }
 
 fn build_app_inner(
@@ -634,6 +716,19 @@ mod startup_security_tests {
     use crate::config::AuthMode;
 
     use super::{resolve_bind_addr, validate_startup_security};
+
+    #[test]
+    fn role_parses_the_three_names_and_refuses_everything_else() {
+        use super::Role;
+        assert_eq!(Role::parse(None), Ok(Role::All));
+        assert_eq!(Role::parse(Some("")), Ok(Role::All));
+        assert_eq!(Role::parse(Some("Gateway")), Ok(Role::Gateway));
+        assert_eq!(Role::parse(Some(" control ")), Ok(Role::Control));
+        assert!(Role::parse(Some("both")).unwrap_err().contains("MCP_ROLE"));
+        assert!(Role::All.serves_gateway());
+        assert!(Role::Gateway.serves_gateway());
+        assert!(!Role::Control.serves_gateway());
+    }
 
     #[test]
     fn bind_addr_defaults_to_loopback_with_the_port_env_port() {

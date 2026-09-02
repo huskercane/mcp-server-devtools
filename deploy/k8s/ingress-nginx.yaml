@@ -1,0 +1,32 @@
+# ingress-nginx in front of the gateway. TLS terminates here (ADR-004);
+# cert-manager issues the certificate. Legacy MCP sessions are pinned to
+# the replica that created them by hashing on Mcp-Session-Id (plan §3.4);
+# stateless requests carry no session and balance freely.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mcp-devtools
+  namespace: mcp-devtools
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$http_mcp_session_id"
+    # Matches the server's own 1 MB body cap on /mcp.
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    # Streamable HTTP holds SSE responses open.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["mcp.example.com"]
+      secretName: mcp-devtools-tls
+  rules:
+    - host: mcp.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: mcp-devtools-gateway
+                port: { name: http }

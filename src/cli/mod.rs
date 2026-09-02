@@ -25,8 +25,10 @@ pub mod api;
 pub mod bb;
 pub mod conf;
 pub mod creds;
+pub mod health;
 pub mod jira;
 pub mod policy;
+pub mod serve;
 
 use std::process::ExitCode;
 
@@ -75,6 +77,12 @@ pub enum TopCommand {
         #[command(subcommand)]
         action: policy::Command,
     },
+    /// Run the MCP server (the same as no arguments, with an explicit
+    /// transport and process role).
+    Serve(serve::ServeOpts),
+    /// Probe a running HTTP server's health banner; exit 0 when healthy.
+    /// The container `HEALTHCHECK`, since a distroless image has no curl.
+    Health(health::HealthOpts),
 
     // ----------------------------------------------------------------------
     // Deprecated top-level Bitbucket verbs.
@@ -118,6 +126,8 @@ where
         TopCommand::Conf { action } => conf::dispatch(action).await,
         TopCommand::Creds { action } => creds::dispatch(action).await,
         TopCommand::Policy { action } => policy::dispatch(action),
+        TopCommand::Serve(opts) => return serve::dispatch(opts).await,
+        TopCommand::Health(opts) => return health::dispatch(&opts).await,
         legacy => dispatch_legacy(legacy).await,
     };
 
@@ -159,12 +169,14 @@ async fn dispatch_legacy(legacy: TopCommand) -> Result<(), crate::error::McpErro
             warn_deprecated("clone");
             bb::Command::Clone(opts)
         }
-        // Bb / Jira / Conf / Creds / Policy are handled by the caller; reaching here is a logic bug.
+        // Bb / Jira / Conf / Creds / Policy / Serve / Health are handled by the caller; reaching here is a logic bug.
         TopCommand::Bb { .. }
         | TopCommand::Jira { .. }
         | TopCommand::Conf { .. }
         | TopCommand::Creds { .. }
-        | TopCommand::Policy { .. } => unreachable!(
+        | TopCommand::Policy { .. }
+        | TopCommand::Serve(_)
+        | TopCommand::Health(_) => unreachable!(
             "vendor groups are dispatched directly; legacy path receives only flat verbs"
         ),
     };

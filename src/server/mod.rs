@@ -9,5 +9,5 @@ pub mod session;
 pub mod shutdown;
 pub mod stdio;
 
-pub use http::run_http;
+pub use http::{Role, run_http, run_http_as};
 pub use stdio::run_stdio;

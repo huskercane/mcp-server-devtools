@@ -114,6 +114,7 @@ integration settings, so they may live in the environment, `.env`, or a
 
 | Setting | Default | Purpose |
 |---|---|---|
+| `MCP_ROLE` | `all` | Process env only (or `serve --role`). `all`, `gateway`, or `control` (plan ADR-010). `control` serves only the health banner in Phase A. |
 | `MCP_AUTH_MODE` | `off` | `off` or `okta`. `okta` requires an HTTP transport, a non-loopback-safe configuration below, a policy, and a journal. Any other value is refused. |
 | `MCP_BIND_ADDR` | `127.0.0.1` | Process env only. IP or `ip:port`. A non-loopback bind is refused unless `MCP_AUTH_MODE=okta`. |
 | `MCP_PUBLIC_URL` | — (required for `okta`) | The URL clients reach the server at through the ingress: the RFC 9728 `resource` identifier and the base of the `resource_metadata` URL in every `WWW-Authenticate` challenge. Must be `https` (or `http` on loopback). |
