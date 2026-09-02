@@ -36,7 +36,10 @@ use serde::{Deserialize, Serialize};
 pub use canonical::{CanonicalPath, CanonicalTarget, CanonicalizeError};
 pub use egress::{Enforcement, authorize_egress};
 pub use engine::{FilePolicy, PolicyError};
-pub use scope::{CallScope, EgressRecord, EgressSummary, MAX_EGRESS_RECORDS, OwnerKey};
+pub use scope::{
+    CallScope, EgressDispatch, EgressRecord, EgressSummary, EgressTicket, MAX_EGRESS_RECORDS,
+    OwnerKey,
+};
 
 use crate::transport::HttpMethod;
 

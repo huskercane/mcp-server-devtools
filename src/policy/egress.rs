@@ -17,13 +17,16 @@
 //! durable write per outbound request — but it is not lost either: every
 //! egress decision, allow or deny, is noted on the [`CallScope`] as an
 //! [`EgressRecord`](super::EgressRecord) and carried by the call's
-//! **outcome** record. One tool call can send several requests (a
-//! partitioned Grafana query, a secondary lookup a controller performs), so
-//! the intent's tool-level action alone cannot say which URLs were
-//! individually authorized and sent; the outcome's egress list can. The
+//! **outcome** record, together with what the transport then did with it
+//! ([`EgressDispatch`]: denied, never attempted, served from cache, or sent
+//! — with the attempt count and the final result). One tool call can send
+//! several requests (a partitioned Grafana query, a secondary lookup a
+//! controller performs), so the intent's tool-level action alone cannot say
+//! which URLs were individually authorized and sent; the outcome's egress
+//! list can, and it distinguishes "authorized" from "went on the wire". The
 //! trade: that list is written after dispatch, so a process that dies
-//! between dispatch and outcome loses it — which is exactly the "intent
-//! without outcome" state described below, and nothing more.
+//! between dispatch and outcome loses it — which is the "intent without
+//! outcome" state described below, and nothing more.
 //!
 //! ## What is *not* an egress
 //!
@@ -58,9 +61,17 @@
 //! The outcome record is the other way round: the dispatch has already
 //! happened, so abandoning its append would make a dispatched call look
 //! undispatched. It is therefore **not** appended through this function.
-//! `DevtoolsServer::record_outcome` gives the append its own task that owns
-//! the record and runs to completion; the caller stops *waiting* at the
-//! bound but never cancels the write.
+//! `DevtoolsServer::record_outcome` gives the append its own tracked task
+//! that owns the record; the caller stops *waiting* at the bound but does
+//! not cancel the write, and the transports drain those tasks at shutdown
+//! (bounded, so a dead disk cannot hold the process open forever).
+//!
+//! What that leaves, stated precisely: an intent with no outcome means
+//! **"authorized; dispatch not evidenced"**. Before dispatch it is a refused
+//! call. After dispatch it can only be a process that died, or a journal
+//! that never recovered, between the vendor's response and the outcome's
+//! acknowledgement — and the operator log says which. It never means "known
+//! not to have been dispatched"; an auditor treats it as possibly dispatched.
 
 use std::io;
 use std::sync::Arc;
@@ -74,7 +85,7 @@ use crate::ports::policy_decision_point::PolicyDecisionPoint;
 use crate::transport::HttpMethod;
 
 use super::canonical::CanonicalTarget;
-use super::scope::CallScope;
+use super::scope::{CallScope, EgressDispatch, EgressTicket};
 use super::{ActionContext, PolicyDecision, UpstreamIdentity, extractors};
 
 /// Config key: how long an audit append may wait for durable acknowledgement
@@ -152,8 +163,11 @@ pub fn policy_denied(decision: &PolicyDecision) -> McpError {
     )
 }
 
-/// Evaluate the request the transport is about to send. `Ok(())` means
-/// send it; `Err` means it was denied and the denial journaled.
+/// Evaluate the request the transport is about to send. `Ok(_)` means send
+/// it; `Err` means it was denied and the denial journaled. Inside an
+/// enforcing scope the `Ok` carries the [`EgressTicket`] the transport
+/// reports the dispatch through (cache hit, each wire attempt and its
+/// result); outside one it is `None` and nothing was recorded.
 ///
 /// # Errors
 ///
@@ -163,12 +177,12 @@ pub async fn authorize_egress(
     method: HttpMethod,
     target: &CanonicalTarget,
     body: Option<&Value>,
-) -> Result<(), McpError> {
+) -> Result<Option<EgressTicket>, McpError> {
     let Some(scope) = CallScope::current() else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(enforcement) = scope.enforcement() else {
-        return Ok(());
+        return Ok(None);
     };
     let details = extractors::for_vendor(vendor, method, target, body);
     let context = ActionContext::assemble(
@@ -181,15 +195,20 @@ pub async fn authorize_egress(
         enforcement.upstream.clone(),
     );
     let decision = enforcement.policy.evaluate(&context);
-    scope.note_egress(super::EgressRecord {
+    let ticket = scope.note_egress(super::EgressRecord {
         vendor: vendor.to_owned(),
         method,
         canonical_target: target.url_under(""),
         effect: decision.effect,
         rule_id: decision.rule_id.clone(),
+        dispatch: if decision.is_allow() {
+            EgressDispatch::NotAttempted
+        } else {
+            EgressDispatch::Denied
+        },
     });
     if decision.is_allow() {
-        return Ok(());
+        return Ok(Some(ticket));
     }
 
     let event = AuditEvent {

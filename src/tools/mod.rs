@@ -311,6 +311,16 @@ impl DevtoolsServer {
         self.components.policy.degraded()
     }
 
+    /// The outcome appends still in flight after their caller stopped
+    /// waiting (see `record_outcome`). A transport takes a clone before it
+    /// starts serving and passes it to [`drain_pending_audit`] once serving
+    /// has stopped, so a graceful shutdown does not abort a write the
+    /// journal was still acknowledging.
+    #[must_use]
+    pub fn pending_audit(&self) -> tokio_util::task::TaskTracker {
+        self.components.pending_audit.clone()
+    }
+
     /// The principal a request was made under.
     ///
     /// The bearer middleware inserts the validated [`Principal`] into the
@@ -632,7 +642,12 @@ impl DevtoolsServer {
             egress: call.scope.take_egress(),
         };
         let sink = Arc::clone(&call.sink);
-        let mut pending = tokio::spawn(async move { sink.append(&outcome_event).await });
+        // Tracked, so the transports can drain it at shutdown (see
+        // `pending_audit`).
+        let mut pending = self
+            .components
+            .pending_audit
+            .spawn(async move { sink.append(&outcome_event).await });
         match tokio::time::timeout(call.append_timeout, &mut pending).await {
             Ok(Ok(Ok(_seq))) => {}
             // Category only, for the same reason as the intent branch.
@@ -652,7 +667,7 @@ impl DevtoolsServer {
                      queued until the journal acknowledges or fails it"
                 );
                 let tool = tool_name.clone();
-                tokio::spawn(async move {
+                self.components.pending_audit.spawn(async move {
                     match pending.await {
                         Ok(Ok(_seq)) => {
                             tracing::warn!(tool = %tool, "late audit outcome acknowledged");
@@ -795,6 +810,37 @@ impl ServerHandler for DevtoolsServer {
 }
 
 // ---- helpers ----
+
+/// How long a shutdown waits for in-flight outcome appends before giving
+/// up on them: long enough for a slow disk to catch up, short enough that a
+/// dead one cannot hold the process open.
+pub const AUDIT_DRAIN_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Wait for the outcome appends in `pending` to finish, up to
+/// [`AUDIT_DRAIN_BOUND`]. Called by each transport after it has stopped
+/// serving. A drain that times out is logged: those calls stay in the
+/// journal as intents without outcomes ("authorized; dispatch not
+/// evidenced", see `policy::egress`).
+pub async fn drain_pending_audit(pending: &tokio_util::task::TaskTracker) {
+    pending.close();
+    if pending.is_empty() {
+        return;
+    }
+    tracing::info!(
+        pending = pending.len(),
+        "waiting for in-flight audit outcome appends before exit"
+    );
+    if tokio::time::timeout(AUDIT_DRAIN_BOUND, pending.wait())
+        .await
+        .is_err()
+    {
+        tracing::error!(
+            pending = pending.len(),
+            "audit outcome appends still pending at exit; their calls remain \
+             journaled as intents without outcomes"
+        );
+    }
+}
 
 /// Canonical vendor for a tool name, by its prefix. `None` for tools that
 /// address no vendor (`artifact_read`) and for unknown names — the audit

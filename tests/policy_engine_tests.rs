@@ -273,6 +273,12 @@ async fn a_vanished_policy_file_keeps_the_last_policy_and_reports_degraded_healt
     let text = banner.text().await.unwrap();
     assert!(text.contains("policy reload is failing"), "{text}");
     assert!(text.contains("last good policy in force"), "{text}");
+    // The banner is unauthenticated: a category, never the reason, which
+    // names the policy path on disk.
+    assert!(
+        !text.contains(path.to_str().unwrap()) && !text.contains("cannot read"),
+        "the public banner must not carry the reload error: {text}"
+    );
 
     // The file is back, unchanged: no longer degraded, same version.
     std::fs::write(&path, document).unwrap();

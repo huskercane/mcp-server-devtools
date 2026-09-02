@@ -305,6 +305,64 @@ async fn a_stalled_outcome_append_is_not_cancelled_by_the_bound() {
     assert_eq!(events[1]["request_id"], events[0]["request_id"]);
 }
 
+/// The other half of the outcome guarantee: an append that outlived its
+/// caller is tracked, and a shutdown drains it instead of dropping it with
+/// the runtime. `pending_audit()` is what the transports drain.
+#[tokio::test]
+async fn pending_outcome_appends_are_tracked_for_shutdown_to_drain() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/myself"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"name": "alice"})))
+        .mount(&mock)
+        .await;
+
+    let (release, released) = tokio::sync::watch::channel(false);
+    let sink = Arc::new(StallingSink {
+        inner: InMemoryAuditSink::new(),
+        released,
+    });
+    let server = ServerBuilder::new()
+        .config(Config::from_map(HashMap::from([
+            (
+                "ATLASSIAN_USER_EMAIL".to_owned(),
+                "alice@example.com".to_owned(),
+            ),
+            ("ATLASSIAN_API_TOKEN".to_owned(), "test-token".to_owned()),
+            ("MCP_AUDIT_APPEND_TIMEOUT_MS".to_owned(), "100".to_owned()),
+        ])))
+        .vendors(Vendors {
+            jira: JiraVendor::with_base_url(mock.uri()),
+            ..Vendors::default()
+        })
+        .audit_sink(Arc::<StallingSink>::clone(&sink))
+        .build()
+        .expect("build server");
+    let pending = server.pending_audit();
+    let base = spawn(server).await;
+
+    let body = call_jira_get(&base).await;
+    assert_ne!(body["result"]["isError"], true, "{body}");
+    assert_eq!(sink.inner.events().len(), 1, "outcome still pending");
+
+    // A drain that starts now must wait: the append is in flight.
+    pending.close();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), pending.wait())
+            .await
+            .is_err(),
+        "the tracker must hold the pending append"
+    );
+    // The journal recovers; the drain completes and the outcome is there.
+    release.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), pending.wait())
+        .await
+        .expect("drain completes once the journal acknowledges");
+    let events = sink.inner.events();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1]["kind"], "tool_call_outcome");
+}
+
 #[tokio::test]
 async fn journal_configured_via_config_is_written_through_and_fails_startup_when_unusable() {
     // End-to-end through MCP_AUDIT_JOURNAL_DIR (the production wiring, no

@@ -34,11 +34,14 @@ policy stays in force; the ingress example no longer hashes on
 `Mcp-Session-Id`; and the allocation probe gained the two §8 stages it had
 no entry for.
 
-One parity claim was narrowed: local mode is unchanged in **protocol
-behaviour, tool surface, and wire requests** (`tests/auth_mode_tests.rs`),
-not in every observable. The startup log line gained `auth=` and `role=`
-fields, and the in-memory response cache's identity digest now includes a
-fixed owner prefix. Neither is persisted or parsed by anything.
+One parity claim was narrowed: what `tests/auth_mode_tests.rs` proves is
+that unset and explicit-`off` modes are **identical to each other** in
+protocol behaviour and tool surface — not that either is byte-identical to
+pre-Phase-A `main`. The wire bytes did change relative to `main` (CF-19,
+which locks the current form); the startup log line gained `auth=` and
+`role=` fields; and the in-memory response cache's identity digest now
+includes a fixed owner prefix. The last two are neither persisted nor
+parsed by anything.
 
 ---
 
@@ -210,6 +213,19 @@ states are truthful because nothing was dispatched.
 `tests/audit_journal_tests.rs::a_stalled_outcome_append_is_not_cancelled_by_the_bound`
 holds the outcome append behind a gate past the bound and proves the record
 lands once the gate opens.
+
+**Second amendment, same day.** A detached append survives its caller, but
+not the runtime: a graceful shutdown that completed before the journal
+recovered would have aborted it. The appends are now tracked
+(`Components.pending_audit`, a `TaskTracker`) and both transports drain
+them after serving stops, for up to 30 s (`tools::AUDIT_DRAIN_BOUND`) so a
+dead disk cannot hold the process open. And the semantics are stated with
+the remaining gap in view, in `policy::egress`: an intent with no outcome
+means **"authorized; dispatch not evidenced"** — a refused call before
+dispatch, or a death / unrecovered journal after it, and the operator log
+says which. It never means "known not to have been dispatched".
+`pending_outcome_appends_are_tracked_for_shutdown_to_drain` proves the
+tracker holds the append and the drain completes once the journal does.
 
 ### CF-16 · Session affinity past one replica; emergency deny
 **Open · Phase C (scaling) / Phase B (revocation)**
@@ -409,7 +425,10 @@ Notes for the Phase B comparison:
   writer batches. Read the p99 as "one call on an idle gateway", and
   re-measure on the partner's storage class before quoting it (Gate A).
 - The review added the egress list to the outcome record and a per-call
-  `EgressRecord` on the scope. Both are enterprise-only (no scope, no
-  record), so no stage in this table moved; the cost is two or three
-  allocations per outbound request inside an enforcing scope.
+  `EgressRecord` on the scope, with a dispatch state the transport fills in
+  (denied / not attempted / cache hit / attempted with attempt count and
+  final result), so "authorized" and "sent" are distinct facts. All of it
+  is enterprise-only (no scope, no record), so no stage in this table
+  moved; the cost is two or three allocations per outbound request inside
+  an enforcing scope.
 - The §8 CI comparison itself is CF-20.

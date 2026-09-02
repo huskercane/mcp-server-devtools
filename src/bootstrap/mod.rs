@@ -78,6 +78,9 @@ pub struct Components {
     /// Bound on how long an audit append may wait for durable
     /// acknowledgement before the call is refused (CF-14).
     pub audit_append_timeout: std::time::Duration,
+    /// Outcome appends that outlived their caller's wait, so a shutdown can
+    /// drain them (`DevtoolsServer::pending_audit`).
+    pub pending_audit: tokio_util::task::TaskTracker,
 }
 
 impl Components {
@@ -234,6 +237,7 @@ impl ServerBuilder {
             auth_required: self.auth_required,
             policy,
             audit_append_timeout,
+            pending_audit: tokio_util::task::TaskTracker::new(),
         });
 
         if let Some(pending) = watched {

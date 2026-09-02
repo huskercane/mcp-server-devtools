@@ -1017,7 +1017,11 @@ pub async fn fetch_streamed_artifact_with_policy(
     let method = options.method.unwrap_or(HttpMethod::Get);
     // Plan §1.3: the request about to go on the wire is the fact policy is
     // evaluated on. Outside an enforcing call scope this is one lookup.
-    crate::policy::authorize_egress(vendor.name(), method, &target, options.body.as_ref()).await?;
+    let ticket =
+        crate::policy::authorize_egress(vendor.name(), method, &target, options.body.as_ref())
+            .await?;
+    // Each wire attempt, and how the last one ended, for the egress record.
+    let report = |status, failure| report_attempt(ticket.as_ref(), status, failure);
     let url = target.url_under(&base);
     let (auth_name, auth_header) = validate_auth(credentials)?;
     let client = streaming_client()?;
@@ -1045,26 +1049,31 @@ pub async fn fetch_streamed_artifact_with_policy(
             result = tokio::time::timeout(remaining, request.send()) => match result {
                 Ok(Ok(response)) => response,
                 Ok(Err(error)) if attempt < attempts && is_retryable_stream_request_error(&error) => {
+                    report(None, Some("transport_error"));
                     log_http_transport_failure(call, &error, true);
                     retry_stream_attempt(attempt, &policy, deadline).await?;
                     continue;
                 }
                 Ok(Err(error)) => {
+                    report(None, Some("transport_error"));
                     log_http_transport_failure(call, &error, false);
                     return Err(map_reqwest_error(&error, &url));
                 }
                 Err(_) if attempt < attempts => {
+                    report(None, Some("timeout"));
                     log_http_timeout_failure(call, true);
                     retry_stream_attempt(attempt, &policy, deadline).await?;
                     continue;
                 }
                 Err(_) => {
+                    report(None, Some("timeout"));
                     log_http_timeout_failure(call, false);
                     return Err(api_error("streaming request exceeded total deadline", Some(408), None));
                 }
             }
         };
         let status = response.status();
+        report(Some(status.as_u16()), None);
         if !status.is_success() {
             let will_retry = attempt < attempts && matches!(status.as_u16(), 429 | 502 | 503 | 504);
             log_http_status_failure(call, status, will_retry);
@@ -1511,7 +1520,9 @@ pub async fn fetch(
     let method = options.method.unwrap_or(HttpMethod::Get);
     // Plan §1.3: the request about to go on the wire is the fact policy is
     // evaluated on. Outside an enforcing call scope this is one lookup.
-    crate::policy::authorize_egress(vendor.name(), method, &target, options.body.as_ref()).await?;
+    let ticket =
+        crate::policy::authorize_egress(vendor.name(), method, &target, options.body.as_ref())
+            .await?;
     let url = target.url_under(&base);
 
     let (auth_name, auth_header) = validate_auth(credentials)?;
@@ -1535,6 +1546,7 @@ pub async fn fetch(
         && response_cache::request_is_cacheable(&url, &auth_name, &options)
         && let Some(body) = response_cache::get(&cache_key)
     {
+        report_cache_hit(ticket.as_ref());
         debug!(vendor = vendor.name(), %url, "HTTP response cache hit");
         return Ok(TransportResponse {
             data: body,
@@ -1542,12 +1554,7 @@ pub async fn fetch(
         });
     }
 
-    let request_body_for_log = options.body.clone().or_else(|| {
-        options
-            .form
-            .as_ref()
-            .and_then(|form| serde_json::to_value(form).ok())
-    });
+    let request_body_for_log = request_body_for_log(&options);
     let req = build_request(
         client,
         method,
@@ -1569,12 +1576,14 @@ pub async fn fetch(
     let call = HttpCallLog::new(vendor.name(), method.as_str(), &url);
     let start = call.started;
     let response = req.send().await.map_err(|error| {
+        report_attempt(ticket.as_ref(), None, Some("transport_error"));
         log_http_transport_failure(call, &error, false);
         map_reqwest_error(&error, &url)
     })?;
     let duration = start.elapsed();
 
     let status = response.status();
+    report_attempt(ticket.as_ref(), Some(status.as_u16()), None);
     if !status.is_success() {
         log_http_status_failure(call, status, false);
     }
@@ -1699,6 +1708,36 @@ fn streaming_client() -> Result<&'static Client, McpError> {
 }
 
 // ---- helpers ----
+
+/// Report one wire attempt on the request's egress record, when the call
+/// runs inside an enforcing scope (outside one there is no ticket).
+fn report_attempt(
+    ticket: Option<&crate::policy::EgressTicket>,
+    status: Option<u16>,
+    failure: Option<&'static str>,
+) {
+    if let Some(ticket) = ticket {
+        ticket.attempted(status, failure);
+    }
+}
+
+/// Report that the request was answered from the response cache.
+fn report_cache_hit(ticket: Option<&crate::policy::EgressTicket>) {
+    if let Some(ticket) = ticket {
+        ticket.cache_hit();
+    }
+}
+
+/// The request body as the diagnostic log and raw-response record show it:
+/// the JSON body, or the form encoded as JSON.
+fn request_body_for_log(options: &RequestOptions) -> Option<Value> {
+    options.body.clone().or_else(|| {
+        options
+            .form
+            .as_ref()
+            .and_then(|form| serde_json::to_value(form).ok())
+    })
+}
 
 /// Canonicalize the caller's path-and-query (plan §3.5) before it is joined
 /// onto the configured base. This is the one place an upstream URL is

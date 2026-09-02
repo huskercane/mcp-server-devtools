@@ -144,6 +144,7 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
         .watch_config(true)
         .require_inbound_auth(inbound_auth.is_some())
         .build()?;
+    let pending_audit = server.pending_audit();
     let app = build_app_for_role(
         role,
         server,
@@ -165,6 +166,9 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
             shutdown_cancel.cancel();
         })
         .await;
+    // Serving has stopped; nothing new can start an outcome append. Let the
+    // ones already in flight reach the journal before the runtime goes.
+    crate::tools::drain_pending_audit(&pending_audit).await;
     crate::transport::raw_response::shutdown_and_cleanup().await;
     result?;
     Ok(())
@@ -502,9 +506,11 @@ fn health(server: &DevtoolsServer) -> Response {
     );
     if server.audit_available() {
         let mut banner = format!("mcp-server-devtools v{VERSION} is running");
-        if let Some(reason) = server.policy_degraded() {
-            banner.push_str("; policy reload is failing, last good policy in force: ");
-            banner.push_str(&reason);
+        // A fixed category: this route is unauthenticated, and the reason
+        // names the policy path and parser detail. Those go to the operator
+        // log (the watcher warns on every failed reload), not to the world.
+        if server.policy_degraded().is_some() {
+            banner.push_str("; policy reload is failing; last good policy in force");
         }
         (StatusCode::OK, [content_type], banner).into_response()
     } else {

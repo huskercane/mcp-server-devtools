@@ -222,6 +222,17 @@ struct KeyCache {
     /// `kid` → key. Keys without a `kid` are unusable: rotation is keyed on it.
     keys: Arc<HashMap<String, DecodingKey>>,
     fetched_at: Option<Instant>,
+    /// Bumped on every key installation. A validation remembers the
+    /// generation of the keys it verified against and is cached only if
+    /// that generation is still current — see [`OktaJwksValidator::remember`].
+    generation: u64,
+}
+
+/// What a validation reads: the keys, their age, and their generation.
+struct KeySnapshot {
+    keys: Arc<HashMap<String, DecodingKey>>,
+    fetched_at: Option<Instant>,
+    generation: u64,
 }
 
 struct Validated {
@@ -264,6 +275,7 @@ impl OktaJwksValidator {
             keys: RwLock::new(KeyCache {
                 keys: Arc::new(HashMap::new()),
                 fetched_at: None,
+                generation: 0,
             }),
             fetch_gate: tokio::sync::Mutex::new(None),
             refreshing: AtomicBool::new(false),
@@ -330,9 +342,22 @@ impl OktaJwksValidator {
         }
         let set: JwkSet =
             serde_json::from_slice(&body).map_err(|_| "JWKS document is not valid".to_owned())?;
-        let keys = admit_keys(&set);
+        Ok(self.install_keys(admit_keys(&set)))
+    }
+
+    /// Make `keys` the current set and evict every cached validation whose
+    /// key is no longer in it, as **one** critical section on the validated
+    /// cache. Lock order is validated → keys, the same order [`Self::remember`]
+    /// takes, so no lookup can observe the new keys with the old cache and
+    /// no validation that read the old keys can be inserted after the prune
+    /// (its generation is stale by then). Returns the number of usable keys.
+    fn install_keys(&self, keys: HashMap<String, DecodingKey>) -> usize {
         let count = keys.len();
         let keys = Arc::new(keys);
+        let mut validated = self
+            .validated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         {
             let mut cache = self
                 .keys
@@ -340,28 +365,30 @@ impl OktaJwksValidator {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             cache.keys = Arc::clone(&keys);
             cache.fetched_at = Some(Instant::now());
+            cache.generation += 1;
         }
         // A token verified by a key the identity provider no longer
         // publishes must not keep being served from the validated cache.
-        self.validated
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|_, entry| keys.contains_key(&entry.kid));
-        Ok(count)
+        validated.retain(|_, entry| keys.contains_key(&entry.kid));
+        count
     }
 
-    /// Current key snapshot and its age.
-    fn snapshot(&self) -> (Arc<HashMap<String, DecodingKey>>, Option<Instant>) {
+    /// Current key snapshot, its age, and its generation.
+    fn snapshot(&self) -> KeySnapshot {
         let cache = self
             .keys
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (Arc::clone(&cache.keys), cache.fetched_at)
+        KeySnapshot {
+            keys: Arc::clone(&cache.keys),
+            fetched_at: cache.fetched_at,
+            generation: cache.generation,
+        }
     }
 
     /// Refetch because a `kid` was not found, unless a fetch happened too
     /// recently. Returns the fresh snapshot either way.
-    async fn refetch_for_unknown_kid(&self) -> Arc<HashMap<String, DecodingKey>> {
+    async fn refetch_for_unknown_kid(&self) -> KeySnapshot {
         let mut last = self.fetch_gate.lock().await;
         let recently =
             last.is_some_and(|at| at.elapsed() < self.settings.jwks_min_refetch_interval);
@@ -372,7 +399,7 @@ impl OktaJwksValidator {
             }
         }
         drop(last);
-        self.snapshot().0
+        self.snapshot()
     }
 
     /// Kick off a background refresh when the keys are older than the
@@ -412,7 +439,21 @@ impl OktaJwksValidator {
             .map(|entry| entry.principal.clone())
     }
 
-    fn remember(&self, key: [u8; 32], principal: &Principal, exp: u64, kid: String) {
+    /// Cache a validation — unless the keys it was verified against have
+    /// been replaced since (`generation` is no longer current), in which
+    /// case the result is still returned to the caller but not remembered:
+    /// the next request revalidates against the keys now in force. Checked
+    /// under the same lock [`Self::install_keys`] prunes under, so the
+    /// interleaving "snapshot old keys → install and prune → insert" cannot
+    /// leave an entry behind.
+    fn remember(
+        &self,
+        key: [u8; 32],
+        principal: &Principal,
+        exp: u64,
+        kid: String,
+        generation: u64,
+    ) {
         let now_unix = jsonwebtoken::get_current_timestamp();
         let until_exp = Duration::from_secs(exp.saturating_sub(now_unix));
         let ttl = until_exp.min(VALIDATED_TTL);
@@ -424,6 +465,14 @@ impl OktaJwksValidator {
             .validated
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = self
+            .keys
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation;
+        if generation != current {
+            return;
+        }
         if cache.len() >= VALIDATED_CAPACITY {
             cache.retain(|_, entry| entry.expires_at > now);
             if cache.len() >= VALIDATED_CAPACITY {
@@ -486,37 +535,38 @@ impl OktaJwksValidator {
         ))
     }
 
-    /// Full validation: returns the principal, its `exp`, and the `kid` that
-    /// verified it (the cache entry is keyed on that for eviction).
+    /// Full validation: returns the principal, its `exp`, the `kid` that
+    /// verified it, and the key generation used (the cache entry is keyed on
+    /// the first for eviction and gated on the second for insertion).
     async fn validate_uncached(
         self: &Arc<Self>,
         token: &str,
-    ) -> Result<(Principal, u64, String), TokenRejection> {
+    ) -> Result<(Principal, u64, String, u64), TokenRejection> {
         let header = decode_header(token).map_err(|_| TokenRejection::Malformed)?;
         if header.alg != Algorithm::RS256 {
             return Err(TokenRejection::UnsupportedAlgorithm);
         }
         let kid = header.kid.ok_or(TokenRejection::UnknownKey)?;
 
-        let (mut keys, fetched_at) = self.snapshot();
-        if let Some(at) = fetched_at {
+        let mut snapshot = self.snapshot();
+        if let Some(at) = snapshot.fetched_at {
             self.maybe_refresh_in_background(at);
         } else {
             // Never fetched: this request pays for the first fetch.
             // Failure means we can say nothing about any token.
             let _fetching = self.fetch_gate.lock().await;
-            if self.snapshot().1.is_none() {
+            if self.snapshot().fetched_at.is_none() {
                 self.fetch_and_store().await.map_err(|error| {
                     tracing::error!(%error, "cannot obtain signing keys; refusing token");
                     TokenRejection::KeysUnavailable
                 })?;
             }
-            keys = self.snapshot().0;
+            snapshot = self.snapshot();
         }
-        if !keys.contains_key(&kid) {
-            keys = self.refetch_for_unknown_kid().await;
+        if !snapshot.keys.contains_key(&kid) {
+            snapshot = self.refetch_for_unknown_kid().await;
         }
-        let key = keys.get(&kid).ok_or(TokenRejection::UnknownKey)?;
+        let key = snapshot.keys.get(&kid).ok_or(TokenRejection::UnknownKey)?;
 
         let data =
             decode::<Claims>(token, key, &self.validation).map_err(|error| match error.kind() {
@@ -540,7 +590,7 @@ impl OktaJwksValidator {
                 _ => TokenRejection::Malformed,
             })?;
         let (principal, exp) = self.principal_from(data.claims)?;
-        Ok((principal, exp, kid))
+        Ok((principal, exp, kid, snapshot.generation))
     }
 }
 
@@ -551,8 +601,8 @@ impl TokenValidator for Arc<OktaJwksValidator> {
             if let Some(principal) = self.cached_principal(&key) {
                 return Ok(principal);
             }
-            let (principal, exp, kid) = self.validate_uncached(token).await?;
-            self.remember(key, &principal, exp, kid);
+            let (principal, exp, kid, generation) = self.validate_uncached(token).await?;
+            self.remember(key, &principal, exp, kid, generation);
             Ok(principal)
         })
     }
@@ -661,6 +711,64 @@ mod tests {
         ] {
             assert!(OktaSettings::from_config(&config(missing)).is_err());
         }
+    }
+
+    /// The interleaving the generation exists for: a validation snapshots
+    /// the keys, a refresh installs a set without that key and prunes the
+    /// cache, and only then does the validation try to cache its result.
+    /// Not reachable deterministically through `validate` (there is no
+    /// await between snapshot and insert on the common path; the race is
+    /// between worker threads), so the mechanism is exercised directly.
+    #[test]
+    fn a_validation_against_replaced_keys_is_not_cached() {
+        let validator = OktaJwksValidator::new(
+            OktaSettings::from_config(&config(&[
+                ("MCP_OKTA_ISSUER", "https://acme.okta.com/oauth2/default"),
+                ("MCP_OKTA_AUDIENCE", "api://mcp-devtools"),
+            ]))
+            .unwrap(),
+            reqwest::Client::new(),
+        );
+        let key_named = |kid: &str| {
+            HashMap::from([(kid.to_owned(), DecodingKey::from_secret(b"not-a-real-key"))])
+        };
+        let principal = Principal {
+            tenant: "acme".to_owned(),
+            subject: "alice@acme.example".to_owned(),
+            groups: Vec::new(),
+            scopes: Vec::new(),
+            authority: PrincipalAuthority::Okta,
+        };
+        let exp = jsonwebtoken::get_current_timestamp() + 300;
+        let token = digest("token-under-old");
+
+        validator.install_keys(key_named("old"));
+        // Request A reads the keys (generation 1) …
+        let seen_by_a = validator.snapshot();
+        assert!(seen_by_a.keys.contains_key("old"));
+        // … refresh B withdraws `old` and prunes (generation 2) …
+        validator.install_keys(key_named("new"));
+        // … and A, having verified against `old`, tries to cache.
+        validator.remember(
+            token,
+            &principal,
+            exp,
+            "old".to_owned(),
+            seen_by_a.generation,
+        );
+        assert!(
+            validator.cached_principal(&token).is_none(),
+            "a result verified against replaced keys must not be cached"
+        );
+
+        // The same insert with the current generation is cached — the
+        // gate is on staleness, not on the kid alone.
+        let current = validator.snapshot();
+        validator.remember(token, &principal, exp, "new".to_owned(), current.generation);
+        assert!(validator.cached_principal(&token).is_some());
+        // And a later withdrawal of `new` evicts it.
+        validator.install_keys(HashMap::new());
+        assert!(validator.cached_principal(&token).is_none());
     }
 
     #[test]

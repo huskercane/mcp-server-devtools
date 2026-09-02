@@ -48,22 +48,104 @@ tokio::task_local! {
 pub const MAX_EGRESS_RECORDS: usize = 64;
 
 /// One upstream request the egress chokepoint decided on inside a call
-/// scope: what was about to go on the wire, and what policy said about it.
+/// scope: what was about to go on the wire, what policy said about it, and
+/// what the transport then did with it.
 ///
-/// Recorded at the moment of the decision, which the transport makes
-/// immediately before the send — so an `allow` here means the request was
-/// dispatched (or its dispatch was attempted), not merely that it would
-/// have been allowed. Retries of the same request are one decision, not
-/// several.
+/// The decision is recorded when it is made, immediately before the
+/// transport would send; the [`dispatch`](Self::dispatch) state is filled
+/// in by the transport afterwards through an [`EgressTicket`]. An `allow`
+/// on its own therefore means "authorized"; whether bytes went on the wire,
+/// how many times, and with what result is the dispatch state's to say.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EgressRecord {
     pub vendor: String,
     #[serde(serialize_with = "super::serialize_method")]
     pub method: HttpMethod,
-    /// Canonical path and query (§3.5), exactly as evaluated and sent.
+    /// Canonical path and query (§3.5): the form evaluated, and the form
+    /// the transport builds the wire URL from.
     pub canonical_target: String,
     pub effect: PolicyEffect,
     pub rule_id: Option<String>,
+    pub dispatch: EgressDispatch,
+}
+
+/// What the transport did with an authorized request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum EgressDispatch {
+    /// Policy denied it; nothing was sent.
+    Denied,
+    /// Allowed, but the transport never reported a send: it returned before
+    /// one (a credential that would not form a header, a cancelled stream)
+    /// or the call ended first.
+    NotAttempted,
+    /// Allowed and answered from the response cache: nothing went on the
+    /// wire.
+    CacheHit,
+    /// Allowed and sent. `attempts` counts wire attempts (a streamed
+    /// request retries on 429/502/503/504 and transport errors);
+    /// `last_status` is the final attempt's HTTP status, `None` when it
+    /// failed before a response, in which case `failure` says how.
+    Attempted {
+        attempts: u32,
+        last_status: Option<u16>,
+        failure: Option<&'static str>,
+    },
+}
+
+/// The transport's handle on one egress record, for reporting what it did
+/// after the decision. Dropping it without a report leaves the record at
+/// [`EgressDispatch::NotAttempted`].
+#[derive(Debug)]
+pub struct EgressTicket {
+    scope: Arc<CallScope>,
+    /// `None` when the record was beyond [`MAX_EGRESS_RECORDS`] and only
+    /// counted; reports are then no-ops.
+    index: Option<usize>,
+}
+
+impl EgressTicket {
+    /// The request was answered from the response cache.
+    pub fn cache_hit(&self) {
+        self.update(|record| record.dispatch = EgressDispatch::CacheHit);
+    }
+
+    /// One wire attempt completed: with an HTTP status, or with a failure
+    /// before any response.
+    pub fn attempted(&self, status: Option<u16>, failure: Option<&'static str>) {
+        self.update(|record| match &mut record.dispatch {
+            EgressDispatch::Attempted {
+                attempts,
+                last_status,
+                failure: last_failure,
+            } => {
+                *attempts += 1;
+                *last_status = status;
+                *last_failure = failure;
+            }
+            _ => {
+                record.dispatch = EgressDispatch::Attempted {
+                    attempts: 1,
+                    last_status: status,
+                    failure,
+                };
+            }
+        });
+    }
+
+    fn update(&self, apply: impl FnOnce(&mut EgressRecord)) {
+        let Some(index) = self.index else {
+            return;
+        };
+        let mut log = self
+            .scope
+            .egress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(record) = log.records.get_mut(index) {
+            apply(record);
+        }
+    }
 }
 
 /// Every egress decision a call made, in order, for its outcome record.
@@ -116,16 +198,24 @@ impl CallScope {
         }
     }
 
-    /// Record an egress decision for this call's outcome record.
-    pub fn note_egress(&self, record: EgressRecord) {
+    /// Record an egress decision for this call's outcome record, and hand
+    /// back the ticket the transport reports the dispatch through.
+    pub fn note_egress(self: &Arc<Self>, record: EgressRecord) -> EgressTicket {
         let mut log = self
             .egress
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if log.records.len() < MAX_EGRESS_RECORDS {
+        let index = if log.records.len() < MAX_EGRESS_RECORDS {
             log.records.push(record);
+            Some(log.records.len() - 1)
         } else {
             log.omitted += 1;
+            None
+        };
+        drop(log);
+        EgressTicket {
+            scope: Arc::clone(self),
+            index,
         }
     }
 

@@ -102,7 +102,7 @@ struct Slice {
     lines_at_request: Arc<Mutex<Option<usize>>>,
     hits: Arc<AtomicUsize>,
     _jwks: MockServer,
-    _grafana: MockServer,
+    grafana: MockServer,
     _dir: tempfile::TempDir,
 }
 
@@ -196,7 +196,7 @@ async fn spawn_slice(policy: Arc<dyn PolicyDecisionPoint>) -> Slice {
         lines_at_request,
         hits,
         _jwks: jwks,
-        _grafana: grafana,
+        grafana,
         _dir: dir,
     }
 }
@@ -350,6 +350,12 @@ async fn group_a_is_allowed_group_b_is_denied_and_both_are_in_the_journal_first(
     );
     assert_eq!(sent["effect"], "allow");
     assert_eq!(sent["rule_id"], "sre-read-qa-datasources");
+    // …and that it actually went on the wire, once, and was answered.
+    assert_eq!(
+        sent["dispatch"],
+        json!({ "state": "attempted", "attempts": 1, "last_status": 200, "failure": null }),
+        "{sent}"
+    );
     assert!(
         allow_intent["egress"].is_null(),
         "egress is decided after the intent is written"
@@ -447,6 +453,132 @@ async fn an_egress_denial_stops_the_request_and_is_journaled() {
     assert_eq!(listed.as_array().map(Vec::len), Some(1), "{listed}");
     assert_eq!(listed[0]["effect"], "deny");
     assert_eq!(listed[0]["rule_id"], "egress-deny");
+    assert_eq!(listed[0]["dispatch"]["state"], "denied");
+}
+
+/// An authorized request is not the same as a sent one. The egress record
+/// says what the transport did — here, how many attempts a streamed request
+/// took: answered 503 once, then 200, under one authorization.
+#[tokio::test]
+async fn egress_records_count_wire_attempts_under_one_authorization() {
+    let slice = spawn_slice(phase_a_policy()).await;
+    let alice = token_for("alice@acme.example", &["SRE"]);
+    // Mounted after the witness responder, so it takes precedence for its
+    // single use; the witness answers the retry.
+    Mock::given(method("GET"))
+        .and(path(LOKI_QA_PATH))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&slice.grafana)
+        .await;
+    let body = query_logs(&slice.base, &alice, "loki-qa").await;
+    assert_ne!(body["result"]["isError"], true, "{body}");
+    let outcome = journal_lines(&slice.journal)
+        .into_iter()
+        .find(|line| line["kind"] == "tool_call_outcome")
+        .expect("outcome");
+    let requests = &outcome["egress"]["requests"];
+    assert_eq!(requests.as_array().map(Vec::len), Some(1), "one decision");
+    assert_eq!(
+        requests[0]["dispatch"],
+        json!({ "state": "attempted", "attempts": 2, "last_status": 200, "failure": null }),
+        "two wire attempts under one authorization: {requests}"
+    );
+}
+
+/// The other way an authorized request stays off the wire: the response
+/// cache. The second of two identical allowed GETs is answered locally and
+/// its egress record says so.
+#[tokio::test]
+async fn egress_records_mark_cache_hits_as_not_sent() {
+    let jira = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/PLAT-1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("cache-control", "max-age=60")
+                .set_body_json(json!({ "key": "PLAT-1" })),
+        )
+        .expect(1)
+        .mount(&jira)
+        .await;
+    let sink = Arc::new(InMemoryAuditSink::new());
+    let policy = FilePolicy::from_bytes(
+        b"version: 1\nrules:\n  - id: read-plat\n    effect: allow\n    subjects: {everyone: true}\n    match: {vendor: jira, resource_type: issue, resource_id: [\"PLAT-*\"]}\n",
+    )
+    .unwrap();
+    let server = ServerBuilder::new()
+        .config(Config::from_map(HashMap::from([
+            (
+                "ATLASSIAN_USER_EMAIL".to_owned(),
+                "svc@acme.example".to_owned(),
+            ),
+            ("ATLASSIAN_API_TOKEN".to_owned(), "svc-token".to_owned()),
+            ("HTTP_CACHE_ENABLED".to_owned(), "true".to_owned()),
+            ("HTTP_CACHE_DEFAULT_TTL_SECONDS".to_owned(), "60".to_owned()),
+        ])))
+        .vendors(Vendors {
+            jira: mcp_server_devtools::vendor::jira::JiraVendor::with_base_url(jira.uri()),
+            ..Vendors::default()
+        })
+        .audit_sink(Arc::<InMemoryAuditSink>::clone(&sink))
+        .policy(policy as Arc<dyn PolicyDecisionPoint>)
+        .build()
+        .unwrap();
+    let app = mcp_server_devtools::server::http::build_app_with_server(
+        server,
+        Duration::from_mins(5),
+        Duration::from_mins(5),
+        CancellationToken::new(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let jira_get = || async {
+        reqwest::Client::new()
+            .post(format!("http://{addr}/mcp"))
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "tools/call")
+            .header("Mcp-Name", "jira_get")
+            .json(&json!({
+                "jsonrpc": "2.0", "id": "req-cache", "method": "tools/call",
+                "params": {
+                    "name": "jira_get",
+                    "arguments": { "path": "/rest/api/3/issue/PLAT-1" },
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                        "io.modelcontextprotocol/clientInfo": { "name": "cache-test", "version": "0" }
+                    }
+                }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+    assert_eq!(jira_get().await, StatusCode::OK);
+    assert_eq!(jira_get().await, StatusCode::OK);
+    let outcomes: Vec<Value> = sink
+        .events()
+        .into_iter()
+        .filter(|event| event["kind"] == "tool_call_outcome")
+        .collect();
+    assert_eq!(outcomes.len(), 2, "{outcomes:#?}");
+    assert_eq!(
+        outcomes[0]["egress"]["requests"][0]["dispatch"],
+        json!({ "state": "attempted", "attempts": 1, "last_status": 200, "failure": null })
+    );
+    assert_eq!(
+        outcomes[1]["egress"]["requests"][0]["dispatch"],
+        json!({ "state": "cache_hit" }),
+        "the second call was authorized but nothing went on the wire"
+    );
 }
 
 /// One tool call, several upstream requests: a partitioned query sends one
