@@ -72,25 +72,15 @@ representation as **provisional for this reason**. §3.2 must not be declared
 frozen until this lands.
 
 ### CF-3 · Exact-pin the five range dependencies
-**Open · M0 baseline compliance · own reviewed commit**
+**Done · 2026-09-02 (Phase A, first commit)**
 
-`CLAUDE.md` says dependencies are exact-pinned (`=x.y.z`). Five are not:
-
-| Dependency | `Cargo.toml` |
-|---|---|
-| `atomicwrites` | `"0.4.4"` |
-| `rpassword` | `"7"` |
-| `httpdate` | `"1"` |
-| `zstd` | `"0.13"` |
-| `keyring` | `"4.1.6"` (three target-gated rows) |
-
-This is not cosmetic: the community lock holds `keyring 4.1.6` while the
-enterprise lock resolved **`keyring 4.2.0`**, so the two repositories build
-different code from the same source. Guiding constraint 7 ("baseline stays
-pinned") is not currently true.
-
-*The fix*: pin all five with `=`, update both lockfiles deliberately, in one
-commit that does nothing else.
+`CLAUDE.md` says dependencies are exact-pinned (`=x.y.z`). Five were not
+(`atomicwrites`, `rpassword`, `httpdate`, `zstd`, and the three target-gated
+`keyring` rows). They are now pinned to exactly what the community lockfile
+already resolved (`0.4.4`, `7.5.4`, `1.0.3`, `0.13.3`, `4.1.6`), so the
+community `Cargo.lock` did not move. The enterprise lockfile, which had
+resolved `keyring 4.2.0`, is re-resolved against the pin as part of the Phase A
+exit check (its build is what verifies the library surface anyway).
 
 ---
 
