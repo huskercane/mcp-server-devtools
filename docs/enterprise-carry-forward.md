@@ -10,9 +10,12 @@ removed only when it is done, not when it is explained.
 
 Status legend: **open** · **blocked** (needs a decision) · **done**.
 
-Last updated: 2026-09-02, after a sixth review pass (journal backpressure
-timing, fsync-after-truncate fixed directly — see CF-14 and the journal
-durability fix in the same commit).
+Last updated: 2026-09-02, at the Phase A exit. Phase A closed CF-2, CF-3,
+CF-4, CF-5, CF-6, and CF-14 (each entry says how) and opened CF-15. CF-1 /
+CF-13 (resolve-then-attribute) stay open: the Grafana slice's attribution is
+exact because Grafana's resolution is observable, so the slice did not need
+the general fix; the 14-vendor refactor is still owed. CF-7 (audited CLI),
+CF-8 (signed checkpoints), CF-9, CF-10, CF-11, CF-12 are unchanged.
 
 ---
 
@@ -222,20 +225,38 @@ about what else is stored alongside it.
 ## Allocation baseline (for the next phase's comparison)
 
 Per `CLAUDE.md`'s per-phase allocation gate. Numbers from
-`cargo bench --bench response_pipeline` at the M0 boundary.
+`cargo bench --bench response_pipeline` at the **Phase A** boundary
+(2026-09-02), with the M0 figure alongside where the stage existed then.
+Gate result: no pre-existing stage moved; the new stages are additive and,
+apart from canonicalization, run only on enterprise paths.
 
-| Stage | Bytes | Allocations |
-|---|---|---|
-| −1 `jira::extract` GET `/issue/{key}` | <1 KB | 6 |
-| −1 `jira::extract` GET `/search/jql` (long JQL) | 1 KB | 17 |
-| −1 `jira::project_keys_from_jql` (long JQL) | <1 KB | 9 |
-| −1 `jira::extract` unmapped (default arm) | <1 KB | 1 |
-| −1 `grafana::query_logs` | <1 KB | 11 |
-| 0 `ConfigHandle::snapshot()` | 0 | 0 |
-| 1 `apply_jq_filter(None)` | 0 | 0 |
-| 2 `render(Toon)` @ 500 issues | 1736 KB | 19 032 |
-| 3 `truncate_for_ai` | 39 KB | 4 |
-| 2 `render(Toon)` @ 5000 issues | 16 547 KB | 190 035 |
+| Stage | Bytes | Allocations | M0 |
+|---|---|---|---|
+| −1 `canonical`: short path + query (every outbound request) | <1 KB | 4 | new — replaces a `format!` join (1–2) |
+| −1 `canonical`: dot-segments + escapes | <1 KB | 1 | new |
+| −1 `canonical`: search URL, long JQL | <1 KB | 10 | new |
+| −1 `jira::extract` GET `/issue/{key}` (canonical input) | <1 KB | 6 | 6 |
+| −1 `jira::extract` GET `/search/jql` (long JQL) | 1 KB | 17 | 17 |
+| −1 `jira::project_keys_from_jql` (long JQL) | <1 KB | 9 | 9 |
+| −1 `jira::extract` unmapped (default arm) | <1 KB | 1 | 1 |
+| −1 `grafana::query_logs` | <1 KB | 10 | 11 |
+| −1b `ActionContext` via `for_tool` (Grafana; enterprise only) | <1 KB | 21 | new |
+| −1b `FilePolicy::evaluate` @ 500 rules (enterprise only) | 0 | 5 | new |
+| 0 `ConfigHandle::snapshot()` | 0 | 0 | 0 |
+| 1 `apply_jq_filter(None)` | 0 | 0 | 0 |
+| 2 `render(Toon)` @ 500 issues | 1736 KB | 19 032 | 19 032 |
+| 3 `truncate_for_ai` | 39 KB | 4 | 4 |
+| 2 `render(Toon)` @ 5000 issues | 16 547 KB | 190 035 | 190 035 |
 
-Stage −1 is new in M0 (the policy extractors); stages 0–3 are unchanged from
-the previous boundary, and the M0 work does not touch that code.
+Notes for the Phase B comparison:
+
+- Canonicalization is the one new cost on the community path. It is paid
+  once per outbound request, in place of the string join it replaced, and
+  is what makes the extractors sound (CF-5); ~2 extra allocations per
+  request is the price of that and is accepted.
+- The 500-rule decision allocates only for the `PolicyDecision` it returns
+  (rule id, version, reason). Rule matching itself is allocation-free.
+- Not yet probed: the validated-token cache hit (§8: < 50 µs). The Okta
+  validator's cache is exercised by `tests/token_validator_tests.rs` but
+  has no harness entry because building a validator needs a JWKS; add one
+  in Phase B alongside the revocation work that changes that table.

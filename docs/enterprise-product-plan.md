@@ -28,6 +28,7 @@ ordered by partner demand and are not scheduled until Gate B passes.
 | 2.2 | 2026-09-01 | WP 0.5 spike answered: rmcp 3.1.2 propagates per-request axum extensions into `call_tool`'s `RequestContext` on both the stateless and session HTTP paths (`docs/spikes/rmcp-extensions.md`); the §9 session-keyed fallback is not needed and was not built | Spike |
 | 2.3 | 2026-09-01 | M0 engineering landed on `feat/m0-enterprise-foundation`: WP 0.1 (LICENSE, library surface, private repo scaffolded and pushed), 0.4 (core types, `MCP_AUTH_MODE`, fail-closed bind, local-mode byte-identical tests), 0.5 (spike, rev 2.2), 0.6 (`CredentialBroker`), 0.7 (`AuditSink`/`UsageSink`, journal, write-before-dispatch fail-closed), 0.8 start (Grafana+Jira inventory, extractors; schema findings recorded in `docs/read-endpoint-inventory.md` — `ActionContext` not frozen yet). WPs 0.2/0.3 and ADR-002 counsel remain open | Owner + implementation |
 | 2.4 | 2026-09-01 | ADR-007 decided: Phase D console is htmx 4.x + askama server-rendering from the `control` role (rendering as a client of the admin API); one vendored, exact-pinned JS asset, no npm toolchain, strict CSP without eval | Owner |
+| 2.5 | 2026-09-02 | Phase A engineering landed on `feat/phase-a-secure-remote-slice`: A.1–A.10 as one reviewed commit per WP (`TokenValidator` + Okta JWKS + `StaticValidator`; bearer middleware and RFC 9728 metadata; artifact ownership, session binding, principal-partitioned cache; §3.5 canonicalization with a fuzz target; `PolicyDecisionPoint` + `AllowAll` + file policy with tool-level and egress enforcement and `policy check`; Grafana vertical slice; container + `--role` + ingress examples; the A.10 test set). §3.2 frozen with `constrained_by` (CF-2). Two §3.5 deviations documented in `policy::canonical` (`%2F` kept; trailing slash kept once). Egress *allows* are not journaled separately (the intent's decision plus the outcome record already prove them); egress *denials* are. CF-14 decided: bounded append refuses on timeout; intent = requested-and-authorized, outcome = dispatched. Gate A itself (partner, real IdP, real ingress) is owner-led and not started | Implementation |
 
 Unresolved questions are collected in §11. Work that a phase deliberately
 did **not** finish — deferred fixes, decisions we owe someone, and the
@@ -392,6 +393,19 @@ audit record with upstream identity is written before any tool dispatches.
 denied for group B with a reason, the denial and the allow are both in the
 journal with policy version and upstream identity, and the journal was
 written before dispatch.
+
+**Status 2026-09-02 (engineering scope):**
+
+- [x] A.1–A.10 landed (see §0 rev 2.5 and `docs/enterprise-carry-forward.md`
+  for what each closed). `tests/phase_a_vertical_slice_tests.rs` is the
+  "done when" in process — every production component in the loop except
+  the TLS ingress and the container image, which `tests/auth_mode_tests.rs`
+  (binary boundary) and `Dockerfile` + `deploy/k8s/` cover as far as a test
+  can without a cluster.
+- [x] Per-phase allocation gate run at exit; numbers in the carry-forward
+  register's baseline table.
+- [ ] Gate A — owner-led: a partner, their IdP, their non-production upstream.
+- [ ] `SECURITY.md` + disclosure process (security track, before Gate A).
 
 > **Gate A — problem validation.** One partner runs Phase A against their real
 > IdP and a non-production upstream for two weeks. Exit: they confirm the

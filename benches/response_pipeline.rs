@@ -21,8 +21,13 @@ use mcp_server_devtools::config::Config;
 use mcp_server_devtools::format::jmespath::apply_jq_filter;
 use mcp_server_devtools::format::truncation::truncate_for_ai;
 use mcp_server_devtools::format::{OutputFormat, render, to_pretty_json};
-use mcp_server_devtools::policy::extractors::{grafana, jira};
-use mcp_server_devtools::policy::{CanonicalPath, CanonicalTarget};
+use mcp_server_devtools::policy::extractors::{for_tool, grafana, jira};
+use mcp_server_devtools::policy::{
+    ActionContext, CanonicalPath, CanonicalTarget, ClientIdentity, CredentialLabel,
+    EnvironmentClass, FilePolicy, Principal, PrincipalAuthority, RequestRisk, UpstreamAuthority,
+    UpstreamIdentity,
+};
+use mcp_server_devtools::ports::PolicyDecisionPoint;
 use mcp_server_devtools::transport::HttpMethod;
 use serde_json::{Value, json};
 
@@ -222,6 +227,59 @@ fn extractor_stage() {
     });
 }
 
+/// The enterprise decision path, per tool call (plan §8 budgets: context
+/// build + canonicalization < 30 µs, policy decision < 20 µs for 500 rules).
+/// Measured against a 500-rule document so the matcher's cost is visible,
+/// not a three-rule best case.
+fn policy_stage() {
+    let mut document = String::from("version: 1\nrules:\n");
+    for index in 0..500 {
+        let env = ["qa", "prod", "staging", "dev"][index % 4];
+        let group = ["SRE", "Developers", "Contractors", "Auditors"][index % 4];
+        document.push_str(&format!(
+            "  - id: rule-{index}\n    effect: allow\n    subjects: {{groups: [{group}]}}\n    match:\n      vendor: grafana\n      environment: {env}\n      request_risk: read\n      resource_type: datasource\n      resource_id: [\"ds-{index}\", \"loki-{env}-*\"]\n"
+        ));
+    }
+    let policy = FilePolicy::from_bytes(document.as_bytes()).expect("bench policy compiles");
+    let principal = Principal {
+        tenant: "acme".to_owned(),
+        subject: "sre@acme.example".to_owned(),
+        groups: vec!["SRE".to_owned(), "Developers".to_owned()],
+        scopes: vec!["mcp:tools".to_owned()],
+        authority: PrincipalAuthority::Okta,
+    };
+    let upstream = UpstreamIdentity {
+        label: CredentialLabel::slot(
+            mcp_server_devtools::auth::secrets::for_vendor("grafana")
+                .next()
+                .expect("grafana slot"),
+        ),
+        vendor: "grafana".to_owned(),
+        environment: EnvironmentClass::Qa,
+        authority: UpstreamAuthority::Shared,
+    };
+    let arguments =
+        json!({ "datasourceUid": "loki-qa-main", "query": "{app=\"api\"}", "limit": 100 });
+    let arguments = arguments.as_object().unwrap();
+
+    let context = probe("ActionContext via for_tool (grafana)", 2000, || {
+        ActionContext::assemble(
+            principal.clone(),
+            ClientIdentity::default(),
+            None,
+            "grafana_query_logs",
+            for_tool("grafana_query_logs", Some(arguments), RequestRisk::Read),
+            None,
+            upstream.clone(),
+        )
+    });
+    // The last rule that matches an SRE/qa/loki-qa-* call is late in the
+    // document, so this walks most of the 500 rules.
+    probe("FilePolicy::evaluate @ 500 rules", 2000, || {
+        policy.evaluate(&context)
+    });
+}
+
 fn main() {
     println!("=== output size: is TOON earning its CPU? ===");
     output_size_comparison();
@@ -230,6 +288,8 @@ fn main() {
     // response pipeline below and so is invisible to every probe in it.
     println!("\n=== stage -1: policy extractors, per tool call (mean of 2000) ===");
     extractor_stage();
+    println!("\n=== stage -1b: policy decision, per tool call (mean of 2000) ===");
+    policy_stage();
 
     // Stage 0 runs once per *tool call*, before any payload work — so unlike the
     // stages below it is paid even by a request that returns two bytes.
