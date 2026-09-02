@@ -21,10 +21,10 @@ pre-commit the enterprise subset.
 - **`request_risk`** is derived from the endpoint contract (purpose-built
   reads are `read` by construction); for unmapped passthrough paths it is
   derived from the HTTP method, with `POST` conservatively `write`.
-- **Canonicalization**: extractors currently apply tool-level normalization
-  (leading slash, duplicate-slash collapse, trailing-slash trim). The full
-  §3.5 canonicalizer (single percent-decode, dot-segment removal, fuzz
-  target) is Phase A work (A.6) and runs before extraction in production.
+- **Canonicalization**: extractors take a `CanonicalPath`, which only the
+  §3.5 canonicalizer (`src/policy/canonical.rs`, WP A.6) can construct, so
+  every path is normalized before a route is classified. A segment that still
+  carries a percent-escape after canonicalization is never claimed as an id.
 - **Query/body allowlists** below are exhaustive: keys not listed are
   dropped from `query_attributes` and never influence policy; body fields
   not listed are never read by the extractor.

@@ -22,6 +22,7 @@ use mcp_server_devtools::format::jmespath::apply_jq_filter;
 use mcp_server_devtools::format::truncation::truncate_for_ai;
 use mcp_server_devtools::format::{OutputFormat, render, to_pretty_json};
 use mcp_server_devtools::policy::extractors::{grafana, jira};
+use mcp_server_devtools::policy::{CanonicalPath, CanonicalTarget};
 use mcp_server_devtools::transport::HttpMethod;
 use serde_json::{Value, json};
 
@@ -177,22 +178,41 @@ fn extractor_stage() {
         ("expand", "changelog"),
     ];
 
+    // §3.5 canonicalization runs on every outbound request, before any
+    // extractor — its allocation is paid by local mode too.
+    let search_target = format!(
+        "/rest/api/3/search/jql?jql={}&maxResults=100&fields=summary%2Cstatus&expand=changelog",
+        url::form_urlencoded::byte_serialize(long_jql.as_bytes()).collect::<String>()
+    );
+    probe("canonical: short path", 2000, || {
+        CanonicalTarget::parse("/rest/api/3/issue/PLAT-12345?fields=summary").ok()
+    });
+    probe("canonical: dot-segments + escapes", 2000, || {
+        CanonicalTarget::parse("/a/./b/../c/%2e%2e/rest/api/3/issue/PLAT%2D1/").ok()
+    });
+    probe("canonical: search URL (long JQL)", 2000, || {
+        CanonicalTarget::parse(&search_target).ok()
+    });
+
+    let issue_path = || CanonicalPath::parse("/rest/api/3/issue/PLAT-12345").unwrap();
+    let search_path = || CanonicalPath::parse("/rest/api/3/search/jql").unwrap();
+    let create_path = || CanonicalPath::parse("/rest/api/3/issue").unwrap();
     probe("jira::extract GET /issue/{key}", 2000, || {
         jira::extract(
             HttpMethod::Get,
-            "/rest/api/3/issue/PLAT-12345",
+            issue_path(),
             &[("fields", "summary")],
             None,
         )
     });
     probe("jira::extract GET /search/jql (long JQL)", 2000, || {
-        jira::extract(HttpMethod::Get, "/rest/api/3/search/jql", query, None)
+        jira::extract(HttpMethod::Get, search_path(), query, None)
     });
     probe("jira::project_keys_from_jql (long JQL)", 2000, || {
         jira::project_keys_from_jql(&long_jql)
     });
     probe("jira::extract unmapped (default arm)", 2000, || {
-        jira::extract(HttpMethod::Post, "/rest/api/3/issue", &[], None)
+        jira::extract(HttpMethod::Post, create_path(), &[], None)
     });
     probe("grafana::query_logs", 2000, || {
         grafana::query_logs(

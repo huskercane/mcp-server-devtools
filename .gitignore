@@ -38,3 +38,10 @@ Thumbs.db
 
 # Per-user local Claude Code settings (may contain secrets) — never commit
 .claude/settings.local.json
+
+# cargo-fuzz (fuzz/ is a self-rooted crate; see fuzz/Cargo.toml)
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
+/fuzz/Cargo.lock

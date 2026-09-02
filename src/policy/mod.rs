@@ -25,9 +25,12 @@
 //! legacy `AUDIT_LOG` JSONL keeps its camelCase shape untouched — that
 //! surface is parity-locked; this one is new.)
 
+pub mod canonical;
 pub mod extractors;
 
 use serde::Serialize;
+
+pub use canonical::{CanonicalPath, CanonicalTarget, CanonicalizeError};
 
 use crate::transport::HttpMethod;
 
@@ -467,8 +470,8 @@ pub struct ActionDetails {
     normalized_action: NormalizedAction,
     #[serde(serialize_with = "serialize_method")]
     method: HttpMethod,
-    /// Canonicalized request path (§3.5; full canonicalization lands in
-    /// Phase A — until then this is the normalized tool-level path).
+    /// Canonicalized request path (§3.5). Only a [`CanonicalPath`] can be
+    /// supplied to the constructors, so this is canonical by construction.
     canonical_path: String,
     /// Allowlisted query keys/values, sorted by key. Search expressions are
     /// retained as digests, not text — see `policy::extractors`.
@@ -492,7 +495,7 @@ impl ActionDetails {
     #[must_use]
     pub fn read(
         normalized_action: NormalizedAction,
-        canonical_path: String,
+        canonical_path: CanonicalPath,
         query_attributes: Vec<(String, String)>,
         resource_type: ResourceType,
         resource_scope: ResourceScope,
@@ -500,7 +503,7 @@ impl ActionDetails {
         Self {
             normalized_action,
             method: HttpMethod::Get,
-            canonical_path,
+            canonical_path: canonical_path.into_string(),
             query_attributes,
             resource_type,
             resource_scope,
@@ -546,11 +549,11 @@ impl ActionDetails {
     /// Anything the extractor could not classify: `Passthrough`/`Unknown`/
     /// unscoped, with the risk derived conservatively from the method.
     #[must_use]
-    pub fn unclassified(method: HttpMethod, canonical_path: String) -> Self {
+    pub fn unclassified(method: HttpMethod, canonical_path: CanonicalPath) -> Self {
         Self {
             normalized_action: NormalizedAction::Passthrough,
             method,
-            canonical_path,
+            canonical_path: canonical_path.into_string(),
             query_attributes: Vec::new(),
             resource_type: ResourceType::Unknown,
             resource_scope: ResourceScope::unscoped(),
@@ -562,7 +565,7 @@ impl ActionDetails {
     #[must_use]
     pub fn unclassified_with_attributes(
         method: HttpMethod,
-        canonical_path: String,
+        canonical_path: CanonicalPath,
         query_attributes: Vec<(String, String)>,
     ) -> Self {
         Self {
@@ -1309,7 +1312,7 @@ mod tests {
     fn read_downgrades_are_limited_to_approved_endpoints() {
         let get = ActionDetails::read(
             NormalizedAction::ReadIssue,
-            "/rest/api/3/issue/PLAT-1".to_owned(),
+            CanonicalPath::parse("/rest/api/3/issue/PLAT-1").unwrap(),
             Vec::new(),
             ResourceType::Issue,
             ResourceScope::id("PLAT-1"),
@@ -1331,8 +1334,11 @@ mod tests {
 
         // An unclassified call keeps the conservative method-derived risk.
         assert_eq!(
-            ActionDetails::unclassified(HttpMethod::Post, "/rest/api/3/issue".to_owned())
-                .request_risk(),
+            ActionDetails::unclassified(
+                HttpMethod::Post,
+                CanonicalPath::parse("/rest/api/3/issue").unwrap()
+            )
+            .request_risk(),
             RequestRisk::Write
         );
     }

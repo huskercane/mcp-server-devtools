@@ -1013,7 +1013,7 @@ pub async fn fetch_streamed_artifact_with_policy(
     policy: StreamingPolicy,
 ) -> Result<raw_response::StreamedArtifact, McpError> {
     let base = vendor.base_url(config)?;
-    let url = normalize_url_with_base(&base, path);
+    let url = canonical_target(path)?.url_under(&base);
     let method = options.method.unwrap_or(HttpMethod::Get);
     let (auth_name, auth_header) = validate_auth(credentials)?;
     let client = streaming_client()?;
@@ -1503,7 +1503,7 @@ pub async fn fetch(
     options: RequestOptions,
 ) -> Result<TransportResponse, McpError> {
     let base = vendor.base_url(config)?;
-    let url = normalize_url_with_base(&base, path);
+    let url = canonical_target(path)?.url_under(&base);
     let method = options.method.unwrap_or(HttpMethod::Get);
 
     let (auth_name, auth_header) = validate_auth(credentials)?;
@@ -1688,14 +1688,14 @@ fn streaming_client() -> Result<&'static Client, McpError> {
 
 // ---- helpers ----
 
-fn normalize_url_with_base(base: &str, path: &str) -> String {
-    let base = base.trim_end_matches('/');
-    let suffix = if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("/{path}")
-    };
-    format!("{base}{suffix}")
+/// Canonicalize the caller's path-and-query (plan §3.5) before it is joined
+/// onto the configured base. This is the one place an upstream URL is
+/// built from request data, so the form policy evaluates is the form sent.
+/// A path with no canonical form — an absolute URL, an invalid escape, a
+/// control byte — is refused with a 400-shaped error rather than sent.
+fn canonical_target(path: &str) -> Result<crate::policy::CanonicalTarget, McpError> {
+    crate::policy::CanonicalTarget::parse(path)
+        .map_err(|error| api_error(format!("Invalid request path: {error}"), Some(400), None))
 }
 
 fn validate_auth(credentials: &Credentials) -> Result<(HeaderName, HeaderValue), McpError> {

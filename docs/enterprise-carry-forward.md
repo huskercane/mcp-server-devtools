@@ -95,13 +95,27 @@ Grafana UID validation that protects dispatch lives in
 `controllers::grafana`, not in policy.
 
 ### CF-5 · Full §3.5 request canonicalization (A.6)
-**Open · Phase A · must land before extractors gate production traffic**
+**Done · 2026-09-02 (Phase A, WP A.6)**
 
-`extractors::normalize_path` does the tool-level minimum: leading slash,
-trailing-slash trim, duplicate-slash collapse. Percent-decoding, dot-segment
-resolution, and fuzzing are A.6. An extractor claiming a scope from a path
-that has not been fully canonicalized is only as sound as the canonicalizer
-in front of it.
+`policy::canonical` is the single canonicalizer: RFC 3986 syntax-based
+normalization (unreserved escapes decoded once, reserved escapes kept and
+uppercased, dot-segments removed, duplicate slashes collapsed, non-`pchar`
+bytes re-encoded), absolute URLs refused, query decoded and stably sorted.
+The transport builds every outbound URL from the canonical target, so what
+policy evaluates is what is sent. Extractors accept only the `CanonicalPath`
+newtype, which nothing outside that module can construct — the soundness
+caveat this item recorded is now a type-checked fact rather than a
+convention. Two deliberate deviations from the §3.5 wording, both documented
+in the module: `%2F` is **not** decoded (it would split one segment into two
+and misclassify Bitbucket branch paths), and a trailing slash is kept, once
+(Django-style APIs such as edX distinguish it; stripping it broke their
+tests). Fuzz target: `fuzz/fuzz_targets/canonicalize.rs` (libFuzzer,
+nightly to run); the same invariants run on stable in CI over a seeded
+corpus in `tests/canonicalization_tests.rs`.
+
+Follow-up recorded as CF-15: CircleCI's signed log-output download
+(`transport::fetch_streamed_url`) takes an absolute URL from a vendor
+response and bypasses this path entirely.
 
 ### CF-6 · Validated `Principal` from token claims
 **Open · Phase A**
@@ -156,6 +170,17 @@ refused. That is still fail-closed (the vendor is never called), but it
 changes what "the journal has a record for a refused call" means and needs
 to be a reviewed decision, not an incidental one, given the module's stated
 RPO = 0 / no-degraded-mode invariant.
+
+### CF-15 · Response-provided absolute URLs bypass canonicalization
+**Open · Phase B (with the CircleCI read profile)**
+
+`transport::fetch_streamed_url` downloads CircleCI's signed log-output URL
+exactly as the vendor response supplied it: no credential is attached, but
+no canonicalization, host pinning, or egress policy applies either. Every
+other outbound request goes through `CanonicalTarget` and the configured
+base. Resolve when CircleCI gets a read profile: either pin the host to an
+allowlist derived from the CircleCI base URL, or fetch the artifact through
+the authenticated API path instead.
 
 ### CF-9 · `POST /rest/api/3/issue/bulkfetch`
 **Blocked · needs its own review**
