@@ -430,6 +430,9 @@ fn writer_loop(
 ) {
     let mut batch: Vec<WriteRequest> = Vec::with_capacity(MAX_BATCH);
     let mut buffer: Vec<u8> = Vec::new();
+    // Line boundaries within `buffer`, so the chain can fold each line
+    // separately. Reused across batches like `buffer` (allocation gate).
+    let mut boundaries: Vec<usize> = Vec::with_capacity(MAX_BATCH);
     // Set by the first failed write or sync; every later record is refused.
     let mut poison: Option<Arc<io::Error>> = None;
     let mut state = WriterState {
@@ -472,6 +475,7 @@ fn writer_loop(
         }
 
         buffer.clear();
+        boundaries.clear();
         // Checked throughout: at `u64::MAX` an unchecked increment would
         // wrap and start re-issuing numbers that are already on disk.
         let Some(mut seq) = state.last_seq.checked_add(1) else {
@@ -480,8 +484,6 @@ fn writer_loop(
         };
         let first_seq = seq;
         let mut exhausted = false;
-        // Line boundaries, so the chain can fold each line separately.
-        let mut boundaries: Vec<usize> = Vec::with_capacity(batch.len());
         for request in &batch {
             buffer.extend_from_slice(b"{\"seq\":");
             let mut digits = [0u8; MAX_U64_DIGITS];
