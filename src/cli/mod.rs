@@ -26,6 +26,7 @@ pub mod audit;
 pub mod bb;
 pub mod conf;
 pub mod creds;
+pub mod explain;
 pub mod health;
 pub mod jira;
 pub mod policy;

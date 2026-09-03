@@ -349,53 +349,60 @@ struct CompiledRule {
 
 impl CompiledRule {
     fn matches(&self, context: &ActionContext) -> bool {
+        self.mismatch(context).is_none()
+    }
+
+    /// The first key of this rule that `context` fails, or `None` when the
+    /// rule matches. The same early-return walk `matches` always did; the
+    /// key name is what `policy explain` prints (WP B.2).
+    fn mismatch(&self, context: &ActionContext) -> Option<&'static str> {
         if !self.subjects.matches(context.principal()) {
-            return false;
+            return Some("subjects");
         }
         if !self
             .vendor
             .as_ref()
             .is_none_or(|list| list.iter().any(|item| item == context.vendor()))
         {
-            return false;
+            return Some("vendor");
         }
         if !contains(self.environment.as_deref(), &context.environment()) {
-            return false;
+            return Some("environment");
         }
         if !self
             .tool_name
             .as_ref()
             .is_none_or(|globs| any_glob(globs, context.tool_name()))
         {
-            return false;
+            return Some("tool_name");
         }
         if !contains(
             self.normalized_action.as_deref(),
             &context.normalized_action(),
         ) {
-            return false;
+            return Some("normalized_action");
         }
         if !contains(self.request_risk.as_deref(), &context.request_risk()) {
-            return false;
+            return Some("request_risk");
         }
         if !contains(self.resource_type.as_deref(), &context.resource_type()) {
-            return false;
+            return Some("resource_type");
         }
         if !contains(
             self.upstream_authority.as_deref(),
             &context.upstream_identity().authority,
         ) {
-            return false;
+            return Some("upstream_authority");
         }
         if !contains(self.method.as_deref(), &context.method()) {
-            return false;
+            return Some("method");
         }
         if !self
             .canonical_path
             .as_ref()
             .is_none_or(|globs| any_glob(globs, context.canonical_path()))
         {
-            return false;
+            return Some("canonical_path");
         }
         // The three resource keys: all-of, and each only for its own state.
         if let Some(globs) = &self.resource_id
@@ -403,7 +410,7 @@ impl CompiledRule {
                 .resource_scope()
                 .all_ids_allowed(|id| any_glob(globs, id))
         {
-            return false;
+            return Some("resource_id");
         }
         if let Some(kind) = self.resource_scope {
             let scope = context.resource_scope();
@@ -412,7 +419,7 @@ impl CompiledRule {
                 ScopeKind::Unscoped => scope.is_unscoped(),
             };
             if !ok {
-                return false;
+                return Some("resource_scope");
             }
         }
         if let Some((resource_type, globs)) = &self.constrained_by
@@ -421,9 +428,9 @@ impl CompiledRule {
                     && constraint.scope().all_ids_allowed(|id| any_glob(globs, id))
             })
         {
-            return false;
+            return Some("constrained_by");
         }
-        true
+        None
     }
 }
 
@@ -693,6 +700,40 @@ impl SignedBundle<CompiledPolicy> {
             .collect()
     }
 
+    /// Evaluate `context` and say why: the decision, and for every rule
+    /// whether it matched and, if not, the first key it failed on (WP B.2,
+    /// `policy explain`). Same semantics as `evaluate`: an unclassified
+    /// resource is denied before rules are consulted, a matching deny wins,
+    /// the first matching allow is attributed.
+    #[must_use]
+    pub fn explain(&self, context: &ActionContext) -> Explanation {
+        let snapshot = self.snapshot();
+        let policy = &snapshot.document;
+        let unclassified = context.resource_type() == ResourceType::Unknown;
+        let mut rules: Vec<RuleTrace> = policy
+            .rules
+            .iter()
+            .map(|rule| RuleTrace {
+                id: rule.id.clone(),
+                effect: rule.effect,
+                mismatch: rule.mismatch(context),
+                decisive: false,
+            })
+            .collect();
+        let decision = <Self as PolicyDecisionPoint>::evaluate(self, context);
+        if !unclassified
+            && let Some(rule_id) = &decision.rule_id
+            && let Some(trace) = rules.iter_mut().find(|trace| trace.id == *rule_id)
+        {
+            trace.decisive = true;
+        }
+        Explanation {
+            decision,
+            unclassified,
+            rules,
+        }
+    }
+
     /// The rules whose `subjects` clause matches `principal` — what this
     /// principal *could* be allowed or denied, before any call is matched.
     /// The access review is this, per member of each group.
@@ -706,6 +747,33 @@ impl SignedBundle<CompiledPolicy> {
             .map(CompiledRule::describe)
             .collect()
     }
+}
+
+/// One rule's part in a decision (`policy explain`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RuleTrace {
+    pub id: String,
+    pub effect: PolicyEffect,
+    /// The first key the call failed, or `None` when the rule matched.
+    pub mismatch: Option<&'static str>,
+    /// Whether this is the rule the decision names.
+    pub decisive: bool,
+}
+
+impl RuleTrace {
+    #[must_use]
+    pub const fn matched(&self) -> bool {
+        self.mismatch.is_none()
+    }
+}
+
+/// A decision with its reasons.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Explanation {
+    pub decision: PolicyDecision,
+    /// The resource could not be classified, so no rule was consulted.
+    pub unclassified: bool,
+    pub rules: Vec<RuleTrace>,
 }
 
 /// A rule as data: what the document said, after compilation, with every

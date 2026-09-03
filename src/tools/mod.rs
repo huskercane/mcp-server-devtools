@@ -672,20 +672,24 @@ impl DevtoolsServer {
     /// annotations — the input `for_tool` uses for tools with no extractor.
     /// Server-owned, so never a client-supplied risk.
     fn declared_risk(&self, tool: &str) -> crate::policy::RequestRisk {
-        let annotations = self
-            .tool_router
+        risk_from_annotations(
+            self.tool_router
+                .map
+                .get(tool)
+                .and_then(|route| route.attr.annotations.as_ref()),
+        )
+    }
+
+    /// The risk class the server declares for `tool`, without a server:
+    /// builds the tool router once. For `policy explain`, which must use
+    /// the input `call_tool` would. `None` for an unknown tool name.
+    #[must_use]
+    pub fn declared_tool_risk(tool: &str) -> Option<crate::policy::RequestRisk> {
+        let router = Self::tool_router();
+        router
             .map
             .get(tool)
-            .and_then(|route| route.attr.annotations.as_ref());
-        match annotations {
-            Some(annotations) if annotations.read_only_hint == Some(true) => {
-                crate::policy::RequestRisk::Read
-            }
-            Some(annotations) if annotations.destructive_hint == Some(true) => {
-                crate::policy::RequestRisk::Destructive
-            }
-            _ => crate::policy::RequestRisk::Write,
-        }
+            .map(|route| risk_from_annotations(route.attr.annotations.as_ref()))
     }
 
     /// Journal the outcome of a dispatched call and emit its usage event.
@@ -923,10 +927,25 @@ pub async fn drain_pending_audit(pending: &tokio_util::task::TaskTracker) {
     }
 }
 
+/// `readOnlyHint` → read, `destructiveHint` → destructive, else write.
+fn risk_from_annotations(
+    annotations: Option<&rmcp::model::ToolAnnotations>,
+) -> crate::policy::RequestRisk {
+    match annotations {
+        Some(annotations) if annotations.read_only_hint == Some(true) => {
+            crate::policy::RequestRisk::Read
+        }
+        Some(annotations) if annotations.destructive_hint == Some(true) => {
+            crate::policy::RequestRisk::Destructive
+        }
+        _ => crate::policy::RequestRisk::Write,
+    }
+}
+
 /// Canonical vendor for a tool name, by its prefix. `None` for tools that
 /// address no vendor (`artifact_read`) and for unknown names — the audit
 /// path records those as vendor `"unknown"` rather than dropping evidence.
-pub(crate) fn vendor_for_tool(tool: &str) -> Option<&'static str> {
+pub fn vendor_for_tool(tool: &str) -> Option<&'static str> {
     use crate::config::{
         VENDOR_BITBUCKET, VENDOR_CIRCLECI, VENDOR_CONFLUENCE, VENDOR_EDX, VENDOR_GRAFANA,
         VENDOR_JIRA, VENDOR_NEWRELIC, VENDOR_NINJAONE, VENDOR_POSTMAN, VENDOR_SLACK,

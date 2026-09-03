@@ -9,6 +9,11 @@
 //!   private half is written owner-only, the public half is printed for
 //!   `MCP_POLICY_PUBLIC_KEY`.
 //! - `sign <file> --key <keyfile>` writes `<file>.sig`.
+//! - `explain <file> --tool … [--arguments …] --group … [--environment …]`
+//!   shows which rule decides a call and the first key every other rule
+//!   fails on (WP B.2). The `ActionContext` is built exactly as `call_tool`
+//!   builds it — same extractor, same declared risk — so the answer is the
+//!   gateway's answer.
 //!
 //! All of these read files and build no `CliRuntime`, so they are not
 //! subject to the unaudited-CLI refusal.
@@ -31,6 +36,8 @@ pub enum Command {
     Keygen(KeygenOpts),
     /// Sign a policy document (or revocation list), writing `<file>.sig`.
     Sign(SignOpts),
+    /// Show which rule decides a call, and why each other rule does not.
+    Explain(super::explain::ExplainOpts),
 }
 
 #[derive(Debug, Args)]
@@ -86,6 +93,7 @@ pub fn dispatch(command: Command) -> Result<(), McpError> {
         Command::Check(opts) => check(&opts),
         Command::Keygen(opts) => keygen(&opts),
         Command::Sign(opts) => sign(&opts),
+        Command::Explain(opts) => super::explain::run(&opts),
     }
 }
 
