@@ -83,7 +83,11 @@ impl Signed {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("revocations.yaml");
         let (key, _) = SigningKey::generate().unwrap();
-        let signed = Self { _dir: dir, file, key };
+        let signed = Self {
+            _dir: dir,
+            file,
+            key,
+        };
         signed.write(&RevocationFile::empty());
         signed
     }
