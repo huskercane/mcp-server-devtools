@@ -25,21 +25,30 @@
 //! legacy `AUDIT_LOG` JSONL keeps its camelCase shape untouched — that
 //! surface is parity-locked; this one is new.)
 
+pub mod bundle;
 pub mod canonical;
 pub mod egress;
 pub mod engine;
 pub mod extractors;
 pub mod scope;
+pub mod signing;
 
 use serde::{Deserialize, Serialize};
 
+pub use bundle::{
+    BundleAudit, BundleChange, BundleError, ChangeHook, Loaded, SignedBundle, Staged,
+};
 pub use canonical::{CanonicalPath, CanonicalTarget, CanonicalizeError};
 pub use egress::{Enforcement, authorize_egress};
-pub use engine::{FilePolicy, PolicyError};
+pub use engine::{
+    CompiledPolicy, Explanation, FilePolicy, PolicyError, RuleDescription, RuleTrace,
+    SubjectsDescription,
+};
 pub use scope::{
     CallScope, EgressDispatch, EgressRecord, EgressSummary, EgressTicket, MAX_EGRESS_RECORDS,
     OwnerKey,
 };
+pub use signing::{Domain, Signature, SigningError, SigningKey, VerifyingKey};
 
 use crate::transport::HttpMethod;
 
@@ -437,6 +446,12 @@ pub enum NormalizedAction {
     QueryLogs,
     ListDatasources,
     ReadDatasource,
+    /// Slack (WP B.1).
+    ListChannels,
+    ReadChannel,
+    ReadChannelHistory,
+    ReadThread,
+    SearchMessages,
     /// No per-endpoint mapping exists. Paired with
     /// [`ResourceType::Unknown`] this is what default-deny denies.
     Passthrough,
@@ -941,6 +956,35 @@ impl ActionContext {
             upstream_identity,
             request_risk: details.request_risk,
         }
+    }
+
+    /// The context a tool call is judged on, from what the call *asks for*
+    /// — the one place it is built, so the gateway (`call_tool`) and
+    /// `policy explain` cannot drift: the same extractor on the same
+    /// arguments, the same server-declared risk for an unmapped tool, and
+    /// `vendor`/`environment` read off `upstream_identity`. What differs
+    /// between the two callers is only what they pass in: who the
+    /// principal is, which client reported itself, and which upstream
+    /// identity the broker chose under the configuration in force.
+    #[must_use]
+    pub fn for_tool_call(
+        principal: Principal,
+        client: ClientIdentity,
+        tool: &str,
+        arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+        declared_risk: RequestRisk,
+        upstream_identity: UpstreamIdentity,
+    ) -> Self {
+        let details = extractors::for_tool(tool, arguments, declared_risk);
+        Self::assemble(
+            principal,
+            client,
+            None,
+            tool,
+            details,
+            None,
+            upstream_identity,
+        )
     }
 
     #[must_use]

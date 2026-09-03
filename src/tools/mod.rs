@@ -75,7 +75,7 @@ use crate::controllers::zoom::ZoomContext;
 use crate::error::format_error_for_mcp_tool;
 use crate::format::truncation::truncate_for_ai;
 use crate::policy::{ClientIdentity, PolicyDecision, Principal};
-use crate::ports::{AuditEvent, AuditEventKind, UsageEvent};
+use crate::ports::{AuditEvent, AuditEventKind, TokenFacts, UsageEvent};
 #[derive(Clone)]
 pub struct DevtoolsServer {
     components: Arc<Components>,
@@ -136,6 +136,43 @@ impl DevtoolsServer {
         #[cfg(feature = "wrds")]
         let router = router + Self::wrds_router();
         router
+    }
+
+    /// Append the startup evidence — the `policy_loaded` record for the
+    /// policy in force — and wait for it to be durable. A transport calls
+    /// this **before** it binds or starts serving: a process that cannot
+    /// prove which policy it started under does not start (plan §1.2).
+    /// A no-op without a journal or without a file-backed policy.
+    ///
+    /// # Errors
+    ///
+    /// [`McpError`] when the record could not be made durable within the
+    /// audit bound; the message names the failure category.
+    pub async fn journal_startup(&self) -> Result<(), crate::error::McpError> {
+        let (Some(sink), Some(policy)) = (
+            self.components.audit_sink.as_ref(),
+            self.components.policy_file.as_ref(),
+        ) else {
+            return Ok(());
+        };
+        let audit = crate::policy::BundleAudit {
+            sink: Arc::clone(sink),
+            append_timeout: self.components.audit_append_timeout,
+        };
+        policy
+            .journal_in_force(&audit)
+            .await
+            .map(drop)
+            .map_err(|error| {
+                crate::error::unexpected(
+                    format!(
+                        "refusing to start: the policy in force could not be journaled ({}); a \
+                     gateway whose policy load has no durable evidence must not serve",
+                        crate::ports::AuditFailure::classify(&error)
+                    ),
+                    None,
+                )
+            })
     }
 
     /// Snapshot the current config. Returns an `Arc` so a tool call costs one
@@ -311,6 +348,20 @@ impl DevtoolsServer {
         self.components.policy.degraded()
     }
 
+    /// The durable audit sink, when one is configured. The HTTP transport
+    /// hands it to the inbound-auth stack so revocation events share the
+    /// journal.
+    #[must_use]
+    pub fn audit_sink(&self) -> Option<Arc<dyn crate::ports::AuditSink>> {
+        self.components.audit_sink.clone()
+    }
+
+    /// The bound on a durable append (CF-14), shared with the auth stack.
+    #[must_use]
+    pub fn audit_append_timeout(&self) -> std::time::Duration {
+        self.components.audit_append_timeout
+    }
+
     /// The outcome appends still in flight after their caller stopped
     /// waiting (see `record_outcome`). A transport takes a clone before it
     /// starts serving and passes it to [`drain_pending_audit`] once serving
@@ -332,18 +383,67 @@ impl DevtoolsServer {
     fn principal_for(
         &self,
         context: &rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Option<Principal> {
-        let validated = context
-            .extensions
-            .get::<axum::http::request::Parts>()
+    ) -> Option<(Principal, TokenFacts)> {
+        let parts = context.extensions.get::<axum::http::request::Parts>();
+        let validated = parts
             .and_then(|parts| parts.extensions.get::<Principal>())
             .cloned();
         match validated {
-            Some(principal) => Some(principal),
+            Some(principal) => {
+                let facts = parts
+                    .and_then(|parts| parts.extensions.get::<TokenFacts>())
+                    .cloned()
+                    .unwrap_or_default();
+                Some((principal, facts))
+            }
             None if self.components.auth_required => None,
-            None => Some(Principal::local()),
+            None => Some((Principal::local(), TokenFacts::default())),
         }
     }
+}
+
+/// Config key: the oldest token (by `iat`, in seconds) that may perform a
+/// non-read call (plan §3.6, "high-risk operations"). Default
+/// [`DEFAULT_WRITE_MAX_TOKEN_AGE`]; `0` disables the rule. Applies only when
+/// inbound authentication is required — local mode has no token to date.
+pub const WRITE_MAX_TOKEN_AGE_KEY: &str = "MCP_WRITE_MAX_TOKEN_AGE_SECONDS";
+pub const DEFAULT_WRITE_MAX_TOKEN_AGE: std::time::Duration = std::time::Duration::from_mins(5);
+
+/// Why a write must wait for a fresh token: a token that was minted more
+/// than `max_age` ago may predate a group change or a revocation the
+/// caller's client has not yet seen. A token with no `iat` cannot be shown
+/// to be fresh, so it is refused for writes (fail closed). `None` means the
+/// call may proceed.
+fn stale_for_write(facts: &TokenFacts, max_age: std::time::Duration) -> Option<String> {
+    if max_age.is_zero() {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    match facts.issued_at {
+        None => Some(format!(
+            "non-read calls need a token no older than {}s, and this token carries no issue \
+             time; obtain a fresh token",
+            max_age.as_secs()
+        )),
+        Some(issued_at) if now.saturating_sub(issued_at) > max_age.as_secs() => Some(format!(
+            "non-read calls need a token no older than {}s (this one was issued {}s ago); \
+             obtain a fresh token",
+            max_age.as_secs(),
+            now.saturating_sub(issued_at)
+        )),
+        Some(_) => None,
+    }
+}
+
+/// Read [`WRITE_MAX_TOKEN_AGE_KEY`] from configuration.
+#[must_use]
+pub fn write_max_token_age(config: &Config) -> std::time::Duration {
+    config
+        .get(WRITE_MAX_TOKEN_AGE_KEY)
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_WRITE_MAX_TOKEN_AGE, std::time::Duration::from_secs)
 }
 
 // ============================================================================
@@ -479,6 +579,7 @@ impl DevtoolsServer {
         arguments: Option<&rmcp::model::JsonObject>,
         audit: &crate::audit::AuditCall,
         principal: &Principal,
+        facts: &TokenFacts,
         client_info: Option<&Implementation>,
     ) -> Result<Option<EnterpriseCall>, Refusal> {
         let Some(sink) = self.components.audit_sink.as_ref() else {
@@ -509,18 +610,31 @@ impl DevtoolsServer {
         // check, never the only guard (plan §1.3). Under `AllowAll` the
         // context is still built so the journal carries it.
         let policy = &self.components.policy;
-        let details =
-            crate::policy::extractors::for_tool(tool, arguments, self.declared_risk(tool));
-        let action = crate::policy::ActionContext::assemble(
+        let action = crate::policy::ActionContext::for_tool_call(
             principal.clone(),
             client.clone(),
-            None,
             tool,
-            details,
-            None,
+            arguments,
+            self.declared_risk(tool),
             upstream.clone(),
         );
-        let decision = policy.evaluate(&action);
+        let mut decision = policy.evaluate(&action);
+        // §3.6: a non-read call needs a recent token, whatever the policy
+        // says — the rule that stops a stale-but-unexpired token from
+        // writing after its holder lost the right to. Journaled as the
+        // denial it is, under the policy version in force.
+        if decision.is_allow()
+            && self.components.auth_required
+            && action.request_risk() != crate::policy::RequestRisk::Read
+            && let Some(reason) = stale_for_write(facts, write_max_token_age(&config))
+        {
+            decision = PolicyDecision {
+                effect: crate::policy::PolicyEffect::Deny,
+                rule_id: None,
+                policy_version: decision.policy_version,
+                reason,
+            };
+        }
         let append_timeout = self.components.audit_append_timeout;
 
         let intent = AuditEvent {
@@ -592,20 +706,24 @@ impl DevtoolsServer {
     /// annotations — the input `for_tool` uses for tools with no extractor.
     /// Server-owned, so never a client-supplied risk.
     fn declared_risk(&self, tool: &str) -> crate::policy::RequestRisk {
-        let annotations = self
-            .tool_router
+        risk_from_annotations(
+            self.tool_router
+                .map
+                .get(tool)
+                .and_then(|route| route.attr.annotations.as_ref()),
+        )
+    }
+
+    /// The risk class the server declares for `tool`, without a server:
+    /// builds the tool router once. For `policy explain`, which must use
+    /// the input `call_tool` would. `None` for an unknown tool name.
+    #[must_use]
+    pub fn declared_tool_risk(tool: &str) -> Option<crate::policy::RequestRisk> {
+        let router = Self::tool_router();
+        router
             .map
             .get(tool)
-            .and_then(|route| route.attr.annotations.as_ref());
-        match annotations {
-            Some(annotations) if annotations.read_only_hint == Some(true) => {
-                crate::policy::RequestRisk::Read
-            }
-            Some(annotations) if annotations.destructive_hint == Some(true) => {
-                crate::policy::RequestRisk::Destructive
-            }
-            _ => crate::policy::RequestRisk::Write,
-        }
+            .map(|route| risk_from_annotations(route.attr.annotations.as_ref()))
     }
 
     /// Journal the outcome of a dispatched call and emit its usage event.
@@ -717,7 +835,7 @@ impl ServerHandler for DevtoolsServer {
 
         // WP A.2 / CF-6: the validated principal, or `local`. A required
         // principal that is absent is a refusal before anything else runs.
-        let Some(principal) = self.principal_for(&context) else {
+        let Some((principal, facts)) = self.principal_for(&context) else {
             tracing::error!(
                 tool = %request.name.as_ref(),
                 "tool call reached dispatch without a validated principal; refusing"
@@ -736,6 +854,7 @@ impl ServerHandler for DevtoolsServer {
                 request.arguments.as_ref(),
                 &audit,
                 &principal,
+                &facts,
                 client.as_ref(),
             )
             .await
@@ -842,10 +961,25 @@ pub async fn drain_pending_audit(pending: &tokio_util::task::TaskTracker) {
     }
 }
 
+/// `readOnlyHint` → read, `destructiveHint` → destructive, else write.
+fn risk_from_annotations(
+    annotations: Option<&rmcp::model::ToolAnnotations>,
+) -> crate::policy::RequestRisk {
+    match annotations {
+        Some(annotations) if annotations.read_only_hint == Some(true) => {
+            crate::policy::RequestRisk::Read
+        }
+        Some(annotations) if annotations.destructive_hint == Some(true) => {
+            crate::policy::RequestRisk::Destructive
+        }
+        _ => crate::policy::RequestRisk::Write,
+    }
+}
+
 /// Canonical vendor for a tool name, by its prefix. `None` for tools that
 /// address no vendor (`artifact_read`) and for unknown names — the audit
 /// path records those as vendor `"unknown"` rather than dropping evidence.
-pub(crate) fn vendor_for_tool(tool: &str) -> Option<&'static str> {
+pub fn vendor_for_tool(tool: &str) -> Option<&'static str> {
     use crate::config::{
         VENDOR_BITBUCKET, VENDOR_CIRCLECI, VENDOR_CONFLUENCE, VENDOR_EDX, VENDOR_GRAFANA,
         VENDOR_JIRA, VENDOR_NEWRELIC, VENDOR_NINJAONE, VENDOR_POSTMAN, VENDOR_SLACK,

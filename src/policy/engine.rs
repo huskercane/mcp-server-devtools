@@ -73,26 +73,50 @@
 //! open. The policy version is `v<version>+sha256:<16 hex>` of the exact
 //! bytes, so an audit record names the document that decided it.
 //!
+//! ## Signed bundles (WP B.3)
+//!
+//! When a verifying key is configured (`MCP_POLICY_PUBLIC_KEY`, required in
+//! `MCP_AUTH_MODE=okta`), the document must be accompanied by a detached
+//! Ed25519 signature in `<file>.sig` ([`super::signing`]), and a document
+//! whose signature is missing or does not verify is refused exactly like
+//! one that does not compile: at startup that is fatal, on reload the last
+//! good policy stays in force. Signing is a separate step from writing the
+//! file, so a policy change is two files landing on disk; the watcher only
+//! ever sees a mismatch as a rejected reload, and picks the pair up on the
+//! next tick once both are in place.
+//!
+//! A change is **journaled before it is applied**: the watcher stages the
+//! new document, appends a `policy_changed` control record carrying the old
+//! and new version labels and the signature status, and only then commits
+//! the staged document. A change whose record cannot be made durable is
+//! not applied — the same write-before-act rule a tool call follows — and
+//! health reports the policy as degraded until the journal recovers.
+//! Rejected reloads are journaled too, once per distinct failure, not once
+//! per poll. The machinery is [`super::bundle::SignedBundle`], shared with
+//! the revocation list; this module supplies the document.
+//!
 //! **A file that disappears or becomes unreadable is treated the same way:
 //! the last good policy stays in force**, indefinitely. Deleting the file is
 //! therefore *not* an emergency deny — a gateway keeps serving under the
 //! document it last compiled, which is the same posture the plan gives a
 //! gateway whose control plane is down (§3.4, "last signed policy bundle").
-//! The state is not silent: [`FilePolicy::degraded`] reports the last
+//! The state is not silent: `FilePolicy::degraded` reports the last
 //! reload failure, and the HTTP health banner prints it. To stop traffic,
 //! publish a document that denies (`version: N, rules: []` denies
 //! everything) or take the gateway out of rotation; the deny-list and
 //! `revoke-all` controls arrive in Phase B (CF-16).
 
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::ports::audit_sink::ControlEventKind;
 use crate::ports::policy_decision_point::PolicyDecisionPoint;
 use crate::transport::HttpMethod;
 
+use super::bundle::{BundleDocument, BundleError, SignedBundle, version_label};
+use super::signing::Domain;
 use super::{
     ActionContext, EnvironmentClass, NormalizedAction, PolicyDecision, PolicyEffect, Principal,
     RequestRisk, ResourceType, UpstreamAuthority,
@@ -101,30 +125,20 @@ use super::{
 /// Config key naming the policy document. Required in enterprise mode.
 pub const POLICY_FILE_KEY: &str = "MCP_POLICY_FILE";
 
+/// Config key holding the base64 Ed25519 public key that policy documents
+/// (and the revocation list) must be signed with. Required in enterprise
+/// mode; optional for local dry runs.
+pub const POLICY_PUBLIC_KEY_KEY: &str = "MCP_POLICY_PUBLIC_KEY";
+
 /// How often the watcher looks at the file.
-pub const POLICY_WATCH_INTERVAL: Duration = Duration::from_millis(500);
+pub const POLICY_WATCH_INTERVAL: Duration = super::bundle::WATCH_INTERVAL;
 
 /// Largest document accepted.
-const MAX_POLICY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_POLICY_BYTES: usize = super::bundle::MAX_DOCUMENT_BYTES;
 
 /// Why a document was refused. Carries the document's own text (rule ids,
 /// key names), never anything from a request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PolicyError(String);
-
-impl PolicyError {
-    fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
-    }
-}
-
-impl std::fmt::Display for PolicyError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for PolicyError {}
+pub type PolicyError = BundleError;
 
 // ---------------------------------------------------------------------------
 // Document schema (what the operator writes)
@@ -335,53 +349,60 @@ struct CompiledRule {
 
 impl CompiledRule {
     fn matches(&self, context: &ActionContext) -> bool {
+        self.mismatch(context).is_none()
+    }
+
+    /// The first key of this rule that `context` fails, or `None` when the
+    /// rule matches. The same early-return walk `matches` always did; the
+    /// key name is what `policy explain` prints (WP B.2).
+    fn mismatch(&self, context: &ActionContext) -> Option<&'static str> {
         if !self.subjects.matches(context.principal()) {
-            return false;
+            return Some("subjects");
         }
         if !self
             .vendor
             .as_ref()
             .is_none_or(|list| list.iter().any(|item| item == context.vendor()))
         {
-            return false;
+            return Some("vendor");
         }
         if !contains(self.environment.as_deref(), &context.environment()) {
-            return false;
+            return Some("environment");
         }
         if !self
             .tool_name
             .as_ref()
             .is_none_or(|globs| any_glob(globs, context.tool_name()))
         {
-            return false;
+            return Some("tool_name");
         }
         if !contains(
             self.normalized_action.as_deref(),
             &context.normalized_action(),
         ) {
-            return false;
+            return Some("normalized_action");
         }
         if !contains(self.request_risk.as_deref(), &context.request_risk()) {
-            return false;
+            return Some("request_risk");
         }
         if !contains(self.resource_type.as_deref(), &context.resource_type()) {
-            return false;
+            return Some("resource_type");
         }
         if !contains(
             self.upstream_authority.as_deref(),
             &context.upstream_identity().authority,
         ) {
-            return false;
+            return Some("upstream_authority");
         }
         if !contains(self.method.as_deref(), &context.method()) {
-            return false;
+            return Some("method");
         }
         if !self
             .canonical_path
             .as_ref()
             .is_none_or(|globs| any_glob(globs, context.canonical_path()))
         {
-            return false;
+            return Some("canonical_path");
         }
         // The three resource keys: all-of, and each only for its own state.
         if let Some(globs) = &self.resource_id
@@ -389,7 +410,7 @@ impl CompiledRule {
                 .resource_scope()
                 .all_ids_allowed(|id| any_glob(globs, id))
         {
-            return false;
+            return Some("resource_id");
         }
         if let Some(kind) = self.resource_scope {
             let scope = context.resource_scope();
@@ -398,7 +419,7 @@ impl CompiledRule {
                 ScopeKind::Unscoped => scope.is_unscoped(),
             };
             if !ok {
-                return false;
+                return Some("resource_scope");
             }
         }
         if let Some((resource_type, globs)) = &self.constrained_by
@@ -407,9 +428,9 @@ impl CompiledRule {
                     && constraint.scope().all_ids_allowed(|id| any_glob(globs, id))
             })
         {
-            return false;
+            return Some("constrained_by");
         }
-        true
+        None
     }
 }
 
@@ -418,10 +439,30 @@ fn contains<T: PartialEq>(list: Option<&[T]>, value: &T) -> bool {
     list.is_none_or(|list| list.contains(value))
 }
 
+/// A compiled policy document: the rules as matchers plus the version
+/// label. Public so the bundle type can name it; its fields are not.
 #[derive(Debug)]
-struct CompiledPolicy {
+pub struct CompiledPolicy {
     version: String,
     rules: Vec<CompiledRule>,
+}
+
+impl BundleDocument for CompiledPolicy {
+    const DOMAIN: Domain = Domain::PolicyBundle;
+    const NOUN: &'static str = "policy";
+    const KINDS: [ControlEventKind; 3] = [
+        ControlEventKind::PolicyLoaded,
+        ControlEventKind::PolicyChanged,
+        ControlEventKind::PolicyRejected,
+    ];
+
+    fn compile(bytes: &[u8]) -> Result<Self, BundleError> {
+        compile(bytes)
+    }
+
+    fn version(&self) -> &str {
+        &self.version
+    }
 }
 
 fn parse_method(value: &str) -> Result<HttpMethod, PolicyError> {
@@ -631,189 +672,234 @@ fn compile_subjects(
     Ok(compiled)
 }
 
-fn version_label(version: u32, bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-
-    use sha2::{Digest as _, Sha256};
-
-    let digest = Sha256::digest(bytes);
-    let mut label = format!("v{version}+sha256:");
-    for byte in &digest[..8] {
-        let _ = write!(label, "{byte:02x}");
-    }
-    label
-}
-
 // ---------------------------------------------------------------------------
 // The decision point
 // ---------------------------------------------------------------------------
 
-/// A policy document on disk, compiled, hot-reloadable.
-pub struct FilePolicy {
-    path: PathBuf,
-    current: RwLock<Arc<CompiledPolicy>>,
-    /// The bytes the current snapshot was compiled from, for the watcher.
-    loaded_bytes: RwLock<Vec<u8>>,
-    /// Why the last reload failed, while the last good document stays in
-    /// force. Cleared by the next successful reload. Off the request path:
-    /// written by the watcher, read by health.
-    last_reload_error: Mutex<Option<String>>,
-}
+/// A policy document on disk, verified, compiled, hot-reloadable — a
+/// [`SignedBundle`] over [`CompiledPolicy`]. `load`, `load_verified`,
+/// `from_bytes`, `reload`, `stage`/`commit`, `spawn_watcher`, `degraded`,
+/// and `signature` come from the bundle.
+pub type FilePolicy = SignedBundle<CompiledPolicy>;
 
-impl FilePolicy {
-    /// Read and compile the document at `path`.
-    ///
-    /// # Errors
-    ///
-    /// When the file cannot be read or does not compile. A startup caller
-    /// treats this as fatal: enterprise mode never runs with no policy.
-    pub fn load(path: &Path) -> Result<Arc<Self>, PolicyError> {
-        let bytes = std::fs::read(path).map_err(|error| {
-            PolicyError::new(format!("cannot read policy {}: {error}", path.display()))
-        })?;
-        let compiled = compile(&bytes)
-            .map_err(|error| PolicyError::new(format!("policy {}: {error}", path.display())))?;
-        Ok(Arc::new(Self {
-            path: path.to_owned(),
-            current: RwLock::new(Arc::new(compiled)),
-            loaded_bytes: RwLock::new(bytes),
-            last_reload_error: Mutex::new(None),
-        }))
-    }
-
-    /// Compile a document from bytes, for `policy check` and tests. Not
-    /// reloadable (there is no file to watch).
-    ///
-    /// # Errors
-    ///
-    /// When the document does not compile.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Arc<Self>, PolicyError> {
-        let compiled = compile(bytes)?;
-        Ok(Arc::new(Self {
-            path: PathBuf::new(),
-            current: RwLock::new(Arc::new(compiled)),
-            loaded_bytes: RwLock::new(bytes.to_vec()),
-            last_reload_error: Mutex::new(None),
-        }))
-    }
-
-    /// Why the last reload failed — the file vanished, became unreadable,
-    /// or does not compile — while the last good document stays in force.
-    /// `None` when the document in force is the one on disk.
-    #[must_use]
-    pub fn degraded(&self) -> Option<String> {
-        self.last_reload_error
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
-    fn note_reload(&self, outcome: &Result<bool, PolicyError>) {
-        let mut last = self
-            .last_reload_error
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *last = outcome.as_ref().err().map(ToString::to_string);
-    }
-
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
+impl SignedBundle<CompiledPolicy> {
     #[must_use]
     pub fn rule_count(&self) -> usize {
-        self.snapshot().rules.len()
+        self.snapshot().document.rules.len()
     }
 
-    fn snapshot(&self) -> Arc<CompiledPolicy> {
-        Arc::clone(
-            &self
-                .current
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+    /// Every rule, as data, in document order (WP B.5 access review, WP
+    /// B.2 explain).
+    #[must_use]
+    pub fn describe_rules(&self) -> Vec<RuleDescription> {
+        self.snapshot()
+            .document
+            .rules
+            .iter()
+            .map(CompiledRule::describe)
+            .collect()
     }
 
-    /// Re-read the file. A document that does not compile — or a file that
-    /// cannot be read — leaves the current policy in force, records the
-    /// failure for [`Self::degraded`], and returns the error.
-    ///
-    /// # Errors
-    ///
-    /// When the file cannot be read or does not compile.
-    pub fn reload(&self) -> Result<bool, PolicyError> {
-        let outcome = self.reload_inner();
-        self.note_reload(&outcome);
-        outcome
-    }
-
-    fn reload_inner(&self) -> Result<bool, PolicyError> {
-        let bytes = std::fs::read(&self.path).map_err(|error| {
-            PolicyError::new(format!(
-                "cannot read policy {}: {error}",
-                self.path.display()
-            ))
-        })?;
-        let unchanged = *self
-            .loaded_bytes
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            == bytes;
-        if unchanged {
-            return Ok(false);
+    /// Evaluate `context` and say why: the decision, and for every rule
+    /// whether it matched and, if not, the first key it failed on (WP B.2,
+    /// `policy explain`). Same semantics as `evaluate`: an unclassified
+    /// resource is denied before rules are consulted, a matching deny wins,
+    /// the first matching allow is attributed.
+    #[must_use]
+    pub fn explain(&self, context: &ActionContext) -> Explanation {
+        let snapshot = self.snapshot();
+        let policy = &snapshot.document;
+        let unclassified = context.resource_type() == ResourceType::Unknown;
+        let mut rules: Vec<RuleTrace> = policy
+            .rules
+            .iter()
+            .map(|rule| RuleTrace {
+                id: rule.id.clone(),
+                effect: rule.effect,
+                mismatch: rule.mismatch(context),
+                decisive: false,
+            })
+            .collect();
+        let decision = <Self as PolicyDecisionPoint>::evaluate(self, context);
+        if !unclassified
+            && let Some(rule_id) = &decision.rule_id
+            && let Some(trace) = rules.iter_mut().find(|trace| trace.id == *rule_id)
+        {
+            trace.decisive = true;
         }
-        let compiled = compile(&bytes)?;
-        *self
-            .current
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(compiled);
-        *self
-            .loaded_bytes
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = bytes;
-        Ok(true)
+        Explanation {
+            decision,
+            unclassified,
+            rules,
+        }
     }
 
-    /// Poll the file and reload on change, on the current Tokio runtime.
-    /// Holds only a `Weak`, so the task ends with the policy. A no-op with a
-    /// warning outside a runtime, like the config watcher.
-    pub fn spawn_watcher(self: &Arc<Self>) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            tracing::warn!(path = %self.path.display(), "policy watcher requires a Tokio runtime");
-            return;
-        };
-        let weak: Weak<Self> = Arc::downgrade(self);
-        runtime.spawn(async move {
-            let mut interval = tokio::time::interval(POLICY_WATCH_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                interval.tick().await;
-                let Some(policy) = weak.upgrade() else {
-                    return;
-                };
-                let path = policy.path.clone();
-                // Reading and compiling a policy is file I/O plus parsing:
-                // off the worker threads.
-                let outcome = tokio::task::spawn_blocking(move || policy.reload()).await;
-                match outcome {
-                    Ok(Ok(true)) => tracing::info!(path = %path.display(), "reloaded policy"),
-                    Ok(Ok(false)) => {}
-                    Ok(Err(error)) => tracing::warn!(
-                        path = %path.display(),
-                        %error,
-                        "policy cannot be reloaded; keeping the previous policy in force"
-                    ),
-                    Err(error) => tracing::warn!(%error, "policy reload task failed"),
-                }
+    /// The rules whose `subjects` clause matches `principal` — what this
+    /// principal *could* be allowed or denied, before any call is matched.
+    /// The access review is this, per member of each group.
+    #[must_use]
+    pub fn rules_for(&self, principal: &Principal) -> Vec<RuleDescription> {
+        self.snapshot()
+            .document
+            .rules
+            .iter()
+            .filter(|rule| rule.subjects.matches(principal))
+            .map(CompiledRule::describe)
+            .collect()
+    }
+}
+
+/// One rule's part in a decision (`policy explain`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RuleTrace {
+    pub id: String,
+    pub effect: PolicyEffect,
+    /// The first key the call failed, or `None` when the rule matched.
+    pub mismatch: Option<&'static str>,
+    /// Whether this is the rule the decision names.
+    pub decisive: bool,
+}
+
+impl RuleTrace {
+    #[must_use]
+    pub const fn matched(&self) -> bool {
+        self.mismatch.is_none()
+    }
+}
+
+/// A decision with its reasons.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Explanation {
+    pub decision: PolicyDecision,
+    /// The resource could not be classified, so no rule was consulted.
+    pub unclassified: bool,
+    pub rules: Vec<RuleTrace>,
+}
+
+/// A rule as data: what the document said, after compilation, with every
+/// list normalized to a list of strings. What the access review and
+/// `policy explain` print.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RuleDescription {
+    pub id: String,
+    pub effect: PolicyEffect,
+    pub subjects: SubjectsDescription,
+    /// The match keys the rule names, in the document's vocabulary.
+    /// Absent keys match anything.
+    pub matches: std::collections::BTreeMap<&'static str, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SubjectsDescription {
+    pub everyone: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+}
+
+fn glob_patterns(globs: Option<&Vec<Glob>>) -> Vec<String> {
+    globs
+        .map(|globs| globs.iter().map(|glob| glob.pattern.clone()).collect())
+        .unwrap_or_default()
+}
+
+fn enum_labels<T: serde::Serialize>(values: Option<&Vec<T>>) -> Vec<String> {
+    values
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| {
+                    serde_json::to_value(value)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+impl CompiledRule {
+    fn describe(&self) -> RuleDescription {
+        let mut matches = std::collections::BTreeMap::new();
+        let mut put = |key: &'static str, values: Vec<String>| {
+            if !values.is_empty() {
+                matches.insert(key, values);
             }
-        });
+        };
+        put("vendor", self.vendor.clone().unwrap_or_default());
+        put("environment", enum_labels(self.environment.as_ref()));
+        put("tool_name", glob_patterns(self.tool_name.as_ref()));
+        put(
+            "normalized_action",
+            enum_labels(self.normalized_action.as_ref()),
+        );
+        put("request_risk", enum_labels(self.request_risk.as_ref()));
+        put("resource_type", enum_labels(self.resource_type.as_ref()));
+        put("resource_id", glob_patterns(self.resource_id.as_ref()));
+        put(
+            "resource_scope",
+            self.resource_scope
+                .map(|kind| match kind {
+                    ScopeKind::Collection => vec!["collection".to_owned()],
+                    ScopeKind::Unscoped => vec!["unscoped".to_owned()],
+                })
+                .unwrap_or_default(),
+        );
+        if let Some((resource_type, globs)) = &self.constrained_by {
+            let label = serde_json::to_value(resource_type)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_default();
+            put(
+                "constrained_by",
+                globs
+                    .iter()
+                    .map(|glob| format!("{label}:{}", glob.pattern))
+                    .collect(),
+            );
+        }
+        put(
+            "upstream_authority",
+            enum_labels(self.upstream_authority.as_ref()),
+        );
+        put(
+            "method",
+            self.method
+                .as_ref()
+                .map(|methods| {
+                    methods
+                        .iter()
+                        .map(|method| method.as_str().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
+        put(
+            "canonical_path",
+            glob_patterns(self.canonical_path.as_ref()),
+        );
+        RuleDescription {
+            id: self.id.clone(),
+            effect: self.effect,
+            subjects: SubjectsDescription {
+                everyone: self.subjects.everyone,
+                groups: glob_patterns(self.subjects.groups.as_ref()),
+                subjects: glob_patterns(self.subjects.subjects.as_ref()),
+                scopes: glob_patterns(self.subjects.scopes.as_ref()),
+            },
+            matches,
+        }
     }
 }
 
 impl PolicyDecisionPoint for FilePolicy {
     fn evaluate(&self, context: &ActionContext) -> PolicyDecision {
-        let policy = self.snapshot();
+        let snapshot = self.snapshot();
+        let policy = &snapshot.document;
         if context.resource_type() == ResourceType::Unknown {
             return PolicyDecision::default_deny_under(
                 &policy.version,
@@ -846,25 +932,25 @@ impl PolicyDecisionPoint for FilePolicy {
     }
 
     fn version(&self) -> Option<String> {
-        Some(self.snapshot().version.clone())
+        Some(SignedBundle::version(self))
     }
 
     fn degraded(&self) -> Option<String> {
-        FilePolicy::degraded(self)
+        SignedBundle::degraded(self)
     }
 }
 
 impl PolicyDecisionPoint for Arc<FilePolicy> {
     fn evaluate(&self, context: &ActionContext) -> PolicyDecision {
-        FilePolicy::evaluate(self, context)
+        <FilePolicy as PolicyDecisionPoint>::evaluate(self, context)
     }
 
     fn version(&self) -> Option<String> {
-        FilePolicy::version(self)
+        <FilePolicy as PolicyDecisionPoint>::version(self)
     }
 
     fn degraded(&self) -> Option<String> {
-        FilePolicy::degraded(self)
+        <FilePolicy as PolicyDecisionPoint>::degraded(self)
     }
 }
 

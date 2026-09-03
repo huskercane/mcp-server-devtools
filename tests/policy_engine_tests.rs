@@ -160,7 +160,7 @@ async fn a_changed_document_is_picked_up_and_a_broken_one_is_ignored() {
     let allow_sre = "version: 1\nrules:\n  - id: sre\n    effect: allow\n    subjects: {groups: [SRE]}\n    match: {vendor: grafana}\n";
     std::fs::write(&path, allow_sre).unwrap();
     let policy = FilePolicy::load(&path).unwrap();
-    policy.spawn_watcher();
+    policy.spawn_watcher(None, None);
     let first_version = policy.version().unwrap();
 
     let sre = |policy: &FilePolicy| {
@@ -228,7 +228,7 @@ async fn a_vanished_policy_file_keeps_the_last_policy_and_reports_degraded_healt
     let document = "version: 7\nrules:\n  - id: sre\n    effect: allow\n    subjects: {groups: [SRE]}\n    match: {vendor: grafana}\n";
     std::fs::write(&path, document).unwrap();
     let policy = FilePolicy::load(&path).unwrap();
-    policy.spawn_watcher();
+    policy.spawn_watcher(None, None);
     let version = policy.version().unwrap();
     assert_eq!(policy.degraded(), None);
 
@@ -309,7 +309,7 @@ fn policy_check_command_reports_compiling_and_broken_documents() {
     );
     let stdout = String::from_utf8_lossy(&good.stdout);
     assert!(stdout.starts_with("OK:"), "{stdout}");
-    assert!(stdout.contains("7 rules"), "{stdout}");
+    assert!(stdout.contains("10 rules"), "{stdout}");
 
     let json = Command::new(cargo_bin("mcp-devtools"))
         .args(["policy", "check", "--json"])
@@ -318,7 +318,7 @@ fn policy_check_command_reports_compiling_and_broken_documents() {
         .unwrap();
     let parsed: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     assert_eq!(parsed["ok"], true);
-    assert_eq!(parsed["rules"], 7);
+    assert_eq!(parsed["rules"], 10);
 
     let dir = tempfile::tempdir().unwrap();
     let broken = dir.path().join("broken.yaml");

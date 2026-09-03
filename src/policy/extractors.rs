@@ -331,6 +331,202 @@ pub mod grafana {
     }
 }
 
+/// Slack purpose-built read tools (WP B.1) and the passthrough classifier
+/// for the same endpoints.
+///
+/// Slack's Web API is method-shaped: one path segment per method
+/// (`/conversations.history`), the arguments in the query string. The
+/// resource is the **channel**, named by the `channel` parameter — so the
+/// channel id is validated here the way Grafana's datasource UID is
+/// (`[A-Z0-9]{1,64}`), and a call whose channel id does not pass is not
+/// classified. `search.messages` reaches every channel the token can see
+/// and cannot be scoped by anything in the request (an `in:` modifier is a
+/// hint to Slack's ranking, not a bound), so it is an *unscoped* channel
+/// read that needs its own rule.
+pub mod slack {
+    use super::{
+        ActionDetails, CanonicalPath, HttpMethod, NormalizedAction, ResourceScope, ResourceType,
+        Retention, allowlisted_attributes,
+    };
+
+    const FLAG: Retention = Retention::Enumerated(&["true", "false"]);
+
+    const LIST_ALLOWLIST: &[(&str, Retention)] = &[
+        ("cursor", Retention::Digest),
+        ("exclude_archived", FLAG),
+        ("limit", Retention::Digest),
+        ("types", Retention::Digest),
+    ];
+    const HISTORY_ALLOWLIST: &[(&str, Retention)] = &[
+        ("cursor", Retention::Digest),
+        ("inclusive", FLAG),
+        ("latest", Retention::Digest),
+        ("limit", Retention::Digest),
+        ("oldest", Retention::Digest),
+        ("ts", Retention::Digest),
+    ];
+    const SEARCH_ALLOWLIST: &[(&str, Retention)] = &[
+        ("count", Retention::Digest),
+        ("page", Retention::Digest),
+        ("query", Retention::Digest),
+        ("sort", Retention::Enumerated(&["score", "timestamp"])),
+        ("sort_dir", Retention::Enumerated(&["asc", "desc"])),
+    ];
+
+    /// Slack ids are short and uppercase alphanumeric (`C0123ABCDEF`,
+    /// `G…`, `D…`); 64 leaves headroom without letting an unbounded string
+    /// into a query the policy has classified.
+    const MAX_ID_LEN: usize = 64;
+
+    /// Whether `id` is a well-formed Slack channel id. The single
+    /// definition shared with `controllers::slack`, so the controller
+    /// refuses exactly what the extractor declines to classify.
+    #[must_use]
+    pub fn is_valid_channel_id(id: &str) -> bool {
+        !id.is_empty()
+            && id.len() <= MAX_ID_LEN
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    }
+
+    /// Whether `ts` is a Slack message timestamp: digits, one `.`, digits.
+    #[must_use]
+    pub fn is_valid_message_ts(ts: &str) -> bool {
+        let Some((seconds, fraction)) = ts.split_once('.') else {
+            return false;
+        };
+        !seconds.is_empty()
+            && !fraction.is_empty()
+            && ts.len() <= 32
+            && seconds.bytes().all(|byte| byte.is_ascii_digit())
+            && fraction.bytes().all(|byte| byte.is_ascii_digit())
+    }
+
+    fn method_path(method: &'static str) -> CanonicalPath {
+        CanonicalPath::from_plain_segments(&[method]).unwrap_or_else(CanonicalPath::root)
+    }
+
+    /// `slack_list_channels`: the channel collection.
+    #[must_use]
+    pub fn list_channels(params: &[(&str, &str)]) -> ActionDetails {
+        ActionDetails::read(
+            NormalizedAction::ListChannels,
+            method_path("conversations.list"),
+            allowlisted_attributes(params, LIST_ALLOWLIST),
+            ResourceType::Channel,
+            ResourceScope::collection(),
+        )
+    }
+
+    /// A read of one channel (`conversations.info`, `.history`, `.replies`).
+    /// An invalid channel id is not classified: `Passthrough`/`Unknown`/
+    /// `Unscoped`, which default-deny denies, and the hostile value never
+    /// enters the record.
+    fn channel_read(
+        action: NormalizedAction,
+        method: &'static str,
+        channel: &str,
+        params: &[(&str, &str)],
+    ) -> ActionDetails {
+        if is_valid_channel_id(channel) {
+            ActionDetails::read(
+                action,
+                method_path(method),
+                allowlisted_attributes(params, HISTORY_ALLOWLIST),
+                ResourceType::Channel,
+                ResourceScope::id(channel),
+            )
+        } else {
+            ActionDetails::unclassified_with_attributes(
+                HttpMethod::Get,
+                method_path(method),
+                allowlisted_attributes(params, HISTORY_ALLOWLIST),
+            )
+        }
+    }
+
+    /// `slack_channel_info`.
+    #[must_use]
+    pub fn channel_info(channel: &str) -> ActionDetails {
+        channel_read(
+            NormalizedAction::ReadChannel,
+            "conversations.info",
+            channel,
+            &[],
+        )
+    }
+
+    /// `slack_channel_history`.
+    #[must_use]
+    pub fn channel_history(channel: &str, params: &[(&str, &str)]) -> ActionDetails {
+        channel_read(
+            NormalizedAction::ReadChannelHistory,
+            "conversations.history",
+            channel,
+            params,
+        )
+    }
+
+    /// `slack_thread_replies`.
+    #[must_use]
+    pub fn thread_replies(channel: &str, params: &[(&str, &str)]) -> ActionDetails {
+        channel_read(
+            NormalizedAction::ReadThread,
+            "conversations.replies",
+            channel,
+            params,
+        )
+    }
+
+    /// `slack_search_messages`: reaches every channel the token can see.
+    #[must_use]
+    pub fn search_messages(params: &[(&str, &str)]) -> ActionDetails {
+        ActionDetails::read(
+            NormalizedAction::SearchMessages,
+            method_path("search.messages"),
+            allowlisted_attributes(params, SEARCH_ALLOWLIST),
+            ResourceType::Channel,
+            ResourceScope::unscoped(),
+        )
+    }
+
+    /// Classify a Slack HTTP call by its canonical path and query, for the
+    /// egress chokepoint and the `slack_get` passthrough. Only the five
+    /// read methods are mapped; everything else — every `POST`, every other
+    /// method name — is `Passthrough`/`Unknown`, which default-deny denies.
+    #[must_use]
+    pub fn extract(
+        method: HttpMethod,
+        path: CanonicalPath,
+        query: &[(&str, &str)],
+    ) -> ActionDetails {
+        if method != HttpMethod::Get {
+            return ActionDetails::unclassified(method, path);
+        }
+        // `channel` names the resource, so it must name exactly one. A
+        // repeated key is two answers to "which channel?": the gateway
+        // would classify one while Slack could read the other (a last-value
+        // parser), and the tool-level and egress decisions would agree with
+        // each other but not with the request. Not classified, so denied.
+        let mut channels = query
+            .iter()
+            .filter_map(|(key, value)| (*key == "channel").then_some(*value));
+        let channel = channels.next().unwrap_or_default();
+        if channels.next().is_some() {
+            return ActionDetails::unclassified(method, path);
+        }
+        match path.as_str() {
+            "/conversations.list" => list_channels(query),
+            "/conversations.info" => channel_info(channel),
+            "/conversations.history" => channel_history(channel, query),
+            "/conversations.replies" => thread_replies(channel, query),
+            "/search.messages" => search_messages(query),
+            _ => ActionDetails::unclassified(method, path),
+        }
+    }
+}
+
 /// Jira passthrough extractor: maps `(method, path, query, body)` from the
 /// generic `jira_*` verb tools onto normalized actions.
 pub mod jira {
@@ -744,6 +940,7 @@ pub fn for_vendor(
     match vendor {
         crate::config::VENDOR_GRAFANA => grafana::extract(method, target.path().clone(), &query),
         crate::config::VENDOR_JIRA => jira::extract(method, target.path().clone(), &query, body),
+        crate::config::VENDOR_SLACK => slack::extract(method, target.path().clone(), &query),
         _ => ActionDetails::unclassified(method, target.path().clone()),
     }
 }
@@ -784,6 +981,23 @@ pub fn for_tool(
             }
             grafana::query_logs(uid, &params)
         }
+        "slack_list_channels"
+        | "slack_channel_info"
+        | "slack_channel_history"
+        | "slack_thread_replies"
+        | "slack_search_messages" => slack_tool(tool, arguments),
+        "slack_get" | "slack_post" | "slack_put" | "slack_patch" | "slack_delete" => {
+            let method = match tool {
+                "slack_get" => HttpMethod::Get,
+                "slack_post" => HttpMethod::Post,
+                "slack_put" => HttpMethod::Put,
+                "slack_patch" => HttpMethod::Patch,
+                _ => HttpMethod::Delete,
+            };
+            passthrough_details(method, arguments, |target, query, _body| {
+                slack::extract(method, target.path().clone(), query)
+            })
+        }
         "jira_get" | "jira_post" | "jira_put" | "jira_patch" | "jira_delete" => {
             let method = match tool {
                 "jira_get" => HttpMethod::Get,
@@ -797,6 +1011,100 @@ pub fn for_tool(
             })
         }
         _ => ActionDetails::unmapped_tool(declared_risk),
+    }
+}
+
+/// The Slack purpose-built tools' half of [`for_tool`], from their typed
+/// arguments (WP B.1).
+fn slack_tool(
+    tool: &str,
+    arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> ActionDetails {
+    let text = |key: &str| {
+        arguments
+            .and_then(|args| args.get(key))
+            .and_then(serde_json::Value::as_str)
+    };
+    match tool {
+        "slack_list_channels" => {
+            let limit = arguments
+                .and_then(|args| args.get("limit"))
+                .map(serde_json::Value::to_string);
+            let archived = arguments
+                .and_then(|args| args.get("excludeArchived"))
+                .and_then(serde_json::Value::as_bool)
+                .map(|flag| flag.to_string());
+            let mut params: Vec<(&str, &str)> = Vec::with_capacity(4);
+            for key in ["types", "cursor"] {
+                if let Some(value) = text(key) {
+                    params.push((key, value));
+                }
+            }
+            if let Some(limit) = limit.as_deref() {
+                params.push(("limit", limit));
+            }
+            if let Some(archived) = archived.as_deref() {
+                params.push(("exclude_archived", archived));
+            }
+            slack::list_channels(&params)
+        }
+        "slack_channel_info" => slack::channel_info(text("channelId").unwrap_or_default()),
+        "slack_channel_history" | "slack_thread_replies" => {
+            let channel = text("channelId").unwrap_or_default();
+            let limit = arguments
+                .and_then(|args| args.get("limit"))
+                .map(serde_json::Value::to_string);
+            let inclusive = arguments
+                .and_then(|args| args.get("inclusive"))
+                .and_then(serde_json::Value::as_bool)
+                .map(|flag| flag.to_string());
+            let mut params: Vec<(&str, &str)> = Vec::with_capacity(6);
+            for key in ["oldest", "latest", "cursor"] {
+                if let Some(value) = text(key) {
+                    params.push((key, value));
+                }
+            }
+            if let Some(limit) = limit.as_deref() {
+                params.push(("limit", limit));
+            }
+            if let Some(inclusive) = inclusive.as_deref() {
+                params.push(("inclusive", inclusive));
+            }
+            if tool == "slack_thread_replies" {
+                if let Some(ts) = text("threadTs") {
+                    params.push(("ts", ts));
+                }
+                slack::thread_replies(channel, &params)
+            } else {
+                slack::channel_history(channel, &params)
+            }
+        }
+        "slack_search_messages" => {
+            let count = arguments
+                .and_then(|args| args.get("count"))
+                .map(serde_json::Value::to_string);
+            let page = arguments
+                .and_then(|args| args.get("page"))
+                .map(serde_json::Value::to_string);
+            let mut params: Vec<(&str, &str)> = Vec::with_capacity(5);
+            for (key, argument) in [
+                ("query", "query"),
+                ("sort", "sort"),
+                ("sort_dir", "sortDir"),
+            ] {
+                if let Some(value) = text(argument) {
+                    params.push((key, value));
+                }
+            }
+            if let Some(count) = count.as_deref() {
+                params.push(("count", count));
+            }
+            if let Some(page) = page.as_deref() {
+                params.push(("page", page));
+            }
+            slack::search_messages(&params)
+        }
+        _ => ActionDetails::unmapped_tool(RequestRisk::Read),
     }
 }
 
@@ -1582,5 +1890,182 @@ mod tests {
         let slack = for_vendor("slack", HttpMethod::Post, &target, None);
         assert_eq!(slack.resource_type(), ResourceType::Unknown);
         assert_eq!(slack.request_risk(), RequestRisk::Write);
+    }
+}
+
+#[cfg(test)]
+mod slack_tests {
+    use pretty_assertions::assert_eq;
+
+    use super::slack;
+    use super::*;
+
+    fn target(path_and_query: &str) -> CanonicalTarget {
+        CanonicalTarget::parse(path_and_query).expect("canonical")
+    }
+
+    #[test]
+    fn channel_reads_are_scoped_to_the_channel_id_and_invalid_ids_are_unclassified() {
+        let details = slack::channel_history("C0INCIDENTS", &[("limit", "50"), ("oldest", "1")]);
+        assert_eq!(
+            details.normalized_action(),
+            NormalizedAction::ReadChannelHistory
+        );
+        assert_eq!(details.resource_type(), ResourceType::Channel);
+        assert!(
+            details
+                .resource_scope()
+                .all_ids_allowed(|id| id == "C0INCIDENTS")
+        );
+        assert_eq!(details.canonical_path(), "/conversations.history");
+        assert_eq!(details.request_risk(), RequestRisk::Read);
+        assert_eq!(
+            details
+                .query_attributes()
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["limit", "oldest"]
+        );
+        for hostile in ["c0incidents", "C0/../admin", "", "C0 INCIDENTS", "C0%2F"] {
+            let details = slack::channel_history(hostile, &[]);
+            assert_eq!(
+                details.resource_type(),
+                ResourceType::Unknown,
+                "{hostile:?}"
+            );
+            assert_eq!(details.normalized_action(), NormalizedAction::Passthrough);
+            assert!(!details.canonical_path().contains(hostile.trim()) || hostile.is_empty());
+        }
+    }
+
+    #[test]
+    fn list_is_the_collection_and_search_is_unscoped() {
+        let list =
+            slack::list_channels(&[("types", "public_channel"), ("exclude_archived", "true")]);
+        assert_eq!(list.normalized_action(), NormalizedAction::ListChannels);
+        assert!(list.resource_scope().is_collection());
+        assert_eq!(
+            list.query_attributes()[0],
+            ("exclude_archived".to_owned(), "true".to_owned())
+        );
+        let search =
+            slack::search_messages(&[("query", "outage in:#incidents"), ("sort", "TIMESTAMP")]);
+        assert_eq!(search.normalized_action(), NormalizedAction::SearchMessages);
+        assert!(search.resource_scope().is_unscoped());
+        let attributes = search.query_attributes();
+        assert!(
+            attributes[0].1.starts_with("sha256:"),
+            "query text is a digest: {attributes:?}"
+        );
+        assert_eq!(attributes[1], ("sort".to_owned(), "timestamp".to_owned()));
+    }
+
+    /// A `channel` given twice — once in the path's own query and once in
+    /// `queryParams`, or twice in either — is not classified, whichever
+    /// values it carries: the first value is what policy would judge and
+    /// the second is what a last-value parser at Slack would read.
+    #[test]
+    fn a_repeated_channel_key_is_never_classified() {
+        for (path, extra) in [
+            ("/conversations.history?channel=C0ALLOWED", Some("C0SECRET")),
+            (
+                "/conversations.history?channel=C0ALLOWED",
+                Some("C0ALLOWED"),
+            ),
+            (
+                "/conversations.info?channel=C0ALLOWED&channel=C0SECRET",
+                None,
+            ),
+            (
+                "/conversations.replies?channel=C0A&channel=C0A&ts=1.2",
+                None,
+            ),
+        ] {
+            let mut arguments = serde_json::Map::new();
+            arguments.insert(
+                "path".to_owned(),
+                serde_json::Value::String(path.to_owned()),
+            );
+            if let Some(extra) = extra {
+                arguments.insert(
+                    "queryParams".to_owned(),
+                    serde_json::json!({ "channel": extra }),
+                );
+            }
+            let via_tool = for_tool("slack_get", Some(&arguments), RequestRisk::Read);
+            assert_eq!(
+                via_tool.normalized_action(),
+                NormalizedAction::Passthrough,
+                "{path} + {extra:?}"
+            );
+            assert_eq!(via_tool.resource_type(), ResourceType::Unknown);
+            // The egress chokepoint sees the same wire query and agrees.
+            let wire = target(&match extra {
+                Some(extra) => format!("{path}&channel={extra}"),
+                None => path.to_owned(),
+            });
+            let via_egress = for_vendor(crate::config::VENDOR_SLACK, HttpMethod::Get, &wire, None);
+            assert_eq!(
+                via_egress.normalized_action(),
+                NormalizedAction::Passthrough
+            );
+        }
+        // One channel, however it arrives, still classifies.
+        let single = for_vendor(
+            crate::config::VENDOR_SLACK,
+            HttpMethod::Get,
+            &target("/conversations.history?limit=5&channel=C0ALLOWED"),
+            None,
+        );
+        assert_eq!(
+            single.normalized_action(),
+            NormalizedAction::ReadChannelHistory
+        );
+    }
+
+    #[test]
+    fn passthrough_and_purpose_built_classify_alike() {
+        let via_get = for_tool(
+            "slack_get",
+            Some(
+                serde_json::json!({ "path": "/conversations.history", "queryParams": { "channel": "C0INCIDENTS", "limit": "5" } })
+                    .as_object()
+                    .unwrap(),
+            ),
+            RequestRisk::Read,
+        );
+        let purpose_built = for_tool(
+            "slack_channel_history",
+            Some(
+                serde_json::json!({ "channelId": "C0INCIDENTS", "limit": 5 })
+                    .as_object()
+                    .unwrap(),
+            ),
+            RequestRisk::Read,
+        );
+        assert_eq!(via_get, purpose_built);
+        let egress = for_vendor(
+            crate::config::VENDOR_SLACK,
+            HttpMethod::Get,
+            &target("/conversations.history?channel=C0INCIDENTS&limit=5"),
+            None,
+        );
+        assert_eq!(egress, purpose_built);
+        // A write, an unknown method, and a POST to a read method are all unclassified.
+        for (method, path) in [
+            (HttpMethod::Post, "/chat.postMessage"),
+            (HttpMethod::Get, "/users.list"),
+            (
+                HttpMethod::Post,
+                "/conversations.history?channel=C0INCIDENTS",
+            ),
+        ] {
+            let details = for_vendor(crate::config::VENDOR_SLACK, method, &target(path), None);
+            assert_eq!(details.resource_type(), ResourceType::Unknown, "{path}");
+        }
+        assert!(slack::is_valid_message_ts("1700000000.123456"));
+        assert!(!slack::is_valid_message_ts("1700000000"));
+        assert!(!slack::is_valid_message_ts("17.00.00"));
     }
 }

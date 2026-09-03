@@ -115,6 +115,122 @@ fn http_refuses_okta_mode_without_its_configuration() {
 }
 
 /// The binary boundary of the Phase A slice: fully configured, the server
+/// Copy the Phase A fixture policy into `dir`, sign it with a fresh key,
+/// and return the copy's path and the base64 public key.
+fn signed_policy_copy(dir: &std::path::Path) -> (std::path::PathBuf, String) {
+    use mcp_server_devtools::policy::{Domain, SigningKey};
+    let source = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/policy/phase-a.yaml"
+    );
+    let bytes = std::fs::read(source).unwrap();
+    let policy_file = dir.join("policy.yaml");
+    std::fs::write(&policy_file, &bytes).unwrap();
+    let (key, _pkcs8) = SigningKey::generate().unwrap();
+    mcp_server_devtools::policy::signing::write_detached(
+        &policy_file,
+        &key.sign(Domain::PolicyBundle, &bytes),
+    )
+    .unwrap();
+    // An empty, signed revocation list next to it (WP B.4).
+    let revocations = dir.join("revocations.yaml");
+    let empty = mcp_server_devtools::auth::revocation::RevocationFile::empty()
+        .to_yaml()
+        .unwrap();
+    std::fs::write(&revocations, &empty).unwrap();
+    mcp_server_devtools::policy::signing::write_detached(
+        &revocations,
+        &key.sign(Domain::RevocationList, empty.as_bytes()),
+    )
+    .unwrap();
+    // And the gateway's own checkpoint signing key (WP B.6).
+    let (_, audit_pkcs8) = SigningKey::generate().unwrap();
+    mcp_server_devtools::policy::signing::write_key_file(
+        &dir.join("audit-signing.key"),
+        &audit_pkcs8,
+    )
+    .unwrap();
+    (policy_file, key.verifying_key().to_base64())
+}
+
+#[test]
+fn http_refuses_okta_mode_without_an_audit_signing_key() {
+    let journal = tempfile::tempdir().unwrap();
+    let (policy_file, public_key) = signed_policy_copy(journal.path());
+    let (ok, stderr) = run_to_exit(|command| {
+        command
+            .env("TRANSPORT_MODE", "http")
+            .env("MCP_AUTH_MODE", "okta")
+            .env("MCP_OKTA_ISSUER", "https://acme.okta.com/oauth2/default")
+            .env("MCP_OKTA_AUDIENCE", "api://mcp-devtools")
+            .env("MCP_PUBLIC_URL", "https://mcp.acme.example")
+            .env("MCP_POLICY_FILE", &policy_file)
+            .env("MCP_POLICY_PUBLIC_KEY", public_key)
+            .env(
+                "MCP_REVOCATION_FILE",
+                journal.path().join("revocations.yaml"),
+            )
+            .env("MCP_AUDIT_JOURNAL_DIR", journal.path());
+    });
+    assert!(!ok);
+    assert!(
+        stderr.contains("MCP_AUDIT_SIGNING_KEY"),
+        "stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("audit keygen"), "stderr:\n{stderr}");
+}
+
+#[test]
+fn http_refuses_okta_mode_without_a_revocation_list() {
+    let journal = tempfile::tempdir().unwrap();
+    let (policy_file, public_key) = signed_policy_copy(journal.path());
+    let (ok, stderr) = run_to_exit(|command| {
+        command
+            .env("TRANSPORT_MODE", "http")
+            .env("MCP_AUTH_MODE", "okta")
+            .env("MCP_OKTA_ISSUER", "https://acme.okta.com/oauth2/default")
+            .env("MCP_OKTA_AUDIENCE", "api://mcp-devtools")
+            .env("MCP_PUBLIC_URL", "https://mcp.acme.example")
+            .env("MCP_POLICY_FILE", &policy_file)
+            .env("MCP_POLICY_PUBLIC_KEY", public_key)
+            .env(
+                "MCP_AUDIT_SIGNING_KEY",
+                journal.path().join("audit-signing.key"),
+            )
+            .env("MCP_AUDIT_JOURNAL_DIR", journal.path());
+    });
+    assert!(!ok);
+    assert!(stderr.contains("MCP_REVOCATION_FILE"), "stderr:\n{stderr}");
+    assert!(stderr.contains("revoke init"), "stderr:\n{stderr}");
+}
+
+#[test]
+fn http_refuses_okta_mode_without_a_policy_public_key() {
+    let journal = tempfile::tempdir().unwrap();
+    let (ok, stderr) = run_to_exit(|command| {
+        command
+            .env("TRANSPORT_MODE", "http")
+            .env("MCP_AUTH_MODE", "okta")
+            .env("MCP_OKTA_ISSUER", "https://acme.okta.com/oauth2/default")
+            .env("MCP_OKTA_AUDIENCE", "api://mcp-devtools")
+            .env("MCP_PUBLIC_URL", "https://mcp.acme.example")
+            .env(
+                "MCP_POLICY_FILE",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/policy/phase-a.yaml"
+                ),
+            )
+            .env("MCP_AUDIT_JOURNAL_DIR", journal.path());
+    });
+    assert!(!ok);
+    assert!(
+        stderr.contains("MCP_POLICY_PUBLIC_KEY"),
+        "stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("policy keygen"), "stderr:\n{stderr}");
+}
+
 /// starts in Okta mode, challenges anonymous callers, publishes the RFC
 /// 9728 document, and accepts a token signed by the test key served from
 /// a loopback JWKS.
@@ -142,6 +258,9 @@ async fn http_starts_in_okta_mode_when_fully_configured() {
     if cfg!(windows) {
         std::fs::File::create(journal.path().join("audit-journal.jsonl")).unwrap();
     }
+    // Enterprise mode applies only signed bundles (WP B.3): sign a copy of
+    // the fixture with a throwaway key and hand the gateway the public half.
+    let (policy_file, public_key) = signed_policy_copy(journal.path());
 
     let mut command = tokio::process::Command::new(cargo_bin(BIN));
     command
@@ -153,12 +272,15 @@ async fn http_starts_in_okta_mode_when_fully_configured() {
         .env("MCP_OKTA_ISSUER", &issuer)
         .env("MCP_OKTA_AUDIENCE", "api://mcp-devtools")
         .env("MCP_PUBLIC_URL", "http://127.0.0.1:3000")
+        .env("MCP_POLICY_FILE", &policy_file)
+        .env("MCP_POLICY_PUBLIC_KEY", public_key)
         .env(
-            "MCP_POLICY_FILE",
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/policy/phase-a.yaml"
-            ),
+            "MCP_REVOCATION_FILE",
+            journal.path().join("revocations.yaml"),
+        )
+        .env(
+            "MCP_AUDIT_SIGNING_KEY",
+            journal.path().join("audit-signing.key"),
         )
         .env("MCP_AUDIT_JOURNAL_DIR", journal.path())
         .stdout(Stdio::null())

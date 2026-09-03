@@ -21,15 +21,22 @@
 //! heap allocation on every request.
 
 pub mod audit_sink;
+pub mod checkpoint_sink;
 pub mod command_runner;
 pub mod credential_broker;
 pub mod policy_decision_point;
 pub mod token_validator;
 pub mod usage_sink;
 
-pub use audit_sink::{AuditEvent, AuditEventKind, AuditFailure, AuditSink, InMemoryAuditSink};
+pub use audit_sink::{
+    AuditEvent, AuditEventKind, AuditFailure, AuditSink, ControlEvent, ControlEventKind,
+    InMemoryAuditSink, SignatureStatus,
+};
+pub use checkpoint_sink::{CheckpointSink, DirectoryCheckpointSink, InMemoryCheckpointSink};
 pub use command_runner::{CommandOutput, CommandRunner};
 pub use credential_broker::{ConfigCredentialBroker, CredentialBroker, StaticCredentialBroker};
 pub use policy_decision_point::{AllowAll, PolicyDecisionPoint};
-pub use token_validator::{StaticValidator, TokenRejection, TokenValidator};
+pub use token_validator::{
+    Authenticated, StaticValidator, TokenFacts, TokenRejection, TokenValidator,
+};
 pub use usage_sink::{BoundedUsageChannel, NoopUsageSink, UsageEvent, UsageSink};

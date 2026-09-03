@@ -65,6 +65,91 @@ impl DevtoolsServer {
         Ok(run_write_slack(self, HttpMethod::Patch, &args).await)
     }
 
+    #[doc = include_str!("descriptions/slack_list_channels.md")]
+    #[tool(annotations(
+        read_only_hint = true,
+        destructive_hint = false,
+        idempotent_hint = true,
+        open_world_hint = true,
+    ))]
+    async fn slack_list_channels(
+        &self,
+        Parameters(args): Parameters<SlackListChannelsArgs>,
+    ) -> Result<CallToolResult, RmcpError> {
+        let config = self.config();
+        Ok(purpose_built(
+            crate::controllers::slack::list_channels(&self.slack_ctx(&config), &args).await,
+        ))
+    }
+
+    #[doc = include_str!("descriptions/slack_channel_info.md")]
+    #[tool(annotations(
+        read_only_hint = true,
+        destructive_hint = false,
+        idempotent_hint = true,
+        open_world_hint = true,
+    ))]
+    async fn slack_channel_info(
+        &self,
+        Parameters(args): Parameters<SlackChannelInfoArgs>,
+    ) -> Result<CallToolResult, RmcpError> {
+        let config = self.config();
+        Ok(purpose_built(
+            crate::controllers::slack::channel_info(&self.slack_ctx(&config), &args).await,
+        ))
+    }
+
+    #[doc = include_str!("descriptions/slack_channel_history.md")]
+    #[tool(annotations(
+        read_only_hint = true,
+        destructive_hint = false,
+        idempotent_hint = true,
+        open_world_hint = true,
+    ))]
+    async fn slack_channel_history(
+        &self,
+        Parameters(args): Parameters<SlackChannelHistoryArgs>,
+    ) -> Result<CallToolResult, RmcpError> {
+        let config = self.config();
+        Ok(purpose_built(
+            crate::controllers::slack::channel_history(&self.slack_ctx(&config), &args).await,
+        ))
+    }
+
+    #[doc = include_str!("descriptions/slack_thread_replies.md")]
+    #[tool(annotations(
+        read_only_hint = true,
+        destructive_hint = false,
+        idempotent_hint = true,
+        open_world_hint = true,
+    ))]
+    async fn slack_thread_replies(
+        &self,
+        Parameters(args): Parameters<SlackThreadRepliesArgs>,
+    ) -> Result<CallToolResult, RmcpError> {
+        let config = self.config();
+        Ok(purpose_built(
+            crate::controllers::slack::thread_replies(&self.slack_ctx(&config), &args).await,
+        ))
+    }
+
+    #[doc = include_str!("descriptions/slack_search_messages.md")]
+    #[tool(annotations(
+        read_only_hint = true,
+        destructive_hint = false,
+        idempotent_hint = true,
+        open_world_hint = true,
+    ))]
+    async fn slack_search_messages(
+        &self,
+        Parameters(args): Parameters<SlackSearchMessagesArgs>,
+    ) -> Result<CallToolResult, RmcpError> {
+        let config = self.config();
+        Ok(purpose_built(
+            crate::controllers::slack::search_messages(&self.slack_ctx(&config), &args).await,
+        ))
+    }
+
     #[doc = include_str!("descriptions/slack_delete.md")]
     #[tool(annotations(
         read_only_hint = false,
@@ -77,6 +162,19 @@ impl DevtoolsServer {
         Parameters(args): Parameters<ReadArgs>,
     ) -> Result<CallToolResult, RmcpError> {
         Ok(run_read_slack(self, HttpMethod::Delete, &args).await)
+    }
+}
+
+/// Render a purpose-built read's response the way the passthrough tools do.
+fn purpose_built(
+    result: Result<crate::controllers::api::ControllerResponse, crate::error::McpError>,
+) -> CallToolResult {
+    match result {
+        Ok(resp) => {
+            let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
+            CallToolResult::success(vec![Content::text(text)])
+        }
+        Err(err) => error_to_result(&err),
     }
 }
 

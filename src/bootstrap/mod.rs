@@ -75,6 +75,11 @@ pub struct Components {
     /// compiled `MCP_POLICY_FILE` otherwise. `dyn` for the same reason as
     /// the broker: consulted twice per call on a path that does file I/O.
     pub policy: Arc<dyn PolicyDecisionPoint>,
+    /// The same policy as a file-backed bundle, when `MCP_POLICY_FILE`
+    /// supplied it: what [`DevtoolsServer::journal_startup`] journals the
+    /// `policy_loaded` record for. `None` under [`AllowAll`] or a policy the
+    /// builder was handed directly.
+    pub policy_file: Option<Arc<crate::policy::FilePolicy>>,
     /// Bound on how long an audit append may wait for durable
     /// acknowledgement before the call is refused (CF-14).
     pub audit_append_timeout: std::time::Duration,
@@ -218,11 +223,19 @@ impl ServerBuilder {
             Some(sink) => Some(sink),
             None => open_configured_journal(&config)?,
         };
-        let policy = match self.policy {
-            Some(policy) => policy,
-            None => load_configured_policy(&config)?,
-        };
         let audit_append_timeout = crate::policy::egress::audit_append_timeout(&config);
+        let (policy, policy_file): (Arc<dyn PolicyDecisionPoint>, _) = match self.policy {
+            Some(policy) => (policy, None),
+            None => {
+                match load_configured_policy(&config, audit_sink.as_ref(), audit_append_timeout)? {
+                    Some(file) => (
+                        Arc::clone(&file) as Arc<dyn PolicyDecisionPoint>,
+                        Some(file),
+                    ),
+                    None => (Arc::new(AllowAll), None),
+                }
+            }
+        };
 
         let components = Arc::new(Components {
             config: ConfigHandle::new(config),
@@ -236,6 +249,7 @@ impl ServerBuilder {
             usage_sink: self.usage_sink.unwrap_or_else(|| Arc::new(NoopUsageSink)),
             auth_required: self.auth_required,
             policy,
+            policy_file,
             audit_append_timeout,
             pending_audit: tokio_util::task::TaskTracker::new(),
         });
@@ -266,44 +280,169 @@ fn open_configured_journal(config: &Config) -> Result<Option<Arc<dyn AuditSink>>
     let Some(dir) = configured_journal_dir(config) else {
         return Ok(None);
     };
-    let sink = crate::audit::journal::JournalAuditSink::open(std::path::Path::new(dir)).map_err(
-        |error| {
-            crate::error::unexpected(
-                format!(
-                    "cannot open the durable audit journal in MCP_AUDIT_JOURNAL_DIR={dir}: \
-                     {error}; refusing to start (fail closed, plan §1.2)"
-                ),
-                None,
-            )
-        },
-    )?;
+    let checkpoints = configured_checkpoint_policy(config)?;
+    let sink =
+        crate::audit::journal::JournalAuditSink::open_with(std::path::Path::new(dir), checkpoints)
+            .map_err(|error| {
+                crate::error::unexpected(
+                    format!(
+                        "cannot open the durable audit journal in MCP_AUDIT_JOURNAL_DIR={dir}: \
+                 {error}; refusing to start (fail closed, plan §1.2)"
+                    ),
+                    None,
+                )
+            })?;
     Ok(Some(Arc::new(sink)))
 }
 
-/// Load and start watching the policy named by `MCP_POLICY_FILE`, or
-/// [`AllowAll`] when none is configured. A configured policy that does not
-/// compile is a hard startup error — enterprise mode never runs on a
-/// guess, and local mode with a broken dry-run policy should say so.
-fn load_configured_policy(config: &Config) -> Result<Arc<dyn PolicyDecisionPoint>, McpError> {
+/// The journal's checkpoint policy from configuration (WP B.6): cadence,
+/// the signing key file, and the export directory. Each is optional here;
+/// okta mode requires the signing key (`server::http`).
+///
+/// # Errors
+///
+/// When a value is malformed, the key file cannot be loaded, or the export
+/// directory cannot be created.
+pub fn configured_checkpoint_policy(
+    config: &Config,
+) -> Result<crate::audit::journal::CheckpointPolicy, McpError> {
+    use crate::audit::journal::CheckpointPolicy;
+    let mut policy = CheckpointPolicy::unsigned();
+    if let Some(value) = configured(config, CheckpointPolicy::RECORDS_KEY) {
+        policy.every_records = value
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| {
+                crate::error::unexpected(
+                    format!(
+                        "{} must be a positive integer, got {value:?}",
+                        CheckpointPolicy::RECORDS_KEY
+                    ),
+                    None,
+                )
+            })?;
+    }
+    if let Some(value) = configured(config, CheckpointPolicy::SECONDS_KEY) {
+        let seconds = value
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| {
+                crate::error::unexpected(
+                    format!(
+                        "{} must be a positive integer, got {value:?}",
+                        CheckpointPolicy::SECONDS_KEY
+                    ),
+                    None,
+                )
+            })?;
+        policy.every_seconds = std::time::Duration::from_secs(seconds);
+    }
+    if let Some(path) = configured(config, CheckpointPolicy::SIGNING_KEY_KEY) {
+        let key = crate::policy::SigningKey::load(std::path::Path::new(path)).map_err(|error| {
+            crate::error::unexpected(
+                format!(
+                    "{}: {error}; refusing to start",
+                    CheckpointPolicy::SIGNING_KEY_KEY
+                ),
+                None,
+            )
+        })?;
+        policy.signing_key = Some(key);
+    }
+    if let Some(dir) = configured(config, CheckpointPolicy::EXPORT_DIR_KEY) {
+        let sink = crate::ports::DirectoryCheckpointSink::open(std::path::Path::new(dir)).map_err(
+            |error| {
+                crate::error::unexpected(
+                    format!(
+                        "{}={dir}: {error}; refusing to start",
+                        CheckpointPolicy::EXPORT_DIR_KEY
+                    ),
+                    None,
+                )
+            },
+        )?;
+        policy.export = Some(Arc::new(sink));
+    }
+    Ok(policy)
+}
+
+/// A configured, non-blank value.
+fn configured<'a>(config: &'a Config, key: &str) -> Option<&'a str> {
+    config
+        .get(key)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// The verifying key named by `MCP_POLICY_PUBLIC_KEY`, if any. Blank counts
+/// as absent; a value that is not a key is a startup error.
+///
+/// # Errors
+///
+/// When the value is set but is not a base64 Ed25519 public key.
+pub fn configured_policy_public_key(
+    config: &Config,
+) -> Result<Option<crate::policy::VerifyingKey>, McpError> {
+    let key = crate::policy::engine::POLICY_PUBLIC_KEY_KEY;
+    config
+        .get(key)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            crate::policy::VerifyingKey::from_base64(value).map_err(|error| {
+                crate::error::unexpected(format!("{key}: {error}; refusing to start"), None)
+            })
+        })
+        .transpose()
+}
+
+/// Load and start watching the policy named by `MCP_POLICY_FILE`; `None`
+/// when none is configured (the caller uses [`AllowAll`]). A configured
+/// policy that does not compile — or, with `MCP_POLICY_PUBLIC_KEY` set, is
+/// not validly signed — is a hard startup error: enterprise mode never runs
+/// on a guess, and local mode with a broken dry-run policy should say so.
+/// With a journal, the watcher journals every later change; the policy in
+/// force is journaled by [`DevtoolsServer::journal_startup`], before the
+/// process is reachable.
+fn load_configured_policy(
+    config: &Config,
+    audit_sink: Option<&Arc<dyn AuditSink>>,
+    append_timeout: std::time::Duration,
+) -> Result<Option<Arc<crate::policy::FilePolicy>>, McpError> {
     let Some(path) = config
         .get(crate::policy::engine::POLICY_FILE_KEY)
         .map(str::trim)
         .filter(|path| !path.is_empty())
     else {
-        return Ok(Arc::new(AllowAll));
+        return Ok(None);
     };
-    let policy = crate::policy::FilePolicy::load(std::path::Path::new(path)).map_err(|error| {
+    let verifier = configured_policy_public_key(config)?;
+    let path = std::path::Path::new(path);
+    let loaded = match verifier {
+        Some(verifier) => crate::policy::FilePolicy::load_verified(path, verifier),
+        None => crate::policy::FilePolicy::load(path),
+    };
+    let policy = loaded.map_err(|error| {
         crate::error::unexpected(
             format!(
-                "cannot load the policy in {}={path}: {error}; refusing to start (fail closed, \
+                "cannot load the policy in {}={}: {error}; refusing to start (fail closed, \
                  plan §1.2)",
-                crate::policy::engine::POLICY_FILE_KEY
+                crate::policy::engine::POLICY_FILE_KEY,
+                path.display()
             ),
             None,
         )
     })?;
-    policy.spawn_watcher();
-    Ok(Arc::new(policy))
+    policy.spawn_watcher(
+        audit_sink.map(|sink| crate::policy::BundleAudit {
+            sink: Arc::clone(sink),
+            append_timeout,
+        }),
+        None,
+    );
+    Ok(Some(policy))
 }
 
 /// Dependencies for a one-shot CLI subcommand.

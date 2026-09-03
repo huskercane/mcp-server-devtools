@@ -132,6 +132,66 @@
       "principal": { "subject": "sre@acme.example", "groups": ["SRE"] },
       "call": { "tool": "slack_post_message", "arguments": { "channel": "C1", "text": "hi" }, "environment": "qa" },
       "expect": { "effect": "deny", "rule_id": null, "reason_contains": "could not be classified" }
+    },
+    {
+      "case": "Phase B: SRE reads the incident channel's history",
+      "principal": { "subject": "sre@acme.example", "groups": ["SRE"] },
+      "call": { "tool": "slack_channel_history", "arguments": { "channelId": "C0INCIDENTS", "limit": 50 }, "environment": "qa" },
+      "expect": { "effect": "allow", "rule_id": "sre-read-incident-channels" }
+    },
+    {
+      "case": "Phase B: the same read through the passthrough tool is the same decision",
+      "principal": { "subject": "sre@acme.example", "groups": ["SRE"] },
+      "call": { "tool": "slack_get", "arguments": { "path": "/conversations.history", "queryParams": { "channel": "C0INCIDENTS" } }, "environment": "qa" },
+      "expect": { "effect": "allow", "rule_id": "sre-read-incident-channels" }
+    },
+    {
+      "case": "Phase B: a thread in the incident channel is allowed by the same rule",
+      "principal": { "subject": "sre@acme.example", "groups": ["SRE"] },
+      "call": { "tool": "slack_thread_replies", "arguments": { "channelId": "C0INCIDENTS", "threadTs": "1700000000.000100" }, "environment": "qa" },
+      "expect": { "effect": "allow", "rule_id": "sre-read-incident-channels" }
+    },
+    {
+      "case": "Phase B: another channel is denied by default",
+      "principal": { "subject": "sre@acme.example", "groups": ["SRE"] },
+      "call": { "tool": "slack_channel_history", "arguments": { "channelId": "C0SECRET" }, "environment": "qa" },
+      "expect": { "effect": "deny", "rule_id": null }
+    },
+    {
+      "case": "Phase B: a malformed channel id is unclassified, whatever the group",
+      "principal": { "subject": "sre@acme.example", "groups": ["SRE"] },
+      "call": { "tool": "slack_channel_history", "arguments": { "channelId": "c0incidents/../admin" }, "environment": "qa" },
+      "expect": { "effect": "deny", "rule_id": null, "reason_contains": "could not be classified" }
+    },
+    {
+      "case": "Phase B: listing channels is the collection permission",
+      "principal": { "subject": "sre@acme.example", "groups": ["SRE"] },
+      "call": { "tool": "slack_list_channels", "arguments": { "types": "public_channel" }, "environment": "qa" },
+      "expect": { "effect": "allow", "rule_id": "sre-list-channels" }
+    },
+    {
+      "case": "Phase B: search is unscoped — SRE has no rule for it",
+      "principal": { "subject": "sre@acme.example", "groups": ["SRE"] },
+      "call": { "tool": "slack_search_messages", "arguments": { "query": "outage in:#incidents" }, "environment": "qa" },
+      "expect": { "effect": "deny", "rule_id": null }
+    },
+    {
+      "case": "Phase B: an incident commander may search",
+      "principal": { "subject": "ic@acme.example", "groups": ["IncidentCommanders"] },
+      "call": { "tool": "slack_search_messages", "arguments": { "query": "outage" }, "environment": "qa" },
+      "expect": { "effect": "allow", "rule_id": "incident-commanders-search" }
+    },
+    {
+      "case": "Phase B: a Slack write through the passthrough is unclassified",
+      "principal": { "subject": "sre@acme.example", "groups": ["SRE"] },
+      "call": { "tool": "slack_post", "arguments": { "path": "/chat.postMessage", "body": { "channel": "C0INCIDENTS", "text": "hi" } }, "environment": "qa" },
+      "expect": { "effect": "deny", "rule_id": null, "reason_contains": "could not be classified" }
+    },
+    {
+      "case": "Phase B: cross-vendor — the contractor deny wins over the SRE Slack allow in prod",
+      "principal": { "subject": "carl@contractor.example", "groups": ["SRE", "Contractors"] },
+      "call": { "tool": "slack_channel_history", "arguments": { "channelId": "C0INCIDENTS" }, "environment": "prod" },
+      "expect": { "effect": "deny", "rule_id": "contractors-never-prod" }
     }
   ]
 }

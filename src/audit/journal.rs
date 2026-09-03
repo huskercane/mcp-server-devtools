@@ -53,18 +53,38 @@
 //!   the tamper-evidence story depends on that, and it now holds without a
 //!   shared lock on the request path.
 //!
-//! Per-record signing and checkpointing remain Phase B work (B.6); this is
-//! the durability floor they will build on.
+//! ## Chain and checkpoints (WP B.6)
+//!
+//! The writer folds every line it appends into a running SHA-256
+//! ([`super::checkpoint::Chain`]) and, every [`CheckpointPolicy::every_records`]
+//! records or [`CheckpointPolicy::every_seconds`] — and when the journal is
+//! closed cleanly — appends a signed **checkpoint** record carrying the
+//! chain value over everything before it. `mcp-devtools audit verify`
+//! recomputes the chain offline and checks each checkpoint's value and
+//! signature; each checkpoint is also handed to the configured
+//! [`CheckpointSink`], whose copy is what proves the tail was not cut off.
+//! The chain is reconstructed at startup from the bytes already on disk, so
+//! it runs unbroken across restarts. A checkpoint write is a journal write:
+//! its failure poisons the journal like any other. An export failure only
+//! logs — the record is already durable here.
+//!
+//! The time-based trigger runs on a ticker thread that posts a tick into
+//! the writer's own queue; the writer thread never sleeps on a timer, so a
+//! record and a tick can never race for the file.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::ports::audit_sink::{AppendFuture, AuditEvent, AuditSink};
+use super::checkpoint::{CHECKPOINT_KIND, Chain, Checkpoint};
+use crate::policy::signing::SigningKey;
+use crate::ports::audit_sink::{AppendFuture, AuditEvent, AuditSink, ControlEvent};
+use crate::ports::checkpoint_sink::CheckpointSink;
 
 /// File name inside `MCP_AUDIT_JOURNAL_DIR`.
 pub const JOURNAL_FILE_NAME: &str = "audit-journal.jsonl";
@@ -85,10 +105,63 @@ struct WriteRequest {
     ack: oneshot::Sender<Result<u64, Arc<io::Error>>>,
 }
 
+/// What the writer's queue carries: a record, or the ticker's prompt to
+/// consider a time-based checkpoint.
+enum Message {
+    Record(WriteRequest),
+    Tick,
+}
+
+/// When the writer seals the journal with a checkpoint, and with what.
+pub struct CheckpointPolicy {
+    /// Checkpoint after this many records since the last one.
+    pub every_records: u64,
+    /// Checkpoint after this long since the last one, if any record was
+    /// written since.
+    pub every_seconds: Duration,
+    /// Signs each checkpoint. `None` writes unsigned checkpoints (the chain
+    /// still verifies); okta mode requires a key.
+    pub signing_key: Option<SigningKey>,
+    /// Where each checkpoint is copied.
+    pub export: Option<Arc<dyn CheckpointSink>>,
+}
+
+impl CheckpointPolicy {
+    /// Config key: records between checkpoints (default 256, minimum 1).
+    pub const RECORDS_KEY: &'static str = "MCP_AUDIT_CHECKPOINT_RECORDS";
+    /// Config key: seconds between checkpoints (default 60, minimum 1).
+    pub const SECONDS_KEY: &'static str = "MCP_AUDIT_CHECKPOINT_SECONDS";
+    /// Config key: path of the Ed25519 PKCS#8 key that signs checkpoints.
+    pub const SIGNING_KEY_KEY: &'static str = "MCP_AUDIT_SIGNING_KEY";
+    /// Config key: directory each checkpoint is copied to.
+    pub const EXPORT_DIR_KEY: &'static str = "MCP_AUDIT_CHECKPOINT_EXPORT_DIR";
+
+    pub const DEFAULT_EVERY_RECORDS: u64 = 256;
+    pub const DEFAULT_EVERY_SECONDS: Duration = Duration::from_mins(1);
+
+    /// The defaults with no key and no export: what tests and local dry
+    /// runs get.
+    #[must_use]
+    pub fn unsigned() -> Self {
+        Self {
+            every_records: Self::DEFAULT_EVERY_RECORDS,
+            every_seconds: Self::DEFAULT_EVERY_SECONDS,
+            signing_key: None,
+            export: None,
+        }
+    }
+}
+
+impl Default for CheckpointPolicy {
+    fn default() -> Self {
+        Self::unsigned()
+    }
+}
+
 /// Append-only, sequence-numbered journal.
 pub struct JournalAuditSink {
     /// `None` only while [`Drop`] is closing the channel.
-    requests: Option<mpsc::Sender<WriteRequest>>,
+    requests: Option<mpsc::Sender<Message>>,
     writer: Option<std::thread::JoinHandle<()>>,
     path: PathBuf,
     /// Set by the writer on the first failed write or sync. Read by
@@ -107,6 +180,15 @@ impl JournalAuditSink {
     /// validate its existing contents. Callers treat this as a startup
     /// failure — there is no degraded mode.
     pub fn open(dir: &Path) -> io::Result<Self> {
+        Self::open_with(dir, CheckpointPolicy::unsigned())
+    }
+
+    /// [`Self::open`] with an explicit [`CheckpointPolicy`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::open`].
+    pub fn open_with(dir: &Path, checkpoints: CheckpointPolicy) -> io::Result<Self> {
         // On a platform with no directory fsync there is no way to make a
         // *newly created* directory entry durable, so the honest posture is
         // to require the operator to create it in advance rather than to
@@ -219,14 +301,31 @@ impl JournalAuditSink {
             Err(std::fs::TryLockError::Error(error)) => return Err(error),
         }
 
-        let last_seq = recover(&file, &path)?;
+        let recovered = recover(&file, &path)?;
 
         let (requests, receiver) = mpsc::channel(WRITE_QUEUE_DEPTH);
         let poisoned = Arc::new(AtomicBool::new(false));
         let poison_flag = Arc::clone(&poisoned);
+        let ticker_interval = checkpoints.every_seconds;
         let writer = std::thread::Builder::new()
             .name("audit-journal".to_owned())
-            .spawn(move || writer_loop(file, last_seq, receiver, &poison_flag))?;
+            .spawn(move || writer_loop(file, recovered, receiver, &poison_flag, checkpoints))?;
+        // The ticker holds only a weak sender: it cannot keep the channel
+        // open past the sink's drop, and it exits when the upgrade fails.
+        let weak = requests.downgrade();
+        std::thread::Builder::new()
+            .name("audit-journal-ticker".to_owned())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(ticker_interval);
+                    let Some(sender) = weak.upgrade() else {
+                        return;
+                    };
+                    if sender.blocking_send(Message::Tick).is_err() {
+                        return;
+                    }
+                }
+            })?;
 
         Ok(Self {
             requests: Some(requests),
@@ -242,7 +341,7 @@ impl JournalAuditSink {
         &self.path
     }
 
-    fn sender(&self) -> io::Result<&mpsc::Sender<WriteRequest>> {
+    fn sender(&self) -> io::Result<&mpsc::Sender<Message>> {
         self.requests
             .as_ref()
             .ok_or_else(|| io::Error::other("audit journal is shutting down"))
@@ -261,10 +360,14 @@ impl Drop for JournalAuditSink {
     }
 }
 
-impl AuditSink for JournalAuditSink {
-    fn append<'a>(&'a self, event: &'a AuditEvent) -> AppendFuture<'a> {
+impl JournalAuditSink {
+    /// Hand a serialized record to the writer and wait for its durable
+    /// acknowledgement. Shared by every record kind: the journal does not
+    /// care what a record says, only that it is a JSON object it can
+    /// stamp a sequence number into.
+    fn enqueue(&self, serialized: serde_json::Result<Vec<u8>>) -> AppendFuture<'_> {
         Box::pin(async move {
-            let body = serde_json::to_vec(event)
+            let body = serialized
                 .map_err(|error| io::Error::other(format!("serialize audit event: {error}")))?;
             if body.len() < 3 || body.first() != Some(&b'{') {
                 return Err(io::Error::other(
@@ -274,7 +377,7 @@ impl AuditSink for JournalAuditSink {
 
             let (ack, acked) = oneshot::channel();
             self.sender()?
-                .send(WriteRequest { body, ack })
+                .send(Message::Record(WriteRequest { body, ack }))
                 .await
                 .map_err(|_| io::Error::other("the audit journal writer has stopped"))?;
 
@@ -289,30 +392,77 @@ impl AuditSink for JournalAuditSink {
             }
         })
     }
+}
+
+impl AuditSink for JournalAuditSink {
+    fn append<'a>(&'a self, event: &'a AuditEvent) -> AppendFuture<'a> {
+        self.enqueue(serde_json::to_vec(event))
+    }
+
+    fn append_control<'a>(&'a self, event: &'a ControlEvent) -> AppendFuture<'a> {
+        self.enqueue(serde_json::to_vec(event))
+    }
 
     fn is_available(&self) -> bool {
         self.requests.is_some() && !self.poisoned.load(Ordering::Acquire)
     }
 }
 
+/// What recovery establishes about the journal on disk.
+struct Recovered {
+    last_seq: u64,
+    chain: Chain,
+    /// Sequence of the last checkpoint record, if any.
+    last_checkpoint: Option<u64>,
+    /// Records written after the last checkpoint.
+    since_checkpoint: u64,
+}
+
 /// The writer thread: the only place a sequence number is assigned and the
 /// only place the file is touched after `open`.
+#[allow(clippy::needless_pass_by_value)] // the thread owns the policy for its lifetime
 fn writer_loop(
     mut file: File,
-    mut last_seq: u64,
-    mut receiver: mpsc::Receiver<WriteRequest>,
+    recovered: Recovered,
+    mut receiver: mpsc::Receiver<Message>,
     poisoned: &AtomicBool,
+    checkpoints: CheckpointPolicy,
 ) {
     let mut batch: Vec<WriteRequest> = Vec::with_capacity(MAX_BATCH);
     let mut buffer: Vec<u8> = Vec::new();
+    // Line boundaries within `buffer`, so the chain can fold each line
+    // separately. Reused across batches like `buffer` (allocation gate).
+    let mut boundaries: Vec<usize> = Vec::with_capacity(MAX_BATCH);
     // Set by the first failed write or sync; every later record is refused.
     let mut poison: Option<Arc<io::Error>> = None;
+    let mut state = WriterState {
+        last_seq: recovered.last_seq,
+        chain: recovered.chain,
+        last_checkpoint: recovered.last_checkpoint,
+        since_checkpoint: recovered.since_checkpoint,
+        last_checkpoint_at: Instant::now(),
+    };
 
-    while let Some(first) = receiver.blocking_recv() {
-        batch.push(first);
+    while let Some(message) = receiver.blocking_recv() {
+        match message {
+            Message::Tick => {
+                if poison.is_none()
+                    && state.since_checkpoint > 0
+                    && state.last_checkpoint_at.elapsed() >= checkpoints.every_seconds
+                    && let Err(error) = state.checkpoint(&mut file, &checkpoints)
+                {
+                    fail_batch(&mut batch, &mut poison, poisoned, &error);
+                }
+                continue;
+            }
+            Message::Record(first) => batch.push(first),
+        }
         while batch.len() < MAX_BATCH {
             match receiver.try_recv() {
-                Ok(next) => batch.push(next),
+                Ok(Message::Record(next)) => batch.push(next),
+                // A tick drained here is answered by the threshold check
+                // below, which runs after every batch anyway.
+                Ok(Message::Tick) => {}
                 Err(_) => break,
             }
         }
@@ -325,9 +475,10 @@ fn writer_loop(
         }
 
         buffer.clear();
+        boundaries.clear();
         // Checked throughout: at `u64::MAX` an unchecked increment would
         // wrap and start re-issuing numbers that are already on disk.
-        let Some(mut seq) = last_seq.checked_add(1) else {
+        let Some(mut seq) = state.last_seq.checked_add(1) else {
             fail_batch(&mut batch, &mut poison, poisoned, &sequence_exhausted());
             continue;
         };
@@ -340,6 +491,7 @@ fn writer_loop(
             buffer.push(b',');
             buffer.extend_from_slice(&request.body[1..]);
             buffer.push(b'\n');
+            boundaries.push(buffer.len());
             let Some(next) = seq.checked_add(1) else {
                 exhausted = true;
                 break;
@@ -355,15 +507,35 @@ fn writer_loop(
 
         match result {
             Ok(()) => {
+                let mut start = 0usize;
+                for end in &boundaries {
+                    state.chain.extend(&buffer[start..*end]);
+                    start = *end;
+                }
                 let mut acked = first_seq;
                 for request in batch.drain(..) {
                     let _ = request.ack.send(Ok(acked));
                     acked += 1;
                 }
-                last_seq = acked - 1;
+                state.last_seq = acked - 1;
+                state.since_checkpoint += boundaries.len() as u64;
+                if state.since_checkpoint >= checkpoints.every_records
+                    && let Err(error) = state.checkpoint(&mut file, &checkpoints)
+                {
+                    fail_batch(&mut batch, &mut poison, poisoned, &error);
+                }
             }
             Err(error) => fail_batch(&mut batch, &mut poison, poisoned, &error),
         }
+    }
+
+    // Seal the tail on a clean close, so nothing written in this run is
+    // left uncovered by a checkpoint.
+    if poison.is_none()
+        && state.since_checkpoint > 0
+        && let Err(error) = state.checkpoint(&mut file, &checkpoints)
+    {
+        tracing::error!(error = %error, "final audit checkpoint failed");
     }
 
     // Release the exclusive lock explicitly, before the thread exits and
@@ -373,6 +545,60 @@ fn writer_loop(
     // the sink is dropped, and it keeps holding if some future refactor
     // duplicates the descriptor.
     let _ = file.unlock();
+}
+
+/// The writer's view of where the journal stands.
+struct WriterState {
+    last_seq: u64,
+    chain: Chain,
+    last_checkpoint: Option<u64>,
+    since_checkpoint: u64,
+    last_checkpoint_at: Instant,
+}
+
+impl WriterState {
+    /// Append a checkpoint over everything written so far, as its own
+    /// write and sync, then hand it to the export sink.
+    fn checkpoint(&mut self, file: &mut File, policy: &CheckpointPolicy) -> io::Result<()> {
+        let seq = self
+            .last_seq
+            .checked_add(1)
+            .ok_or_else(sequence_exhausted)?;
+        let covers_from = self.last_checkpoint.map_or(1, |previous| previous + 1);
+        let mut checkpoint = Checkpoint::new(
+            seq,
+            covers_from,
+            &self.chain,
+            self.last_checkpoint,
+            crate::logger::iso_timestamp(),
+        );
+        if let Some(key) = &policy.signing_key {
+            checkpoint.sign(seq, key);
+        }
+        let body = serde_json::to_vec(&checkpoint)
+            .map_err(|error| io::Error::other(format!("serialize checkpoint: {error}")))?;
+        let mut line = Vec::with_capacity(body.len() + 32);
+        line.extend_from_slice(b"{\"seq\":");
+        let mut digits = [0u8; MAX_U64_DIGITS];
+        line.extend_from_slice(render_u64(&mut digits, seq));
+        line.push(b',');
+        line.extend_from_slice(&body[1..]);
+        line.push(b'\n');
+        write_batch(file, &line)?;
+        self.chain.extend(&line);
+        self.last_seq = seq;
+        self.last_checkpoint = Some(seq);
+        self.since_checkpoint = 0;
+        self.last_checkpoint_at = Instant::now();
+        if let Some(export) = &policy.export
+            && let Err(error) = export.export(seq, &line)
+        {
+            // The checkpoint is durable in the journal; the copy is what
+            // failed. Loud, but not a reason to refuse tool calls.
+            tracing::error!(seq, error = %error, "audit checkpoint export failed");
+        }
+        Ok(())
+    }
 }
 
 /// Poison the journal and refuse every record in the current batch. After a
@@ -489,11 +715,14 @@ fn render_u64(buffer: &mut [u8; MAX_U64_DIGITS], mut value: u64) -> &[u8] {
 /// next append landed directly after the torn bytes, so *that* record became
 /// unparseable too, and the restart after it re-issued the same sequence
 /// number. One lost record plus one duplicate, from one torn write.
-fn recover(file: &File, path: &Path) -> io::Result<u64> {
+fn recover(file: &File, path: &Path) -> io::Result<Recovered> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut line = Vec::new();
     let mut complete_len: u64 = 0;
     let mut expected: u64 = 1;
+    let mut chain = Chain::genesis();
+    let mut last_checkpoint: Option<u64> = None;
+    let mut since_checkpoint: u64 = 0;
 
     loop {
         line.clear();
@@ -525,7 +754,7 @@ fn recover(file: &File, path: &Path) -> io::Result<u64> {
             break;
         }
 
-        let seq = parse_seq(&line[..read - 1]).ok_or_else(|| {
+        let (seq, is_checkpoint) = parse_seq(&line[..read - 1]).ok_or_else(|| {
             corrupt(
                 path,
                 expected,
@@ -539,6 +768,13 @@ fn recover(file: &File, path: &Path) -> io::Result<u64> {
                 &format!("out-of-order or duplicated sequence {seq}"),
             ));
         }
+        chain.extend(&line);
+        if is_checkpoint {
+            last_checkpoint = Some(seq);
+            since_checkpoint = 0;
+        } else {
+            since_checkpoint += 1;
+        }
         expected = expected
             .checked_add(1)
             .ok_or_else(|| corrupt(path, expected, "sequence space exhausted"))?;
@@ -546,12 +782,21 @@ fn recover(file: &File, path: &Path) -> io::Result<u64> {
             .map_err(|_| corrupt(path, expected, "record length does not fit a u64"))?;
     }
 
-    Ok(expected - 1)
+    Ok(Recovered {
+        last_seq: expected - 1,
+        chain,
+        last_checkpoint,
+        since_checkpoint,
+    })
 }
 
-fn parse_seq(line: &[u8]) -> Option<u64> {
+/// The record's sequence and whether it is a checkpoint.
+fn parse_seq(line: &[u8]) -> Option<(u64, bool)> {
     let value: serde_json::Value = serde_json::from_slice(line).ok()?;
-    value.get("seq")?.as_u64()
+    let seq = value.get("seq")?.as_u64()?;
+    let is_checkpoint =
+        value.get("kind").and_then(serde_json::Value::as_str) == Some(CHECKPOINT_KIND);
+    Some((seq, is_checkpoint))
 }
 
 fn corrupt(path: &Path, at: u64, detail: &str) -> io::Error {
@@ -666,13 +911,16 @@ mod tests {
             sink.append(&sample_event()).await.unwrap();
             sink.append(&sample_event()).await.unwrap();
         }
+        // The clean close sealed the two records with checkpoint 3.
         let reopened = JournalAuditSink::open(dir.path()).unwrap();
         assert_eq!(
             reopened.append(&sample_event()).await.unwrap(),
-            3,
+            4,
             "restart must continue the sequence, not restart it"
         );
-        assert_eq!(journal_lines(reopened.path()).len(), 3);
+        let lines = journal_lines(reopened.path());
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[2]["kind"], "checkpoint");
     }
 
     /// The regression: a torn trailing write must be repaired, not appended
@@ -686,31 +934,33 @@ mod tests {
             let sink = JournalAuditSink::open(dir.path()).unwrap();
             sink.append(&sample_event()).await.unwrap();
         }
+        // On disk: record 1, and the checkpoint (2) the clean close wrote.
         let path = dir.path().join(JOURNAL_FILE_NAME);
         let mut contents = std::fs::read(&path).unwrap();
-        contents.extend_from_slice(b"{\"seq\":2,\"kind\":\"tool_call_int");
+        contents.extend_from_slice(b"{\"seq\":3,\"kind\":\"tool_call_int");
         std::fs::write(&path, contents).unwrap();
 
         {
             let reopened = JournalAuditSink::open(dir.path()).unwrap();
-            assert_eq!(reopened.append(&sample_event()).await.unwrap(), 2);
+            assert_eq!(reopened.append(&sample_event()).await.unwrap(), 3);
             let lines = journal_lines(&path);
-            assert_eq!(lines.len(), 2, "the torn bytes are gone");
-            assert_eq!(lines[1]["seq"], 2);
+            assert_eq!(lines.len(), 3, "the torn bytes are gone");
+            assert_eq!(lines[2]["seq"], 3);
         }
 
         // And the sequence is not re-issued on the *next* restart either,
-        // which is what the old behaviour got wrong.
+        // which is what the old behaviour got wrong (the close above sealed
+        // record 3 with checkpoint 4).
         let again = JournalAuditSink::open(dir.path()).unwrap();
-        assert_eq!(again.append(&sample_event()).await.unwrap(), 3);
+        assert_eq!(again.append(&sample_event()).await.unwrap(), 5);
         let lines = journal_lines(&path);
-        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.len(), 5);
         assert_eq!(
             lines
                 .iter()
                 .map(|line| line["seq"].as_u64())
                 .collect::<Vec<_>>(),
-            vec![Some(1), Some(2), Some(3)]
+            vec![Some(1), Some(2), Some(3), Some(4), Some(5)]
         );
     }
 
@@ -804,13 +1054,13 @@ mod tests {
         let sink = JournalAuditSink::open(&nested).unwrap();
         assert_eq!(sink.append(&sample_event()).await.unwrap(), 1);
         assert!(nested.join(JOURNAL_FILE_NAME).is_file());
-        drop(sink);
+        drop(sink); // seals with checkpoint 2
 
         // Reopening an existing tree creates nothing and still syncs — the
         // retry hole was skipping the sync whenever the file already
         // existed, which made a failed first sync permanent.
         let reopened = JournalAuditSink::open(&nested).unwrap();
-        assert_eq!(reopened.append(&sample_event()).await.unwrap(), 2);
+        assert_eq!(reopened.append(&sample_event()).await.unwrap(), 3);
     }
 
     /// The counterpart of `creating_a_nested_journal_directory_syncs_every_new_entry`

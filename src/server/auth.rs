@@ -15,6 +15,15 @@
 //! | Token rejected by the validator | 401 | `… error="invalid_token", error_description="<category>"` |
 //! | Validator has no signing keys | 503 | — (the token may be fine) |
 //! | Token valid but lacks the required scope | 403 | `… error="insufficient_scope", scope="<required>"` |
+//! | Token valid but revoked (WP B.4) | 401 | `… error="invalid_token", error_description="revoked"` |
+//!
+//! The revocation check runs **after** validation and regardless of the
+//! validated-token cache, so a revocation takes effect at the next request
+//! once the list has been reloaded; each refusal is a `revoked_token_rejected`
+//! control record in the audit journal (bounded append, category-only
+//! logging). The [`Principal`](crate::policy::Principal) and the
+//! [`TokenFacts`] go into the request extensions together, so `call_tool`
+//! can apply the fresh-token rule for writes (§3.6).
 //!
 //! `resource_metadata` points at `/.well-known/oauth-protected-resource` on
 //! the configured public URL, as RFC 9728 §5.1 specifies, so an MCP client
@@ -34,7 +43,11 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use tracing::warn;
 
-use crate::ports::{TokenRejection, TokenValidator};
+use crate::auth::revocation::{RevocationList, RevocationReason};
+use crate::policy::BundleAudit;
+use crate::policy::bundle::BundleDocument as _;
+use crate::ports::audit_sink::{AuditFailure, ControlEvent, ControlEventKind};
+use crate::ports::{Authenticated, TokenRejection, TokenValidator};
 
 /// RFC 9728 well-known path.
 pub const PROTECTED_RESOURCE_METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
@@ -120,10 +133,13 @@ impl InboundAuthSettings {
     }
 }
 
-/// The middleware's state: a validator and the settings.
+/// The middleware's state: a validator, the settings, and — in enterprise
+/// mode — the revocation list and where to journal refusals.
 pub struct InboundAuth {
     validator: Arc<dyn TokenValidator>,
     settings: InboundAuthSettings,
+    revocations: Option<Arc<RevocationList>>,
+    audit: Option<BundleAudit>,
 }
 
 impl InboundAuth {
@@ -132,12 +148,97 @@ impl InboundAuth {
         Self {
             validator,
             settings,
+            revocations: None,
+            audit: None,
         }
+    }
+
+    /// Enforce `list` after validation (WP B.4).
+    #[must_use]
+    pub fn with_revocations(mut self, list: Arc<RevocationList>) -> Self {
+        self.revocations = Some(list);
+        self
+    }
+
+    /// Journal revoked-token refusals (and, through the list's watcher,
+    /// revocation-list changes) to `audit`.
+    #[must_use]
+    pub fn with_audit(mut self, audit: BundleAudit) -> Self {
+        self.audit = Some(audit);
+        self
     }
 
     #[must_use]
     pub fn settings(&self) -> &InboundAuthSettings {
         &self.settings
+    }
+
+    #[must_use]
+    pub fn validator(&self) -> &Arc<dyn TokenValidator> {
+        &self.validator
+    }
+
+    #[must_use]
+    pub fn revocations(&self) -> Option<&Arc<RevocationList>> {
+        self.revocations.as_ref()
+    }
+
+    #[must_use]
+    pub fn audit(&self) -> Option<&BundleAudit> {
+        self.audit.as_ref()
+    }
+
+    /// Append the `revocation_loaded` record for the list in force (WP
+    /// B.4), before the port is bound. A no-op without a list or a journal.
+    ///
+    /// # Errors
+    ///
+    /// When the record could not be made durable: the server must not
+    /// start, for the same reason as [`crate::tools::DevtoolsServer::journal_startup`].
+    pub async fn journal_startup(&self) -> std::io::Result<()> {
+        let (Some(list), Some(audit)) = (&self.revocations, &self.audit) else {
+            return Ok(());
+        };
+        list.journal_in_force(audit).await.map(drop)
+    }
+
+    /// Whether the revocation list refuses `authenticated`, and why.
+    fn revocation(&self, authenticated: &Authenticated) -> Option<(RevocationReason, String)> {
+        let list = self.revocations.as_ref()?;
+        let snapshot = list.snapshot();
+        snapshot
+            .document
+            .check(authenticated)
+            .map(|reason| (reason, snapshot.document.version().to_owned()))
+    }
+
+    /// Journal a refused revoked token. The refusal happens either way;
+    /// the record not being durable is loud but changes nothing.
+    async fn journal_revoked(
+        &self,
+        authenticated: &Authenticated,
+        reason: RevocationReason,
+        list_version: String,
+    ) {
+        let Some(audit) = &self.audit else {
+            return;
+        };
+        let mut event =
+            ControlEvent::now(ControlEventKind::RevokedTokenRejected).with_reason(reason.as_str());
+        event.principal = Some(authenticated.principal.clone());
+        event.version = Some(list_version);
+        if let Err(error) = crate::policy::egress::append_control_bounded(
+            audit.sink.as_ref(),
+            &event,
+            audit.append_timeout,
+        )
+        .await
+        {
+            tracing::error!(
+                failure = %AuditFailure::classify(&error),
+                "failed to journal a revoked-token refusal"
+            );
+        }
     }
 
     /// The RFC 9728 document, as JSON.
@@ -195,8 +296,8 @@ pub async fn require_bearer(
         );
     };
 
-    let principal = match auth.validator.validate(token).await {
-        Ok(principal) => principal,
+    let authenticated = match auth.validator.authenticate(token).await {
+        Ok(authenticated) => authenticated,
         Err(rejection) if rejection.is_server_side() => {
             warn!(rejection = %rejection, "cannot validate bearer tokens; refusing (503)");
             return (
@@ -221,6 +322,28 @@ pub async fn require_bearer(
         }
     };
 
+    // WP B.4: the list is consulted on every request, cached validation or
+    // not, so revocation does not wait for a cache miss.
+    if let Some((reason, list_version)) = auth.revocation(&authenticated) {
+        warn!(
+            rejection = "revoked",
+            revoked_by = reason.as_str(),
+            "rejected a revoked bearer token"
+        );
+        auth.journal_revoked(&authenticated, reason, list_version)
+            .await;
+        return auth.challenge(
+            StatusCode::UNAUTHORIZED,
+            Some(("invalid_token", TokenRejection::Revoked)),
+            "invalid_token",
+            "the token has been revoked",
+        );
+    }
+
+    let Authenticated {
+        principal,
+        token: facts,
+    } = authenticated;
     if !principal
         .scopes
         .iter()
@@ -237,6 +360,7 @@ pub async fn require_bearer(
     }
 
     request.extensions_mut().insert(principal);
+    request.extensions_mut().insert(facts);
     next.run(request).await
 }
 
@@ -315,6 +439,7 @@ fn rejection_description(rejection: &TokenRejection) -> &'static str {
         TokenRejection::UnsupportedAlgorithm => "the token uses an unsupported algorithm",
         TokenRejection::InvalidSignature => "the token signature did not verify",
         TokenRejection::MissingClaim(_) => "the token is missing a required claim",
+        TokenRejection::Revoked => "the token has been revoked",
         _ => "the token was not accepted",
     }
 }

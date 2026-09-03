@@ -361,6 +361,167 @@ pub struct GrafanaListDatasourcesArgs {
     pub output_format: Option<OutputFormatArg>,
 }
 
+/// Arguments for `slack_list_channels` (WP B.1).
+///
+/// Lists the channels the token can see so the caller can find a channel id
+/// for the other Slack read tools.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SlackListChannelsArgs {
+    /// Comma-separated channel kinds: `public_channel` (default),
+    /// `private_channel`, `mpim`, `im`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub types: Option<String>,
+
+    /// Omit archived channels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_archived: Option<bool>,
+
+    /// Page size (Slack caps at 1000). Keep this small to reduce token costs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+
+    /// `response_metadata.next_cursor` from the previous page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+
+    /// JMESPath expression to filter/transform the response. Example to find
+    /// a channel by name: `channels[?name=='incidents'].{id: id, name: name}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `slack_channel_info`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SlackChannelInfoArgs {
+    /// The channel id, e.g. `C0123ABCDEF`. Find it with `slack_list_channels`.
+    pub channel_id: String,
+
+    /// JMESPath expression to filter/transform the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `slack_channel_history`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SlackChannelHistoryArgs {
+    /// The channel id, e.g. `C0123ABCDEF`. Find it with `slack_list_channels`.
+    pub channel_id: String,
+
+    /// Only messages after this Unix timestamp (seconds; decimals allowed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest: Option<String>,
+
+    /// Only messages before this Unix timestamp (seconds; decimals allowed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
+
+    /// Include messages exactly at `oldest` / `latest`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inclusive: Option<bool>,
+
+    /// Page size (Slack caps at 999). Keep this small to reduce token costs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+
+    /// `response_metadata.next_cursor` from the previous page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+
+    /// JMESPath expression to filter/transform the response. Example:
+    /// `messages[*].{ts: ts, user: user, text: text}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `slack_thread_replies`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SlackThreadRepliesArgs {
+    /// The channel id, e.g. `C0123ABCDEF`.
+    pub channel_id: String,
+
+    /// The parent message's `ts` (the `thread_ts` on a reply), e.g.
+    /// `1700000000.123456`.
+    pub thread_ts: String,
+
+    /// Only replies after this Unix timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest: Option<String>,
+
+    /// Only replies before this Unix timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
+
+    /// Include replies exactly at `oldest` / `latest`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inclusive: Option<bool>,
+
+    /// Page size (Slack caps at 999).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+
+    /// `response_metadata.next_cursor` from the previous page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+
+    /// JMESPath expression to filter/transform the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `slack_search_messages`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SlackSearchMessagesArgs {
+    /// The search expression, with Slack modifiers (`in:#incidents`,
+    /// `from:@alice`, `after:2026-09-01`, quoted phrases).
+    pub query: String,
+
+    /// Results per page (max 100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u16>,
+
+    /// Page number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u16>,
+
+    /// `score` (default) or `timestamp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<String>,
+
+    /// `asc` or `desc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_dir: Option<String>,
+
+    /// JMESPath expression to filter/transform the response. Example:
+    /// `messages.matches[*].{channel: channel.name, ts: ts, text: text}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
 /// Arguments for `sonarqube_quality_gate`.
 ///
 /// Reports the failing quality-gate conditions for a Sonar analysis — the "why

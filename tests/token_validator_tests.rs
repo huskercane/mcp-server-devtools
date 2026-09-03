@@ -140,6 +140,11 @@ async fn the_negative_matrix() {
     expired["exp"] = json!(now - 600);
     let mut not_yet = base_claims();
     not_yet["nbf"] = json!(now + 600);
+    // A correctly signed token whose issue time is in the future would
+    // outrun every `revoke all` cut-off and count as freshly minted for
+    // writes; it is refused before anything is cached.
+    let mut issued_in_future = base_claims();
+    issued_in_future["iat"] = json!(now + 600);
     let mut wrong_iss = base_claims();
     wrong_iss["iss"] = json!("https://evil.okta.com/oauth2/default");
     let mut wrong_aud = base_claims();
@@ -187,6 +192,11 @@ async fn the_negative_matrix() {
     let rows: Vec<(&str, String, TokenRejection)> = vec![
         ("expired", sign(&expired), TokenRejection::Expired),
         ("not yet valid", sign(&not_yet), TokenRejection::NotYetValid),
+        (
+            "issued in the future",
+            sign(&issued_in_future),
+            TokenRejection::NotYetValid,
+        ),
         (
             "wrong issuer",
             sign(&wrong_iss),
@@ -266,6 +276,11 @@ async fn the_negative_matrix() {
 
     // And the matrix did not poison the valid path.
     assert!(validator.validate(&valid).await.is_ok());
+    // An `iat` inside the configured skew (60 s here) is clock drift, not
+    // a forgery, and is accepted.
+    let mut within_skew = base_claims();
+    within_skew["iat"] = json!(now + 30);
+    assert!(validator.validate(&sign(&within_skew)).await.is_ok());
 }
 
 #[tokio::test]

@@ -55,6 +55,7 @@ spec:
             - { name: tmp, mountPath: /tmp }
             - { name: journal, mountPath: /journal }
             - { name: policy, mountPath: /policy, readOnly: true }
+            - { name: audit-signing-key, mountPath: /keys, readOnly: true }
           readinessProbe:
             exec: { command: ["/mcp-devtools", "health"] }
             periodSeconds: 10
@@ -73,6 +74,13 @@ spec:
           persistentVolumeClaim: { claimName: mcp-devtools-journal }
         - name: policy
           configMap: { name: mcp-devtools-policy }
+        - name: audit-signing-key
+          # With `fsGroup` set above, Kubernetes projects this file as
+          # root:65532 mode 0440 (the defaultMode ORed with group read), which
+          # is what the gateway accepts: owner or group readable, nothing
+          # wider, never group-writable. Do not add subPath (it freezes the
+          # projection) or a wider defaultMode (the gateway refuses it).
+          secret: { secretName: mcp-devtools-audit-signing-key, defaultMode: 0400 }
 ---
 apiVersion: v1
 kind: Service

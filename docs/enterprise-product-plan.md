@@ -31,6 +31,9 @@ ordered by partner demand and are not scheduled until Gate B passes.
 | 2.5 | 2026-09-02 | Phase A engineering landed on `feat/phase-a-secure-remote-slice`: A.1–A.10 as one reviewed commit per WP (`TokenValidator` + Okta JWKS + `StaticValidator`; bearer middleware and RFC 9728 metadata; artifact ownership, session binding, principal-partitioned cache; §3.5 canonicalization with a fuzz target; `PolicyDecisionPoint` + `AllowAll` + file policy with tool-level and egress enforcement and `policy check`; Grafana vertical slice; container + `--role` + ingress examples; the A.10 test set). §3.2 frozen with `constrained_by` (CF-2). Two §3.5 deviations documented in `policy::canonical` (`%2F` kept; trailing slash kept once). Egress *allows* are not journaled separately (the intent's decision plus the outcome record already prove them); egress *denials* are. CF-14 decided: bounded append refuses on timeout; intent = requested-and-authorized, outcome = dispatched. Gate A itself (partner, real IdP, real ingress) is owner-led and not started | Implementation |
 | 2.6 | 2026-09-02 | Independent review of the Phase A branch, answered in code and in the register: SonarQube `ce/task` and CircleCI build-details requests now pass the egress chokepoint; the outcome append is cancellation-safe and lists every egress decision (the "allows are not journaled separately" reading of rev 2.5 was too weak for multi-request tools); JWKS read is bounded while streaming, RSA-only admission with unambiguous `kid`s, withdrawn keys evict cached tokens; no claim values in the operator log; a vanished policy file reports degraded health with the last good policy in force; ingress example no longer hashes on `Mcp-Session-Id` (§3.4 corrected); allocation probe gained the JWT cache-hit and journal-append stages. Decisions owed: CF-18 (where Okta/file-policy code lives under ADR-001), CF-19 (canonical wire bytes in local mode). Local-mode parity claim narrowed to protocol, tool surface, and wire requests | Independent review |
 
+| 2.7 | 2026-09-03 | Phase B engineering landed on `feat/phase-a-secure-remote-slice`, one commit per WP in dependency order (B.3, B.4, B.6, B.5+B.7, B.1, B.2): signed policy bundles (Ed25519 detached signatures, `MCP_POLICY_PUBLIC_KEY` required in okta mode) with every load/change/rejection journaled and a change committed only after its record is durable; the revocation list as a second signed document (`MCP_REVOCATION_FILE`: subjects, token ids, `not_before` = `revoke all`), enforced after validation regardless of the token cache, with the fresh-token rule for writes; the journal hash chain with signed checkpoints (`MCP_AUDIT_SIGNING_KEY`), a `CheckpointSink` export, and `audit verify`; activity and access-review exports and the §7 metrics; Slack as the second vendor (five purpose-built reads, extractors shared with the passthrough and the egress chokepoint, the incident-investigation profile); `policy explain`. Three new fail-closed startup requirements in okta mode (policy public key, revocation list, audit signing key). CF-8 closed; CF-16's emergency-deny half closed; CF-18's move list grew (see the register). Gate B itself is owner-led | Implementation |
+| 2.8 | 2026-09-03 | Independent review of the Phase B branch, answered in code and in the register: a token whose `iat` is in the future is refused at authentication (it outran every cut-off and counted as fresh for writes); a Slack query naming `channel` twice is not classified (policy judged the first value, Slack could read the second); the verifier reports a journal checkpoint the export lacks (a failed copy was invisible, and a truncation back to it would have stayed so) and duplicate exports; the audit signing key may be group-readable, because a Kubernetes Secret under `fsGroup` is `root:fsGroup 0440` and the owner-only rule made the sample deployment unable to start; a rejected reload is deduplicated only once its record is durable, and by the refused bytes, so distinct bad revisions are distinct records; the `policy_loaded`/`revocation_loaded` records are appended before the port is bound and their failure is a startup failure; key files are installed with a no-replace link and loaded through the handle that was permission-checked, revocation edits serialize on an advisory lock and `init` never replaces; `policy explain` builds its context through the one builder `call_tool` uses, with the live configuration and the real broker; CSV cells that a spreadsheet would evaluate are neutralised; time bounds compare at full precision; four documents corrected. Pushed back: the initialize/revocation interleaving leaves a session object, not access (CF-16). Recorded: the checkpoint threat model and external retention (CF-23), policy and revocation as separate signed documents (CF-24), §7 metrics as proxies (CF-25), the cached `jti` allocation (CF-26), and the remaining unlocked behaviours (CF-27) | Independent review |
+
 Unresolved questions are collected in §11. Work that a phase deliberately
 did **not** finish — deferred fixes, decisions we owe someone, and the
 allocation baseline for the next phase's comparison — is tracked in
@@ -315,9 +318,9 @@ builder and fuzz-tested:
 | Token expiry | Rejected on next request | ≤ token TTL (recommend 5–15 min at the IdP) |
 | Validated-token cache | Keyed by token hash; TTL = min(`exp`, 5 min) | Adds ≤ 5 min |
 | Group removal at IdP | Takes effect when the client obtains a new token | ≤ token TTL + cache TTL; documented; measured in Phase B |
-| Emergency deny-list | Admin API: deny by `sub` or `jti`; pushed to gateways with the policy bundle; cache entries purged | ≤ bundle poll interval (default 30 s) |
-| Signing-key compromise | Rotate at IdP; gateways refetch JWKS on unknown `kid`; admin `revoke-all` clears the token cache and session table | Minutes; runbook in Phase B |
-| High-risk operations | `request_risk != read` requires a token no older than a configurable age (default 5 min), bypassing the cache | — |
+| Emergency deny-list | Signed revocation list (`MCP_REVOCATION_FILE`, part of the policy bundle): deny by `sub` or `jti`; edited with `mcp-devtools revoke …`; enforced on every request after validation, cache or not; cache cleared and the subject's sessions closed on change (Phase B, B.4) | ≤ file distribution + one poll (500 ms); measured under 2 s in `tests/revocation_tests.rs` |
+| Signing-key compromise | Rotate at IdP; gateways refetch JWKS on unknown `kid`; `mcp-devtools revoke all` sets a `not_before` cut-off that refuses every token issued before it, clears the token cache, and closes every principal session | Minutes; `docs/revocation-runbook.md` |
+| High-risk operations | `request_risk != read` requires a token issued within `MCP_WRITE_MAX_TOKEN_AGE_SECONDS` (default 300); a token with no `iat` is refused for writes | Enforced in `call_tool` (B.4) |
 
 ### 3.7 Where existing code changes
 
@@ -438,6 +441,28 @@ written before dispatch.
 read succeeds → group change → denied with reason → revocation window
 measured — and the partner can produce an access-review export themselves.
 
+**Status 2026-09-03 (engineering scope):**
+
+- [x] B.1–B.7 landed (see §0 rev 2.7 and `docs/enterprise-carry-forward.md`).
+  The "done when" runs in process: `tests/revocation_tests.rs::group_removal_waits_for_the_token_but_revocation_does_not`
+  is provision → read → group change → denied with reason → revocation
+  window measured, with the real Okta validator on a mock JWKS;
+  `tests/phase_b_slack_slice_tests.rs` is the second vendor end to end;
+  `tests/audit_report_tests.rs` produces the access-review and activity
+  exports through the CLI. The partner-side half of each measurement (the
+  identity-provider clock) is Gate B's to record.
+- [x] Per-phase allocation gate run at exit; numbers in the register's
+  baseline table.
+- [ ] Gate B — owner-led: two organizations, trials, pricing, security
+  evidence. `docs/gate-a-runbook.md` carries the three new okta-mode
+  requirements (policy public key, revocation list, audit signing key) so
+  the Gate A image is the Phase B image.
+- [ ] CF-18 — the move list grew by every Phase B module; decide before
+  any external contribution.
+- [x] Independent review of the Phase B branch (rev 2.8): every accepted
+  finding answered in code with a regression test, the pushed-back one
+  answered in the register, and the rest recorded as CF-23 through CF-27.
+
 > **Gate B — willingness to deploy and pay.** Two organizations complete a
 > trial and confirm: they would deploy this instead of distributing personal
 > tokens; the upstream identity model is acceptable; a budget owner exists;
@@ -543,7 +568,7 @@ enterprise mode must not move it noticeably.
 | JWT validation (cache hit) | < 50 µs | Validated-token cache keyed by token hash, TTL = min(`exp`, 5 min); JWKS cached with background refresh |
 | `ActionContext` build + canonicalization | < 30 µs | Single pass; no regex on the hot path; extractors are tested table lookups |
 | Policy decision | < 20 µs for 500 rules | Rules compiled to a matcher at load; decisions read an `Arc` snapshot |
-| Durable audit (intent + decision) | < 200 µs p99 on local NVMe; fsync batched per checkpoint, not per record | Append-only journal; sequence numbers; checkpoint every N records or T seconds, signed. **Never dropped; fail closed if the journal is unwritable** |
+| Durable audit (intent + decision) | < 200 µs p99 on local NVMe; one fsync per writer batch (concurrent appends group-commit), never fewer — an acknowledged record is on disk | Append-only journal; sequence numbers; per-line hash chain; checkpoint every N records or T seconds, signed (a checkpoint is a signature boundary, not a sync boundary). **Never dropped; fail closed if the journal is unwritable** |
 | Usage write | Off the request path | Bounded channel; drop-with-counter |
 | Cache partitioning | No measurable change | Fixed-width principal hash prefix in the key |
 | Admin API / console | Never contends with `/mcp` | Separate limiter and task budget; queries hit rollups, not the journal |
@@ -571,17 +596,17 @@ that fails on a > 20 % regression against the checked-in baseline.
 ## 10. Definition of done for the committed scope (M0 + A + B)
 
 - [ ] Licensing boundary in the repository; `LICENSE`; CLA.
-- [ ] Community build unchanged: golden tool surface, audit shape, health banner identical with `MCP_AUTH_MODE=off`.
-- [ ] Fail-closed startup on non-loopback bind without auth, auth without policy, or unwritable journal.
-- [ ] Okta token validation with the full negative matrix against a wiremock JWKS.
-- [ ] `ActionContext` with resource extractors for two vendors; default-deny policy with resource-level rules; golden decision table.
-- [ ] Canonicalization with a fuzz target; canonical form in audit and goldens.
-- [ ] Durable audit written before dispatch, sequence-numbered, checkpointed, offline-verifiable; usage separately and lossy.
-- [ ] Upstream identity from `CredentialBroker` in every audit event and in structured response metadata.
-- [ ] Artifacts, cache, and sessions principal-owned; cross-principal access is a tested 404.
-- [ ] Revocation: token cache, deny-list, `revoke-all`, measured group-removal window, key-rotation runbook.
-- [ ] Container with `--role`, ingress examples, `SECURITY.md`.
-- [ ] Access-review and activity exports produced by the partner unaided.
+- [ ] Community build unchanged: golden tool surface, audit shape, health banner identical with `MCP_AUTH_MODE=off`. (Narrowed in rev 2.6: unset and explicit-off are identical to each other; the tool surface deliberately grew by five Slack reads in B.1 and the journal now carries checkpoint records.)
+- [x] Fail-closed startup on non-loopback bind without auth, auth without policy, or unwritable journal. (Phase B adds: auth without a policy public key, a revocation list, or an audit signing key.)
+- [x] Okta token validation with the full negative matrix against a wiremock JWKS.
+- [x] `ActionContext` with resource extractors for two vendors; default-deny policy with resource-level rules; golden decision table. (Grafana in A.8, Slack in B.1; cross-vendor rows in B.2.)
+- [x] Canonicalization with a fuzz target; canonical form in audit and goldens.
+- [x] Durable audit written before dispatch, sequence-numbered, checkpointed, offline-verifiable; usage separately and lossy. (B.6: signed checkpoints, `audit verify`.)
+- [ ] Upstream identity from `CredentialBroker` in every audit event and in structured response metadata. (In every event since M0; structured response metadata still open.)
+- [x] Artifacts, cache, and sessions principal-owned; cross-principal access is a tested 404.
+- [x] Revocation: token cache, deny-list, `revoke-all`, measured group-removal window, key-rotation runbook. (B.4; `docs/revocation-runbook.md`.)
+- [ ] Container with `--role`, ingress examples, `SECURITY.md`. (`SECURITY.md` still owner-led.)
+- [x] Access-review and activity exports produced by the partner unaided. (B.5: `mcp-devtools audit export …`; the "unaided" half is Gate B's to confirm.)
 - [ ] Trial metrics (§7) reported; Gate A and Gate B outcomes recorded in §0.
 
 ## 11. Unresolved questions

@@ -80,7 +80,9 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::error::McpError;
-use crate::ports::audit_sink::{AppendFuture, AuditEvent, AuditEventKind, AuditFailure, AuditSink};
+use crate::ports::audit_sink::{
+    AppendFuture, AuditEvent, AuditEventKind, AuditFailure, AuditSink, ControlEvent,
+};
 use crate::ports::policy_decision_point::PolicyDecisionPoint;
 use crate::transport::HttpMethod;
 
@@ -140,6 +142,27 @@ pub fn append_bounded<'a>(
 ) -> AppendFuture<'a> {
     Box::pin(async move {
         match tokio::time::timeout(timeout, sink.append(event)).await {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "audit append did not acknowledge within the configured bound",
+            )),
+        }
+    })
+}
+
+/// [`append_bounded`] for a control-plane record.
+///
+/// # Errors
+///
+/// The sink's error, or `TimedOut` when the bound elapsed first.
+pub fn append_control_bounded<'a>(
+    sink: &'a dyn AuditSink,
+    event: &'a ControlEvent,
+    timeout: Duration,
+) -> AppendFuture<'a> {
+    Box::pin(async move {
+        match tokio::time::timeout(timeout, sink.append_control(event)).await {
             Ok(result) => result,
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,

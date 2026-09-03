@@ -24,8 +24,10 @@ under ADR-001), and it cuts both ways here:
 
 Either is fine. Not deciding, and then moving the code mid-trial, is not.
 
-The enterprise crate becomes the test artifact once Phase B puts revocation
-(B.4) and the admin surface in it.
+Phase B did **not** move anything: revocation (B.4) and the rest of Phase B
+live in the community crate like Phase A, and CF-18's move list grew
+accordingly. The enterprise crate becomes the test artifact only once CF-18
+is decided and executed; until then the community image is the artifact.
 
 ## Steps
 
@@ -38,6 +40,21 @@ The enterprise crate becomes the test artifact once Phase B puts revocation
    filled in: `MCP_OKTA_ISSUER`, `MCP_OKTA_AUDIENCE`, `MCP_PUBLIC_URL`,
    `MCP_POLICY_FILE` (start from `deploy/policies/grafana-read-only.yaml`
    with their group names), `MCP_AUDIT_JOURNAL_DIR` on a persistent volume.
+   **Phase B added three requirements** the image refuses to start without:
+   - `MCP_POLICY_PUBLIC_KEY` — run `mcp-devtools policy keygen --out policy-signing.key`
+     on an operator machine, keep the private key there, put the printed
+     public key in the ConfigMap, and sign the policy with
+     `mcp-devtools policy sign policy.yaml --key policy-signing.key`
+     (ship `policy.yaml.sig` next to it; every edit needs a re-sign);
+   - `MCP_REVOCATION_FILE` — `mcp-devtools revoke init --file revocations.yaml --key policy-signing.key`
+     produces the empty, signed list; ship both files;
+   - `MCP_AUDIT_SIGNING_KEY` — `mcp-devtools audit keygen --out audit-signing.key`,
+     mounted from a Secret (Kubernetes projects it as `root:<fsGroup>`
+     `0440`, which the gateway accepts; world-readable or group-writable is
+     refused); keep the printed public key for `mcp-devtools audit verify`.
+   `deploy/k8s/config.yaml` shows all three. If the partner's workflow is
+   the incident one, start from `deploy/policies/incident-investigation.yaml`
+   (Grafana + Slack) instead.
    One gateway replica (the example's default; see CF-16 before scaling).
    Vendor credentials per `docs/configuration.md`.
 3. **Smoke.** The two `curl` calls in `deploy/k8s/README.md`: the RFC 9728
@@ -70,8 +87,15 @@ The enterprise crate becomes the test artifact once Phase B puts revocation
      stay open past the proxy's read timeout setting; the 1 MB body cap
      matches.
 7. **Two weeks of use.** Their incident workflow, their tokens, their
-   policy edits (hot reload; `mcp-devtools policy check` before applying).
-   Collect the §7 trial metrics that exist at this stage.
+   policy edits (`policy check` → `policy sign` → apply; the reload is
+   journaled). Exercise the Phase B controls once each, against their IdP:
+   revoke a test user (`mcp-devtools revoke subject …`) and confirm the
+   next request is refused with `error_description="revoked"` and a
+   `revoked_token_rejected` record; `revoke all` after a rehearsed key
+   rotation; `mcp-devtools audit verify` on a copy of the journal and
+   `/journal/checkpoints`; `mcp-devtools audit export access-review` with
+   their group export. `mcp-devtools audit metrics` produces the §7
+   figures the journal can supply (`docs/audit-reports.md`).
 
 ## Exit
 

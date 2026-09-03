@@ -10,7 +10,37 @@ removed only when it is done, not when it is explained.
 
 Status legend: **open** · **blocked** (needs a decision) · **done**.
 
-Last updated: 2026-09-02, after the independent review of the Phase A
+Last updated: 2026-09-03, after the independent review of the Phase B
+branch (plan §0 rev 2.8). The review opened CF-23 (checkpoint threat model
+and an external retention boundary), CF-24 (policy and revocation are two
+signed documents, not one bundle), CF-25 (the §7 metrics are proxies),
+CF-26 (the cached `jti` allocation), and CF-27 (behaviours not yet
+regression-locked); it added a note to CF-16 (the initialize/revocation
+interleaving) and to CF-19 (the parity claim in `docs/configuration.md`
+now matches it). Everything else the review found was answered in code,
+each with a test that fails on the previous commit: a future `iat` is
+refused at authentication; a repeated Slack `channel` key is not
+classified; the verifier reports a journal checkpoint with no export and
+duplicate exports; the audit signing key may be group-readable (the
+Kubernetes projection under `fsGroup` is `root:fsGroup 0440`, which the
+owner-only rule refused, so the sample deployment could not start); a
+rejected reload is journaled once per refused revision and only once its
+record is durable; the `*_loaded` records are appended before the port is
+bound and their failure is a startup failure; key files are installed with
+a no-replace link and checked and read through one handle; revocation
+edits serialize on an advisory lock and `init` never replaces; `policy
+explain` builds its context through the builder `call_tool` uses, from
+the live configuration and the real broker; CSV cells that a spreadsheet
+would evaluate are neutralised; time bounds compare at full precision.
+
+Previously: 2026-09-03, at the Phase B exit. Phase B closed CF-8 (signed
+checkpoints) and the emergency-deny half of CF-16 (the revocation list);
+CF-18's move list grew by every Phase B module; CF-21 (Slack search
+scoping) and CF-22 (access-review scope assumption) were opened; the
+allocation baseline table gained the Phase B column. CF-1/CF-13, CF-7,
+CF-9, CF-10, CF-11, CF-12, CF-15, CF-17, CF-19, CF-20 are unchanged.
+
+Previously: 2026-09-02, after the independent review of the Phase A
 branch. Phase A closed CF-2, CF-3, CF-4, CF-5, CF-6, and CF-14 (each entry
 says how) and opened CF-15. The review amended CF-14 (the post-dispatch
 half), and opened CF-16 through CF-20: two engineering items (CF-16 session
@@ -180,12 +210,20 @@ answer: the CLI should dispatch through the audited orchestration boundary
 like any other caller.
 
 ### CF-8 · Per-record signing and checkpoints (B.6)
-**Open · Phase B**
+**Done · 2026-09-03 (Phase B, WP B.6)**
 
-The journal is durable (`sync_data` per batch; the journal directory and
-every ancestor it creates synced at startup) and tamper-*evident* by
-contiguous sequence, but not tamper-*proof*. Signed checkpoints every N
-records or T seconds are B.6.
+Every line the writer appends extends a SHA-256 chain, and a signed
+checkpoint record (Ed25519, `MCP_AUDIT_SIGNING_KEY`, required in okta mode)
+carrying the chain value is appended every `MCP_AUDIT_CHECKPOINT_RECORDS`
+records, after `MCP_AUDIT_CHECKPOINT_SECONDS` with unsealed records, and at
+every clean close; the chain is reconstructed from disk at startup. Each
+checkpoint is also handed to the `CheckpointSink` port (a directory adapter
+ships; SIEM is C.3), which is what makes a truncated tail detectable.
+`mcp-devtools audit verify` recomputes the chain offline and checks
+coverage, signatures, and exports (`src/audit/{checkpoint,reader,verify}.rs`,
+`tests/audit_checkpoint_tests.rs`). Records are signed per checkpoint, not
+per record, as §8 budgets; the records after the last checkpoint are the
+documented gap (`docs/audit-reports.md`).
 
 ### CF-14 · Journal append has no bound on how long a call can wait
 **Done · 2026-09-02 (Phase A, WP A.7) — decision recorded**
@@ -248,13 +286,28 @@ could not deliver:
   *response* (ingress cookie affinity, if the MCP clients in use keep
   cookies) or a shared session store (plan §3.4). Decide when Phase C
   scopes horizontal scaling; the plan's §3.4 "Sessions" row is corrected.
-- **Emergency deny.** Deleting the policy file keeps the last good policy
-  in force, indefinitely (documented in `policy::engine`; health reports
-  the degraded state). That is deliberate — a gateway must not fail open
-  or turn into an outage because a file went missing — but it means there
-  is no file-level "stop everything". Today's answer is to publish a
-  document that denies (`rules: []`) or drain the pod. The deny-list and
-  `revoke-all` (plan §3.6) are the real control and belong to Phase B.
+- **Emergency deny — done (Phase B, WP B.4).** The revocation list
+  (`auth::revocation`, `MCP_REVOCATION_FILE`, signed with the policy key,
+  required in okta mode) is the control: `mcp-devtools revoke subject|token|all`
+  rewrites and re-signs it, every gateway applies it within one poll on
+  every request regardless of the validated-token cache, clears the cache,
+  and closes the revoked subjects' sessions (all principal sessions when
+  the `not_before` cut-off moves). Deleting the policy file still keeps the
+  last good policy in force, by design. Only the affinity half of this item
+  stays open, for Phase C.
+- **Interleaving, noted by the Phase B review (not fixed, by decision).** An
+  `initialize` that authenticated before a revocation committed can bind
+  its session after the close-sessions sweep ran, leaving a session bound
+  to a revoked subject. That session is an object, not access: every
+  request re-authenticates and is checked against the list *before* the
+  session binding is consulted (`server::auth::require_bearer`, then
+  `session::enforce_session_owner`), so a token for a revoked subject is
+  refused whichever session it names, and a token issued after a
+  `not_before` cut-off is legitimately valid and reuses a session bound to
+  its own subject. Nothing the revocation withdrew is reachable through
+  the stale binding. A revocation generation on bindings would close the
+  cosmetic gap; do it when session affinity (above) is designed, since
+  both touch the binding step.
 
 ### CF-17 · Credential-provider bootstrap traffic is outside the egress policy
 **Open · Phase B (with the vendor read profiles)**
@@ -311,6 +364,18 @@ carries a real SPDX `license` field.
 ### CF-18 · Where the Okta validator and the file policy engine live (ADR-001)
 **Blocked · owner + counsel (with CF-10) · before any external contribution**
 
+**Amended 2026-09-03 (Phase B).** Phase B added to the public crate, for
+the same reason Phase A did (the enterprise crate has no runtime, and Gate A
+runs the community image): `policy::signing`, `policy::bundle`,
+`auth::revocation`, `audit::{checkpoint,reader,verify,export,metrics}`,
+the `ports::checkpoint_sink` port, and the `policy`, `revoke`, and `audit`
+CLI groups. Each is a self-contained module behind a port or a CLI
+boundary, so option 1 ("move") is still a file move plus the composition
+in `server::http` and `bootstrap`. The list of what would move is now long
+enough that option 2 ("amend ADR-001") deserves a fresh look: everything
+here is what makes remote deployment *safe*, not what makes it
+*administrable* (Phase C/D).
+
 ADR-001 says enterprise code lives in the private repository and "the
 community binary never links enterprise code". The Phase A branch ships
 `auth::okta::OktaJwksValidator`, `policy::engine::FilePolicy`, the bearer
@@ -363,6 +428,11 @@ wants the byte-preserving mode anyway, it is a `RequestOptions` flag on
 the transport plus a second `url_under` — a day's work — and this entry is
 where that decision is recorded.
 
+The Phase B review found `docs/configuration.md` still claiming that with
+enterprise mode off the server "behaves byte-for-byte as before"; that
+sentence now says what the tests prove (unset and `off` are identical to
+each other) and points here for the wire-byte differences.
+
 ### CF-20 · §8 budgets as a CI gate
 **Open · Phase B**
 
@@ -375,6 +445,127 @@ comparison means committing a baseline file, a release-profile CI job that
 runs the probe, and a diff step with the 20 % threshold; the numbers must
 be allocation counts, not wall time, because the CI runners are not stable
 enough for a timing threshold.
+
+### CF-21 · Slack `search.messages` cannot be scoped from the request
+**Open · revisit with the partner's Slack workflow**
+
+`search.messages` is classified as an *unscoped* channel read (WP B.1):
+an `in:#channel` modifier is a ranking hint to Slack, not a bound the
+gateway can rely on, so the shipped profile gives search to incident
+commanders only. Extracting `in:` clauses as a `constrained_by: channel`
+would let a rule allow "search, but only inside these channels" — only if
+Slack guarantees `in:` is exclusive, which its documentation does not
+state. Decide with a test against a real workspace, not from the docs.
+Also open: search needs a *user* token, and whether the shared-identity
+model (ADR-006) extends to a shared user token is a Gate A/B question.
+
+### CF-22 · The access review assumes the default required scope
+**Open · Phase C (admin API)**
+
+`mcp-devtools audit export access-review` (WP B.5) builds one principal
+per member holding `MCP_REQUIRED_SCOPE`'s default, so a rule whose
+`subjects.scopes` names another scope is not reflected. The review is of
+people; scopes are a property of tokens the identity provider mints. When
+the admin API (C.4) can read the identity provider's scope assignments, the
+review should take them as input rather than assume.
+
+### CF-23 · The checkpoint threat model, and an external retention boundary
+**Open · Phase C.3 (SIEM forwarder) — and a documentation commitment now**
+
+What the chain and the checkpoints prove, stated exactly, from the Phase
+B review. The chain and coverage checks are sound: recovery and
+verification hash the same complete line bytes, torn tails are truncated
+first, and each checkpoint signs the chain value before its own line.
+Against that, an adversary holding the **audit signing key** can rewrite
+from sequence 1 and re-sign every checkpoint; detection then depends on an
+independently retained *old* checkpoint that the rewritten history no
+longer matches. And an adversary who can write the **export directory**
+can remove or rewrite the copies along with the journal.
+
+The design therefore protects against modification of the journal file by
+someone who does not hold the signing key, when an auditor holds a
+trusted public key; and against truncation only when checkpoints are
+retained somewhere the gateway's host cannot alter. The Kubernetes example
+exports to `/journal/checkpoints` on the same volume as the journal
+(`deploy/k8s/config.yaml`), which gives the first property and not the
+second; its README now says so. Claiming "tamper-evident against a
+compromised host" needs a remote or WORM `CheckpointSink` (object storage
+with object lock, or a SIEM that keeps its own copy) — the C.3 forwarder —
+and until then the deployment notes must not claim it.
+
+### CF-24 · Policy and revocation are two signed documents, not one bundle
+**Open · decide with Phase C's admin API (C.4)**
+
+The plan's §3.6 row describes the deny-list as "part of the policy
+bundle". The implementation (WPs B.3 and B.4) is two independent files
+with two watchers, two version labels, two commits, and two `*_changed`
+records. A deployment that updates both — a policy that stops relying on
+a group, and a revocation for the people who had it — can therefore
+expose the new policy with the old list for up to one poll, or the
+reverse. The review asked that this be recorded rather than left implied:
+
+- there is no joint generation or transaction across the pair, and no
+  ordering guarantee between their reloads;
+- revocation is edited with a separate CLI (`revoke …`), not pushed as
+  part of a policy publish;
+- "bundle hash in every audit event" (B.3) means the **policy document's**
+  hash in the decision's `policy_version`; the revocation list's version is
+  on `revocation_*` and `revoked_token_rejected` records only, and no
+  record carries a combined policy-plus-revocation state hash.
+
+Acceptable for Phase B: the two documents answer different questions and
+a stale-by-one-poll pairing fails closed on the revocation side (a subject
+revoked under either document is refused). If the admin API takes over
+publishing, publish the pair as one signed generation and stamp both
+versions on every decision.
+
+### CF-25 · The §7 trial metrics are proxies, not the measurements they are named after
+**Open · Gate B evidence**
+
+`mcp-devtools audit report metrics` (B.7) computes the §7 figures from the
+journal alone, and each is an inference: `revocation_window_ms` attributes
+a refusal to the **latest** `revocation_changed` record, which may be an
+unrelated change; `deny_after_allow_ms` is the interval to *any* later
+denial for the subject, including a resource, default, or stale-token
+denial; `cross_environment_attempts` infers intent from an allow in
+another environment. `docs/audit-reports.md` calls them proxies. Keep the
+product language equally qualified, and treat the true measurements —
+which need the identity provider's event timestamps and a correlation
+between a control record and the refusals it caused — as Gate B's to
+collect with the partner, not as something the journal can produce.
+
+### CF-26 · The JWT cache hit's ninth allocation
+**Open · next allocation pass**
+
+The Phase B baseline records the JWT cache hit at 9 allocations against
+Phase A's 8: the cached `Authenticated` carries `TokenFacts.token_id:
+Option<String>`, cloned on every hit so the revocation list can name the
+`jti`. `Option<Arc<str>>`, or handing out the cached result by `Arc`,
+removes it with no architectural change. Under the 20 % gate; recorded so
+the next pass takes it rather than rediscovering it.
+
+### CF-27 · Behaviours the review found unit-tested only, or not locked
+**Open · fold into the next WP that touches each area**
+
+The Phase B review listed behaviours whose guarantees were asserted in
+prose or unit tests only. This round locked most of them in integration
+tests (`tests/token_validator_tests.rs`, `tests/revocation_tests.rs`,
+`tests/phase_b_slack_slice_tests.rs`, `tests/audit_checkpoint_tests.rs`,
+`tests/policy_signing_tests.rs`, `tests/policy_explain_tests.rs`,
+`tests/audit_report_tests.rs`). Still open:
+
+- **Checkpoint write poisoning.** A checkpoint whose journal write fails
+  poisons the writer like any record; no fault-injection test drives that
+  path end to end.
+- **Concurrent `keygen` to one path.** The no-replace link is exercised
+  single-threaded; a two-process race is not.
+- **Initialize / revocation interleaving.** Recorded under CF-16 with the
+  reasoning for not building a barrier test; add one if the binding step
+  gains a generation.
+- **Timing-sensitive watcher tests.** The bundle watcher tests poll with
+  deadlines and the time-bound checkpoint test sleeps ~1.5 s. They pass
+  reliably locally; if CI flakes, inject the tick (`WATCH_INTERVAL`) or the
+  clock rather than lengthening the sleeps.
 
 ### CF-12 · Expression digest strength
 **Open · revisit when a policy needs it**
@@ -389,11 +580,61 @@ about what else is stored alongside it.
 
 ## Allocation baseline (for the next phase's comparison)
 
+Re-run after the Phase B review round (rev 2.8): every stage's byte and
+allocation count is identical to the table below (JWT cache hit 9, journal
+append 6, extractor stages unchanged); the review's fixes touched the
+authentication path only by one integer comparison and the Slack
+extractor by an iterator, neither of which allocates.
+
 Per `CLAUDE.md`'s per-phase allocation gate. Numbers from
-`cargo bench --bench response_pipeline` at the **Phase A** boundary
-(2026-09-02), with the M0 figure alongside where the stage existed then.
-Gate result: no pre-existing stage moved; the new stages are additive and,
-apart from canonicalization, run only on enterprise paths.
+`cargo bench --bench response_pipeline` at the **Phase B** boundary
+(2026-09-03), with the Phase A figure alongside. Gate result: **no stage
+moved except one**, and that one by a single allocation — the JWT cache
+hit went from 8 to 9 allocations because the cached entry now carries the
+token's `jti` (an `Option<String>`) so the revocation list can name it;
+12.5 %, under the 20 % threshold, and on an enterprise-only stage. The
+journal append is unchanged at 6 allocations after hoisting the writer's
+per-batch boundary buffer (a first cut had added one); its wall time
+gained the per-line SHA-256 (p50 11 µs vs 8 µs, p99 18–31 µs across two
+runs vs 11 µs, max ≈ 100 µs vs 65 µs on a local SSD), still an order of
+magnitude inside the 200 µs p99 budget. Every community-path stage (0–3)
+and every extractor stage is byte-for-byte what Phase A recorded.
+
+| Stage | Bytes | Allocations | Phase A |
+|---|---|---|---|
+| −1 `canonical`: short path + query | <1 KB | 4 | 4 |
+| −1 `canonical`: dot-segments + escapes | <1 KB | 1 | 1 |
+| −1 `canonical`: search URL, long JQL | <1 KB | 10 | 10 |
+| −1 `jira::extract` GET `/issue/{key}` | <1 KB | 6 | 6 |
+| −1 `jira::extract` GET `/search/jql` (long JQL) | 1 KB | 17 | 17 |
+| −1 `jira::project_keys_from_jql` (long JQL) | <1 KB | 9 | 9 |
+| −1 `jira::extract` unmapped (default arm) | <1 KB | 1 | 1 |
+| −1 `grafana::query_logs` | <1 KB | 10 | 10 |
+| −1b `ActionContext` via `for_tool` (Grafana; enterprise only) | <1 KB | 21 | 21 |
+| −1b `FilePolicy::evaluate` @ 500 rules (enterprise only) | 0 | 5 | 5 |
+| −1c JWT validate, cache hit (enterprise only; §8 budget 50 µs) | 1 KB | **9** | 8 — 3.7 µs (was 3.5) |
+| −1c journal append, sequential (enterprise only; §8 budget p99 200 µs) | 1 KB | 6 | 6 — p50 11 µs, p99 18–31 µs, max ≈ 100 µs (chain hash per line) |
+| 0 `ConfigHandle::snapshot()` | 0 | 0 | 0 |
+| 1 `apply_jq_filter(None)` | 0 | 0 | 0 |
+| 2 `render(Toon)` @ 500 issues | 1736 KB | 19 032 | 19 032 |
+| 3 `truncate_for_ai` | 39 KB | 4 | 4 |
+| 2 `render(Toon)` @ 5000 issues | 16 547 KB | 190 035 | 190 035 |
+
+Notes for the Phase C comparison:
+
+- The Slack extractors (`slack::channel_history` and friends) have no
+  probe row yet; they are shaped like `grafana::query_logs` (one canonical
+  path from plain segments, one id, an allowlisted attribute list) and
+  should land at or under its 10. Add the row when the probe next gains
+  stages (CF-20 is still the CI comparison).
+- Revocation checks are two hash-set lookups and one integer compare per
+  request, on the middleware path, allocation-free; the revoked-token
+  refusal path allocates only for its control record.
+- Checkpoints cost one SHA-256 update per line on the writer thread and
+  one extra write+sync per 256 records (or per minute), off the request
+  path.
+
+### Phase A baseline (2026-09-02), kept for the record
 
 | Stage | Bytes | Allocations | M0 |
 |---|---|---|---|
@@ -415,7 +656,7 @@ apart from canonicalization, run only on enterprise paths.
 | 3 `truncate_for_ai` | 39 KB | 4 | 4 |
 | 2 `render(Toon)` @ 5000 issues | 16 547 KB | 190 035 | 190 035 |
 
-Notes for the Phase B comparison:
+Notes recorded at the Phase A boundary:
 
 - Canonicalization is the one new cost on the community path. It is paid
   once per outbound request, in place of the string join it replaced, and

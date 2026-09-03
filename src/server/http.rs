@@ -37,6 +37,7 @@ use tracing::{info, warn};
 use crate::config::{AuthMode, Config};
 use crate::constants::VERSION;
 use crate::error::McpError;
+use crate::policy::{BundleAudit, OwnerKey};
 use crate::server::auth::{
     InboundAuth, InboundAuthSettings, PROTECTED_RESOURCE_METADATA_PATH,
     protected_resource_metadata, require_bearer,
@@ -126,11 +127,6 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
     let auth_mode = AuthMode::parse(config.get("MCP_AUTH_MODE"))?;
     let addr = resolve_bind_addr(std::env::var("MCP_BIND_ADDR").ok().as_deref(), port)?;
     validate_startup_security(auth_mode, &addr)?;
-    let inbound_auth = match auth_mode {
-        AuthMode::Off => None,
-        AuthMode::Okta => Some(Arc::new(enterprise_inbound_auth(&config)?)),
-    };
-
     // Shared across rmcp (drops in-flight SSE on cancel) and axum (stops
     // accepting new connections + drains existing ones on cancel).
     let cancel = CancellationToken::new();
@@ -139,11 +135,30 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
     // stored as an error *inside* the router, so the process logged
     // "listening", held the port, and failed every call while a health check
     // marked it ready. Constructing first means a startup failure never
-    // reaches the point of being reachable at all.
+    // reaches the point of being reachable at all. The inbound-auth stack
+    // is built from the server, because the revocation list journals to
+    // the server's audit sink.
     let server = crate::bootstrap::ServerBuilder::new()
         .watch_config(true)
-        .require_inbound_auth(inbound_auth.is_some())
+        .require_inbound_auth(matches!(auth_mode, AuthMode::Okta))
         .build()?;
+    let inbound_auth = match auth_mode {
+        AuthMode::Off => None,
+        AuthMode::Okta => Some(Arc::new(enterprise_inbound_auth(&config, &server)?)),
+    };
+    // The startup evidence — which policy and which revocation list this
+    // process runs under — is durable before the port opens. A journal
+    // that cannot take these records is a journal that cannot take the
+    // first tool call's intent either, so this fails the same way.
+    server.journal_startup().await?;
+    if let Some(auth) = &inbound_auth {
+        auth.journal_startup().await.map_err(|error| {
+            format!(
+                "refusing to start: the revocation list in force could not be journaled ({})",
+                crate::ports::AuditFailure::classify(&error)
+            )
+        })?;
+    }
     let pending_audit = server.pending_audit();
     let app = build_app_for_role(
         role,
@@ -180,7 +195,10 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
 /// Required together: the Okta issuer and audience, the public URL clients
 /// are told to obtain a token for, and the durable audit journal — evidence
 /// is the product, so enterprise mode without a journal is not a mode.
-fn enterprise_inbound_auth(config: &Config) -> Result<InboundAuth, String> {
+fn enterprise_inbound_auth(
+    config: &Config,
+    server: &DevtoolsServer,
+) -> Result<InboundAuth, String> {
     let okta = crate::auth::okta::OktaSettings::from_config(config)?;
     let settings = InboundAuthSettings::from_config(config, vec![okta.issuer.clone()])?;
     if config
@@ -205,9 +223,71 @@ fn enterprise_inbound_auth(config: &Config) -> Result<InboundAuth, String> {
             crate::policy::engine::POLICY_FILE_KEY
         ));
     }
+    if config
+        .get(crate::policy::engine::POLICY_PUBLIC_KEY_KEY)
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        return Err(format!(
+            "refusing to start: MCP_AUTH_MODE=okta requires {} — enterprise mode applies only \
+             signed policy bundles, so a gateway with no verifying key could not tell an \
+             authored policy from a planted one (fail-closed; plan §4 B.3). Generate a key \
+             pair with `mcp-devtools policy keygen` and sign the policy with \
+             `mcp-devtools policy sign`",
+            crate::policy::engine::POLICY_PUBLIC_KEY_KEY
+        ));
+    }
+    if config
+        .get(crate::audit::journal::CheckpointPolicy::SIGNING_KEY_KEY)
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        return Err(format!(
+            "refusing to start: MCP_AUTH_MODE=okta requires {} — the audit journal's \
+             checkpoints are signed so tampering is detectable offline, and an unsigned \
+             journal is evidence only for whoever holds the disk (plan §3.3, B.6). Generate \
+             a key with `mcp-devtools audit keygen`",
+            crate::audit::journal::CheckpointPolicy::SIGNING_KEY_KEY
+        ));
+    }
+    let revocation_path = config
+        .get(crate::auth::revocation::REVOCATION_FILE_KEY)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "refusing to start: MCP_AUTH_MODE=okta requires {} — the revocation list is \
+                 the emergency stop (deny by subject, by token id, or `revoke all`), and a \
+                 gateway without one has no way to cut a compromised token off before it \
+                 expires (plan §3.6, B.4). Create an empty, signed list with \
+                 `mcp-devtools revoke init`",
+                crate::auth::revocation::REVOCATION_FILE_KEY
+            )
+        })?;
+    let verifier = crate::bootstrap::configured_policy_public_key(config)
+        .map_err(|error| error.message)?
+        .ok_or_else(|| "MCP_POLICY_PUBLIC_KEY is required".to_owned())?;
+    let revocations = crate::auth::revocation::RevocationList::load_verified(
+        std::path::Path::new(revocation_path),
+        verifier,
+    )
+    .map_err(|error| {
+        format!(
+            "cannot load the revocation list in {}={revocation_path}: {error}; refusing to \
+             start (fail closed, plan §1.2)",
+            crate::auth::revocation::REVOCATION_FILE_KEY
+        )
+    })?;
     let client = crate::transport::build_client().map_err(|error| error.message)?;
     let validator = Arc::new(crate::auth::okta::OktaJwksValidator::new(okta, client));
-    Ok(InboundAuth::new(Arc::new(validator), settings))
+    let mut auth = InboundAuth::new(Arc::new(validator), settings).with_revocations(revocations);
+    if let Some(sink) = server.audit_sink() {
+        auth = auth.with_audit(BundleAudit {
+            sink,
+            append_timeout: server.audit_append_timeout(),
+        });
+    }
+    Ok(auth)
 }
 
 /// Build the full Axum app with a caller-owned cancellation token. Tests use
@@ -349,6 +429,7 @@ fn build_app_inner(
         }),
     );
     if let Some(auth) = auth {
+        watch_revocations(&auth, &manager);
         // Inner layer first: the session binding runs after the bearer
         // check has placed the principal in the extensions.
         protected = protected
@@ -377,6 +458,47 @@ fn build_app_inner(
         .merge(protected)
         .layer(middleware::from_fn(origin_allowlist))
         .layer(cors)
+}
+
+/// Start the revocation-list watcher (WP B.4). On every change: cached
+/// validations are dropped so the next request revalidates, and the
+/// sessions of newly revoked subjects are closed — every principal's
+/// sessions when the `not_before` cut-off moved, since a session cannot
+/// say which token created it. The middleware check is what actually
+/// refuses a revoked token; this keeps nothing derived from one alive.
+fn watch_revocations(auth: &Arc<InboundAuth>, manager: &Arc<ReapingSessionManager>) {
+    let Some(list) = auth.revocations() else {
+        return;
+    };
+    let validator = Arc::clone(auth.validator());
+    let sessions = Arc::clone(manager);
+    list.spawn_watcher(
+        auth.audit().cloned(),
+        Some(Box::new(move |previous, current| {
+            validator.forget_validated();
+            let cutoff_moved =
+                previous.document.not_before_epoch() != current.document.not_before_epoch();
+            let sessions = Arc::clone(&sessions);
+            let current = Arc::clone(current);
+            tokio::spawn(async move {
+                let closed = sessions
+                    .close_where(|owner| match owner {
+                        OwnerKey::Principal { subject, .. } => {
+                            cutoff_moved || current.document.revokes_subject(subject)
+                        }
+                        OwnerKey::Local => false,
+                    })
+                    .await;
+                info!(
+                    closed,
+                    cutoff_moved,
+                    revoked_subjects = current.document.subject_count(),
+                    revoked_tokens = current.document.token_count(),
+                    "revocation list changed; validated-token cache cleared"
+                );
+            });
+        })),
+    );
 }
 
 async fn download_artifact(AxumPath(id): AxumPath<String>, request: Request) -> Response {

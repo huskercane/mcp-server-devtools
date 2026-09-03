@@ -228,6 +228,13 @@ impl mcp_server_devtools::ports::AuditSink for StallingSink {
             self.inner.append_now(event)
         })
     }
+
+    fn append_control<'a>(
+        &'a self,
+        event: &'a mcp_server_devtools::ports::ControlEvent,
+    ) -> mcp_server_devtools::ports::audit_sink::AppendFuture<'a> {
+        self.inner.append_control(event)
+    }
 }
 
 /// CF-14, the post-dispatch half: the outcome append is bounded in how long

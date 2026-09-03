@@ -2831,6 +2831,146 @@
  },
  {
   "annotations": {
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": true,
+   "readOnlyHint": true
+  },
+  "description": "Read the messages in one Slack channel. Returns TOON format by default (30-60% fewer tokens than JSON).\n\nThe incident-investigation read: fetch what was said in `#incidents` (or any channel the token can see) in a time window. Each message includes `ts`, `user`, `text`, `thread_ts` (when it has replies \u2014 pass it to `slack_thread_replies`), and `reactions`. Find the channel id with `slack_list_channels`.\n\nAuthenticates with the configured Slack OAuth token (`SLACK_TOKEN`) sent as `Authorization: Bearer`. Calls `conversations.history` (read-only; `channels:history` / `groups:history`).\n\n**Parameters:**\n- `channelId` (required): the channel id, e.g. `C0123ABCDEF`\n- `oldest` / `latest`: Unix timestamps (seconds, decimals allowed) bounding the window\n- `inclusive`: `true` to include messages exactly at `oldest`/`latest`\n- `limit`: page size (Slack caps at 999; keep it small to reduce token costs)\n- `cursor`: `response_metadata.next_cursor` from the previous page\n\n**Typical use \u2014 messages with text and author only:**\n- `jq`: `messages[*].{ts: ts, user: user, text: text}`\n\n**Output format:** TOON (default) or JSON (`outputFormat: \"json\"`).\n\nAPI reference: https://api.slack.com/methods/conversations.history\n",
+  "inputSchema": {
+   "$defs": {
+    "OutputFormatArg": {
+     "description": "Serializable/deserializable `OutputFormat` for tool arg surfaces.",
+     "enum": [
+      "toon",
+      "json"
+     ],
+     "type": "string"
+    }
+   },
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+   "properties": {
+    "channelId": {
+     "description": "The channel id, e.g. `C0123ABCDEF`. Find it with `slack_list_channels`.",
+     "type": "string"
+    },
+    "cursor": {
+     "description": "`response_metadata.next_cursor` from the previous page.",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "inclusive": {
+     "description": "Include messages exactly at `oldest` / `latest`.",
+     "type": [
+      "boolean",
+      "null"
+     ]
+    },
+    "jq": {
+     "description": "JMESPath expression to filter/transform the response. Example:\n`messages[*].{ts: ts, user: user, text: text}`.",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "latest": {
+     "description": "Only messages before this Unix timestamp (seconds; decimals allowed).",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "limit": {
+     "description": "Page size (Slack caps at 999). Keep this small to reduce token costs.",
+     "format": "uint16",
+     "maximum": 65535,
+     "minimum": 0,
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "oldest": {
+     "description": "Only messages after this Unix timestamp (seconds; decimals allowed).",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "outputFormat": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/OutputFormatArg"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "description": "Output format: \"toon\" (default) or \"json\"."
+    }
+   },
+   "required": [
+    "channelId"
+   ],
+   "type": "object"
+  },
+  "name": "slack_channel_history"
+ },
+ {
+  "annotations": {
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": true,
+   "readOnlyHint": true
+  },
+  "description": "Get one Slack channel's metadata by id. Returns TOON format by default (30-60% fewer tokens than JSON).\n\nReturns `name`, `topic`, `purpose`, `created`, `creator`, `is_private`, `is_archived`, and `num_members` for the channel. Find the id with `slack_list_channels`.\n\nAuthenticates with the configured Slack OAuth token (`SLACK_TOKEN`) sent as `Authorization: Bearer`. Calls `conversations.info` (read-only; `channels:read` / `groups:read`).\n\n**Parameters:**\n- `channelId` (required): the channel id, e.g. `C0123ABCDEF`\n\n**Output format:** TOON (default) or JSON (`outputFormat: \"json\"`).\n\nAPI reference: https://api.slack.com/methods/conversations.info\n",
+  "inputSchema": {
+   "$defs": {
+    "OutputFormatArg": {
+     "description": "Serializable/deserializable `OutputFormat` for tool arg surfaces.",
+     "enum": [
+      "toon",
+      "json"
+     ],
+     "type": "string"
+    }
+   },
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+   "properties": {
+    "channelId": {
+     "description": "The channel id, e.g. `C0123ABCDEF`. Find it with `slack_list_channels`.",
+     "type": "string"
+    },
+    "jq": {
+     "description": "JMESPath expression to filter/transform the response.",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "outputFormat": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/OutputFormatArg"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "description": "Output format: \"toon\" (default) or \"json\"."
+    }
+   },
+   "required": [
+    "channelId"
+   ],
+   "type": "object"
+  },
+  "name": "slack_channel_info"
+ },
+ {
+  "annotations": {
    "destructiveHint": true,
    "idempotentHint": true,
    "openWorldHint": true,
@@ -2950,6 +3090,81 @@
    "type": "object"
   },
   "name": "slack_get"
+ },
+ {
+  "annotations": {
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": true,
+   "readOnlyHint": true
+  },
+  "description": "List the Slack channels the token can see. Returns TOON format by default (30-60% fewer tokens than JSON).\n\nUse this to discover a channel's `id` (e.g. `C0123ABCDEF`) for `slack_channel_history`, `slack_channel_info`, and `slack_thread_replies`. Each entry includes `id`, `name`, `is_private`, `is_archived`, `num_members`, and `topic`/`purpose`.\n\nAuthenticates with the configured Slack OAuth token (`SLACK_TOKEN`, a bot `xoxb-\u2026` or user `xoxp-\u2026` token) sent as `Authorization: Bearer`. Calls `conversations.list` (read-only; needs the `channels:read` and, for private channels, `groups:read` scopes).\n\n**Parameters:**\n- `types`: comma-separated channel kinds \u2014 `public_channel` (default), `private_channel`, `mpim`, `im`\n- `excludeArchived`: `true` to omit archived channels\n- `limit`: page size (Slack caps at 1000; keep it small)\n- `cursor`: `response_metadata.next_cursor` from the previous page\n\n**Typical use \u2014 find a channel by name:**\n- `jq`: `channels[?name=='incidents'].{id: id, name: name}`\n\n**Output format:** TOON (default) or JSON (`outputFormat: \"json\"`).\n\nAPI reference: https://api.slack.com/methods/conversations.list\n",
+  "inputSchema": {
+   "$defs": {
+    "OutputFormatArg": {
+     "description": "Serializable/deserializable `OutputFormat` for tool arg surfaces.",
+     "enum": [
+      "toon",
+      "json"
+     ],
+     "type": "string"
+    }
+   },
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+   "properties": {
+    "cursor": {
+     "description": "`response_metadata.next_cursor` from the previous page.",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "excludeArchived": {
+     "description": "Omit archived channels.",
+     "type": [
+      "boolean",
+      "null"
+     ]
+    },
+    "jq": {
+     "description": "JMESPath expression to filter/transform the response. Example to find\na channel by name: `channels[?name=='incidents'].{id: id, name: name}`.",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "limit": {
+     "description": "Page size (Slack caps at 1000). Keep this small to reduce token costs.",
+     "format": "uint16",
+     "maximum": 65535,
+     "minimum": 0,
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "outputFormat": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/OutputFormatArg"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "description": "Output format: \"toon\" (default) or \"json\"."
+    },
+    "types": {
+     "description": "Comma-separated channel kinds: `public_channel` (default),\n`private_channel`, `mpim`, `im`.",
+     "type": [
+      "string",
+      "null"
+     ]
+    }
+   },
+   "type": "object"
+  },
+  "name": "slack_list_channels"
  },
  {
   "annotations": {
@@ -3145,6 +3360,185 @@
    "type": "object"
   },
   "name": "slack_put"
+ },
+ {
+  "annotations": {
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": true,
+   "readOnlyHint": true
+  },
+  "description": "Search Slack messages across the workspace. Returns TOON format by default (30-60% fewer tokens than JSON).\n\nFull-text search with Slack's query modifiers (`in:#incidents`, `from:@alice`, `after:2026-09-01`, quoted phrases). Each match includes `channel.name`, `user`, `username`, `ts`, `text`, and a `permalink`.\n\nAuthenticates with the configured Slack OAuth token (`SLACK_TOKEN`) sent as `Authorization: Bearer`. Calls `search.messages`, which Slack allows only for **user** tokens (`xoxp-\u2026`, `search:read`); a bot token gets `not_allowed_token_type`.\n\n**Parameters:**\n- `query` (required): the search expression\n- `count`: results per page (max 100)\n- `page`: page number\n- `sort`: `score` (default) or `timestamp`\n- `sortDir`: `asc` or `desc`\n\n**Typical use \u2014 just the hits:**\n- `jq`: `messages.matches[*].{channel: channel.name, ts: ts, text: text}`\n\n**Output format:** TOON (default) or JSON (`outputFormat: \"json\"`).\n\nAPI reference: https://api.slack.com/methods/search.messages\n",
+  "inputSchema": {
+   "$defs": {
+    "OutputFormatArg": {
+     "description": "Serializable/deserializable `OutputFormat` for tool arg surfaces.",
+     "enum": [
+      "toon",
+      "json"
+     ],
+     "type": "string"
+    }
+   },
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+   "properties": {
+    "count": {
+     "description": "Results per page (max 100).",
+     "format": "uint16",
+     "maximum": 65535,
+     "minimum": 0,
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "jq": {
+     "description": "JMESPath expression to filter/transform the response. Example:\n`messages.matches[*].{channel: channel.name, ts: ts, text: text}`.",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "outputFormat": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/OutputFormatArg"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "description": "Output format: \"toon\" (default) or \"json\"."
+    },
+    "page": {
+     "description": "Page number.",
+     "format": "uint16",
+     "maximum": 65535,
+     "minimum": 0,
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "query": {
+     "description": "The search expression, with Slack modifiers (`in:#incidents`,\n`from:@alice`, `after:2026-09-01`, quoted phrases).",
+     "type": "string"
+    },
+    "sort": {
+     "description": "`score` (default) or `timestamp`.",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "sortDir": {
+     "description": "`asc` or `desc`.",
+     "type": [
+      "string",
+      "null"
+     ]
+    }
+   },
+   "required": [
+    "query"
+   ],
+   "type": "object"
+  },
+  "name": "slack_search_messages"
+ },
+ {
+  "annotations": {
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": true,
+   "readOnlyHint": true
+  },
+  "description": "Read the replies in one Slack thread. Returns TOON format by default (30-60% fewer tokens than JSON).\n\nGiven a channel id and the parent message's `ts` (the `thread_ts` on a message from `slack_channel_history`), returns the parent and its replies in order.\n\nAuthenticates with the configured Slack OAuth token (`SLACK_TOKEN`) sent as `Authorization: Bearer`. Calls `conversations.replies` (read-only; `channels:history` / `groups:history`).\n\n**Parameters:**\n- `channelId` (required): the channel id, e.g. `C0123ABCDEF`\n- `threadTs` (required): the parent message timestamp, e.g. `1700000000.123456`\n- `oldest` / `latest` / `inclusive` / `limit` / `cursor`: as for `slack_channel_history`\n\n**Output format:** TOON (default) or JSON (`outputFormat: \"json\"`).\n\nAPI reference: https://api.slack.com/methods/conversations.replies\n",
+  "inputSchema": {
+   "$defs": {
+    "OutputFormatArg": {
+     "description": "Serializable/deserializable `OutputFormat` for tool arg surfaces.",
+     "enum": [
+      "toon",
+      "json"
+     ],
+     "type": "string"
+    }
+   },
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+   "properties": {
+    "channelId": {
+     "description": "The channel id, e.g. `C0123ABCDEF`.",
+     "type": "string"
+    },
+    "cursor": {
+     "description": "`response_metadata.next_cursor` from the previous page.",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "inclusive": {
+     "description": "Include replies exactly at `oldest` / `latest`.",
+     "type": [
+      "boolean",
+      "null"
+     ]
+    },
+    "jq": {
+     "description": "JMESPath expression to filter/transform the response.",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "latest": {
+     "description": "Only replies before this Unix timestamp.",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "limit": {
+     "description": "Page size (Slack caps at 999).",
+     "format": "uint16",
+     "maximum": 65535,
+     "minimum": 0,
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "oldest": {
+     "description": "Only replies after this Unix timestamp.",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "outputFormat": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/OutputFormatArg"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "description": "Output format: \"toon\" (default) or \"json\"."
+    },
+    "threadTs": {
+     "description": "The parent message's `ts` (the `thread_ts` on a reply), e.g.\n`1700000000.123456`.",
+     "type": "string"
+    }
+   },
+   "required": [
+    "channelId",
+    "threadTs"
+   ],
+   "type": "object"
+  },
+  "name": "slack_thread_replies"
  },
  {
   "annotations": {
