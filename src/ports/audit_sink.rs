@@ -89,6 +89,124 @@ pub struct AuditEvent {
     pub egress: Option<EgressSummary>,
 }
 
+/// Kinds of control-plane record: what the gateway itself did, as opposed
+/// to what a caller asked it to do (WPs B.3 and B.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ControlEventKind {
+    /// The policy document in force when the gateway started.
+    PolicyLoaded,
+    /// A changed policy document was verified and compiled; it is put in
+    /// force **after** this record is durable, never before.
+    PolicyChanged,
+    /// A changed policy document was refused — the signature did not
+    /// verify, it did not compile, or it could not be read — and the last
+    /// good document stays in force. Written once per distinct failure,
+    /// not once per poll.
+    PolicyRejected,
+    /// The revocation list in force when the gateway started.
+    RevocationLoaded,
+    /// A changed revocation list was verified and applied; cached
+    /// validations were dropped and affected sessions closed.
+    RevocationChanged,
+    /// A changed revocation list was refused; the last good list stays.
+    RevocationRejected,
+    /// A request carrying a validated token was refused because the
+    /// revocation list names its subject, its token id, or its issue time.
+    RevokedTokenRejected,
+}
+
+/// Whether a loaded document carried a verified signature, and from which
+/// key. `verified: false` with no key is an unsigned load in a deployment
+/// that does not require signatures (local dry runs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SignatureStatus {
+    pub verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+}
+
+/// A control-plane audit record. Same journal, same sequence, same
+/// durability as tool-call events; a different shape, because there is no
+/// tool, no decision, and no upstream identity to report. Every field
+/// beyond `kind` and `timestamp` is optional so one type covers policy
+/// loads, revocation changes, and revoked-token refusals without inventing
+/// placeholder principals.
+#[derive(Debug, Clone, Serialize)]
+pub struct ControlEvent {
+    pub timestamp: String,
+    pub kind: ControlEventKind,
+    /// The principal a request-driven record is about (a revoked-token
+    /// refusal). Absent for watcher-driven records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal: Option<Principal>,
+    /// Where the document came from — an operator-configured path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Version label of the document previously in force, on a change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_version: Option<String>,
+    /// Version label of the document this record is about: the one loaded,
+    /// put in force, or refused (the refused document's own hash, so the
+    /// bytes that were rejected can be identified later).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<SignatureStatus>,
+    /// A bounded, operator-facing reason on rejections and refusals. Names
+    /// a category or a parser's complaint about an operator-authored file;
+    /// never request content, never key material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Revocation-list contents summary, on revocation records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_subjects: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
+}
+
+impl ControlEvent {
+    /// A record with only a kind and the current timestamp; callers fill
+    /// in what applies.
+    #[must_use]
+    pub fn now(kind: ControlEventKind) -> Self {
+        Self {
+            timestamp: crate::logger::iso_timestamp(),
+            kind,
+            principal: None,
+            source: None,
+            previous_version: None,
+            version: None,
+            signature: None,
+            reason: None,
+            revoked_subjects: None,
+            revoked_tokens: None,
+            not_before: None,
+        }
+    }
+
+    /// Attach a reason, bounded so a parser's complaint about a large
+    /// document cannot balloon a record.
+    #[must_use]
+    pub fn with_reason(mut self, reason: &str) -> Self {
+        const MAX_REASON: usize = 512;
+        let mut text = reason.to_owned();
+        if text.len() > MAX_REASON {
+            let mut cut = MAX_REASON;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.truncate(cut);
+            text.push('…');
+        }
+        self.reason = Some(text);
+        self
+    }
+}
+
 /// Why an audit append failed, as a closed set of categories.
 ///
 /// A sink adapter's own error text is **not** part of this. A sink is free to
@@ -166,6 +284,16 @@ pub trait AuditSink: Send + Sync {
     /// the dispatch path must fail closed (refuse the call), never proceed.
     fn append<'a>(&'a self, event: &'a AuditEvent) -> AppendFuture<'a>;
 
+    /// Append a control-plane record ([`ControlEvent`]) under the same
+    /// sequence and durability contract as [`Self::append`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::append`]: any error means the record is not durable.
+    /// Callers that are about to *change* the gateway's behaviour on the
+    /// strength of the record (put a new policy in force) must not proceed.
+    fn append_control<'a>(&'a self, event: &'a ControlEvent) -> AppendFuture<'a>;
+
     /// Whether the sink can currently accept records. A poisoned journal
     /// answers `false`, and the HTTP health endpoint reports it: a gateway
     /// that will refuse every tool call must not look healthy to the load
@@ -182,6 +310,14 @@ pub(crate) struct SequencedEvent<'a> {
     pub seq: u64,
     #[serde(flatten)]
     pub event: &'a AuditEvent,
+}
+
+/// A sequence-stamped control record as a sink persists it.
+#[derive(Serialize)]
+pub(crate) struct SequencedControlEvent<'a> {
+    pub seq: u64,
+    #[serde(flatten)]
+    pub event: &'a ControlEvent,
 }
 
 /// In-memory sink for tests: sequences like the journal, records the exact
@@ -218,6 +354,22 @@ impl InMemoryAuditSink {
     ///
     /// When [`Self::set_failing`] is on, or the event does not serialize.
     pub fn append_now(&self, event: &AuditEvent) -> io::Result<u64> {
+        self.record(|seq| serde_json::to_value(SequencedEvent { seq, event }))
+    }
+
+    /// The synchronous body of [`AuditSink::append_control`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::append_now`].
+    pub fn append_control_now(&self, event: &ControlEvent) -> io::Result<u64> {
+        self.record(|seq| serde_json::to_value(SequencedControlEvent { seq, event }))
+    }
+
+    fn record(
+        &self,
+        serialize: impl FnOnce(u64) -> serde_json::Result<serde_json::Value>,
+    ) -> io::Result<u64> {
         if self.failing.load(Ordering::SeqCst) {
             return Err(io::Error::other("audit sink is failing (test switch)"));
         }
@@ -227,7 +379,7 @@ impl InMemoryAuditSink {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.next_seq += 1;
         let seq = state.next_seq;
-        let value = serde_json::to_value(SequencedEvent { seq, event })
+        let value = serialize(seq)
             .map_err(|error| io::Error::other(format!("serialize audit event: {error}")))?;
         state.events.push(value);
         Ok(seq)
@@ -248,6 +400,10 @@ impl AuditSink for InMemoryAuditSink {
     fn append<'a>(&'a self, event: &'a AuditEvent) -> AppendFuture<'a> {
         // No I/O to wait for: resolve immediately.
         Box::pin(std::future::ready(self.append_now(event)))
+    }
+
+    fn append_control<'a>(&'a self, event: &'a ControlEvent) -> AppendFuture<'a> {
+        Box::pin(std::future::ready(self.append_control_now(event)))
     }
 
     /// The failing switch doubles as "unavailable", so health-endpoint

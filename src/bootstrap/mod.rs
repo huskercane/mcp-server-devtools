@@ -218,11 +218,11 @@ impl ServerBuilder {
             Some(sink) => Some(sink),
             None => open_configured_journal(&config)?,
         };
+        let audit_append_timeout = crate::policy::egress::audit_append_timeout(&config);
         let policy = match self.policy {
             Some(policy) => policy,
-            None => load_configured_policy(&config)?,
+            None => load_configured_policy(&config, audit_sink.as_ref(), audit_append_timeout)?,
         };
-        let audit_append_timeout = crate::policy::egress::audit_append_timeout(&config);
 
         let components = Arc::new(Components {
             config: ConfigHandle::new(config),
@@ -280,11 +280,39 @@ fn open_configured_journal(config: &Config) -> Result<Option<Arc<dyn AuditSink>>
     Ok(Some(Arc::new(sink)))
 }
 
+/// The verifying key named by `MCP_POLICY_PUBLIC_KEY`, if any. Blank counts
+/// as absent; a value that is not a key is a startup error.
+///
+/// # Errors
+///
+/// When the value is set but is not a base64 Ed25519 public key.
+pub fn configured_policy_public_key(
+    config: &Config,
+) -> Result<Option<crate::policy::VerifyingKey>, McpError> {
+    let key = crate::policy::engine::POLICY_PUBLIC_KEY_KEY;
+    config
+        .get(key)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            crate::policy::VerifyingKey::from_base64(value).map_err(|error| {
+                crate::error::unexpected(format!("{key}: {error}; refusing to start"), None)
+            })
+        })
+        .transpose()
+}
+
 /// Load and start watching the policy named by `MCP_POLICY_FILE`, or
 /// [`AllowAll`] when none is configured. A configured policy that does not
-/// compile is a hard startup error — enterprise mode never runs on a
-/// guess, and local mode with a broken dry-run policy should say so.
-fn load_configured_policy(config: &Config) -> Result<Arc<dyn PolicyDecisionPoint>, McpError> {
+/// compile — or, with `MCP_POLICY_PUBLIC_KEY` set, is not validly signed —
+/// is a hard startup error: enterprise mode never runs on a guess, and
+/// local mode with a broken dry-run policy should say so. With a journal,
+/// the watcher journals the policy in force and every later change.
+fn load_configured_policy(
+    config: &Config,
+    audit_sink: Option<&Arc<dyn AuditSink>>,
+    append_timeout: std::time::Duration,
+) -> Result<Arc<dyn PolicyDecisionPoint>, McpError> {
     let Some(path) = config
         .get(crate::policy::engine::POLICY_FILE_KEY)
         .map(str::trim)
@@ -292,17 +320,27 @@ fn load_configured_policy(config: &Config) -> Result<Arc<dyn PolicyDecisionPoint
     else {
         return Ok(Arc::new(AllowAll));
     };
-    let policy = crate::policy::FilePolicy::load(std::path::Path::new(path)).map_err(|error| {
+    let verifier = configured_policy_public_key(config)?;
+    let path = std::path::Path::new(path);
+    let loaded = match verifier {
+        Some(verifier) => crate::policy::FilePolicy::load_verified(path, verifier),
+        None => crate::policy::FilePolicy::load(path),
+    };
+    let policy = loaded.map_err(|error| {
         crate::error::unexpected(
             format!(
-                "cannot load the policy in {}={path}: {error}; refusing to start (fail closed, \
+                "cannot load the policy in {}={}: {error}; refusing to start (fail closed, \
                  plan §1.2)",
-                crate::policy::engine::POLICY_FILE_KEY
+                crate::policy::engine::POLICY_FILE_KEY,
+                path.display()
             ),
             None,
         )
     })?;
-    policy.spawn_watcher();
+    policy.spawn_watcher(audit_sink.map(|sink| crate::policy::PolicyAudit {
+        sink: Arc::clone(sink),
+        append_timeout,
+    }));
     Ok(Arc::new(policy))
 }
 

@@ -205,6 +205,20 @@ fn enterprise_inbound_auth(config: &Config) -> Result<InboundAuth, String> {
             crate::policy::engine::POLICY_FILE_KEY
         ));
     }
+    if config
+        .get(crate::policy::engine::POLICY_PUBLIC_KEY_KEY)
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        return Err(format!(
+            "refusing to start: MCP_AUTH_MODE=okta requires {} — enterprise mode applies only \
+             signed policy bundles, so a gateway with no verifying key could not tell an \
+             authored policy from a planted one (fail-closed; plan §4 B.3). Generate a key \
+             pair with `mcp-devtools policy keygen` and sign the policy with \
+             `mcp-devtools policy sign`",
+            crate::policy::engine::POLICY_PUBLIC_KEY_KEY
+        ));
+    }
     let client = crate::transport::build_client().map_err(|error| error.message)?;
     let validator = Arc::new(crate::auth::okta::OktaJwksValidator::new(okta, client));
     Ok(InboundAuth::new(Arc::new(validator), settings))

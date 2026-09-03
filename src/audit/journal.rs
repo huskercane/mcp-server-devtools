@@ -64,7 +64,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::ports::audit_sink::{AppendFuture, AuditEvent, AuditSink};
+use crate::ports::audit_sink::{AppendFuture, AuditEvent, AuditSink, ControlEvent};
 
 /// File name inside `MCP_AUDIT_JOURNAL_DIR`.
 pub const JOURNAL_FILE_NAME: &str = "audit-journal.jsonl";
@@ -261,10 +261,14 @@ impl Drop for JournalAuditSink {
     }
 }
 
-impl AuditSink for JournalAuditSink {
-    fn append<'a>(&'a self, event: &'a AuditEvent) -> AppendFuture<'a> {
+impl JournalAuditSink {
+    /// Hand a serialized record to the writer and wait for its durable
+    /// acknowledgement. Shared by every record kind: the journal does not
+    /// care what a record says, only that it is a JSON object it can
+    /// stamp a sequence number into.
+    fn enqueue(&self, serialized: serde_json::Result<Vec<u8>>) -> AppendFuture<'_> {
         Box::pin(async move {
-            let body = serde_json::to_vec(event)
+            let body = serialized
                 .map_err(|error| io::Error::other(format!("serialize audit event: {error}")))?;
             if body.len() < 3 || body.first() != Some(&b'{') {
                 return Err(io::Error::other(
@@ -288,6 +292,16 @@ impl AuditSink for JournalAuditSink {
                 )),
             }
         })
+    }
+}
+
+impl AuditSink for JournalAuditSink {
+    fn append<'a>(&'a self, event: &'a AuditEvent) -> AppendFuture<'a> {
+        self.enqueue(serde_json::to_vec(event))
+    }
+
+    fn append_control<'a>(&'a self, event: &'a ControlEvent) -> AppendFuture<'a> {
+        self.enqueue(serde_json::to_vec(event))
     }
 
     fn is_available(&self) -> bool {

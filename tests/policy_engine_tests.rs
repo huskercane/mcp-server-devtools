@@ -160,7 +160,7 @@ async fn a_changed_document_is_picked_up_and_a_broken_one_is_ignored() {
     let allow_sre = "version: 1\nrules:\n  - id: sre\n    effect: allow\n    subjects: {groups: [SRE]}\n    match: {vendor: grafana}\n";
     std::fs::write(&path, allow_sre).unwrap();
     let policy = FilePolicy::load(&path).unwrap();
-    policy.spawn_watcher();
+    policy.spawn_watcher(None);
     let first_version = policy.version().unwrap();
 
     let sre = |policy: &FilePolicy| {
@@ -228,7 +228,7 @@ async fn a_vanished_policy_file_keeps_the_last_policy_and_reports_degraded_healt
     let document = "version: 7\nrules:\n  - id: sre\n    effect: allow\n    subjects: {groups: [SRE]}\n    match: {vendor: grafana}\n";
     std::fs::write(&path, document).unwrap();
     let policy = FilePolicy::load(&path).unwrap();
-    policy.spawn_watcher();
+    policy.spawn_watcher(None);
     let version = policy.version().unwrap();
     assert_eq!(policy.degraded(), None);
 

@@ -95,6 +95,11 @@ jsonwebtoken        = { version = "=11.0.0", default-features = false, features 
 # archived upstream and flagged unmaintained by cargo-deny; this is the
 # maintained fork with the same API and licence.
 serde_norway        = "=0.9.42"
+# Ed25519 detached signatures for policy bundles (WP B.3), the revocation
+# list (WP B.4), and audit checkpoints (WP B.6). Already in the tree as the
+# crypto provider behind `rustls` and `jsonwebtoken`, so this pins the version
+# the lockfile had resolved and adds no second crypto stack.
+aws-lc-rs           = "=1.18.0"
 
 # --- WRDS (feature = "wrds") --------------------------------------------------
 # WRDS is PostgreSQL-only; these back the `wrds_*` tools. `with-serde_json-1`

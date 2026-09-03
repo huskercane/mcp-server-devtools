@@ -30,16 +30,18 @@ pub mod egress;
 pub mod engine;
 pub mod extractors;
 pub mod scope;
+pub mod signing;
 
 use serde::{Deserialize, Serialize};
 
 pub use canonical::{CanonicalPath, CanonicalTarget, CanonicalizeError};
 pub use egress::{Enforcement, authorize_egress};
-pub use engine::{FilePolicy, PolicyError};
+pub use engine::{FilePolicy, PolicyAudit, PolicyChange, PolicyError, StagedPolicy};
 pub use scope::{
     CallScope, EgressDispatch, EgressRecord, EgressSummary, EgressTicket, MAX_EGRESS_RECORDS,
     OwnerKey,
 };
+pub use signing::{Domain, Signature, SigningError, SigningKey, VerifyingKey};
 
 use crate::transport::HttpMethod;
 

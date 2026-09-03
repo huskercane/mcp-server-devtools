@@ -27,7 +27,10 @@ pub mod policy_decision_point;
 pub mod token_validator;
 pub mod usage_sink;
 
-pub use audit_sink::{AuditEvent, AuditEventKind, AuditFailure, AuditSink, InMemoryAuditSink};
+pub use audit_sink::{
+    AuditEvent, AuditEventKind, AuditFailure, AuditSink, ControlEvent, ControlEventKind,
+    InMemoryAuditSink, SignatureStatus,
+};
 pub use command_runner::{CommandOutput, CommandRunner};
 pub use credential_broker::{ConfigCredentialBroker, CredentialBroker, StaticCredentialBroker};
 pub use policy_decision_point::{AllowAll, PolicyDecisionPoint};
