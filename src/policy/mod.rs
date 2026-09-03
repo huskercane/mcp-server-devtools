@@ -40,7 +40,7 @@ pub use bundle::{
 };
 pub use canonical::{CanonicalPath, CanonicalTarget, CanonicalizeError};
 pub use egress::{Enforcement, authorize_egress};
-pub use engine::{CompiledPolicy, FilePolicy, PolicyError};
+pub use engine::{CompiledPolicy, FilePolicy, PolicyError, RuleDescription, SubjectsDescription};
 pub use scope::{
     CallScope, EgressDispatch, EgressRecord, EgressSummary, EgressTicket, MAX_EGRESS_RECORDS,
     OwnerKey,

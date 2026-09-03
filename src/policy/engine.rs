@@ -680,6 +680,152 @@ impl SignedBundle<CompiledPolicy> {
     pub fn rule_count(&self) -> usize {
         self.snapshot().document.rules.len()
     }
+
+    /// Every rule, as data, in document order (WP B.5 access review, WP
+    /// B.2 explain).
+    #[must_use]
+    pub fn describe_rules(&self) -> Vec<RuleDescription> {
+        self.snapshot()
+            .document
+            .rules
+            .iter()
+            .map(CompiledRule::describe)
+            .collect()
+    }
+
+    /// The rules whose `subjects` clause matches `principal` — what this
+    /// principal *could* be allowed or denied, before any call is matched.
+    /// The access review is this, per member of each group.
+    #[must_use]
+    pub fn rules_for(&self, principal: &Principal) -> Vec<RuleDescription> {
+        self.snapshot()
+            .document
+            .rules
+            .iter()
+            .filter(|rule| rule.subjects.matches(principal))
+            .map(CompiledRule::describe)
+            .collect()
+    }
+}
+
+/// A rule as data: what the document said, after compilation, with every
+/// list normalized to a list of strings. What the access review and
+/// `policy explain` print.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RuleDescription {
+    pub id: String,
+    pub effect: PolicyEffect,
+    pub subjects: SubjectsDescription,
+    /// The match keys the rule names, in the document's vocabulary.
+    /// Absent keys match anything.
+    pub matches: std::collections::BTreeMap<&'static str, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SubjectsDescription {
+    pub everyone: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+}
+
+fn glob_patterns(globs: Option<&Vec<Glob>>) -> Vec<String> {
+    globs
+        .map(|globs| globs.iter().map(|glob| glob.pattern.clone()).collect())
+        .unwrap_or_default()
+}
+
+fn enum_labels<T: serde::Serialize>(values: Option<&Vec<T>>) -> Vec<String> {
+    values
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| {
+                    serde_json::to_value(value)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+impl CompiledRule {
+    fn describe(&self) -> RuleDescription {
+        let mut matches = std::collections::BTreeMap::new();
+        let mut put = |key: &'static str, values: Vec<String>| {
+            if !values.is_empty() {
+                matches.insert(key, values);
+            }
+        };
+        put("vendor", self.vendor.clone().unwrap_or_default());
+        put("environment", enum_labels(self.environment.as_ref()));
+        put("tool_name", glob_patterns(self.tool_name.as_ref()));
+        put(
+            "normalized_action",
+            enum_labels(self.normalized_action.as_ref()),
+        );
+        put("request_risk", enum_labels(self.request_risk.as_ref()));
+        put("resource_type", enum_labels(self.resource_type.as_ref()));
+        put("resource_id", glob_patterns(self.resource_id.as_ref()));
+        put(
+            "resource_scope",
+            self.resource_scope
+                .map(|kind| match kind {
+                    ScopeKind::Collection => vec!["collection".to_owned()],
+                    ScopeKind::Unscoped => vec!["unscoped".to_owned()],
+                })
+                .unwrap_or_default(),
+        );
+        if let Some((resource_type, globs)) = &self.constrained_by {
+            let label = serde_json::to_value(resource_type)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_default();
+            put(
+                "constrained_by",
+                globs
+                    .iter()
+                    .map(|glob| format!("{label}:{}", glob.pattern))
+                    .collect(),
+            );
+        }
+        put(
+            "upstream_authority",
+            enum_labels(self.upstream_authority.as_ref()),
+        );
+        put(
+            "method",
+            self.method
+                .as_ref()
+                .map(|methods| {
+                    methods
+                        .iter()
+                        .map(|method| method.as_str().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
+        put(
+            "canonical_path",
+            glob_patterns(self.canonical_path.as_ref()),
+        );
+        RuleDescription {
+            id: self.id.clone(),
+            effect: self.effect,
+            subjects: SubjectsDescription {
+                everyone: self.subjects.everyone,
+                groups: glob_patterns(self.subjects.groups.as_ref()),
+                subjects: glob_patterns(self.subjects.subjects.as_ref()),
+                scopes: glob_patterns(self.subjects.scopes.as_ref()),
+            },
+            matches,
+        }
+    }
 }
 
 impl PolicyDecisionPoint for FilePolicy {

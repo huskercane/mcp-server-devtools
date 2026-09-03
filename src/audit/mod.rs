@@ -6,7 +6,9 @@
 //! serialized records; a dedicated worker owns all file I/O and rotation.
 
 pub mod checkpoint;
+pub mod export;
 pub mod journal;
+pub mod metrics;
 pub mod reader;
 pub mod verify;
 
