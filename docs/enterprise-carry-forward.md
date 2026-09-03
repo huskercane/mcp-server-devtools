@@ -362,7 +362,24 @@ carries a real SPDX `license` field.
 **Open** — still unstarted from the M0 work-package list.
 
 ### CF-18 · Where the Okta validator and the file policy engine live (ADR-001)
-**Blocked · owner + counsel (with CF-10) · before any external contribution**
+**Deferred · decided 2026-09-03: option 2 in practice while the repository is private · revisit at open-sourcing, with CF-10**
+
+**Decision 2026-09-03.** The community repository is private for now, so
+the boundary ADR-001 draws — "the community binary never links enterprise
+code" — has no external party on the other side of it. Option 1 (move)
+would today cost a second binary with its own CI, release train, image,
+and manifests; a change of trial artifact between Gate A and Gate B;
+roughly half the integration suite leaving the crate that exercises the
+wire path; two-repo changes for every feature that touches a port and its
+implementation; and a split allocation gate — and it would deliver
+nothing that runs differently. The secure remote slice therefore stays in
+this crate (option 2 in practice), ADR-001 stays as written but
+amended-pending, and the private enterprise crate begins with the control
+plane in Phase C. Revisit if and when the community repository is opened,
+together with the licence text (CF-10), since whether "enterprise" means
+the control plane or the whole secure slice is what decides what moves.
+Every module involved sits behind a port or a CLI boundary, so a later
+move is the same file move it is today.
 
 **Amended 2026-09-03 (Phase B).** Phase B added to the public crate, for
 the same reason Phase A did (the enterprise crate has no runtime, and Gate A
