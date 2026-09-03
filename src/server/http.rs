@@ -224,6 +224,19 @@ fn enterprise_inbound_auth(
             crate::policy::engine::POLICY_PUBLIC_KEY_KEY
         ));
     }
+    if config
+        .get(crate::audit::journal::CheckpointPolicy::SIGNING_KEY_KEY)
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        return Err(format!(
+            "refusing to start: MCP_AUTH_MODE=okta requires {} — the audit journal's \
+             checkpoints are signed so tampering is detectable offline, and an unsigned \
+             journal is evidence only for whoever holds the disk (plan §3.3, B.6). Generate \
+             a key with `mcp-devtools audit keygen`",
+            crate::audit::journal::CheckpointPolicy::SIGNING_KEY_KEY
+        ));
+    }
     let revocation_path = config
         .get(crate::auth::revocation::REVOCATION_FILE_KEY)
         .map(str::trim)

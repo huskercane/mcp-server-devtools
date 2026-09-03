@@ -266,18 +266,100 @@ fn open_configured_journal(config: &Config) -> Result<Option<Arc<dyn AuditSink>>
     let Some(dir) = configured_journal_dir(config) else {
         return Ok(None);
     };
-    let sink = crate::audit::journal::JournalAuditSink::open(std::path::Path::new(dir)).map_err(
-        |error| {
+    let checkpoints = configured_checkpoint_policy(config)?;
+    let sink =
+        crate::audit::journal::JournalAuditSink::open_with(std::path::Path::new(dir), checkpoints)
+            .map_err(|error| {
+                crate::error::unexpected(
+                    format!(
+                        "cannot open the durable audit journal in MCP_AUDIT_JOURNAL_DIR={dir}: \
+                 {error}; refusing to start (fail closed, plan §1.2)"
+                    ),
+                    None,
+                )
+            })?;
+    Ok(Some(Arc::new(sink)))
+}
+
+/// The journal's checkpoint policy from configuration (WP B.6): cadence,
+/// the signing key file, and the export directory. Each is optional here;
+/// okta mode requires the signing key (`server::http`).
+///
+/// # Errors
+///
+/// When a value is malformed, the key file cannot be loaded, or the export
+/// directory cannot be created.
+pub fn configured_checkpoint_policy(
+    config: &Config,
+) -> Result<crate::audit::journal::CheckpointPolicy, McpError> {
+    use crate::audit::journal::CheckpointPolicy;
+    let mut policy = CheckpointPolicy::unsigned();
+    if let Some(value) = configured(config, CheckpointPolicy::RECORDS_KEY) {
+        policy.every_records = value
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| {
+                crate::error::unexpected(
+                    format!(
+                        "{} must be a positive integer, got {value:?}",
+                        CheckpointPolicy::RECORDS_KEY
+                    ),
+                    None,
+                )
+            })?;
+    }
+    if let Some(value) = configured(config, CheckpointPolicy::SECONDS_KEY) {
+        let seconds = value
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| {
+                crate::error::unexpected(
+                    format!(
+                        "{} must be a positive integer, got {value:?}",
+                        CheckpointPolicy::SECONDS_KEY
+                    ),
+                    None,
+                )
+            })?;
+        policy.every_seconds = std::time::Duration::from_secs(seconds);
+    }
+    if let Some(path) = configured(config, CheckpointPolicy::SIGNING_KEY_KEY) {
+        let key = crate::policy::SigningKey::load(std::path::Path::new(path)).map_err(|error| {
             crate::error::unexpected(
                 format!(
-                    "cannot open the durable audit journal in MCP_AUDIT_JOURNAL_DIR={dir}: \
-                     {error}; refusing to start (fail closed, plan §1.2)"
+                    "{}: {error}; refusing to start",
+                    CheckpointPolicy::SIGNING_KEY_KEY
                 ),
                 None,
             )
-        },
-    )?;
-    Ok(Some(Arc::new(sink)))
+        })?;
+        policy.signing_key = Some(key);
+    }
+    if let Some(dir) = configured(config, CheckpointPolicy::EXPORT_DIR_KEY) {
+        let sink = crate::ports::DirectoryCheckpointSink::open(std::path::Path::new(dir)).map_err(
+            |error| {
+                crate::error::unexpected(
+                    format!(
+                        "{}={dir}: {error}; refusing to start",
+                        CheckpointPolicy::EXPORT_DIR_KEY
+                    ),
+                    None,
+                )
+            },
+        )?;
+        policy.export = Some(Arc::new(sink));
+    }
+    Ok(policy)
+}
+
+/// A configured, non-blank value.
+fn configured<'a>(config: &'a Config, key: &str) -> Option<&'a str> {
+    config
+        .get(key)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 /// The verifying key named by `MCP_POLICY_PUBLIC_KEY`, if any. Blank counts

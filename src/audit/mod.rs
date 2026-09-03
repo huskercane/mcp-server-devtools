@@ -5,7 +5,10 @@
 //! cannot accidentally disable the audit trail. Request threads only enqueue
 //! serialized records; a dedicated worker owns all file I/O and rotation.
 
+pub mod checkpoint;
 pub mod journal;
+pub mod reader;
+pub mod verify;
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};

@@ -55,6 +55,7 @@ spec:
             - { name: tmp, mountPath: /tmp }
             - { name: journal, mountPath: /journal }
             - { name: policy, mountPath: /policy, readOnly: true }
+            - { name: audit-signing-key, mountPath: /keys, readOnly: true }
           readinessProbe:
             exec: { command: ["/mcp-devtools", "health"] }
             periodSeconds: 10
@@ -73,6 +74,9 @@ spec:
           persistentVolumeClaim: { claimName: mcp-devtools-journal }
         - name: policy
           configMap: { name: mcp-devtools-policy }
+        - name: audit-signing-key
+          # Owner-only: the gateway refuses a signing key other users can read.
+          secret: { secretName: mcp-devtools-audit-signing-key, defaultMode: 0400 }
 ---
 apiVersion: v1
 kind: Service

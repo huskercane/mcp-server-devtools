@@ -22,6 +22,7 @@
 //! prefix.
 
 pub mod api;
+pub mod audit;
 pub mod bb;
 pub mod conf;
 pub mod creds;
@@ -79,6 +80,11 @@ pub enum TopCommand {
         #[command(subcommand)]
         action: policy::Command,
     },
+    /// Verify, export, and report on the audit journal (`audit keygen|verify|…`).
+    Audit {
+        #[command(subcommand)]
+        action: audit::Command,
+    },
     /// Edit and re-sign the revocation list (`revoke subject|token|all|…`).
     Revoke {
         #[command(subcommand)]
@@ -134,6 +140,7 @@ where
         TopCommand::Creds { action } => creds::dispatch(action).await,
         TopCommand::Policy { action } => policy::dispatch(action),
         TopCommand::Revoke { action } => revoke::dispatch(action),
+        TopCommand::Audit { action } => audit::dispatch(action),
         TopCommand::Serve(opts) => return serve::dispatch(opts).await,
         TopCommand::Health(opts) => return health::dispatch(&opts).await,
         legacy => dispatch_legacy(legacy).await,
@@ -184,6 +191,7 @@ async fn dispatch_legacy(legacy: TopCommand) -> Result<(), crate::error::McpErro
         | TopCommand::Creds { .. }
         | TopCommand::Policy { .. }
         | TopCommand::Revoke { .. }
+        | TopCommand::Audit { .. }
         | TopCommand::Serve(_)
         | TopCommand::Health(_) => unreachable!(
             "vendor groups are dispatched directly; legacy path receives only flat verbs"
