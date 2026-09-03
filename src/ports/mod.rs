@@ -34,5 +34,7 @@ pub use audit_sink::{
 pub use command_runner::{CommandOutput, CommandRunner};
 pub use credential_broker::{ConfigCredentialBroker, CredentialBroker, StaticCredentialBroker};
 pub use policy_decision_point::{AllowAll, PolicyDecisionPoint};
-pub use token_validator::{StaticValidator, TokenRejection, TokenValidator};
+pub use token_validator::{
+    Authenticated, StaticValidator, TokenFacts, TokenRejection, TokenValidator,
+};
 pub use usage_sink::{BoundedUsageChannel, NoopUsageSink, UsageEvent, UsageSink};

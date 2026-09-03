@@ -154,6 +154,29 @@ impl ReapingSessionManager {
             .is_some_and(|owner| owner == requester)
     }
 
+    /// Close every session whose owner satisfies `revoked` (WP B.4): a
+    /// revoked subject's sessions must not outlive the revocation, and a
+    /// `revoke all` closes every principal-bound session. Returns how many
+    /// were closed. Unbound and local sessions are never touched.
+    pub async fn close_where(&self, revoked: impl Fn(&OwnerKey) -> bool) -> usize {
+        let doomed: Vec<SessionId> = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .iter()
+                .filter(|(_, state)| state.owner.as_ref().is_some_and(&revoked))
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in &doomed {
+            debug!(session_id = %id, "closing session of a revoked principal");
+            if let Err(err) = self.inner.close_session(id).await {
+                warn!(session_id = %id, error = %err, "failed to close revoked session");
+            }
+            self.sessions.write().await.remove(id);
+        }
+        doomed.len()
+    }
+
     /// The owner a session is bound to, for tests and diagnostics.
     pub async fn owner_of(&self, id: &SessionId) -> Option<OwnerKey> {
         self.sessions

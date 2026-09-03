@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::cargo::cargo_bin;
 use mcp_server_devtools::policy::signing::{Domain, SigningKey, VerifyingKey, write_detached};
-use mcp_server_devtools::policy::{FilePolicy, PolicyAudit};
+use mcp_server_devtools::policy::{BundleAudit, FilePolicy};
 use mcp_server_devtools::ports::audit_sink::{AppendFuture, AuditEvent, ControlEvent};
 use mcp_server_devtools::ports::{AuditSink, InMemoryAuditSink, PolicyDecisionPoint};
 use pretty_assertions::assert_eq;
@@ -153,10 +153,13 @@ async fn a_change_is_journaled_before_it_takes_effect_and_rejections_once() {
         versions_at_append: Mutex::new(Vec::new()),
     });
     witness.bind(&policy);
-    policy.spawn_watcher(Some(PolicyAudit {
-        sink: Arc::clone(&witness) as Arc<dyn AuditSink>,
-        append_timeout: Duration::from_secs(5),
-    }));
+    policy.spawn_watcher(
+        Some(BundleAudit {
+            sink: Arc::clone(&witness) as Arc<dyn AuditSink>,
+            append_timeout: Duration::from_secs(5),
+        }),
+        None,
+    );
 
     // The policy in force is journaled when the watcher starts.
     assert!(
@@ -242,10 +245,13 @@ async fn a_change_whose_record_cannot_be_journaled_is_not_applied() {
     let policy = FilePolicy::load_verified(&path, key.verifying_key()).unwrap();
     let v1 = policy.version().unwrap();
     let sink = Arc::new(InMemoryAuditSink::new());
-    policy.spawn_watcher(Some(PolicyAudit {
-        sink: Arc::clone(&sink) as Arc<dyn AuditSink>,
-        append_timeout: Duration::from_secs(1),
-    }));
+    policy.spawn_watcher(
+        Some(BundleAudit {
+            sink: Arc::clone(&sink) as Arc<dyn AuditSink>,
+            append_timeout: Duration::from_secs(1),
+        }),
+        None,
+    );
     assert!(
         wait_until(Duration::from_secs(3), || {
             !control_events(&sink, "policy_loaded").is_empty()

@@ -75,7 +75,7 @@ use crate::controllers::zoom::ZoomContext;
 use crate::error::format_error_for_mcp_tool;
 use crate::format::truncation::truncate_for_ai;
 use crate::policy::{ClientIdentity, PolicyDecision, Principal};
-use crate::ports::{AuditEvent, AuditEventKind, UsageEvent};
+use crate::ports::{AuditEvent, AuditEventKind, TokenFacts, UsageEvent};
 #[derive(Clone)]
 pub struct DevtoolsServer {
     components: Arc<Components>,
@@ -311,6 +311,20 @@ impl DevtoolsServer {
         self.components.policy.degraded()
     }
 
+    /// The durable audit sink, when one is configured. The HTTP transport
+    /// hands it to the inbound-auth stack so revocation events share the
+    /// journal.
+    #[must_use]
+    pub fn audit_sink(&self) -> Option<Arc<dyn crate::ports::AuditSink>> {
+        self.components.audit_sink.clone()
+    }
+
+    /// The bound on a durable append (CF-14), shared with the auth stack.
+    #[must_use]
+    pub fn audit_append_timeout(&self) -> std::time::Duration {
+        self.components.audit_append_timeout
+    }
+
     /// The outcome appends still in flight after their caller stopped
     /// waiting (see `record_outcome`). A transport takes a clone before it
     /// starts serving and passes it to [`drain_pending_audit`] once serving
@@ -332,18 +346,67 @@ impl DevtoolsServer {
     fn principal_for(
         &self,
         context: &rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Option<Principal> {
-        let validated = context
-            .extensions
-            .get::<axum::http::request::Parts>()
+    ) -> Option<(Principal, TokenFacts)> {
+        let parts = context.extensions.get::<axum::http::request::Parts>();
+        let validated = parts
             .and_then(|parts| parts.extensions.get::<Principal>())
             .cloned();
         match validated {
-            Some(principal) => Some(principal),
+            Some(principal) => {
+                let facts = parts
+                    .and_then(|parts| parts.extensions.get::<TokenFacts>())
+                    .cloned()
+                    .unwrap_or_default();
+                Some((principal, facts))
+            }
             None if self.components.auth_required => None,
-            None => Some(Principal::local()),
+            None => Some((Principal::local(), TokenFacts::default())),
         }
     }
+}
+
+/// Config key: the oldest token (by `iat`, in seconds) that may perform a
+/// non-read call (plan §3.6, "high-risk operations"). Default
+/// [`DEFAULT_WRITE_MAX_TOKEN_AGE`]; `0` disables the rule. Applies only when
+/// inbound authentication is required — local mode has no token to date.
+pub const WRITE_MAX_TOKEN_AGE_KEY: &str = "MCP_WRITE_MAX_TOKEN_AGE_SECONDS";
+pub const DEFAULT_WRITE_MAX_TOKEN_AGE: std::time::Duration = std::time::Duration::from_mins(5);
+
+/// Why a write must wait for a fresh token: a token that was minted more
+/// than `max_age` ago may predate a group change or a revocation the
+/// caller's client has not yet seen. A token with no `iat` cannot be shown
+/// to be fresh, so it is refused for writes (fail closed). `None` means the
+/// call may proceed.
+fn stale_for_write(facts: &TokenFacts, max_age: std::time::Duration) -> Option<String> {
+    if max_age.is_zero() {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    match facts.issued_at {
+        None => Some(format!(
+            "non-read calls need a token no older than {}s, and this token carries no issue \
+             time; obtain a fresh token",
+            max_age.as_secs()
+        )),
+        Some(issued_at) if now.saturating_sub(issued_at) > max_age.as_secs() => Some(format!(
+            "non-read calls need a token no older than {}s (this one was issued {}s ago); \
+             obtain a fresh token",
+            max_age.as_secs(),
+            now.saturating_sub(issued_at)
+        )),
+        Some(_) => None,
+    }
+}
+
+/// Read [`WRITE_MAX_TOKEN_AGE_KEY`] from configuration.
+#[must_use]
+pub fn write_max_token_age(config: &Config) -> std::time::Duration {
+    config
+        .get(WRITE_MAX_TOKEN_AGE_KEY)
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_WRITE_MAX_TOKEN_AGE, std::time::Duration::from_secs)
 }
 
 // ============================================================================
@@ -479,6 +542,7 @@ impl DevtoolsServer {
         arguments: Option<&rmcp::model::JsonObject>,
         audit: &crate::audit::AuditCall,
         principal: &Principal,
+        facts: &TokenFacts,
         client_info: Option<&Implementation>,
     ) -> Result<Option<EnterpriseCall>, Refusal> {
         let Some(sink) = self.components.audit_sink.as_ref() else {
@@ -520,7 +584,23 @@ impl DevtoolsServer {
             None,
             upstream.clone(),
         );
-        let decision = policy.evaluate(&action);
+        let mut decision = policy.evaluate(&action);
+        // §3.6: a non-read call needs a recent token, whatever the policy
+        // says — the rule that stops a stale-but-unexpired token from
+        // writing after its holder lost the right to. Journaled as the
+        // denial it is, under the policy version in force.
+        if decision.is_allow()
+            && self.components.auth_required
+            && action.request_risk() != crate::policy::RequestRisk::Read
+            && let Some(reason) = stale_for_write(facts, write_max_token_age(&config))
+        {
+            decision = PolicyDecision {
+                effect: crate::policy::PolicyEffect::Deny,
+                rule_id: None,
+                policy_version: decision.policy_version,
+                reason,
+            };
+        }
         let append_timeout = self.components.audit_append_timeout;
 
         let intent = AuditEvent {
@@ -717,7 +797,7 @@ impl ServerHandler for DevtoolsServer {
 
         // WP A.2 / CF-6: the validated principal, or `local`. A required
         // principal that is absent is a refusal before anything else runs.
-        let Some(principal) = self.principal_for(&context) else {
+        let Some((principal, facts)) = self.principal_for(&context) else {
             tracing::error!(
                 tool = %request.name.as_ref(),
                 "tool call reached dispatch without a validated principal; refusing"
@@ -736,6 +816,7 @@ impl ServerHandler for DevtoolsServer {
                 request.arguments.as_ref(),
                 &audit,
                 &principal,
+                &facts,
                 client.as_ref(),
             )
             .await

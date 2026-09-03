@@ -337,10 +337,13 @@ fn load_configured_policy(
             None,
         )
     })?;
-    policy.spawn_watcher(audit_sink.map(|sink| crate::policy::PolicyAudit {
-        sink: Arc::clone(sink),
-        append_timeout,
-    }));
+    policy.spawn_watcher(
+        audit_sink.map(|sink| crate::policy::BundleAudit {
+            sink: Arc::clone(sink),
+            append_timeout,
+        }),
+        None,
+    );
     Ok(Arc::new(policy))
 }
 

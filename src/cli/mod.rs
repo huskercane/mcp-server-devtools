@@ -28,6 +28,7 @@ pub mod creds;
 pub mod health;
 pub mod jira;
 pub mod policy;
+pub mod revoke;
 pub mod serve;
 
 use std::process::ExitCode;
@@ -72,10 +73,16 @@ pub enum TopCommand {
         #[command(subcommand)]
         action: creds::Command,
     },
-    /// Validate an enterprise policy document (`policy check <file>`).
+    /// Validate, sign, and explain enterprise policy documents
+    /// (`policy check|keygen|sign|explain`).
     Policy {
         #[command(subcommand)]
         action: policy::Command,
+    },
+    /// Edit and re-sign the revocation list (`revoke subject|token|all|…`).
+    Revoke {
+        #[command(subcommand)]
+        action: revoke::Command,
     },
     /// Run the MCP server (the same as no arguments, with an explicit
     /// transport and process role).
@@ -126,6 +133,7 @@ where
         TopCommand::Conf { action } => conf::dispatch(action).await,
         TopCommand::Creds { action } => creds::dispatch(action).await,
         TopCommand::Policy { action } => policy::dispatch(action),
+        TopCommand::Revoke { action } => revoke::dispatch(action),
         TopCommand::Serve(opts) => return serve::dispatch(opts).await,
         TopCommand::Health(opts) => return health::dispatch(&opts).await,
         legacy => dispatch_legacy(legacy).await,
@@ -175,6 +183,7 @@ async fn dispatch_legacy(legacy: TopCommand) -> Result<(), crate::error::McpErro
         | TopCommand::Conf { .. }
         | TopCommand::Creds { .. }
         | TopCommand::Policy { .. }
+        | TopCommand::Revoke { .. }
         | TopCommand::Serve(_)
         | TopCommand::Health(_) => unreachable!(
             "vendor groups are dispatched directly; legacy path receives only flat verbs"

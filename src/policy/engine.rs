@@ -86,37 +86,37 @@
 //! next tick once both are in place.
 //!
 //! A change is **journaled before it is applied**: the watcher stages the
-//! new document ([`FilePolicy::stage`]), appends a `policy_changed` control
-//! record carrying the old and new version labels and the signature
-//! status, and only then commits the staged document
-//! ([`FilePolicy::commit`]). A change whose record cannot be made durable
-//! is not applied — the same write-before-act rule a tool call follows —
-//! and health reports the policy as degraded until the journal recovers.
+//! new document, appends a `policy_changed` control record carrying the old
+//! and new version labels and the signature status, and only then commits
+//! the staged document. A change whose record cannot be made durable is
+//! not applied — the same write-before-act rule a tool call follows — and
+//! health reports the policy as degraded until the journal recovers.
 //! Rejected reloads are journaled too, once per distinct failure, not once
-//! per poll.
+//! per poll. The machinery is [`super::bundle::SignedBundle`], shared with
+//! the revocation list; this module supplies the document.
 //!
 //! **A file that disappears or becomes unreadable is treated the same way:
 //! the last good policy stays in force**, indefinitely. Deleting the file is
 //! therefore *not* an emergency deny — a gateway keeps serving under the
 //! document it last compiled, which is the same posture the plan gives a
 //! gateway whose control plane is down (§3.4, "last signed policy bundle").
-//! The state is not silent: [`FilePolicy::degraded`] reports the last
+//! The state is not silent: `FilePolicy::degraded` reports the last
 //! reload failure, and the HTTP health banner prints it. To stop traffic,
 //! publish a document that denies (`version: N, rules: []` denies
 //! everything) or take the gateway out of rotation; the deny-list and
 //! `revoke-all` controls arrive in Phase B (CF-16).
 
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::ports::audit_sink::{AuditSink, ControlEvent, ControlEventKind, SignatureStatus};
+use crate::ports::audit_sink::ControlEventKind;
 use crate::ports::policy_decision_point::PolicyDecisionPoint;
 use crate::transport::HttpMethod;
 
-use super::signing::{Domain, VerifyingKey};
+use super::bundle::{BundleDocument, BundleError, SignedBundle, version_label};
+use super::signing::Domain;
 use super::{
     ActionContext, EnvironmentClass, NormalizedAction, PolicyDecision, PolicyEffect, Principal,
     RequestRisk, ResourceType, UpstreamAuthority,
@@ -131,29 +131,14 @@ pub const POLICY_FILE_KEY: &str = "MCP_POLICY_FILE";
 pub const POLICY_PUBLIC_KEY_KEY: &str = "MCP_POLICY_PUBLIC_KEY";
 
 /// How often the watcher looks at the file.
-pub const POLICY_WATCH_INTERVAL: Duration = Duration::from_millis(500);
+pub const POLICY_WATCH_INTERVAL: Duration = super::bundle::WATCH_INTERVAL;
 
 /// Largest document accepted.
-const MAX_POLICY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_POLICY_BYTES: usize = super::bundle::MAX_DOCUMENT_BYTES;
 
 /// Why a document was refused. Carries the document's own text (rule ids,
 /// key names), never anything from a request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PolicyError(String);
-
-impl PolicyError {
-    fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
-    }
-}
-
-impl std::fmt::Display for PolicyError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for PolicyError {}
+pub type PolicyError = BundleError;
 
 // ---------------------------------------------------------------------------
 // Document schema (what the operator writes)
@@ -447,13 +432,30 @@ fn contains<T: PartialEq>(list: Option<&[T]>, value: &T) -> bool {
     list.is_none_or(|list| list.contains(value))
 }
 
+/// A compiled policy document: the rules as matchers plus the version
+/// label. Public so the bundle type can name it; its fields are not.
 #[derive(Debug)]
-struct CompiledPolicy {
+pub struct CompiledPolicy {
     version: String,
     rules: Vec<CompiledRule>,
-    /// How the document was authenticated: `None` when no verifying key is
-    /// configured, `Some` (always `verified: true`) when one is.
-    signature: Option<SignatureStatus>,
+}
+
+impl BundleDocument for CompiledPolicy {
+    const DOMAIN: Domain = Domain::PolicyBundle;
+    const NOUN: &'static str = "policy";
+    const KINDS: [ControlEventKind; 3] = [
+        ControlEventKind::PolicyLoaded,
+        ControlEventKind::PolicyChanged,
+        ControlEventKind::PolicyRejected,
+    ];
+
+    fn compile(bytes: &[u8]) -> Result<Self, BundleError> {
+        compile(bytes)
+    }
+
+    fn version(&self) -> &str {
+        &self.version
+    }
 }
 
 fn parse_method(value: &str) -> Result<HttpMethod, PolicyError> {
@@ -499,7 +501,6 @@ fn compile(bytes: &[u8]) -> Result<CompiledPolicy, PolicyError> {
     Ok(CompiledPolicy {
         version: version_label(document.version, bytes),
         rules,
-        signature: None,
     })
 }
 
@@ -664,443 +665,27 @@ fn compile_subjects(
     Ok(compiled)
 }
 
-fn version_label(version: u32, bytes: &[u8]) -> String {
-    let mut label = format!("v{version}+");
-    push_digest_label(&mut label, bytes);
-    label
-}
-
-/// `sha256:<16 hex>` of `bytes` — the bundle hash on its own, for a
-/// document that was refused before its version number could be read.
-fn digest_label(bytes: &[u8]) -> String {
-    let mut label = String::with_capacity(23);
-    push_digest_label(&mut label, bytes);
-    label
-}
-
-fn push_digest_label(label: &mut String, bytes: &[u8]) {
-    use std::fmt::Write as _;
-
-    use sha2::{Digest as _, Sha256};
-
-    let digest = Sha256::digest(bytes);
-    label.push_str("sha256:");
-    for byte in &digest[..8] {
-        let _ = write!(label, "{byte:02x}");
-    }
-}
-
-/// Read the document at `path` and, when a verifying key is configured,
-/// its detached signature. Returns the bytes and the signature status.
-fn read_document(
-    path: &Path,
-    verifier: Option<&VerifyingKey>,
-) -> Result<(Vec<u8>, Option<SignatureStatus>), PolicyError> {
-    let bytes = std::fs::read(path).map_err(|error| {
-        PolicyError::new(format!("cannot read policy {}: {error}", path.display()))
-    })?;
-    let signature = verify_document(path, &bytes, verifier)?;
-    Ok((bytes, signature))
-}
-
-/// Check the detached signature of `bytes` when a verifier is configured.
-fn verify_document(
-    path: &Path,
-    bytes: &[u8],
-    verifier: Option<&VerifyingKey>,
-) -> Result<Option<SignatureStatus>, PolicyError> {
-    let Some(verifier) = verifier else {
-        return Ok(None);
-    };
-    let signature = super::signing::read_detached(path)
-        .map_err(|error| PolicyError::new(format!("policy {}: {error}", path.display())))?;
-    verifier
-        .verify(Domain::PolicyBundle, bytes, &signature)
-        .map_err(|error| {
-            PolicyError::new(format!(
-                "policy {}: {error} (key {})",
-                path.display(),
-                verifier.key_id()
-            ))
-        })?;
-    Ok(Some(SignatureStatus {
-        verified: true,
-        key_id: Some(verifier.key_id()),
-    }))
-}
-
 // ---------------------------------------------------------------------------
 // The decision point
 // ---------------------------------------------------------------------------
 
-/// A policy document on disk, compiled, hot-reloadable.
-pub struct FilePolicy {
-    path: PathBuf,
-    /// The key documents must be signed with; `None` for unsigned local
-    /// dry runs.
-    verifier: Option<VerifyingKey>,
-    current: RwLock<Arc<CompiledPolicy>>,
-    /// The bytes the current snapshot was compiled from, for the watcher.
-    loaded_bytes: RwLock<Vec<u8>>,
-    /// Why the last reload failed, while the last good document stays in
-    /// force. Cleared by the next successful reload. Off the request path:
-    /// written by the watcher, read by health.
-    last_reload_error: Mutex<Option<String>>,
-}
+/// A policy document on disk, verified, compiled, hot-reloadable — a
+/// [`SignedBundle`] over [`CompiledPolicy`]. `load`, `load_verified`,
+/// `from_bytes`, `reload`, `stage`/`commit`, `spawn_watcher`, `degraded`,
+/// and `signature` come from the bundle.
+pub type FilePolicy = SignedBundle<CompiledPolicy>;
 
-/// A document that has been read, verified, and compiled but not yet put
-/// in force. Produced by [`FilePolicy::stage`], consumed by
-/// [`FilePolicy::commit`]; the gap between them is where the change record
-/// is made durable.
-pub struct StagedPolicy {
-    compiled: CompiledPolicy,
-    bytes: Vec<u8>,
-}
-
-impl StagedPolicy {
-    /// Version label of the staged document.
-    #[must_use]
-    pub fn version(&self) -> &str {
-        &self.compiled.version
-    }
-
-    /// Signature status of the staged document.
-    #[must_use]
-    pub fn signature(&self) -> Option<&SignatureStatus> {
-        self.compiled.signature.as_ref()
-    }
-}
-
-/// What [`FilePolicy::commit`] reports: the labels of the document that
-/// was in force and the one that now is.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PolicyChange {
-    pub previous_version: String,
-    pub version: String,
-    pub signature: Option<SignatureStatus>,
-}
-
-/// Where the watcher journals policy events (WP B.3).
-pub struct PolicyAudit {
-    pub sink: Arc<dyn AuditSink>,
-    pub append_timeout: Duration,
-}
-
-impl FilePolicy {
-    /// Read and compile the document at `path`, unsigned.
-    ///
-    /// # Errors
-    ///
-    /// When the file cannot be read or does not compile. A startup caller
-    /// treats this as fatal: enterprise mode never runs with no policy.
-    pub fn load(path: &Path) -> Result<Arc<Self>, PolicyError> {
-        Self::load_with(path, None)
-    }
-
-    /// Read, verify against `verifier`, and compile the document at
-    /// `path`. The detached signature must be in `<path>.sig`.
-    ///
-    /// # Errors
-    ///
-    /// When the file or its signature cannot be read, the signature does
-    /// not verify, or the document does not compile.
-    pub fn load_verified(path: &Path, verifier: VerifyingKey) -> Result<Arc<Self>, PolicyError> {
-        Self::load_with(path, Some(verifier))
-    }
-
-    fn load_with(path: &Path, verifier: Option<VerifyingKey>) -> Result<Arc<Self>, PolicyError> {
-        let (bytes, signature) = read_document(path, verifier.as_ref())?;
-        let mut compiled = compile(&bytes)
-            .map_err(|error| PolicyError::new(format!("policy {}: {error}", path.display())))?;
-        compiled.signature = signature;
-        Ok(Arc::new(Self {
-            path: path.to_owned(),
-            verifier,
-            current: RwLock::new(Arc::new(compiled)),
-            loaded_bytes: RwLock::new(bytes),
-            last_reload_error: Mutex::new(None),
-        }))
-    }
-
-    /// Compile a document from bytes, for `policy check` and tests. Not
-    /// reloadable (there is no file to watch).
-    ///
-    /// # Errors
-    ///
-    /// When the document does not compile.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Arc<Self>, PolicyError> {
-        let compiled = compile(bytes)?;
-        Ok(Arc::new(Self {
-            path: PathBuf::new(),
-            verifier: None,
-            current: RwLock::new(Arc::new(compiled)),
-            loaded_bytes: RwLock::new(bytes.to_vec()),
-            last_reload_error: Mutex::new(None),
-        }))
-    }
-
-    /// How the document in force was authenticated (see
-    /// [`CompiledPolicy::signature`]).
-    #[must_use]
-    pub fn signature(&self) -> Option<SignatureStatus> {
-        self.snapshot().signature.clone()
-    }
-
-    /// Whether documents must carry a verified signature.
-    #[must_use]
-    pub const fn requires_signature(&self) -> bool {
-        self.verifier.is_some()
-    }
-
-    /// Why the last reload failed — the file vanished, became unreadable,
-    /// or does not compile — while the last good document stays in force.
-    /// `None` when the document in force is the one on disk.
-    #[must_use]
-    pub fn degraded(&self) -> Option<String> {
-        self.last_reload_error
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
-    fn note_reload<T>(&self, outcome: &Result<T, PolicyError>) {
-        let mut last = self
-            .last_reload_error
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *last = outcome.as_ref().err().map(ToString::to_string);
-    }
-
-    /// Record a failure that happened *after* staging — the change record
-    /// could not be journaled — so health reports it like any other stale
-    /// policy state.
-    fn note_failure(&self, reason: &str) {
-        let mut last = self
-            .last_reload_error
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *last = Some(reason.to_owned());
-    }
-
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
+impl SignedBundle<CompiledPolicy> {
     #[must_use]
     pub fn rule_count(&self) -> usize {
-        self.snapshot().rules.len()
+        self.snapshot().document.rules.len()
     }
-
-    fn snapshot(&self) -> Arc<CompiledPolicy> {
-        Arc::clone(
-            &self
-                .current
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
-    }
-
-    /// Re-read the file and put a changed document in force at once —
-    /// [`Self::stage`] followed by [`Self::commit`], with nothing journaled
-    /// in between. For tests and unaudited local dry runs; the watcher
-    /// journals the change between the two steps. `Ok(false)` means the
-    /// bytes on disk are the ones already in force.
-    ///
-    /// # Errors
-    ///
-    /// When the file cannot be read, its signature does not verify, or it
-    /// does not compile. The current policy stays in force and the failure
-    /// is reported by [`Self::degraded`].
-    pub fn reload(&self) -> Result<bool, PolicyError> {
-        match self.stage()? {
-            Some(staged) => {
-                self.commit(staged);
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-
-    /// Read, verify, and compile the file without putting it in force.
-    /// `Ok(None)` when the bytes on disk are the ones already in force.
-    /// Records the outcome for [`Self::degraded`]: a failure sets it, a
-    /// success (changed or not) clears it.
-    ///
-    /// # Errors
-    ///
-    /// When the file cannot be read, its signature does not verify, or it
-    /// does not compile.
-    pub fn stage(&self) -> Result<Option<StagedPolicy>, PolicyError> {
-        let outcome = self.stage_inner();
-        self.note_reload(&outcome);
-        outcome
-    }
-
-    fn stage_inner(&self) -> Result<Option<StagedPolicy>, PolicyError> {
-        let (bytes, signature) = read_document(&self.path, self.verifier.as_ref())?;
-        let unchanged = *self
-            .loaded_bytes
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            == bytes;
-        if unchanged {
-            return Ok(None);
-        }
-        let mut compiled = compile(&bytes)?;
-        compiled.signature = signature;
-        Ok(Some(StagedPolicy { compiled, bytes }))
-    }
-
-    /// Put a staged document in force. In-flight decisions keep the
-    /// snapshot they started with.
-    pub fn commit(&self, staged: StagedPolicy) -> PolicyChange {
-        let previous_version = {
-            let mut current = self
-                .current
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let previous = current.version.clone();
-            *current = Arc::new(staged.compiled);
-            previous
-        };
-        *self
-            .loaded_bytes
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = staged.bytes;
-        let now = self.snapshot();
-        PolicyChange {
-            previous_version,
-            version: now.version.clone(),
-            signature: now.signature.clone(),
-        }
-    }
-
-    /// The label a rejected document is journaled under: its own bundle
-    /// hash when it could be read, so the refused bytes are identifiable.
-    fn rejected_version(&self) -> Option<String> {
-        std::fs::read(&self.path)
-            .ok()
-            .map(|bytes| digest_label(&bytes))
-    }
-
-    /// Poll the file and reload on change, on the current Tokio runtime.
-    /// Holds only a `Weak`, so the task ends with the policy. A no-op with a
-    /// warning outside a runtime, like the config watcher.
-    ///
-    /// With `audit`, the policy in force is journaled when the watcher
-    /// starts (`policy_loaded`), every change is journaled **before** it is
-    /// committed (`policy_changed`), and each distinct rejected reload is
-    /// journaled once (`policy_rejected`). A change whose record cannot be
-    /// made durable within the bound is not applied.
-    pub fn spawn_watcher(self: &Arc<Self>, audit: Option<PolicyAudit>) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            tracing::warn!(path = %self.path.display(), "policy watcher requires a Tokio runtime");
-            return;
-        };
-        let weak: Weak<Self> = Arc::downgrade(self);
-        runtime.spawn(async move {
-            if let Some(audit) = &audit
-                && let Some(policy) = weak.upgrade()
-            {
-                let snapshot = policy.snapshot();
-                let mut event = ControlEvent::now(ControlEventKind::PolicyLoaded);
-                event.source = Some(policy.path.display().to_string());
-                event.version = Some(snapshot.version.clone());
-                event.signature = snapshot.signature.clone();
-                if let Err(error) = append_control(audit, &event).await {
-                    tracing::error!(
-                        failure = %crate::ports::audit_sink::AuditFailure::classify(&error),
-                        "failed to journal the policy in force at startup"
-                    );
-                }
-            }
-            let mut interval = tokio::time::interval(POLICY_WATCH_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                interval.tick().await;
-                let Some(policy) = weak.upgrade() else {
-                    return;
-                };
-                let previous_error = policy.degraded();
-                let path = policy.path.clone();
-                // Reading, verifying, and compiling a policy is file I/O
-                // plus parsing: off the worker threads.
-                let staging = Arc::clone(&policy);
-                let outcome = tokio::task::spawn_blocking(move || staging.stage()).await;
-                match outcome {
-                    Ok(Ok(None)) => {}
-                    Ok(Ok(Some(staged))) => {
-                        if let Some(audit) = &audit {
-                            let mut event = ControlEvent::now(ControlEventKind::PolicyChanged);
-                            event.source = Some(path.display().to_string());
-                            event.previous_version = policy.version();
-                            event.version = Some(staged.version().to_owned());
-                            event.signature = staged.signature().cloned();
-                            if let Err(error) = append_control(audit, &event).await {
-                                // Not applied: the record is the evidence
-                                // that the policy changed, and a change
-                                // nobody can prove is a change that did
-                                // not happen. The next tick tries again.
-                                const REASON: &str = "policy change could not be journaled; \
-                                    last good policy in force";
-                                policy.note_failure(REASON);
-                                tracing::error!(
-                                    path = %path.display(),
-                                    failure = %crate::ports::audit_sink::AuditFailure::classify(&error),
-                                    REASON
-                                );
-                                continue;
-                            }
-                        }
-                        let change = policy.commit(staged);
-                        tracing::info!(
-                            path = %path.display(),
-                            from = %change.previous_version,
-                            to = %change.version,
-                            signed = change.signature.as_ref().is_some_and(|status| status.verified),
-                            "reloaded policy"
-                        );
-                    }
-                    Ok(Err(error)) => {
-                        tracing::warn!(
-                            path = %path.display(),
-                            %error,
-                            "policy cannot be reloaded; keeping the previous policy in force"
-                        );
-                        let reason = error.to_string();
-                        if let Some(audit) = &audit
-                            && previous_error.as_deref() != Some(reason.as_str())
-                        {
-                            let mut event = ControlEvent::now(ControlEventKind::PolicyRejected)
-                                .with_reason(&reason);
-                            event.source = Some(path.display().to_string());
-                            event.previous_version = policy.version();
-                            event.version = policy.rejected_version();
-                            if let Err(error) = append_control(audit, &event).await {
-                                tracing::error!(
-                                    failure = %crate::ports::audit_sink::AuditFailure::classify(&error),
-                                    "failed to journal a rejected policy reload"
-                                );
-                            }
-                        }
-                    }
-                    Err(error) => tracing::warn!(%error, "policy reload task failed"),
-                }
-            }
-        });
-    }
-}
-
-/// Bounded control-record append for the watcher (CF-14 semantics: the
-/// bound limits the wait, and a timeout means "not proven durable").
-async fn append_control(audit: &PolicyAudit, event: &ControlEvent) -> std::io::Result<u64> {
-    super::egress::append_control_bounded(audit.sink.as_ref(), event, audit.append_timeout).await
 }
 
 impl PolicyDecisionPoint for FilePolicy {
     fn evaluate(&self, context: &ActionContext) -> PolicyDecision {
-        let policy = self.snapshot();
+        let snapshot = self.snapshot();
+        let policy = &snapshot.document;
         if context.resource_type() == ResourceType::Unknown {
             return PolicyDecision::default_deny_under(
                 &policy.version,
@@ -1133,25 +718,25 @@ impl PolicyDecisionPoint for FilePolicy {
     }
 
     fn version(&self) -> Option<String> {
-        Some(self.snapshot().version.clone())
+        Some(SignedBundle::version(self))
     }
 
     fn degraded(&self) -> Option<String> {
-        FilePolicy::degraded(self)
+        SignedBundle::degraded(self)
     }
 }
 
 impl PolicyDecisionPoint for Arc<FilePolicy> {
     fn evaluate(&self, context: &ActionContext) -> PolicyDecision {
-        FilePolicy::evaluate(self, context)
+        <FilePolicy as PolicyDecisionPoint>::evaluate(self, context)
     }
 
     fn version(&self) -> Option<String> {
-        FilePolicy::version(self)
+        <FilePolicy as PolicyDecisionPoint>::version(self)
     }
 
     fn degraded(&self) -> Option<String> {
-        FilePolicy::degraded(self)
+        <FilePolicy as PolicyDecisionPoint>::degraded(self)
     }
 }
 

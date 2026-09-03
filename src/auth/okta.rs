@@ -65,7 +65,10 @@ use serde::Deserialize;
 
 use crate::config::Config;
 use crate::policy::{Principal, PrincipalAuthority};
-use crate::ports::token_validator::{TokenRejection, TokenValidator, ValidateFuture, digest};
+use crate::ports::token_validator::{
+    AuthenticateFuture, Authenticated, TokenFacts, TokenRejection, TokenValidator, ValidateFuture,
+    digest,
+};
 
 /// Config key: the Okta authorization server issuer URL
 /// (`https://<org>.okta.com/oauth2/<server id>`). Required.
@@ -210,6 +213,8 @@ fn optional<'a>(config: &'a Config, key: &str) -> Option<&'a str> {
 struct Claims {
     sub: Option<String>,
     exp: Option<u64>,
+    iat: Option<u64>,
+    jti: Option<String>,
     #[serde(default)]
     scp: Option<Vec<String>>,
     #[serde(default)]
@@ -244,7 +249,7 @@ struct KeySnapshot {
 }
 
 struct Validated {
-    principal: Principal,
+    authenticated: Authenticated,
     expires_at: Instant,
     /// The `kid` whose key verified this token, and that key's material. A
     /// fetch that no longer publishes the kid — or publishes it with other
@@ -255,7 +260,7 @@ struct Validated {
 
 /// What a full validation established, for the caller and for the cache.
 struct Verified {
-    principal: Principal,
+    authenticated: Authenticated,
     exp: u64,
     kid: String,
     fingerprint: [u8; 32],
@@ -451,7 +456,7 @@ impl OktaJwksValidator {
         });
     }
 
-    fn cached_principal(&self, key: &[u8; 32]) -> Option<Principal> {
+    fn cached(&self, key: &[u8; 32]) -> Option<Authenticated> {
         let cache = self
             .validated
             .lock()
@@ -459,7 +464,7 @@ impl OktaJwksValidator {
         cache
             .get(key)
             .filter(|entry| entry.expires_at > Instant::now())
-            .map(|entry| entry.principal.clone())
+            .map(|entry| entry.authenticated.clone())
     }
 
     /// Cache a validation — unless the keys it was verified against have
@@ -498,7 +503,7 @@ impl OktaJwksValidator {
         cache.insert(
             key,
             Validated {
-                principal: verified.principal.clone(),
+                authenticated: verified.authenticated.clone(),
                 expires_at: now + ttl,
                 kid: verified.kid.clone(),
                 fingerprint: verified.fingerprint,
@@ -506,7 +511,8 @@ impl OktaJwksValidator {
         );
     }
 
-    /// Drop every cached validation. Phase B's `revoke-all` calls this.
+    /// Drop every cached validation. The revocation-list watcher calls this
+    /// on every change (WP B.4), through [`TokenValidator::forget_validated`].
     pub fn clear_validated(&self) {
         self.validated
             .lock()
@@ -514,12 +520,16 @@ impl OktaJwksValidator {
             .clear();
     }
 
-    fn principal_from(&self, claims: Claims) -> Result<(Principal, u64), TokenRejection> {
+    fn principal_from(&self, claims: Claims) -> Result<(Authenticated, u64), TokenRejection> {
         let subject = claims
             .sub
             .filter(|sub| !sub.trim().is_empty())
             .ok_or(TokenRejection::MissingClaim("sub"))?;
         let exp = claims.exp.ok_or(TokenRejection::MissingClaim("exp"))?;
+        let token = TokenFacts {
+            issued_at: claims.iat,
+            token_id: claims.jti.filter(|jti| !jti.trim().is_empty()),
+        };
         let mut scopes = claims.scp.unwrap_or_default();
         if let Some(scope) = claims.scope {
             scopes.extend(scope.split_whitespace().map(str::to_owned));
@@ -541,12 +551,15 @@ impl OktaJwksValidator {
         groups.sort_unstable();
         groups.dedup();
         Ok((
-            Principal {
-                tenant: self.settings.tenant.clone(),
-                subject,
-                groups,
-                scopes,
-                authority: PrincipalAuthority::Okta,
+            Authenticated {
+                principal: Principal {
+                    tenant: self.settings.tenant.clone(),
+                    subject,
+                    groups,
+                    scopes,
+                    authority: PrincipalAuthority::Okta,
+                },
+                token,
             },
             exp,
         ))
@@ -605,9 +618,9 @@ impl OktaJwksValidator {
                     _ => TokenRejection::Malformed,
                 },
             )?;
-        let (principal, exp) = self.principal_from(data.claims)?;
+        let (authenticated, exp) = self.principal_from(data.claims)?;
         Ok(Verified {
-            principal,
+            authenticated,
             exp,
             kid,
             fingerprint: admitted.fingerprint,
@@ -618,15 +631,23 @@ impl OktaJwksValidator {
 
 impl TokenValidator for Arc<OktaJwksValidator> {
     fn validate<'a>(&'a self, token: &'a str) -> ValidateFuture<'a> {
+        Box::pin(async move { Ok(self.authenticate(token).await?.principal) })
+    }
+
+    fn authenticate<'a>(&'a self, token: &'a str) -> AuthenticateFuture<'a> {
         Box::pin(async move {
             let key = digest(token);
-            if let Some(principal) = self.cached_principal(&key) {
-                return Ok(principal);
+            if let Some(authenticated) = self.cached(&key) {
+                return Ok(authenticated);
             }
             let verified = self.validate_uncached(token).await?;
             self.remember(key, &verified);
-            Ok(verified.principal)
+            Ok(verified.authenticated)
         })
+    }
+
+    fn forget_validated(&self) {
+        self.clear_validated();
     }
 }
 
@@ -776,12 +797,15 @@ mod tests {
             )])
         };
         let verified = |kid: &str, material: u8, generation: u64| Verified {
-            principal: Principal {
-                tenant: "acme".to_owned(),
-                subject: "alice@acme.example".to_owned(),
-                groups: Vec::new(),
-                scopes: Vec::new(),
-                authority: PrincipalAuthority::Okta,
+            authenticated: Authenticated {
+                principal: Principal {
+                    tenant: "acme".to_owned(),
+                    subject: "alice@acme.example".to_owned(),
+                    groups: Vec::new(),
+                    scopes: Vec::new(),
+                    authority: PrincipalAuthority::Okta,
+                },
+                token: TokenFacts::default(),
             },
             exp: jsonwebtoken::get_current_timestamp() + 300,
             kid: kid.to_owned(),
@@ -799,7 +823,7 @@ mod tests {
         // … and A, having verified against `old`, tries to cache.
         validator.remember(token, &verified("old", 1, seen_by_a.generation));
         assert!(
-            validator.cached_principal(&token).is_none(),
+            validator.cached(&token).is_none(),
             "a result verified against replaced keys must not be cached"
         );
 
@@ -807,20 +831,20 @@ mod tests {
         // gate is on staleness, not on the kid alone.
         let current = validator.snapshot();
         validator.remember(token, &verified("new", 2, current.generation));
-        assert!(validator.cached_principal(&token).is_some());
+        assert!(validator.cached(&token).is_some());
         // The same kid republished with other material evicts it: the kid
         // is a label, the material is the key.
         validator.install_keys(key_named("new", 3));
         assert!(
-            validator.cached_principal(&token).is_none(),
+            validator.cached(&token).is_none(),
             "same kid, new material: the cached verification is void"
         );
         let current = validator.snapshot();
         validator.remember(token, &verified("new", 3, current.generation));
-        assert!(validator.cached_principal(&token).is_some());
+        assert!(validator.cached(&token).is_some());
         // And a withdrawal of `new` evicts it too.
         validator.install_keys(HashMap::new());
-        assert!(validator.cached_principal(&token).is_none());
+        assert!(validator.cached(&token).is_none());
     }
 
     #[test]

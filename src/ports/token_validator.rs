@@ -67,6 +67,9 @@ pub enum TokenRejection {
     KeysUnavailable,
     /// The validator does not recognise the token at all (static tables).
     Unknown,
+    /// The token validated, but the revocation list names its subject,
+    /// its id, or its issue time (WP B.4).
+    Revoked,
 }
 
 impl TokenRejection {
@@ -86,6 +89,7 @@ impl TokenRejection {
             Self::MissingClaim(_) => "missing_claim",
             Self::KeysUnavailable => "keys_unavailable",
             Self::Unknown => "unknown_token",
+            Self::Revoked => "revoked",
         }
     }
 
@@ -109,6 +113,31 @@ impl fmt::Display for TokenRejection {
 pub type ValidateFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Principal, TokenRejection>> + Send + 'a>>;
 
+/// The future [`TokenValidator::authenticate`] returns.
+pub type AuthenticateFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Authenticated, TokenRejection>> + Send + 'a>>;
+
+/// Facts about the token itself that revocation needs (plan §3.6, WP B.4)
+/// and that are **not** part of the principal: they describe one credential,
+/// not the person. Never the token, never a signature.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenFacts {
+    /// `iat`, seconds since the Unix epoch, when the token carries it. A
+    /// `revoke all` cut-off and the fresh-token rule for writes compare
+    /// against this; a token without it fails both, closed.
+    pub issued_at: Option<u64>,
+    /// `jti`, when the token carries it. What a per-token revocation names.
+    pub token_id: Option<String>,
+}
+
+/// A validated token: who it proves, and the facts about the token that
+/// revocation checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Authenticated {
+    pub principal: Principal,
+    pub token: TokenFacts,
+}
+
 /// Turns a bearer token into a validated principal.
 pub trait TokenValidator: Send + Sync {
     /// Validate `token` and return the principal it proves.
@@ -116,6 +145,26 @@ pub trait TokenValidator: Send + Sync {
     /// Implementations must never log, store, or return the token. Async
     /// because a first validation may need to fetch signing keys.
     fn validate<'a>(&'a self, token: &'a str) -> ValidateFuture<'a>;
+
+    /// Validate `token` and return the principal together with the
+    /// [`TokenFacts`] revocation needs. The default wraps
+    /// [`Self::validate`] with empty facts, which a revocation list
+    /// treats as "undatable": fine for a validator with no notion of
+    /// issue time, wrong for one that has it — so a real validator
+    /// overrides this.
+    fn authenticate<'a>(&'a self, token: &'a str) -> AuthenticateFuture<'a> {
+        Box::pin(async move {
+            Ok(Authenticated {
+                principal: self.validate(token).await?,
+                token: TokenFacts::default(),
+            })
+        })
+    }
+
+    /// Drop every cached validation, so the next request revalidates from
+    /// scratch. Called when the revocation list changes; a validator with
+    /// no cache has nothing to do.
+    fn forget_validated(&self) {}
 }
 
 /// Fixed token → principal table for tests and local development.
@@ -126,7 +175,7 @@ pub trait TokenValidator: Send + Sync {
 /// production validator: it has no expiry, no issuer, and no rotation.
 #[derive(Debug, Default)]
 pub struct StaticValidator {
-    by_digest: HashMap<[u8; 32], Principal>,
+    by_digest: HashMap<[u8; 32], Authenticated>,
 }
 
 impl StaticValidator {
@@ -135,22 +184,44 @@ impl StaticValidator {
         Self::default()
     }
 
-    /// Accept `token` as `principal`.
+    /// Accept `token` as `principal`, with no token facts.
     #[must_use]
-    pub fn with(mut self, token: &str, principal: Principal) -> Self {
-        self.by_digest.insert(digest(token), principal);
+    pub fn with(self, token: &str, principal: Principal) -> Self {
+        self.with_facts(token, principal, TokenFacts::default())
+    }
+
+    /// Accept `token` as `principal`, carrying `facts` (an issue time, a
+    /// token id) for revocation tests.
+    #[must_use]
+    pub fn with_facts(mut self, token: &str, principal: Principal, facts: TokenFacts) -> Self {
+        self.by_digest.insert(
+            digest(token),
+            Authenticated {
+                principal,
+                token: facts,
+            },
+        );
         self
+    }
+
+    fn lookup(&self, token: &str) -> Result<Authenticated, TokenRejection> {
+        self.by_digest
+            .get(&digest(token))
+            .cloned()
+            .ok_or(TokenRejection::Unknown)
     }
 }
 
 impl TokenValidator for StaticValidator {
     fn validate<'a>(&'a self, token: &'a str) -> ValidateFuture<'a> {
-        let result = self
-            .by_digest
-            .get(&digest(token))
-            .cloned()
-            .ok_or(TokenRejection::Unknown);
-        Box::pin(std::future::ready(result))
+        Box::pin(std::future::ready(
+            self.lookup(token)
+                .map(|authenticated| authenticated.principal),
+        ))
+    }
+
+    fn authenticate<'a>(&'a self, token: &'a str) -> AuthenticateFuture<'a> {
+        Box::pin(std::future::ready(self.lookup(token)))
     }
 }
 

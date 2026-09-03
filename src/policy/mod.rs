@@ -25,6 +25,7 @@
 //! legacy `AUDIT_LOG` JSONL keeps its camelCase shape untouched — that
 //! surface is parity-locked; this one is new.)
 
+pub mod bundle;
 pub mod canonical;
 pub mod egress;
 pub mod engine;
@@ -34,9 +35,12 @@ pub mod signing;
 
 use serde::{Deserialize, Serialize};
 
+pub use bundle::{
+    BundleAudit, BundleChange, BundleError, ChangeHook, Loaded, SignedBundle, Staged,
+};
 pub use canonical::{CanonicalPath, CanonicalTarget, CanonicalizeError};
 pub use egress::{Enforcement, authorize_egress};
-pub use engine::{FilePolicy, PolicyAudit, PolicyChange, PolicyError, StagedPolicy};
+pub use engine::{CompiledPolicy, FilePolicy, PolicyError};
 pub use scope::{
     CallScope, EgressDispatch, EgressRecord, EgressSummary, EgressTicket, MAX_EGRESS_RECORDS,
     OwnerKey,

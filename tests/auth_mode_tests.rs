@@ -132,7 +132,38 @@ fn signed_policy_copy(dir: &std::path::Path) -> (std::path::PathBuf, String) {
         &key.sign(Domain::PolicyBundle, &bytes),
     )
     .unwrap();
+    // An empty, signed revocation list next to it (WP B.4).
+    let revocations = dir.join("revocations.yaml");
+    let empty = mcp_server_devtools::auth::revocation::RevocationFile::empty()
+        .to_yaml()
+        .unwrap();
+    std::fs::write(&revocations, &empty).unwrap();
+    mcp_server_devtools::policy::signing::write_detached(
+        &revocations,
+        &key.sign(Domain::RevocationList, empty.as_bytes()),
+    )
+    .unwrap();
     (policy_file, key.verifying_key().to_base64())
+}
+
+#[test]
+fn http_refuses_okta_mode_without_a_revocation_list() {
+    let journal = tempfile::tempdir().unwrap();
+    let (policy_file, public_key) = signed_policy_copy(journal.path());
+    let (ok, stderr) = run_to_exit(|command| {
+        command
+            .env("TRANSPORT_MODE", "http")
+            .env("MCP_AUTH_MODE", "okta")
+            .env("MCP_OKTA_ISSUER", "https://acme.okta.com/oauth2/default")
+            .env("MCP_OKTA_AUDIENCE", "api://mcp-devtools")
+            .env("MCP_PUBLIC_URL", "https://mcp.acme.example")
+            .env("MCP_POLICY_FILE", &policy_file)
+            .env("MCP_POLICY_PUBLIC_KEY", public_key)
+            .env("MCP_AUDIT_JOURNAL_DIR", journal.path());
+    });
+    assert!(!ok);
+    assert!(stderr.contains("MCP_REVOCATION_FILE"), "stderr:\n{stderr}");
+    assert!(stderr.contains("revoke init"), "stderr:\n{stderr}");
 }
 
 #[test]
@@ -205,6 +236,10 @@ async fn http_starts_in_okta_mode_when_fully_configured() {
         .env("MCP_PUBLIC_URL", "http://127.0.0.1:3000")
         .env("MCP_POLICY_FILE", &policy_file)
         .env("MCP_POLICY_PUBLIC_KEY", public_key)
+        .env(
+            "MCP_REVOCATION_FILE",
+            journal.path().join("revocations.yaml"),
+        )
         .env("MCP_AUDIT_JOURNAL_DIR", journal.path())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

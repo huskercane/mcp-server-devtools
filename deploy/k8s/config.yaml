@@ -11,6 +11,10 @@ data:
   MCP_PUBLIC_URL: "https://mcp.example.com"
   MCP_REQUIRED_SCOPE: "mcp:tools"
   MCP_POLICY_FILE: "/policy/policy.yaml"
+  # Base64 Ed25519 public key from `mcp-devtools policy keygen`. The gateway
+  # applies only policy and revocation documents signed with its private half.
+  MCP_POLICY_PUBLIC_KEY: "REPLACE-WITH-THE-PUBLIC-KEY-FROM-policy-keygen"
+  MCP_REVOCATION_FILE: "/policy/revocations.yaml"
   MCP_AUDIT_JOURNAL_DIR: "/journal"
   MCP_VENDOR_ENVIRONMENT: "qa"
   GRAFANA_URL: "https://grafana-qa.example.com"
@@ -21,7 +25,15 @@ metadata:
   name: mcp-devtools-policy
   namespace: mcp-devtools
 data:
-  # Validate before applying: mcp-devtools policy check policy.yaml
+  # Validate, then sign, before applying:
+  #   mcp-devtools policy check policy.yaml --public-key "$MCP_POLICY_PUBLIC_KEY"
+  #   mcp-devtools policy sign  policy.yaml --key policy-signing.key
+  # and paste the contents of policy.yaml.sig below. Do the same for the
+  # revocation list (`mcp-devtools revoke init --file revocations.yaml --key …`).
+  policy.yaml.sig: "REPLACE-WITH-THE-CONTENTS-OF-policy.yaml.sig"
+  revocations.yaml: |
+    version: 1
+  revocations.yaml.sig: "REPLACE-WITH-THE-CONTENTS-OF-revocations.yaml.sig"
   policy.yaml: |
     version: 1
     default: deny
