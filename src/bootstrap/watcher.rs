@@ -140,6 +140,7 @@ mod tests {
             usage_sink: Arc::new(crate::ports::NoopUsageSink),
             auth_required: false,
             policy: Arc::new(crate::ports::AllowAll),
+            policy_file: None,
             audit_append_timeout: crate::policy::egress::DEFAULT_AUDIT_APPEND_TIMEOUT,
             pending_audit: tokio_util::task::TaskTracker::new(),
         })

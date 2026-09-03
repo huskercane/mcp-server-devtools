@@ -504,10 +504,18 @@ pub mod slack {
         if method != HttpMethod::Get {
             return ActionDetails::unclassified(method, path);
         }
-        let channel = query
+        // `channel` names the resource, so it must name exactly one. A
+        // repeated key is two answers to "which channel?": the gateway
+        // would classify one while Slack could read the other (a last-value
+        // parser), and the tool-level and egress decisions would agree with
+        // each other but not with the request. Not classified, so denied.
+        let mut channels = query
             .iter()
-            .find_map(|(key, value)| (*key == "channel").then_some(*value))
-            .unwrap_or_default();
+            .filter_map(|(key, value)| (*key == "channel").then_some(*value));
+        let channel = channels.next().unwrap_or_default();
+        if channels.next().is_some() {
+            return ActionDetails::unclassified(method, path);
+        }
         match path.as_str() {
             "/conversations.list" => list_channels(query),
             "/conversations.info" => channel_info(channel),
@@ -1951,6 +1959,69 @@ mod slack_tests {
             "query text is a digest: {attributes:?}"
         );
         assert_eq!(attributes[1], ("sort".to_owned(), "timestamp".to_owned()));
+    }
+
+    /// A `channel` given twice — once in the path's own query and once in
+    /// `queryParams`, or twice in either — is not classified, whichever
+    /// values it carries: the first value is what policy would judge and
+    /// the second is what a last-value parser at Slack would read.
+    #[test]
+    fn a_repeated_channel_key_is_never_classified() {
+        for (path, extra) in [
+            ("/conversations.history?channel=C0ALLOWED", Some("C0SECRET")),
+            (
+                "/conversations.history?channel=C0ALLOWED",
+                Some("C0ALLOWED"),
+            ),
+            (
+                "/conversations.info?channel=C0ALLOWED&channel=C0SECRET",
+                None,
+            ),
+            (
+                "/conversations.replies?channel=C0A&channel=C0A&ts=1.2",
+                None,
+            ),
+        ] {
+            let mut arguments = serde_json::Map::new();
+            arguments.insert(
+                "path".to_owned(),
+                serde_json::Value::String(path.to_owned()),
+            );
+            if let Some(extra) = extra {
+                arguments.insert(
+                    "queryParams".to_owned(),
+                    serde_json::json!({ "channel": extra }),
+                );
+            }
+            let via_tool = for_tool("slack_get", Some(&arguments), RequestRisk::Read);
+            assert_eq!(
+                via_tool.normalized_action(),
+                NormalizedAction::Passthrough,
+                "{path} + {extra:?}"
+            );
+            assert_eq!(via_tool.resource_type(), ResourceType::Unknown);
+            // The egress chokepoint sees the same wire query and agrees.
+            let wire = target(&match extra {
+                Some(extra) => format!("{path}&channel={extra}"),
+                None => path.to_owned(),
+            });
+            let via_egress = for_vendor(crate::config::VENDOR_SLACK, HttpMethod::Get, &wire, None);
+            assert_eq!(
+                via_egress.normalized_action(),
+                NormalizedAction::Passthrough
+            );
+        }
+        // One channel, however it arrives, still classifies.
+        let single = for_vendor(
+            crate::config::VENDOR_SLACK,
+            HttpMethod::Get,
+            &target("/conversations.history?limit=5&channel=C0ALLOWED"),
+            None,
+        );
+        assert_eq!(
+            single.normalized_action(),
+            NormalizedAction::ReadChannelHistory
+        );
     }
 
     #[test]

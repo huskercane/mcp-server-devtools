@@ -101,12 +101,16 @@ These settings use the same three-source cascade. When placed in `configs.json`,
 
 ## Enterprise mode (opt-in)
 
-Everything in this section is off by default, and with it off the server
-behaves byte-for-byte as before it existed (`tests/auth_mode_tests.rs` locks
-that). It is the configuration surface of the enterprise plan
-(`docs/enterprise-product-plan.md`, Phase A). Startup is **fail-closed**: an
-incomplete or contradictory enterprise configuration refuses to start with a
-reason, never falls back to local mode.
+Everything in this section is off by default. With it off, unset and an
+explicit `off` are identical to each other in protocol behaviour and tool
+surface (`tests/auth_mode_tests.rs` locks that); relative to the server
+before the enterprise work, the wire requests it sends are in canonical
+form (`docs/enterprise-carry-forward.md`, CF-19, records the exact
+differences) and the journal, when configured, carries checkpoint records.
+It is the configuration surface of the enterprise plan
+(`docs/enterprise-product-plan.md`, Phases A and B). Startup is
+**fail-closed**: an incomplete or contradictory enterprise configuration
+refuses to start with a reason, never falls back to local mode.
 
 Unless noted, these settings use the same three-source cascade as the
 integration settings, so they may live in the environment, `.env`, or a
@@ -125,22 +129,28 @@ integration settings, so they may live in the environment, `.env`, or a
 | `MCP_OKTA_CLOCK_SKEW_SECONDS` | `60`; at most `300` | Leeway applied to `exp` and `nbf`. |
 | `MCP_REQUIRED_SCOPE` | `mcp:tools` | The scope a token must carry to reach `/mcp`; missing it is a `403 insufficient_scope`. |
 | `MCP_TENANT` | issuer host | Tenant label stamped on every principal, audit record, and artifact owner. |
-| `MCP_POLICY_FILE` | — (required for `okta`) | YAML policy document (`src/policy/engine.rs` documents the schema; `tests/fixtures/policy/phase-a.yaml` is a worked example). Compiled at startup and hot-reloaded on change; a document that does not compile is refused at startup and ignored on reload. A file that vanishes or becomes unreadable is treated the same way: the last good policy stays in force, the health banner reports that reloads are failing (the reason itself goes to the operator log, not the public banner) (deleting the file is **not** an emergency deny — publish `rules: []` to deny everything). Validate with `mcp-devtools policy check <file>`; ask why a call is allowed or denied with `mcp-devtools policy explain <file> --tool … --arguments … --group … --environment …`, which builds the call exactly as the gateway would and lists the first key every rule fails on. Setting it with `MCP_AUTH_MODE=off` enforces the policy against the `local` principal — a dry run. |
+| `MCP_POLICY_FILE` | — (required for `okta`) | YAML policy document (`src/policy/engine.rs` documents the schema; `tests/fixtures/policy/phase-a.yaml` is a worked example). Compiled at startup and hot-reloaded on change; a document that does not compile is refused at startup and ignored on reload. A file that vanishes or becomes unreadable is treated the same way: the last good policy stays in force, the health banner reports that reloads are failing (the reason itself goes to the operator log, not the public banner) (deleting the file is **not** an emergency deny — publish `rules: []` to deny everything). Validate with `mcp-devtools policy check <file>`; ask why a call is allowed or denied with `mcp-devtools policy explain <file> --tool … --arguments … --group …`, which builds the call exactly as the gateway would — same extractor, same upstream identity from the same configuration cascade (`MCP_VENDOR_ENVIRONMENT`, the credential slot) — and lists the first key every rule fails on; `--environment` overrides the configured environment for a what-if, `--client-name`/`--client-version` supply the reporting client. Setting it with `MCP_AUTH_MODE=off` enforces the policy against the `local` principal — a dry run. |
 | `MCP_POLICY_PUBLIC_KEY` | — (required for `okta`) | Base64 Ed25519 public key. When set, `MCP_POLICY_FILE` (and `MCP_REVOCATION_FILE`) must carry a verified detached signature in `<file>.sig`, produced by `mcp-devtools policy sign <file> --key <keyfile>` with the private key from `mcp-devtools policy keygen`. A document whose signature is missing or does not verify is refused at startup and ignored on reload (last good policy in force, health degraded). Every load, change, and rejection is a `policy_*` control record in the audit journal; a change is journaled **before** it takes effect and is not applied if the record cannot be made durable. |
 | `MCP_REVOCATION_FILE` | — (required for `okta`) | The revocation list (`src/auth/revocation.rs`): revoked subjects, revoked token ids (`jti`), and a `not_before` cut-off that refuses every token issued before it (`revoke all`). Signed with the same key as the policy and hot-reloaded the same way; enforced on every request after token validation, regardless of the validated-token cache, so a change takes effect within one poll (≤ 500 ms). On every change the token cache is cleared and the revoked subjects' sessions are closed (all principal sessions when the cut-off moves). Edit with `mcp-devtools revoke init|subject|token|all|remove|clear-all|show`; every refusal is a `revoked_token_rejected` record in the journal. See `docs/revocation-runbook.md`. |
 | `MCP_WRITE_MAX_TOKEN_AGE_SECONDS` | `300`; `0` disables | Plan §3.6 "high-risk operations": a non-read tool call is refused unless the token was issued (`iat`) within this many seconds — a token with no `iat` is refused for writes. Reads are unaffected. Applies only when inbound authentication is required. |
 | `MCP_VENDOR_ENVIRONMENT` | unclassified | `prod`, `staging`, `qa`, or `dev`. Vendor-scoped: put it in a vendor's `configs.json` section to classify that account. An unclassified environment matches no environment-scoped rule. |
 | `MCP_AUDIT_JOURNAL_DIR` | — (required for `okta`) | Directory for the durable, sequence-numbered audit journal. Every tool call's intent is written and synced **before** dispatch; a journal that cannot accept a record refuses the call, and the health banner answers 503. Operational CLI subcommands refuse to run while this is set (they would bypass the journal). |
-| `MCP_AUDIT_SIGNING_KEY` | — (required for `okta`) | Path to the gateway's Ed25519 PKCS#8 key from `mcp-devtools audit keygen` (owner-only file; a Kubernetes Secret mount needs `defaultMode: 0400`). Signs every journal checkpoint. Keep the printed public key for `mcp-devtools audit verify --public-key`. |
+| `MCP_AUDIT_SIGNING_KEY` | — (required for `okta`) | Path to the gateway's Ed25519 PKCS#8 key from `mcp-devtools audit keygen`. The file must be readable by nobody but its owner and, at most, its group (`0600`, `0640`, `0440`); a Kubernetes Secret projected under `fsGroup` arrives as `root:<fsGroup>` `0440` and is accepted, anything world-readable or group-writable is refused at startup. Signs every journal checkpoint. Keep the printed public key for `mcp-devtools audit verify --public-key`. |
 | `MCP_AUDIT_CHECKPOINT_RECORDS` | `256` | Records between checkpoints. Every line extends a SHA-256 chain; a checkpoint records the chain value over everything before it, signed. Also written when this many seconds pass (`MCP_AUDIT_CHECKPOINT_SECONDS`) with unsealed records, and at every clean shutdown. |
 | `MCP_AUDIT_CHECKPOINT_SECONDS` | `60` | Longest a written record stays unsealed by a checkpoint. |
-| `MCP_AUDIT_CHECKPOINT_EXPORT_DIR` | — | Directory each checkpoint is copied to (`checkpoint-<seq>.jsonl`, atomically written), for shipping to object storage or a SIEM. `mcp-devtools audit verify --checkpoints <dir>` compares it to the journal and reports a truncated tail. An export failure is logged, never refuses calls. |
+| `MCP_AUDIT_CHECKPOINT_EXPORT_DIR` | — | Directory each checkpoint is copied to (`checkpoint-<seq>.jsonl`, atomically written), for shipping to object storage or a SIEM. `mcp-devtools audit verify --checkpoints <dir>` compares it to the journal and reports a truncated tail, and reports every journal checkpoint the directory lacks. An export failure is logged (`audit checkpoint export failed`) and never refuses calls; treat the log line as an alert, because until the copy is restored a truncation back to that checkpoint would go unreported. |
 | `MCP_AUDIT_APPEND_TIMEOUT_MS` | `5000`; clamped to `100`–`60000` | Bound on the wait for durable acknowledgement. Before dispatch, a timeout refuses the call. After dispatch, the outcome record is not abandoned: the caller stops waiting at the bound, the write continues on a tracked task, and a graceful shutdown drains such writes for up to 30 s; see `src/policy/egress.rs` for what an intent without an outcome then means. |
 
 Validated tokens are cached for `min(exp, 5 min)` keyed by the token's
 SHA-256, so a revoked group membership takes effect when the client's next
-token is issued (plan §3.6; the deny-list and `revoke-all` arrive in Phase
-B).
+token is issued (plan §3.6); the revocation list above is what cuts a
+token off sooner, and it is checked on every request regardless of the
+cache. A token whose `iat` lies more than the clock skew in the future is
+refused as `not_yet_valid`: it could not be dated against a `revoke all`
+cut-off or the fresh-token rule. The `policy_loaded` and
+`revocation_loaded` records are appended, and made durable, **before** the
+port is bound; a journal that cannot take them stops the server from
+starting.
 
 ## Process-only runtime settings
 

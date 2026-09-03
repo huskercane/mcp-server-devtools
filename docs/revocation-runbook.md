@@ -37,7 +37,10 @@ cache entry to age out.
   with whoever is allowed to revoke. It is the same key that signs the policy:
   revocation is an authorization change, and it should need the same authority.
 - `mcp-devtools` on an operator machine (any platform; the CLI reads and
-  writes files, and never needs the gateway's configuration).
+  writes files, and never needs the gateway's configuration). Two operators
+  editing the same list at once are serialized on `<file>.lock` (an
+  advisory lock every `revoke` edit holds from its read to its write), so
+  neither entry is lost; `revoke init` never replaces a list that exists.
 
 ## Procedures
 
@@ -80,8 +83,11 @@ A token with no `jti` cannot be named; revoke its subject instead.
        --file revocations.yaml --key policy-signing.key`
 3. Publish the pair. Every gateway clears its validated-token cache and
    closes every principal session; every token with `iat` before the
-   cut-off — or with no `iat` — is refused. Clients re-authenticate and
-   re-initialise.
+   cut-off — or with no `iat` — is refused. A token whose `iat` is in the
+   future (beyond `MCP_OKTA_CLOCK_SKEW_SECONDS`) is refused at
+   authentication as `not_yet_valid` and never reaches the cut-off test,
+   so the cut-off cannot be outrun by a mis-dated token. Clients
+   re-authenticate and re-initialise.
 4. Once the incident is closed and every legitimate token has aged past the
    cut-off, the cut-off can stay (it costs nothing) or be dropped with
    `mcp-devtools revoke clear-all`.

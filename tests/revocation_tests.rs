@@ -175,6 +175,8 @@ async fn spawn_with(
             sink: Arc::clone(sink) as Arc<dyn AuditSink>,
             append_timeout: Duration::from_secs(5),
         });
+    // The startup step `run_http` takes before it binds.
+    auth.journal_startup().await.unwrap();
     spawn(build_app_with_server_and_auth(
         server,
         Arc::new(auth),
@@ -583,8 +585,12 @@ const AUDIENCE: &str = "api://mcp-devtools";
 
 fn okta_token(subject: &str, groups: &[&str], jti: &str, ttl: u64) -> String {
     let now = get_current_timestamp();
+    okta_token_issued_at(subject, groups, jti, now, now + ttl)
+}
+
+fn okta_token_issued_at(subject: &str, groups: &[&str], jti: &str, iat: u64, exp: u64) -> String {
     let claims = json!({
-        "sub": subject, "iss": ISSUER, "aud": AUDIENCE, "iat": now, "exp": now + ttl,
+        "sub": subject, "iss": ISSUER, "aud": AUDIENCE, "iat": iat, "exp": exp,
         "jti": jti, "scp": ["mcp:tools"], "groups": groups,
     });
     let mut header = Header::new(Algorithm::RS256);
@@ -695,6 +701,194 @@ async fn group_removal_waits_for_the_token_but_revocation_does_not() {
     let rejected = events(&sink, "revoked_token_rejected");
     assert_eq!(rejected[0]["principal"]["subject"], "alice");
     assert_eq!(rejected[0]["principal"]["groups"], json!(["SRE"]));
+}
+
+/// A correctly signed token whose `iat` lies in the future would postdate
+/// every `revoke all` cut-off and count as freshly minted for writes, so it
+/// is refused at authentication — for reads and writes alike — and never
+/// reaches either rule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_issued_in_the_future_is_refused_before_revocation_or_freshness_see_it() {
+    let jwks = MockServer::start().await;
+    let jwk: Value = serde_json::from_str(PUBLIC_JWK).unwrap();
+    Mock::given(method("GET"))
+        .and(path("/keys"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [jwk] })))
+        .mount(&jwks)
+        .await;
+    let grafana = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/datasources"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{ "uid": "loki-qa" }])))
+        .mount(&grafana)
+        .await;
+    let sink = Arc::new(InMemoryAuditSink::new());
+    let server = server(
+        &sink,
+        Config::from_map(HashMap::from([(
+            "GRAFANA_TOKEN".to_owned(),
+            "glsa".to_owned(),
+        )])),
+        Vendors {
+            grafana: GrafanaVendor::with_base_url(grafana.uri()),
+            ..Vendors::default()
+        },
+    );
+    let validator = Arc::new(OktaJwksValidator::new(
+        OktaSettings {
+            issuer: ISSUER.to_owned(),
+            audience: AUDIENCE.to_owned(),
+            jwks_url: format!("{}/keys", jwks.uri()),
+            groups_claim: "groups".to_owned(),
+            clock_skew: Duration::from_mins(1),
+            tenant: "acme".to_owned(),
+            jwks_refresh: Duration::from_mins(10),
+            jwks_min_refetch_interval: Duration::from_secs(30),
+        },
+        reqwest::Client::new(),
+    ));
+    let signed = Signed::empty();
+    // Everything issued before now is revoked. A token dated an hour from
+    // now is, by that test alone, *after* the cut-off.
+    let cutoff = now();
+    signed.revoke_all_at(&rfc3339(cutoff));
+    let base = spawn_with(server, Arc::new(validator), signed.load(), &sink).await;
+    let client = reqwest::Client::new();
+
+    let from_the_future = okta_token_issued_at(
+        "alice",
+        &["SRE"],
+        "jti-future",
+        cutoff + 3600,
+        cutoff + 7200,
+    );
+    for (tool, arguments) in [
+        ("grafana_list_datasources", json!({})),
+        (
+            "jira_post",
+            json!({ "path": "/rest/api/3/issue", "body": {} }),
+        ),
+    ] {
+        let refused = tool_call(&client, &base, &from_the_future, tool, arguments)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED, "{tool}");
+        let challenge = www_authenticate(&refused);
+        assert!(
+            challenge.contains("error_description=\"not_yet_valid\""),
+            "{tool}: {challenge}"
+        );
+    }
+    assert!(
+        events(&sink, "tool_call_intent").is_empty(),
+        "a token that cannot be dated never reaches a policy decision"
+    );
+
+    // A token issued at the cut-off itself is not before it, and is served.
+    let at_cutoff = okta_token_issued_at("alice", &["SRE"], "jti-now", cutoff, cutoff + 300);
+    let accepted = rpc_result(
+        tool_call(
+            &client,
+            &base,
+            &at_cutoff,
+            "grafana_list_datasources",
+            json!({}),
+        )
+        .send()
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_ne!(accepted["result"]["isError"], true, "{accepted}");
+}
+
+/// The `revocation_loaded` record is the startup step's, and a journal that
+/// will not take it stops the server from starting.
+#[tokio::test]
+async fn startup_refuses_when_the_revocation_list_in_force_cannot_be_journaled() {
+    let signed = Signed::empty();
+    let failing = Arc::new(InMemoryAuditSink::new());
+    failing.set_failing(true);
+    let auth = InboundAuth::new(Arc::new(StaticValidator::new()), settings())
+        .with_revocations(signed.load())
+        .with_audit(BundleAudit {
+            sink: Arc::clone(&failing) as Arc<dyn AuditSink>,
+            append_timeout: Duration::from_secs(1),
+        });
+    assert!(auth.journal_startup().await.is_err());
+    assert!(events(&failing, "revocation_loaded").is_empty());
+
+    // Without a list (local mode) there is nothing to journal.
+    let local = InboundAuth::new(Arc::new(StaticValidator::new()), settings());
+    local.journal_startup().await.unwrap();
+}
+
+/// Two edits of one list serialize on the edit lock: the second waits for
+/// the first's read-modify-write to finish, so neither entry is lost. The
+/// lock is taken here directly; the edit blocks until it is released, then
+/// completes with the entry present.
+#[test]
+fn revoke_edits_serialize_on_the_edit_lock() {
+    use mcp_server_devtools::cli::revoke::{Command, EntryOpts, FileOpts, dispatch, lock_for_edit};
+    use std::sync::mpsc;
+
+    let signed = Signed::empty();
+    let key_file = signed.file.with_file_name("policy-signing.key");
+    let (_, pkcs8) = SigningKey::generate().unwrap();
+    // The list must have been signed by the key the CLI will use.
+    let key = SigningKey::from_pkcs8(&pkcs8).unwrap();
+    let list = RevocationFile::empty();
+    let yaml = list.to_yaml().unwrap();
+    std::fs::write(&signed.file, &yaml).unwrap();
+    write_detached(
+        &signed.file,
+        &key.sign(Domain::RevocationList, yaml.as_bytes()),
+    )
+    .unwrap();
+    mcp_server_devtools::policy::signing::write_key_file(&key_file, &pkcs8).unwrap();
+
+    let held = lock_for_edit(&signed.file).unwrap();
+    let (done, finished) = mpsc::channel();
+    let file = signed.file.clone();
+    let editor = std::thread::spawn(move || {
+        let result = dispatch(Command::Subject(EntryOpts {
+            id: "alice".to_owned(),
+            reason: None,
+            file: FileOpts {
+                file,
+                key: key_file,
+                json: true,
+            },
+        }));
+        done.send(result).unwrap();
+    });
+    assert!(
+        finished.recv_timeout(Duration::from_millis(500)).is_err(),
+        "the edit must wait for the lock"
+    );
+    drop(held);
+    finished
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the edit completes once the lock is released")
+        .unwrap();
+    editor.join().unwrap();
+    let after = RevocationFile::parse(&std::fs::read(&signed.file).unwrap()).unwrap();
+    assert_eq!(after.subjects.len(), 1);
+    assert_eq!(after.subjects[0].subject, "alice");
+
+    // `init` refuses a list that exists, at the moment of writing.
+    let error = dispatch(Command::Init(FileOpts {
+        file: signed.file.clone(),
+        key: signed.file.with_file_name("policy-signing.key"),
+        json: true,
+    }))
+    .unwrap_err();
+    assert!(
+        error.message.contains("already exists"),
+        "{}",
+        error.message
+    );
 }
 
 // --- the CLI --------------------------------------------------------------

@@ -526,6 +526,18 @@ impl OktaJwksValidator {
             .filter(|sub| !sub.trim().is_empty())
             .ok_or(TokenRejection::MissingClaim("sub"))?;
         let exp = claims.exp.ok_or(TokenRejection::MissingClaim("exp"))?;
+        // An issue time in the future (beyond the skew) is not a token this
+        // gateway can date: it would outrun every `revoke all` cut-off and
+        // count as freshly minted for writes forever. `jsonwebtoken` checks
+        // `exp` and `nbf` only, so `iat` is bounded here, before anything is
+        // cached. Rejected under the same category as a premature `nbf`.
+        let now = jsonwebtoken::get_current_timestamp();
+        if claims
+            .iat
+            .is_some_and(|iat| iat > now.saturating_add(self.settings.clock_skew.as_secs()))
+        {
+            return Err(TokenRejection::NotYetValid);
+        }
         let token = TokenFacts {
             issued_at: claims.iat,
             token_id: claims.jti.filter(|jti| !jti.trim().is_empty()),

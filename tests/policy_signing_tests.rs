@@ -5,7 +5,11 @@
 //!   reload, with the last good policy in force.
 //! - Every policy load, change, and rejection is a control record in the
 //!   audit journal, and a change is durable **before** it takes effect.
-//! - A change whose record cannot be made durable is not applied.
+//! - A change whose record cannot be made durable is not applied; a
+//!   rejection whose record cannot be made durable is retried, and two
+//!   refused revisions are two records even when the reason is the same.
+//! - The `policy_loaded` record is the server's startup step, and a server
+//!   whose startup record cannot be journaled refuses to start.
 //! - `policy keygen` / `policy sign` / `policy check --public-key` round
 //!   trip at the binary boundary.
 
@@ -153,21 +157,13 @@ async fn a_change_is_journaled_before_it_takes_effect_and_rejections_once() {
         versions_at_append: Mutex::new(Vec::new()),
     });
     witness.bind(&policy);
-    policy.spawn_watcher(
-        Some(BundleAudit {
-            sink: Arc::clone(&witness) as Arc<dyn AuditSink>,
-            append_timeout: Duration::from_secs(5),
-        }),
-        None,
-    );
-
-    // The policy in force is journaled when the watcher starts.
-    assert!(
-        wait_until(Duration::from_secs(3), || {
-            !control_events(&witness.inner, "policy_loaded").is_empty()
-        })
-        .await
-    );
+    let audit = BundleAudit {
+        sink: Arc::clone(&witness) as Arc<dyn AuditSink>,
+        append_timeout: Duration::from_secs(5),
+    };
+    // The policy in force is journaled by the process, before it serves.
+    policy.journal_in_force(&audit).await.unwrap();
+    policy.spawn_watcher(Some(audit), None);
     let loaded = &control_events(&witness.inner, "policy_loaded")[0];
     assert_eq!(loaded["version"], v1);
     assert_eq!(loaded["signature"]["verified"], true);
@@ -209,6 +205,32 @@ async fn a_change_is_journaled_before_it_takes_effect_and_rejections_once() {
     assert_eq!(policy.version().unwrap(), v1);
     assert!(policy.degraded().is_some());
 
+    // A *different* unsigned revision fails for the same reason: a second
+    // rejection, not a repeat of the first — and while the journal is
+    // down, it is retried until its record lands rather than deduplicated
+    // against a record that was never written.
+    witness.inner.set_failing(true);
+    std::fs::write(&path, V3).unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(control_events(&witness.inner, "policy_rejected").len(), 1);
+    witness.inner.set_failing(false);
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            control_events(&witness.inner, "policy_rejected").len() == 2
+        })
+        .await,
+        "the rejection is journaled once the journal is back"
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let rejected = control_events(&witness.inner, "policy_rejected");
+    assert_eq!(rejected.len(), 2, "{rejected:?}");
+    assert_ne!(
+        rejected[0]["version"], rejected[1]["version"],
+        "each refused revision is identified by its own bytes"
+    );
+    assert_eq!(rejected[0]["reason"], rejected[1]["reason"]);
+    std::fs::write(&path, V2).unwrap();
+
     // Now signed: applied, and the change record was appended while v1 was
     // still in force.
     write_detached(&path, &key.sign(Domain::PolicyBundle, V2)).unwrap();
@@ -245,19 +267,13 @@ async fn a_change_whose_record_cannot_be_journaled_is_not_applied() {
     let policy = FilePolicy::load_verified(&path, key.verifying_key()).unwrap();
     let v1 = policy.version().unwrap();
     let sink = Arc::new(InMemoryAuditSink::new());
-    policy.spawn_watcher(
-        Some(BundleAudit {
-            sink: Arc::clone(&sink) as Arc<dyn AuditSink>,
-            append_timeout: Duration::from_secs(1),
-        }),
-        None,
-    );
-    assert!(
-        wait_until(Duration::from_secs(3), || {
-            !control_events(&sink, "policy_loaded").is_empty()
-        })
-        .await
-    );
+    let audit = BundleAudit {
+        sink: Arc::clone(&sink) as Arc<dyn AuditSink>,
+        append_timeout: Duration::from_secs(1),
+    };
+    policy.journal_in_force(&audit).await.unwrap();
+    policy.spawn_watcher(Some(audit), None);
+    assert_eq!(control_events(&sink, "policy_loaded").len(), 1);
 
     sink.set_failing(true);
     write_signed(&path, V3, &key);
@@ -287,6 +303,60 @@ async fn a_change_whose_record_cannot_be_journaled_is_not_applied() {
     );
     assert!(policy.degraded().is_none());
     assert_eq!(control_events(&sink, "policy_changed").len(), 1);
+}
+
+/// The `policy_loaded` record is appended by the server's startup step,
+/// synchronously, and its failure is fatal: a gateway that cannot evidence
+/// which policy it started under does not start. Through the composition
+/// root, with the policy named by `MCP_POLICY_FILE`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_journals_the_policy_in_force_before_it_serves_or_does_not_serve() {
+    use mcp_server_devtools::bootstrap::ServerBuilder;
+    use mcp_server_devtools::config::Config;
+    use std::collections::HashMap;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("policy.yaml");
+    std::fs::write(&path, V1).unwrap();
+    let config = || {
+        Config::from_map(HashMap::from([(
+            "MCP_POLICY_FILE".to_owned(),
+            path.display().to_string(),
+        )]))
+    };
+
+    let sink = Arc::new(InMemoryAuditSink::new());
+    let server = ServerBuilder::new()
+        .config(config())
+        .audit_sink(Arc::clone(&sink) as Arc<dyn AuditSink>)
+        .build()
+        .unwrap();
+    assert!(
+        control_events(&sink, "policy_loaded").is_empty(),
+        "building the server journals nothing on its own"
+    );
+    server.journal_startup().await.unwrap();
+    let loaded = control_events(&sink, "policy_loaded");
+    assert_eq!(loaded.len(), 1);
+    assert!(
+        loaded[0]["version"].as_str().unwrap().starts_with("v1+"),
+        "{loaded:?}"
+    );
+    assert_eq!(loaded[0]["source"], path.display().to_string());
+
+    let failing = Arc::new(InMemoryAuditSink::new());
+    failing.set_failing(true);
+    let server = ServerBuilder::new()
+        .config(config())
+        .audit_sink(Arc::clone(&failing) as Arc<dyn AuditSink>)
+        .build()
+        .unwrap();
+    let error = server.journal_startup().await.unwrap_err();
+    assert!(
+        error.message.contains("refusing to start"),
+        "{}",
+        error.message
+    );
 }
 
 fn run(args: &[&str]) -> (bool, String, String) {

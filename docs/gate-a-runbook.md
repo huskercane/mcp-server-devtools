@@ -24,8 +24,10 @@ under ADR-001), and it cuts both ways here:
 
 Either is fine. Not deciding, and then moving the code mid-trial, is not.
 
-The enterprise crate becomes the test artifact once Phase B puts revocation
-(B.4) and the admin surface in it.
+Phase B did **not** move anything: revocation (B.4) and the rest of Phase B
+live in the community crate like Phase A, and CF-18's move list grew
+accordingly. The enterprise crate becomes the test artifact only once CF-18
+is decided and executed; until then the community image is the artifact.
 
 ## Steps
 
@@ -47,8 +49,9 @@ The enterprise crate becomes the test artifact once Phase B puts revocation
    - `MCP_REVOCATION_FILE` — `mcp-devtools revoke init --file revocations.yaml --key policy-signing.key`
      produces the empty, signed list; ship both files;
    - `MCP_AUDIT_SIGNING_KEY` — `mcp-devtools audit keygen --out audit-signing.key`,
-     mounted owner-only (`defaultMode: 0400`) from a Secret; keep the
-     printed public key for `mcp-devtools audit verify`.
+     mounted from a Secret (Kubernetes projects it as `root:<fsGroup>`
+     `0440`, which the gateway accepts; world-readable or group-writable is
+     refused); keep the printed public key for `mcp-devtools audit verify`.
    `deploy/k8s/config.yaml` shows all three. If the partner's workflow is
    the incident one, start from `deploy/policies/incident-investigation.yaml`
    (Grafana + Slack) instead.

@@ -17,7 +17,11 @@
 //! **not** poison the journal: the checkpoint is already durable in the
 //! journal itself, and refusing every tool call because a copy failed
 //! would turn an observability gap into an outage. The verifier reports
-//! the gap (a checkpoint in the journal that the export lacks) instead.
+//! the gap in **both** directions instead — an export the journal lacks
+//! (truncation) and a journal checkpoint the export lacks
+//! ([`crate::audit::verify::Problem::ExportMissing`]) — so a failed copy is
+//! a finding an auditor sees, not a silent hole a later truncation could
+//! hide in. An export failure is therefore an operator alert, not noise.
 
 use std::io;
 use std::path::{Path, PathBuf};

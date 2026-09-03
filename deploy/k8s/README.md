@@ -71,7 +71,12 @@ curl -sS -H "Authorization: Bearer $TOKEN" \
 - **The journal is verifiable offline.** Checkpoints signed with the
   gateway's key seal the journal every 256 records / 60 s and at shutdown,
   and are copied to `/journal/checkpoints`; ship that directory and run
-  `mcp-devtools audit verify` on a copy (`docs/audit-reports.md`).
+  `mcp-devtools audit verify` on a copy (`docs/audit-reports.md`). Note
+  what the example does **not** give you: the copies live on the same
+  volume as the journal, so they detect a truncated *file*, not a host
+  whose disk was rewritten wholesale. That needs the export shipped off
+  the pod to storage the gateway cannot alter (`docs/enterprise-carry-forward.md`,
+  CF-23).
 - **Health means "will serve".** The readiness and liveness probes exec
   `mcp-devtools health`, which answers non-zero when the audit journal can
   no longer accept records — a gateway that would refuse every call is

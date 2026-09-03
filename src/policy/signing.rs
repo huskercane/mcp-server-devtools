@@ -13,8 +13,11 @@
 //! ## Format
 //!
 //! - **Private key**: a PKCS#8 v2 DER document on disk, created by
-//!   [`write_key_file`] with owner-only permissions. Loaded with
-//!   [`SigningKey::load`], which refuses a file readable by anyone else.
+//!   [`write_key_file`] owner-only (`0600`, never replacing an existing
+//!   file). Loaded with [`SigningKey::load`], which permits owner read and
+//!   read by an administered service group (`0640`, `0440` — how a
+//!   Kubernetes Secret under `fsGroup` or a systemd `Group=` unit receives
+//!   it) and refuses anything world-readable, group-writable, or executable.
 //! - **Public key**: the raw 32-byte Ed25519 key, base64 (standard alphabet,
 //!   padded) — short enough for an environment variable or a `ConfigMap`.
 //! - **Signature**: 64 bytes, base64, on one line in a sidecar file named
@@ -136,18 +139,30 @@ impl SigningKey {
 
     /// Load a key file written by [`write_key_file`].
     ///
-    /// On Unix the file must not be readable by group or others: a signing
-    /// key that another user on the host can read is not a signing key.
-    /// This is checked before the bytes are read, so a misconfigured file
-    /// is refused without ever being loaded.
+    /// On Unix the file must be readable by nobody but its owner and, at
+    /// most, its group — `0600` or `0640`/`0440`. Anything wider is refused:
+    /// a signing key every user on the host can read is not a signing key.
+    /// Group read is admitted because that is how a platform hands a
+    /// service its own secret — a Kubernetes Secret projected into a pod
+    /// with `fsGroup` arrives as `root:<fsGroup>` mode `0440`, and a systemd
+    /// unit with `Group=` reads `root:<group>` `0640` — and the group is an
+    /// administered grant, not the world. Group *write* is still refused:
+    /// a key another identity can replace is not the gateway's key.
+    ///
+    /// The permission check and the read use one open file, so the bytes
+    /// checked are the bytes loaded — a path swapped between the two would
+    /// simply be checked and loaded as itself.
     ///
     /// # Errors
     ///
     /// When the file cannot be read, is too permissive, or does not parse.
     pub fn load(path: &Path) -> Result<Self, SigningError> {
-        let metadata = std::fs::metadata(path).map_err(|error| {
-            SigningError::new(format!("cannot read key file {}: {error}", path.display()))
-        })?;
+        use std::io::Read as _;
+
+        let cannot_read =
+            |error| SigningError::new(format!("cannot read key file {}: {error}", path.display()));
+        let mut file = std::fs::File::open(path).map_err(cannot_read)?;
+        let metadata = file.metadata().map_err(cannot_read)?;
         if !metadata.is_file() {
             return Err(SigningError::new(format!(
                 "key file {} is not a regular file",
@@ -158,17 +173,17 @@ impl SigningKey {
         {
             use std::os::unix::fs::PermissionsExt as _;
             let mode = metadata.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
+            if mode & !KEY_FILE_ALLOWED_MODE != 0 {
                 return Err(SigningError::new(format!(
                     "key file {} is readable by other users (mode {mode:04o}); a signing \
-                     key must be owner-only (0600)",
+                     key must be owner-only (0600), or at most group-readable (0640) for \
+                     the service's own group",
                     path.display()
                 )));
             }
         }
-        let der = std::fs::read(path).map_err(|error| {
-            SigningError::new(format!("cannot read key file {}: {error}", path.display()))
-        })?;
+        let mut der = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0).min(4096));
+        file.read_to_end(&mut der).map_err(cannot_read)?;
         Self::from_pkcs8(&der)
             .map_err(|error| SigningError::new(format!("key file {}: {error}", path.display())))
     }
@@ -351,42 +366,49 @@ pub fn write_detached(file: &Path, signature: &Signature) -> io::Result<PathBuf>
     Ok(path)
 }
 
+/// The permission bits a key file may carry: owner read/write, group read.
+/// See [`SigningKey::load`].
+#[cfg(unix)]
+const KEY_FILE_ALLOWED_MODE: u32 = 0o640;
+
 /// Write a private key document to `path`, owner-only, refusing to
 /// overwrite an existing file (a key that already exists is either in use
 /// or a mistake, and neither should be silently replaced).
 ///
+/// The refusal is atomic, not checked-then-written: the document is
+/// written to a private temporary file and installed with a link that
+/// fails if `path` exists, so two `keygen`s racing for one path produce
+/// one key and one error, never a key one of them silently replaced.
+///
 /// # Errors
 ///
-/// When the file exists or cannot be created.
+/// `AlreadyExists` when the file exists — at the moment of installation,
+/// not merely when the write started — or any error creating it.
 pub fn write_key_file(path: &Path, pkcs8: &[u8]) -> io::Result<()> {
     write_atomically(path, pkcs8, true)
 }
 
-/// Write `contents` to `path` via a temporary file and rename, so a reader
-/// never sees a partial file. `owner_only` also sets mode `0600` and
-/// refuses to replace an existing file.
+/// Write `contents` to `path` via a temporary file, so a reader never sees
+/// a partial file. `owner_only` also sets mode `0600` and installs without
+/// replacing (see [`write_key_file`]); otherwise the temporary file is
+/// renamed over any existing one.
 fn write_atomically(path: &Path, contents: &[u8], owner_only: bool) -> io::Result<()> {
     use std::io::Write as _;
 
-    if owner_only && path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "{} already exists; refusing to overwrite a key",
-                path.display()
-            ),
-        ));
-    }
     let directory = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
+    // A private name, so concurrent writers never share a temporary file
+    // (a fixed `<name>.tmp` opened with truncation would let one writer
+    // install the other's half-written bytes).
     let temp = {
-        let mut name = path.file_name().unwrap_or_default().to_owned();
-        name.push(".tmp");
+        let mut name = std::ffi::OsString::from(".");
+        name.push(path.file_name().unwrap_or_default());
+        name.push(format!(".{:016x}.tmp", rand::random::<u64>()));
         directory.map_or_else(|| PathBuf::from(&name), |dir| dir.join(&name))
     };
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     if owner_only {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -397,26 +419,39 @@ fn write_atomically(path: &Path, contents: &[u8], owner_only: bool) -> io::Resul
         file.write_all(contents)?;
         file.sync_all()
     })();
-    if let Err(error) = written {
-        let _ = std::fs::remove_file(&temp);
-        return Err(error);
-    }
     drop(file);
-    if owner_only && path.exists() {
+    let installed = written.and_then(|()| {
+        if owner_only {
+            // `link` fails with `AlreadyExists` when the target exists:
+            // a no-replace install in one step, where `rename` would
+            // replace whatever appeared after the last check.
+            std::fs::hard_link(&temp, path).map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "{} already exists; refusing to overwrite a key",
+                            path.display()
+                        ),
+                    )
+                } else {
+                    error
+                }
+            })
+        } else {
+            std::fs::rename(&temp, path)
+        }
+    });
+    if owner_only || installed.is_err() {
+        // After a link the temporary name is a second name for the same
+        // inode; after a failure it is litter. Either way it goes.
         let _ = std::fs::remove_file(&temp);
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "{} already exists; refusing to overwrite a key",
-                path.display()
-            ),
-        ));
     }
-    std::fs::rename(&temp, path)?;
+    installed?;
     if let Some(dir) = directory
         && let Ok(handle) = std::fs::File::open(dir)
     {
-        // Best effort: the rename is durable once the directory is synced;
+        // Best effort: the install is durable once the directory is synced;
         // a platform that cannot sync a directory still has the file.
         let _ = handle.sync_all();
     }
@@ -493,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn key_files_are_owner_only_and_never_overwritten() {
+    fn key_files_are_created_owner_only_and_load_permissions_are_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("signing.key");
         let (key, pkcs8) = SigningKey::generate().unwrap();
@@ -504,14 +539,32 @@ mod tests {
         );
         let loaded = SigningKey::load(&path).unwrap();
         assert_eq!(loaded.verifying_key(), key.verifying_key());
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .all(|entry| entry.unwrap().file_name() == "signing.key"),
+            "no temporary file is left behind, on success or refusal"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-            let error = SigningKey::load(&path).err().unwrap().to_string();
-            assert!(error.contains("readable by other users"), "{error}");
+            // The platform projections: a Kubernetes Secret under `fsGroup`
+            // (0440) and a systemd `Group=` grant (0640) load.
+            for admitted in [0o640, 0o440, 0o400] {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(admitted)).unwrap();
+                assert!(SigningKey::load(&path).is_ok(), "{admitted:04o}");
+            }
+            // World-readable, group-writable, or executable: refused.
+            for refused in [0o644, 0o604, 0o660, 0o620, 0o650, 0o601] {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(refused)).unwrap();
+                let error = SigningKey::load(&path).err().unwrap().to_string();
+                assert!(
+                    error.contains("readable by other users"),
+                    "{refused:04o}: {error}"
+                );
+            }
         }
     }
 }

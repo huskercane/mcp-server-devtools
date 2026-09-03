@@ -139,7 +139,7 @@ where
         TopCommand::Jira { action } => jira::dispatch(action).await,
         TopCommand::Conf { action } => conf::dispatch(action).await,
         TopCommand::Creds { action } => creds::dispatch(action).await,
-        TopCommand::Policy { action } => policy::dispatch(action),
+        TopCommand::Policy { action } => policy::dispatch(action).await,
         TopCommand::Revoke { action } => revoke::dispatch(action),
         TopCommand::Audit { action } => audit::dispatch(action),
         TopCommand::Serve(opts) => return serve::dispatch(opts).await,

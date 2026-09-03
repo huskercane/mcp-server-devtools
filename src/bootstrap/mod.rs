@@ -75,6 +75,11 @@ pub struct Components {
     /// compiled `MCP_POLICY_FILE` otherwise. `dyn` for the same reason as
     /// the broker: consulted twice per call on a path that does file I/O.
     pub policy: Arc<dyn PolicyDecisionPoint>,
+    /// The same policy as a file-backed bundle, when `MCP_POLICY_FILE`
+    /// supplied it: what [`DevtoolsServer::journal_startup`] journals the
+    /// `policy_loaded` record for. `None` under [`AllowAll`] or a policy the
+    /// builder was handed directly.
+    pub policy_file: Option<Arc<crate::policy::FilePolicy>>,
     /// Bound on how long an audit append may wait for durable
     /// acknowledgement before the call is refused (CF-14).
     pub audit_append_timeout: std::time::Duration,
@@ -219,9 +224,17 @@ impl ServerBuilder {
             None => open_configured_journal(&config)?,
         };
         let audit_append_timeout = crate::policy::egress::audit_append_timeout(&config);
-        let policy = match self.policy {
-            Some(policy) => policy,
-            None => load_configured_policy(&config, audit_sink.as_ref(), audit_append_timeout)?,
+        let (policy, policy_file): (Arc<dyn PolicyDecisionPoint>, _) = match self.policy {
+            Some(policy) => (policy, None),
+            None => {
+                match load_configured_policy(&config, audit_sink.as_ref(), audit_append_timeout)? {
+                    Some(file) => (
+                        Arc::clone(&file) as Arc<dyn PolicyDecisionPoint>,
+                        Some(file),
+                    ),
+                    None => (Arc::new(AllowAll), None),
+                }
+            }
         };
 
         let components = Arc::new(Components {
@@ -236,6 +249,7 @@ impl ServerBuilder {
             usage_sink: self.usage_sink.unwrap_or_else(|| Arc::new(NoopUsageSink)),
             auth_required: self.auth_required,
             policy,
+            policy_file,
             audit_append_timeout,
             pending_audit: tokio_util::task::TaskTracker::new(),
         });
@@ -384,23 +398,25 @@ pub fn configured_policy_public_key(
         .transpose()
 }
 
-/// Load and start watching the policy named by `MCP_POLICY_FILE`, or
-/// [`AllowAll`] when none is configured. A configured policy that does not
-/// compile — or, with `MCP_POLICY_PUBLIC_KEY` set, is not validly signed —
-/// is a hard startup error: enterprise mode never runs on a guess, and
-/// local mode with a broken dry-run policy should say so. With a journal,
-/// the watcher journals the policy in force and every later change.
+/// Load and start watching the policy named by `MCP_POLICY_FILE`; `None`
+/// when none is configured (the caller uses [`AllowAll`]). A configured
+/// policy that does not compile — or, with `MCP_POLICY_PUBLIC_KEY` set, is
+/// not validly signed — is a hard startup error: enterprise mode never runs
+/// on a guess, and local mode with a broken dry-run policy should say so.
+/// With a journal, the watcher journals every later change; the policy in
+/// force is journaled by [`DevtoolsServer::journal_startup`], before the
+/// process is reachable.
 fn load_configured_policy(
     config: &Config,
     audit_sink: Option<&Arc<dyn AuditSink>>,
     append_timeout: std::time::Duration,
-) -> Result<Arc<dyn PolicyDecisionPoint>, McpError> {
+) -> Result<Option<Arc<crate::policy::FilePolicy>>, McpError> {
     let Some(path) = config
         .get(crate::policy::engine::POLICY_FILE_KEY)
         .map(str::trim)
         .filter(|path| !path.is_empty())
     else {
-        return Ok(Arc::new(AllowAll));
+        return Ok(None);
     };
     let verifier = configured_policy_public_key(config)?;
     let path = std::path::Path::new(path);
@@ -426,7 +442,7 @@ fn load_configured_policy(
         }),
         None,
     );
-    Ok(Arc::new(policy))
+    Ok(Some(policy))
 }
 
 /// Dependencies for a one-shot CLI subcommand.

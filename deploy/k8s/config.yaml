@@ -17,7 +17,8 @@ data:
   MCP_REVOCATION_FILE: "/policy/revocations.yaml"
   MCP_AUDIT_JOURNAL_DIR: "/journal"
   # The gateway's checkpoint signing key (`mcp-devtools audit keygen`),
-  # mounted owner-only from the `mcp-devtools-audit-signing-key` Secret.
+  # mounted from the `mcp-devtools-audit-signing-key` Secret (projected as
+  # root:fsGroup 0440; the gateway accepts owner/group-readable, no wider).
   MCP_AUDIT_SIGNING_KEY: "/keys/audit-signing.key"
   # A second copy of every checkpoint, for shipping off the pod.
   MCP_AUDIT_CHECKPOINT_EXPORT_DIR: "/journal/checkpoints"

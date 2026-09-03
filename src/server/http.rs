@@ -146,6 +146,19 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
         AuthMode::Off => None,
         AuthMode::Okta => Some(Arc::new(enterprise_inbound_auth(&config, &server)?)),
     };
+    // The startup evidence — which policy and which revocation list this
+    // process runs under — is durable before the port opens. A journal
+    // that cannot take these records is a journal that cannot take the
+    // first tool call's intent either, so this fails the same way.
+    server.journal_startup().await?;
+    if let Some(auth) = &inbound_auth {
+        auth.journal_startup().await.map_err(|error| {
+            format!(
+                "refusing to start: the revocation list in force could not be journaled ({})",
+                crate::ports::AuditFailure::classify(&error)
+            )
+        })?;
+    }
     let pending_audit = server.pending_audit();
     let app = build_app_for_role(
         role,

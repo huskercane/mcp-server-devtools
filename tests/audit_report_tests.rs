@@ -7,7 +7,7 @@ use std::process::Command;
 
 use assert_cmd::cargo::cargo_bin;
 use mcp_server_devtools::audit::export::{
-    ActivityFilter, Format, GroupsFile, access_review, activity, write_access_review,
+    ActivityFilter, ActivityRow, Format, GroupsFile, access_review, activity, write_access_review,
     write_activity,
 };
 use mcp_server_devtools::audit::journal::{JOURNAL_FILE_NAME, JournalAuditSink};
@@ -324,6 +324,72 @@ async fn activity_export_flattens_every_record_and_filters() {
         .collect();
     assert_eq!(parsed.len(), 9);
     assert_eq!(parsed[0]["rule_id"], "sre-read-qa-loki");
+}
+
+/// Time bounds compare at full precision: a bound a fraction of a second
+/// after a record excludes it as `--since` and includes it as `--until`,
+/// where a millisecond comparison would have called them equal.
+#[test]
+fn time_bounds_keep_sub_millisecond_precision() {
+    use mcp_server_devtools::audit::export::before;
+
+    assert!(before("2026-09-03T09:10:00Z", "2026-09-03T09:10:00.0005Z"));
+    assert!(!before("2026-09-03T09:10:00.0005Z", "2026-09-03T09:10:00Z"));
+    assert!(before(
+        "2026-09-03T09:10:00.0001Z",
+        "2026-09-03T09:10:00.0009Z"
+    ));
+    assert!(!before("2026-09-03T09:10:00Z", "2026-09-03T09:10:00Z"));
+    // Offsets are honoured, and a malformed side falls back to text order.
+    assert!(before("2026-09-03T09:10:00+01:00", "2026-09-03T09:10:00Z"));
+    assert!(before("garbage", "z"));
+}
+
+/// Cells that a spreadsheet would evaluate are neutralised with an
+/// apostrophe inside quotes; ordinary cells and RFC 4180 quoting are
+/// unchanged.
+#[test]
+fn csv_cells_cannot_become_spreadsheet_formulas() {
+    let rows = [
+        "=HYPERLINK(\"http://x\")",
+        "+1",
+        "-1",
+        "@SUM(A1)",
+        "plain",
+        "a,b",
+        "say \"hi\"",
+    ]
+    .into_iter()
+    .map(|subject| ActivityRow {
+        seq: 1,
+        timestamp: "2026-09-03T00:00:00Z".to_owned(),
+        kind: "tool_call_intent".to_owned(),
+        subject: Some(subject.to_owned()),
+        rule_id: Some("-leading-dash".to_owned()),
+        ..ActivityRow::default()
+    })
+    .collect::<Vec<_>>();
+    let mut csv = Vec::new();
+    write_activity(&rows, Format::Csv, &mut csv).unwrap();
+    let csv = String::from_utf8(csv).unwrap();
+    let cells: Vec<&str> = csv
+        .lines()
+        .skip(1)
+        .map(|line| line.split(',').nth(4).unwrap())
+        .collect();
+    assert_eq!(
+        cells,
+        vec![
+            "\"'=HYPERLINK(\"\"http://x\"\")\"",
+            "\"'+1\"",
+            "\"'-1\"",
+            "\"'@SUM(A1)\"",
+            "plain",
+            "\"a",
+            "\"say \"\"hi\"\"\"",
+        ]
+    );
+    assert!(csv.contains(",\"'-leading-dash\","), "{csv}");
 }
 
 #[test]

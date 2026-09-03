@@ -37,7 +37,7 @@ pub enum Command {
     /// Sign a policy document (or revocation list), writing `<file>.sig`.
     Sign(SignOpts),
     /// Show which rule decides a call, and why each other rule does not.
-    Explain(super::explain::ExplainOpts),
+    Explain(Box<super::explain::ExplainOpts>),
 }
 
 #[derive(Debug, Args)]
@@ -88,12 +88,12 @@ pub struct SignOpts {
 /// [`McpError`] when the document cannot be read, does not compile, or its
 /// signature does not verify; the message is the same reason the server
 /// logs at startup.
-pub fn dispatch(command: Command) -> Result<(), McpError> {
+pub async fn dispatch(command: Command) -> Result<(), McpError> {
     match command {
         Command::Check(opts) => check(&opts),
         Command::Keygen(opts) => keygen(&opts),
         Command::Sign(opts) => sign(&opts),
-        Command::Explain(opts) => super::explain::run(&opts),
+        Command::Explain(opts) => super::explain::run(&opts).await,
     }
 }
 

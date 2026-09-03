@@ -138,6 +138,43 @@ impl DevtoolsServer {
         router
     }
 
+    /// Append the startup evidence — the `policy_loaded` record for the
+    /// policy in force — and wait for it to be durable. A transport calls
+    /// this **before** it binds or starts serving: a process that cannot
+    /// prove which policy it started under does not start (plan §1.2).
+    /// A no-op without a journal or without a file-backed policy.
+    ///
+    /// # Errors
+    ///
+    /// [`McpError`] when the record could not be made durable within the
+    /// audit bound; the message names the failure category.
+    pub async fn journal_startup(&self) -> Result<(), crate::error::McpError> {
+        let (Some(sink), Some(policy)) = (
+            self.components.audit_sink.as_ref(),
+            self.components.policy_file.as_ref(),
+        ) else {
+            return Ok(());
+        };
+        let audit = crate::policy::BundleAudit {
+            sink: Arc::clone(sink),
+            append_timeout: self.components.audit_append_timeout,
+        };
+        policy
+            .journal_in_force(&audit)
+            .await
+            .map(drop)
+            .map_err(|error| {
+                crate::error::unexpected(
+                    format!(
+                        "refusing to start: the policy in force could not be journaled ({}); a \
+                     gateway whose policy load has no durable evidence must not serve",
+                        crate::ports::AuditFailure::classify(&error)
+                    ),
+                    None,
+                )
+            })
+    }
+
     /// Snapshot the current config. Returns an `Arc` so a tool call costs one
     /// atomic increment instead of deep-cloning the credential maps; `&Arc<Config>`
     /// deref-coerces to the `&Config` every context factory takes.
@@ -573,15 +610,12 @@ impl DevtoolsServer {
         // check, never the only guard (plan §1.3). Under `AllowAll` the
         // context is still built so the journal carries it.
         let policy = &self.components.policy;
-        let details =
-            crate::policy::extractors::for_tool(tool, arguments, self.declared_risk(tool));
-        let action = crate::policy::ActionContext::assemble(
+        let action = crate::policy::ActionContext::for_tool_call(
             principal.clone(),
             client.clone(),
-            None,
             tool,
-            details,
-            None,
+            arguments,
+            self.declared_risk(tool),
             upstream.clone(),
         );
         let mut decision = policy.evaluate(&action);

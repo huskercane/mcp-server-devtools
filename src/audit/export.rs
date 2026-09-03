@@ -223,21 +223,24 @@ pub fn flatten(seq: u64, kind: &str, value: &Value) -> ActivityRow {
     row
 }
 
-/// An RFC 3339 timestamp as milliseconds since the epoch, for comparing
-/// bounds written with any precision (`…T10:00:00Z`) against the journal's
-/// (`…T10:00:00.000Z`). `None` when it does not parse.
+/// An RFC 3339 timestamp as milliseconds since the epoch, for durations
+/// between records (`metrics`). `None` when it does not parse.
 #[must_use]
 pub fn instant(timestamp: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(timestamp.trim())
-        .ok()
-        .map(|parsed| parsed.timestamp_millis())
+    parse(timestamp).map(|parsed| parsed.timestamp_millis())
 }
 
-/// `timestamp < bound`, chronologically when both parse and lexically
-/// otherwise, so a malformed record is compared rather than dropped.
+fn parse(timestamp: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(timestamp.trim()).ok()
+}
+
+/// `timestamp < bound`, chronologically at full precision when both parse
+/// — a bound written as `…00.0005Z` is after a record at `…00Z`, not equal
+/// to it — and lexically otherwise, so a malformed record is compared
+/// rather than dropped.
 #[must_use]
 pub fn before(timestamp: &str, bound: &str) -> bool {
-    match (instant(timestamp), instant(bound)) {
+    match (parse(timestamp), parse(bound)) {
         (Some(left), Some(right)) => left < right,
         _ => timestamp < bound,
     }
@@ -340,6 +343,15 @@ pub fn write_activity(rows: &[ActivityRow], format: Format, out: &mut dyn Write)
 /// RFC 4180: quote a field containing a comma, a quote, or a line break;
 /// double embedded quotes. Hand-rolled because it is twelve lines and the
 /// alternative is a dependency for one function.
+///
+/// Spreadsheet-safe as well: a field that a spreadsheet would evaluate as
+/// a formula — one starting with `=`, `+`, `-`, `@`, a tab, or a carriage
+/// return — is quoted and prefixed with an apostrophe, the convention
+/// every common spreadsheet reads as "this is text". Subjects,
+/// group names, rule ids, and denial reasons come from the identity
+/// provider, the policy author, and the request, so an export that will be
+/// opened rather than parsed must not let any of them run
+/// `=HYPERLINK(...)`. The JSON Lines format is the one for machines.
 fn write_csv_line(
     out: &mut dyn Write,
     fields: impl Iterator<Item = Option<String>>,
@@ -353,8 +365,12 @@ fn write_csv_line(
         let Some(field) = field else {
             continue;
         };
-        if field.contains([',', '"', '\n', '\r']) {
+        let formula_like = field.starts_with(['=', '+', '-', '@', '\t', '\r']);
+        if formula_like || field.contains([',', '"', '\n', '\r']) {
             out.write_all(b"\"")?;
+            if formula_like {
+                out.write_all(b"'")?;
+            }
             out.write_all(field.replace('"', "\"\"").as_bytes())?;
             out.write_all(b"\"")?;
         } else {

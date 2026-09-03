@@ -188,6 +188,20 @@ impl InboundAuth {
         self.audit.as_ref()
     }
 
+    /// Append the `revocation_loaded` record for the list in force (WP
+    /// B.4), before the port is bound. A no-op without a list or a journal.
+    ///
+    /// # Errors
+    ///
+    /// When the record could not be made durable: the server must not
+    /// start, for the same reason as [`crate::tools::DevtoolsServer::journal_startup`].
+    pub async fn journal_startup(&self) -> std::io::Result<()> {
+        let (Some(list), Some(audit)) = (&self.revocations, &self.audit) else {
+            return Ok(());
+        };
+        list.journal_in_force(audit).await.map(drop)
+    }
+
     /// Whether the revocation list refuses `authenticated`, and why.
     fn revocation(&self, authenticated: &Authenticated) -> Option<(RevocationReason, String)> {
         let list = self.revocations.as_ref()?;

@@ -958,6 +958,35 @@ impl ActionContext {
         }
     }
 
+    /// The context a tool call is judged on, from what the call *asks for*
+    /// — the one place it is built, so the gateway (`call_tool`) and
+    /// `policy explain` cannot drift: the same extractor on the same
+    /// arguments, the same server-declared risk for an unmapped tool, and
+    /// `vendor`/`environment` read off `upstream_identity`. What differs
+    /// between the two callers is only what they pass in: who the
+    /// principal is, which client reported itself, and which upstream
+    /// identity the broker chose under the configuration in force.
+    #[must_use]
+    pub fn for_tool_call(
+        principal: Principal,
+        client: ClientIdentity,
+        tool: &str,
+        arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+        declared_risk: RequestRisk,
+        upstream_identity: UpstreamIdentity,
+    ) -> Self {
+        let details = extractors::for_tool(tool, arguments, declared_risk);
+        Self::assemble(
+            principal,
+            client,
+            None,
+            tool,
+            details,
+            None,
+            upstream_identity,
+        )
+    }
+
     #[must_use]
     pub fn principal(&self) -> &Principal {
         &self.principal

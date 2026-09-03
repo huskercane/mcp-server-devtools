@@ -3,28 +3,31 @@
 //!
 //! Given a policy document, a tool name with its JSON arguments, and a
 //! principal (subject, groups, scopes), this builds the `ActionContext`
-//! **exactly** as `call_tool` does — the same extractor
-//! (`extractors::for_tool`), the same server-declared risk for unmapped
-//! tools, the same environment-from-configuration — evaluates it, and
-//! prints the decision together with every rule: matched, or the first key
-//! it failed on. A policy author uses it to answer "why was this denied?"
-//! and "what would this rule let alice do?" before a gateway ever runs it.
+//! **exactly** as `call_tool` does — through the same
+//! [`ActionContext::for_tool_call`], with the same server-declared risk for
+//! unmapped tools, and the upstream identity the same credential broker
+//! would choose under the configuration in force (the standard cascade:
+//! environment, `.env`, `~/.mcp/configs.json`) — evaluates it, and prints
+//! the decision together with every rule: matched, or the first key it
+//! failed on. A policy author uses it to answer "why was this denied?" and
+//! "what would this rule let alice do?" before a gateway ever runs it.
 //!
-//! The upstream identity is labelled from the credential registry the way
-//! the broker labels it, with `authority: shared` — the only authority the
-//! v1 credential model has — so `upstream_authority` rules explain as they
-//! would enforce.
+//! Only the principal and the reporting client are the operator's to
+//! supply, because they arrive with a request; everything the gateway
+//! reads from configuration is read from configuration here too.
+//! `--environment` overrides the configured `MCP_VENDOR_ENVIRONMENT` for a
+//! what-if ("the same call in prod"), and says so in the output.
 
 use std::path::PathBuf;
 
 use clap::Args;
 
 use crate::error::McpError;
-use crate::policy::extractors::for_tool;
 use crate::policy::{
-    ActionContext, ClientIdentity, CredentialLabel, EnvironmentClass, Explanation, FilePolicy,
-    Principal, PrincipalAuthority, RequestRisk, UpstreamAuthority, UpstreamIdentity, VerifyingKey,
+    ActionContext, ClientIdentity, EnvironmentClass, Explanation, FilePolicy, Principal,
+    PrincipalAuthority, RequestRisk, VerifyingKey,
 };
+use crate::ports::{ConfigCredentialBroker, CredentialBroker as _};
 
 #[derive(Debug, Args)]
 pub struct ExplainOpts {
@@ -48,13 +51,22 @@ pub struct ExplainOpts {
     /// A scope the token carries (repeatable; default `mcp:tools`).
     #[arg(long = "scope")]
     pub scopes: Vec<String>,
-    /// The vendor account's environment (`MCP_VENDOR_ENVIRONMENT`):
-    /// `prod`, `staging`, `qa`, `dev`; unclassified when omitted.
+    /// Override the configured environment (`MCP_VENDOR_ENVIRONMENT`) for a
+    /// what-if: `prod`, `staging`, `qa`, `dev`. Without it the environment
+    /// is the one the gateway would read from configuration.
     #[arg(long)]
     pub environment: Option<String>,
-    /// Tenant label (`MCP_TENANT`).
-    #[arg(long, default_value = "tenant")]
-    pub tenant: String,
+    /// Tenant label of the principal; default `MCP_TENANT` from
+    /// configuration, or the issuer host as the gateway derives it.
+    #[arg(long)]
+    pub tenant: Option<String>,
+    /// The client name the caller would report in `initialize`
+    /// (telemetry only, never an authorization input).
+    #[arg(long)]
+    pub client_name: Option<String>,
+    /// The client version the caller would report.
+    #[arg(long)]
+    pub client_version: Option<String>,
     /// Print the explanation as JSON instead of text.
     #[arg(long)]
     pub json: bool,
@@ -70,7 +82,7 @@ fn failure(message: impl std::fmt::Display) -> McpError {
 ///
 /// When the document cannot be loaded, the arguments are not a JSON
 /// object, the tool name is unknown, or the environment does not parse.
-pub fn run(opts: &ExplainOpts) -> Result<(), McpError> {
+pub async fn run(opts: &ExplainOpts) -> Result<(), McpError> {
     let policy = match &opts.public_key {
         Some(text) => FilePolicy::load_verified(
             &opts.file,
@@ -88,16 +100,37 @@ pub fn run(opts: &ExplainOpts) -> Result<(), McpError> {
     let declared_risk = crate::tools::DevtoolsServer::declared_tool_risk(&opts.tool)
         .ok_or_else(|| failure(format!("unknown tool {:?}", opts.tool)))?;
     let vendor = crate::tools::vendor_for_tool(&opts.tool).unwrap_or("unknown");
-    let environment = match &opts.environment {
-        Some(value) => EnvironmentClass::parse(value).ok_or_else(|| {
-            failure(format!(
-                "--environment {value:?} is not one of prod, staging, qa, dev"
-            ))
-        })?,
-        None => EnvironmentClass::Unclassified,
-    };
-    let (context, declared_risk) =
-        build_context(opts, vendor, environment, arguments, declared_risk);
+    let environment_override = opts
+        .environment
+        .as_deref()
+        .map(|value| {
+            EnvironmentClass::parse(value).ok_or_else(|| {
+                failure(format!(
+                    "--environment {value:?} is not one of prod, staging, qa, dev"
+                ))
+            })
+        })
+        .transpose()?;
+    // The configuration the gateway would read, read the same way. The
+    // broker predicts the upstream identity exactly as `call_tool` asks it
+    // to (keychain probe included), so the label, environment, and
+    // authority are what the journal would carry.
+    let config = crate::config::load();
+    let mut upstream = ConfigCredentialBroker
+        .upstream_identity(&config, vendor)
+        .await;
+    let configured_environment = upstream.environment;
+    if let Some(environment) = environment_override {
+        upstream.environment = environment;
+    }
+    let context = ActionContext::for_tool_call(
+        principal(opts, &config),
+        ClientIdentity::reported(opts.client_name.as_deref(), opts.client_version.as_deref()),
+        &opts.tool,
+        Some(arguments),
+        declared_risk,
+        upstream,
+    );
     let explanation = policy.explain(&context);
     if opts.json {
         println!(
@@ -105,57 +138,49 @@ pub fn run(opts: &ExplainOpts) -> Result<(), McpError> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "policy_version": crate::ports::PolicyDecisionPoint::version(&policy),
                 "action": context,
+                "configured_environment": configured_environment,
                 "explanation": explanation,
             }))
             .map_err(|error| failure(error.to_string()))?
         );
     } else {
-        print_text(&context, &explanation, declared_risk);
+        print_text(
+            &context,
+            &explanation,
+            declared_risk,
+            environment_override.map(|_| configured_environment),
+        );
     }
     Ok(())
 }
 
-fn build_context(
-    opts: &ExplainOpts,
-    vendor: &str,
-    environment: EnvironmentClass,
-    arguments: &serde_json::Map<String, serde_json::Value>,
-    declared_risk: RequestRisk,
-) -> (ActionContext, RequestRisk) {
+/// The principal as the bearer middleware would build it from a token
+/// with these claims: tenant from configuration the way the Okta settings
+/// derive it, the default required scope when none is given.
+fn principal(opts: &ExplainOpts, config: &crate::config::Config) -> Principal {
     let mut scopes = opts.scopes.clone();
     if scopes.is_empty() {
         scopes.push(crate::server::auth::DEFAULT_REQUIRED_SCOPE.to_owned());
     }
-    let principal = Principal {
-        tenant: opts.tenant.clone(),
+    let tenant = opts.tenant.clone().unwrap_or_else(|| {
+        crate::auth::okta::OktaSettings::from_config(config).map_or_else(
+            |_| {
+                config
+                    .get(crate::auth::okta::TENANT_KEY)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map_or_else(|| "tenant".to_owned(), str::to_owned)
+            },
+            |settings| settings.tenant,
+        )
+    });
+    Principal {
+        tenant,
         subject: opts.subject.clone(),
         groups: opts.groups.clone(),
         scopes,
         authority: PrincipalAuthority::Okta,
-    };
-    let label = crate::auth::secrets::for_vendor(vendor).next().map_or_else(
-        || CredentialLabel::unconfigured(vendor),
-        CredentialLabel::slot,
-    );
-    let upstream = UpstreamIdentity {
-        label,
-        vendor: vendor.to_owned(),
-        environment,
-        authority: UpstreamAuthority::Shared,
-    };
-    let details = for_tool(&opts.tool, Some(arguments), declared_risk);
-    (
-        ActionContext::assemble(
-            principal,
-            ClientIdentity::default(),
-            None,
-            opts.tool.clone(),
-            details,
-            None,
-            upstream,
-        ),
-        declared_risk,
-    )
+    }
 }
 
 fn label<T: serde::Serialize>(value: &T) -> String {
@@ -165,7 +190,12 @@ fn label<T: serde::Serialize>(value: &T) -> String {
         .unwrap_or_default()
 }
 
-fn print_text(context: &ActionContext, explanation: &Explanation, declared_risk: RequestRisk) {
+fn print_text(
+    context: &ActionContext,
+    explanation: &Explanation,
+    declared_risk: RequestRisk,
+    overridden_environment: Option<EnvironmentClass>,
+) {
     let verdict = if explanation.decision.is_allow() {
         "ALLOW"
     } else {
@@ -191,11 +221,23 @@ fn print_text(context: &ActionContext, explanation: &Explanation, declared_risk:
         label(&context.resource_type()),
         serde_json::to_string(context.resource_scope()).unwrap_or_default(),
     );
+    if let Some(configured) = overridden_environment {
+        println!(
+            "environment overridden by --environment (configuration says {})",
+            label(&configured)
+        );
+    }
     println!(
-        "principal: subject={} groups=[{}] scopes=[{}]",
+        "principal: subject={} groups=[{}] scopes=[{}] tenant={}",
         context.principal().subject,
         context.principal().groups.join(", "),
-        context.principal().scopes.join(", ")
+        context.principal().scopes.join(", "),
+        context.principal().tenant
+    );
+    println!(
+        "upstream: {} ({})",
+        label(&context.upstream_identity().label),
+        label(&context.upstream_identity().authority)
     );
     if explanation.unclassified {
         println!(

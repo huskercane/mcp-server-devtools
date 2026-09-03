@@ -433,5 +433,12 @@ fn describe(problem: &Problem) -> String {
             "exported checkpoint {seq} lies beyond the journal's last record ({journal_last_seq}): \
              the journal was truncated"
         ),
+        Problem::ExportMissing { seq } => format!(
+            "checkpoint {seq} has no export: its copy failed or was removed, so a truncation \
+             back to it would not be caught until the export is restored"
+        ),
+        Problem::ExportDuplicate { seq } => {
+            format!("checkpoint {seq} is exported more than once")
+        }
     }
 }

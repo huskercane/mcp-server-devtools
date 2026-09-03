@@ -39,9 +39,12 @@ mcp-devtools audit verify /path/to/journal-dir \
    compares it to each checkpoint's `chain`;
 3. checks each checkpoint covers exactly the range since the previous one
    and that its signature verifies with the key it names;
-4. compares every exported checkpoint to the journal's, byte for byte, and
+4. compares every exported checkpoint to the journal's, byte for byte,
    flags any export that lies beyond the journal's last record — a
-   truncated tail, which the chain alone cannot see.
+   truncated tail, which the chain alone cannot see — and flags every
+   journal checkpoint the export directory lacks (a copy that failed or
+   was removed; the gateway logs `audit checkpoint export failed` when it
+   happens) and any sequence exported twice.
 
 Exit code 0 means no problem was found; 1 means at least one was, and the
 report names each (`--json` for machines). What is **not** covered: records
@@ -68,7 +71,15 @@ authority, outcome, duration, and egress counts (allowed / denied / sent).
 Intent and outcome rows share a `request_id`; they are not merged, because
 the journal's own granularity is the evidence. `--format jsonl` gives the
 same rows as JSON Lines. Every filter is optional; time bounds are
-RFC 3339 at any precision.
+RFC 3339 at any precision and are compared at full precision.
+
+The CSV is spreadsheet-safe: a cell that a spreadsheet would evaluate — one
+beginning with `=`, `+`, `-`, `@`, a tab, or a carriage return — is written
+quoted with a leading apostrophe (`"'=HYPERLINK(...)"`), which Excel,
+Sheets, and LibreOffice display as text. Subjects, groups, rule ids, and
+reasons all come from outside the gateway, so an export that is going to
+be *opened* must not let any of them run. A pipeline that parses the CSV
+should strip that apostrophe, or use `--format jsonl`, which is unchanged.
 
 A journal that cannot be read to the end exports what it could and exits
 non-zero with the reason.

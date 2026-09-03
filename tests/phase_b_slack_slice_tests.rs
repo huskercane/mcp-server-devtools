@@ -383,6 +383,25 @@ async fn unknown_methods_and_malformed_ids_never_reach_slack() {
     .await;
     assert_ne!(via_get["result"]["isError"], true, "{via_get}");
 
+    // The allowed channel in the path and another in `queryParams`: the
+    // wire request would carry both, so it is not classified — the tool
+    // decision denies and Slack never sees the second value.
+    let two_channels = call(
+        &slice.base,
+        SRE_TOKEN,
+        "slack_get",
+        json!({
+            "path": "/conversations.history?channel=C0INCIDENTS",
+            "queryParams": { "channel": "C0SECRET" }
+        }),
+    )
+    .await;
+    assert_eq!(two_channels["result"]["isError"], true, "{two_channels}");
+    assert!(
+        text_of(&two_channels).contains("could not be classified"),
+        "{two_channels}"
+    );
+
     // A malformed channel id: the extractor declines to classify it, so
     // policy denies before the controller's own check even runs.
     let hostile = call(
@@ -416,4 +435,13 @@ async fn unknown_methods_and_malformed_ids_never_reach_slack() {
         "only the passthrough history read reached Slack"
     );
     assert_eq!(requests[0].url.path(), "/conversations.history");
+    assert!(
+        !requests[0]
+            .url
+            .query()
+            .unwrap_or_default()
+            .contains("C0SECRET"),
+        "the second channel value never left the gateway: {}",
+        requests[0].url
+    );
 }

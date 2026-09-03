@@ -384,6 +384,114 @@ async fn the_verifier_catches_edits_forgeries_wrong_keys_and_a_truncated_tail() 
     );
 }
 
+/// A sink whose copy of one checkpoint fails, the way a full export disk
+/// or a broken mount would.
+struct FailingExport {
+    inner: DirectoryCheckpointSink,
+    fails_at: u64,
+}
+
+impl mcp_server_devtools::ports::CheckpointSink for FailingExport {
+    fn export(&self, seq: u64, line: &[u8]) -> std::io::Result<()> {
+        if seq == self.fails_at {
+            return Err(std::io::Error::other("export disk full"));
+        }
+        self.inner.export(seq, line)
+    }
+}
+
+/// An export that failed is a finding, not a hole: the journal keeps
+/// serving (the copy is not the evidence), but the verifier names the
+/// checkpoint whose copy is missing — because once it is missing, a
+/// truncation back to that checkpoint is exactly what the export could no
+/// longer contradict.
+#[tokio::test]
+async fn a_failed_export_is_reported_as_missing_and_duplicates_are_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal_dir = dir.path().join("journal");
+    let export_dir = dir.path().join("exports");
+    prepare(&journal_dir);
+    let (key, public) = signing_key();
+    let export = Arc::new(FailingExport {
+        inner: DirectoryCheckpointSink::open(&export_dir).unwrap(),
+        fails_at: 6,
+    });
+    {
+        let sink = JournalAuditSink::open_with(
+            &journal_dir,
+            policy(
+                2,
+                Duration::from_mins(10),
+                Some(&key),
+                Some(export as Arc<dyn mcp_server_devtools::ports::CheckpointSink>),
+            ),
+        )
+        .unwrap();
+        for _ in 0..4 {
+            // The failed copy of checkpoint 6 refuses nothing.
+            sink.append(&event()).await.unwrap();
+        }
+        // 1, 2, [3], 4, 5, [6]: checkpoint 3 exported, checkpoint 6 not.
+    }
+    let report = verify(
+        &journal_dir,
+        std::slice::from_ref(&public),
+        Some(&export_dir),
+    )
+    .unwrap();
+    assert_eq!(report.exports_checked, 1);
+    assert_eq!(report.problems, vec![Problem::ExportMissing { seq: 6 }]);
+    // Without the export directory the journal itself is sound.
+    assert!(
+        verify(&journal_dir, std::slice::from_ref(&public), None)
+            .unwrap()
+            .ok()
+    );
+
+    // The scenario the finding guards against: cut the journal back to
+    // checkpoint 3. Nothing in the export contradicts it — which is why
+    // the missing export above had to be reported while it still could be.
+    let path = journal_dir.join(JOURNAL_FILE_NAME);
+    let pristine = std::fs::read_to_string(&path).unwrap();
+    let truncated: String = pristine
+        .lines()
+        .take(3)
+        .fold(String::new(), |mut text, line| {
+            text.push_str(line);
+            text.push('\n');
+            text
+        });
+    std::fs::write(&path, truncated).unwrap();
+    let report = verify(
+        &journal_dir,
+        std::slice::from_ref(&public),
+        Some(&export_dir),
+    )
+    .unwrap();
+    assert!(report.ok(), "{:?}", report.problems);
+
+    // Two files naming the same sequence are reported, whatever they hold.
+    std::fs::write(&path, &pristine).unwrap();
+    std::fs::copy(
+        export_dir.join(DirectoryCheckpointSink::file_name(3)),
+        export_dir.join("checkpoint-3.jsonl"),
+    )
+    .unwrap();
+    let report = verify(
+        &journal_dir,
+        std::slice::from_ref(&public),
+        Some(&export_dir),
+    )
+    .unwrap();
+    assert_eq!(
+        report.problems,
+        vec![
+            Problem::ExportDuplicate { seq: 3 },
+            Problem::ExportMissing { seq: 6 }
+        ]
+    );
+}
+
 fn run(args: &[&str]) -> (bool, String, String) {
     let output = Command::new(cargo_bin(BIN))
         .args(args)

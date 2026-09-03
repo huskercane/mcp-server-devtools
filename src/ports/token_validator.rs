@@ -50,7 +50,10 @@ pub enum TokenRejection {
     InvalidSignature,
     /// `exp` is in the past (beyond the configured skew).
     Expired,
-    /// `nbf` is in the future (beyond the configured skew).
+    /// `nbf` — or `iat` — is in the future (beyond the configured skew).
+    /// A token that claims to be issued later than now cannot be dated
+    /// against a revocation cut-off or the fresh-token rule, so it is not
+    /// accepted at all.
     NotYetValid,
     /// `iss` is not the configured issuer.
     WrongIssuer,

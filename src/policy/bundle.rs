@@ -18,11 +18,18 @@
 //! - **Stage** does the same for a changed file without putting the result
 //!   in force. **Commit** swaps it in; in-flight readers keep the snapshot
 //!   they started with.
+//! - [`SignedBundle::journal_in_force`] appends the `*_loaded` record for
+//!   the document a process starts with. It is the caller's step, before
+//!   the process becomes reachable, and its failure is the caller's to
+//!   treat as fatal: a gateway must not open its port under a document
+//!   whose load has no durable evidence.
 //! - The **watcher** polls the file and, with a journal, appends a
-//!   `*_loaded` record when it starts, a `*_changed` record **before** each
-//!   commit, and a `*_rejected` record once per distinct failure. A change
-//!   whose record cannot be made durable within the bound is not applied,
-//!   and [`SignedBundle::degraded`] says so until the journal recovers.
+//!   `*_changed` record **before** each commit and a `*_rejected` record
+//!   once per distinct refused document (its bytes and the reason). A
+//!   change whose record cannot be made durable within the bound is not
+//!   applied, and [`SignedBundle::degraded`] says so until the journal
+//!   recovers; a rejection whose record could not be made durable is tried
+//!   again on the next poll.
 //! - A file that vanishes, does not verify, or does not compile leaves the
 //!   **last good document in force**, indefinitely, with the reason in
 //!   [`SignedBundle::degraded`] for the health banner. Deleting a file is
@@ -163,6 +170,22 @@ pub struct SignedBundle<D> {
     /// force. Cleared by the next successful reload. Off the request path:
     /// written by the watcher, read by health.
     last_reload_error: Mutex<Option<String>>,
+    /// The rejection most recently made durable in the journal, so a file
+    /// that stays broken is journaled once — and only once it *has* been
+    /// journaled. Health state above says what is wrong; this says what
+    /// the journal already knows. Cleared by the next successful reload.
+    last_journaled_rejection: Mutex<Option<Rejection>>,
+}
+
+/// A refused document, identified by its bytes and the reason, for
+/// de-duplicating rejection records. Two revisions that fail the same way
+/// are two rejections; one revision seen on every poll is one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Rejection {
+    /// `sha256:<16 hex>` of the bytes that were refused; `None` when the
+    /// file could not be read at all.
+    digest: Option<String>,
+    reason: String,
 }
 
 impl<D: BundleDocument> SignedBundle<D> {
@@ -208,6 +231,7 @@ impl<D: BundleDocument> SignedBundle<D> {
             })),
             loaded_bytes: RwLock::new(bytes),
             last_reload_error: Mutex::new(None),
+            last_journaled_rejection: Mutex::new(None),
         }))
     }
 
@@ -234,6 +258,7 @@ impl<D: BundleDocument> SignedBundle<D> {
             })),
             loaded_bytes: RwLock::new(bytes.to_vec()),
             last_reload_error: Mutex::new(None),
+            last_journaled_rejection: Mutex::new(None),
         }))
     }
 
@@ -328,13 +353,24 @@ impl<D: BundleDocument> SignedBundle<D> {
     /// When the file cannot be read, its signature does not verify, or it
     /// does not compile.
     pub fn stage(&self) -> Result<Option<Staged<D>>, BundleError> {
-        let outcome = self.stage_inner();
-        self.note_reload(&outcome);
-        outcome
+        self.stage_with_digest().0
     }
 
-    fn stage_inner(&self) -> Result<Option<Staged<D>>, BundleError> {
-        let (bytes, signature) = read_document::<D>(&self.path, self.verifier.as_ref())?;
+    /// [`Self::stage`], also returning the digest label of the bytes that
+    /// were read — on a refusal, the identity of what was refused, taken
+    /// from the very bytes that failed rather than from a later re-read of
+    /// a file that may have changed again.
+    fn stage_with_digest(&self) -> (Result<Option<Staged<D>>, BundleError>, Option<String>) {
+        let mut digest = None;
+        let outcome = self.stage_inner(&mut digest);
+        self.note_reload(&outcome);
+        (outcome, digest)
+    }
+
+    fn stage_inner(&self, digest: &mut Option<String>) -> Result<Option<Staged<D>>, BundleError> {
+        let bytes = read_bytes::<D>(&self.path)?;
+        *digest = Some(digest_label(&bytes));
+        let signature = verify_bytes::<D>(&self.path, &bytes, self.verifier.as_ref())?;
         let unchanged = *self
             .loaded_bytes
             .read()
@@ -369,6 +405,11 @@ impl<D: BundleDocument> SignedBundle<D> {
             .loaded_bytes
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = staged.bytes;
+        // A rejection seen again after a good reload is a new event.
+        *self
+            .last_journaled_rejection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let now = self.snapshot();
         (
             BundleChange {
@@ -380,23 +421,17 @@ impl<D: BundleDocument> SignedBundle<D> {
         )
     }
 
-    /// The label a rejected document is journaled under: its own bundle
-    /// hash when it could be read, so the refused bytes are identifiable.
-    fn rejected_version(&self) -> Option<String> {
-        std::fs::read(&self.path)
-            .ok()
-            .map(|bytes| digest_label(&bytes))
-    }
-
     /// Poll the file and reload on change, on the current Tokio runtime.
     /// Holds only a `Weak`, so the task ends with the bundle. A no-op with
     /// a warning outside a runtime, like the config watcher.
     ///
-    /// With `audit`, the document in force is journaled when the watcher
-    /// starts, every change is journaled **before** it is committed, and
-    /// each distinct rejected reload is journaled once. A change whose
-    /// record cannot be made durable is not applied. `on_change` runs after
-    /// each commit.
+    /// With `audit`, every change is journaled **before** it is committed,
+    /// and each distinct rejected document is journaled once its record is
+    /// durable. A change whose record cannot be made durable is not
+    /// applied. `on_change` runs after each commit. The document already
+    /// in force is **not** journaled here — see [`Self::journal_in_force`],
+    /// which the process must call, and must not survive the failure of,
+    /// before it becomes reachable.
     pub fn spawn_watcher(
         self: &Arc<Self>,
         audit: Option<BundleAudit>,
@@ -408,11 +443,6 @@ impl<D: BundleDocument> SignedBundle<D> {
         };
         let weak: Weak<Self> = Arc::downgrade(self);
         runtime.spawn(async move {
-            if let Some(audit) = &audit
-                && let Some(bundle) = weak.upgrade()
-            {
-                bundle.journal_loaded(audit).await;
-            }
             let mut interval = tokio::time::interval(WATCH_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -425,21 +455,26 @@ impl<D: BundleDocument> SignedBundle<D> {
         });
     }
 
-    /// The `*_loaded` record: what is in force when the watcher starts.
-    async fn journal_loaded(&self, audit: &BundleAudit) {
+    /// Append the `*_loaded` record for the document in force: the durable
+    /// evidence of what a process started under. Returns the sequence it
+    /// was recorded at.
+    ///
+    /// The caller decides what a failure means, and for a server it must
+    /// mean "do not start": the record is appended synchronously, before
+    /// the port is bound, so requests are never governed by a document
+    /// whose load the journal does not know about.
+    ///
+    /// # Errors
+    ///
+    /// When the record was not made durable within the audit bound.
+    pub async fn journal_in_force(&self, audit: &BundleAudit) -> std::io::Result<u64> {
         let snapshot = self.snapshot();
         let mut event = ControlEvent::now(D::KINDS[0]);
         event.source = Some(self.path.display().to_string());
         event.version = Some(snapshot.document.version().to_owned());
         event.signature = snapshot.signature.clone();
         snapshot.document.describe(&mut event);
-        if let Err(error) = append_control(audit, &event).await {
-            tracing::error!(
-                failure = %AuditFailure::classify(&error),
-                noun = D::NOUN,
-                "failed to journal the document in force at startup"
-            );
-        }
+        append_control(audit, &event).await
     }
 
     /// One poll: stage, journal, commit — or journal the rejection.
@@ -448,15 +483,14 @@ impl<D: BundleDocument> SignedBundle<D> {
         audit: Option<&BundleAudit>,
         on_change: Option<&ChangeHook<D>>,
     ) {
-        let previous_error = self.degraded();
         let path = self.path.clone();
         // Reading, verifying, and compiling is file I/O plus parsing: off
         // the worker threads.
         let staging = Arc::clone(self);
-        let outcome = tokio::task::spawn_blocking(move || staging.stage()).await;
+        let outcome = tokio::task::spawn_blocking(move || staging.stage_with_digest()).await;
         match outcome {
-            Ok(Ok(None)) => {}
-            Ok(Ok(Some(staged))) => {
+            Ok((Ok(None), _)) => {}
+            Ok((Ok(Some(staged)), _)) => {
                 if let Some(audit) = audit {
                     let mut event = ControlEvent::now(D::KINDS[1]);
                     event.source = Some(path.display().to_string());
@@ -496,26 +530,48 @@ impl<D: BundleDocument> SignedBundle<D> {
                     hook(&previous, &self.snapshot());
                 }
             }
-            Ok(Err(error)) => {
+            Ok((Err(error), digest)) => {
                 tracing::warn!(
                     path = %path.display(),
                     noun = D::NOUN,
                     %error,
                     "cannot be reloaded; keeping the previous document in force"
                 );
-                let reason = error.to_string();
-                if let Some(audit) = audit
-                    && previous_error.as_deref() != Some(reason.as_str())
-                {
-                    let mut event = ControlEvent::now(D::KINDS[2]).with_reason(&reason);
-                    event.source = Some(path.display().to_string());
-                    event.previous_version = Some(self.version());
-                    event.version = self.rejected_version();
-                    if let Err(error) = append_control(audit, &event).await {
+                let Some(audit) = audit else {
+                    return;
+                };
+                let rejection = Rejection {
+                    digest,
+                    reason: error.to_string(),
+                };
+                let already_journaled = self
+                    .last_journaled_rejection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    == Some(&rejection);
+                if already_journaled {
+                    return;
+                }
+                let mut event = ControlEvent::now(D::KINDS[2]).with_reason(&rejection.reason);
+                event.source = Some(path.display().to_string());
+                event.previous_version = Some(self.version());
+                event.version.clone_from(&rejection.digest);
+                match append_control(audit, &event).await {
+                    Ok(_) => {
+                        *self
+                            .last_journaled_rejection
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rejection);
+                    }
+                    Err(error) => {
+                        // Not remembered as journaled: the next poll tries
+                        // again, so a rejection is never lost to a journal
+                        // that was briefly unavailable.
                         tracing::error!(
                             failure = %AuditFailure::classify(&error),
                             noun = D::NOUN,
-                            "failed to journal a rejected reload"
+                            "failed to journal a rejected reload; will retry"
                         );
                     }
                 }
@@ -537,6 +593,13 @@ fn read_document<D: BundleDocument>(
     path: &Path,
     verifier: Option<&VerifyingKey>,
 ) -> Result<(Vec<u8>, Option<SignatureStatus>), BundleError> {
+    let bytes = read_bytes::<D>(path)?;
+    let signature = verify_bytes::<D>(path, &bytes, verifier)?;
+    Ok((bytes, signature))
+}
+
+/// The document's bytes, bounded by [`MAX_DOCUMENT_BYTES`].
+fn read_bytes<D: BundleDocument>(path: &Path) -> Result<Vec<u8>, BundleError> {
     let bytes = std::fs::read(path).map_err(|error| {
         BundleError::new(format!(
             "cannot read {} {}: {error}",
@@ -551,13 +614,23 @@ fn read_document<D: BundleDocument>(
             path.display()
         )));
     }
+    Ok(bytes)
+}
+
+/// Verify `bytes` against the detached signature next to `path`, when a
+/// verifying key is configured.
+fn verify_bytes<D: BundleDocument>(
+    path: &Path,
+    bytes: &[u8],
+    verifier: Option<&VerifyingKey>,
+) -> Result<Option<SignatureStatus>, BundleError> {
     let Some(verifier) = verifier else {
-        return Ok((bytes, None));
+        return Ok(None);
     };
     let signature = super::signing::read_detached(path)
         .map_err(|error| BundleError::new(format!("{} {}: {error}", D::NOUN, path.display())))?;
     verifier
-        .verify(D::DOMAIN, &bytes, &signature)
+        .verify(D::DOMAIN, bytes, &signature)
         .map_err(|error| {
             BundleError::new(format!(
                 "{} {}: {error} (key {})",
@@ -566,13 +639,10 @@ fn read_document<D: BundleDocument>(
                 verifier.key_id()
             ))
         })?;
-    Ok((
-        bytes,
-        Some(SignatureStatus {
-            verified: true,
-            key_id: Some(verifier.key_id()),
-        }),
-    ))
+    Ok(Some(SignatureStatus {
+        verified: true,
+        key_id: Some(verifier.key_id()),
+    }))
 }
 
 /// `v<version>+sha256:<16 hex>` of the exact bytes.

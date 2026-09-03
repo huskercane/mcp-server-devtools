@@ -9,8 +9,12 @@
 //!    since the previous checkpoint, and — when verifying keys are given —
 //!    its signature verifies with the key it names;
 //! 3. when an export directory is given: every exported checkpoint is in
-//!    the journal, byte for byte, and none lies beyond the journal's end
-//!    (a truncated tail).
+//!    the journal, byte for byte, none lies beyond the journal's end (a
+//!    truncated tail), no sequence is exported twice — and every checkpoint
+//!    the journal holds has an export. The last one is what makes the
+//!    export usable as evidence: a checkpoint whose copy never landed is a
+//!    checkpoint the journal could later be cut back to without the export
+//!    contradicting it, so a missing export is reported, not assumed.
 //!
 //! The result is a report, not a verdict: every problem found, plus the
 //! counts an auditor needs — how many records, how many are sealed by a
@@ -52,6 +56,13 @@ pub enum Problem {
     /// The export holds a checkpoint past the journal's last record — the
     /// journal was truncated after it was written.
     ExportBeyondJournal { seq: u64, journal_last_seq: u64 },
+    /// The journal holds a checkpoint the export does not: its copy failed
+    /// (the gateway logs `audit checkpoint export failed`) or was removed.
+    /// Until it is restored from wherever the exports were shipped, a
+    /// truncation back to this checkpoint would go undetected.
+    ExportMissing { seq: u64 },
+    /// Two exported files name the same sequence.
+    ExportDuplicate { seq: u64 },
 }
 
 /// What verification found.
@@ -138,8 +149,17 @@ pub fn verify(
 
     if let Some(dir) = exports {
         let exported = DirectoryCheckpointSink::read_all(dir)?;
+        // Which journal checkpoints an export vouched for; the rest are
+        // reported missing below. Parallel to `checkpoint_lines`.
+        let mut covered = vec![false; checkpoint_lines.len()];
+        let mut previous_seq: Option<u64> = None;
         for (seq, line) in exported {
             report.exports_checked += 1;
+            if previous_seq == Some(seq) {
+                report.problems.push(Problem::ExportDuplicate { seq });
+                continue;
+            }
+            previous_seq = Some(seq);
             if seq > report.last_seq {
                 report.problems.push(Problem::ExportBeyondJournal {
                     seq,
@@ -147,19 +167,22 @@ pub fn verify(
                 });
                 continue;
             }
-            match checkpoint_lines
-                .binary_search_by_key(&seq, |(seq, _)| *seq)
-                .ok()
-                .map(|index| &checkpoint_lines[index].1)
-            {
-                None => report
+            match checkpoint_lines.binary_search_by_key(&seq, |(seq, _)| *seq) {
+                Err(_) => report
                     .problems
                     .push(Problem::ExportMissingFromJournal { seq }),
-                Some(in_journal) if *in_journal != line => {
+                Ok(index) if checkpoint_lines[index].1 != line => {
                     report.problems.push(Problem::ExportDiffers { seq });
                 }
-                Some(_) => {}
+                Ok(index) => covered[index] = true,
             }
+        }
+        for ((seq, _), _) in checkpoint_lines
+            .iter()
+            .zip(covered)
+            .filter(|(_, covered)| !covered)
+        {
+            report.problems.push(Problem::ExportMissing { seq: *seq });
         }
     }
     Ok(report)
