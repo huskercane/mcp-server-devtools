@@ -309,7 +309,7 @@ fn policy_check_command_reports_compiling_and_broken_documents() {
     );
     let stdout = String::from_utf8_lossy(&good.stdout);
     assert!(stdout.starts_with("OK:"), "{stdout}");
-    assert!(stdout.contains("7 rules"), "{stdout}");
+    assert!(stdout.contains("10 rules"), "{stdout}");
 
     let json = Command::new(cargo_bin("mcp-devtools"))
         .args(["policy", "check", "--json"])
@@ -318,7 +318,7 @@ fn policy_check_command_reports_compiling_and_broken_documents() {
         .unwrap();
     let parsed: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     assert_eq!(parsed["ok"], true);
-    assert_eq!(parsed["rules"], 7);
+    assert_eq!(parsed["rules"], 10);
 
     let dir = tempfile::tempdir().unwrap();
     let broken = dir.path().join("broken.yaml");

@@ -1,4 +1,4 @@
-# Read-endpoint inventory: Grafana and Jira (WP 0.8)
+# Read-endpoint inventory: Grafana, Jira, and Slack (WP 0.8, WP B.1)
 
 Status: drafted with working extractor code for the two proving endpoints;
 **pending the two-person review WP 0.8 requires** before the enterprise
@@ -68,6 +68,49 @@ Notes:
   inside LogQL do not restrict which datasource is read. It is kept as a
   bounded allowlisted attribute, not as "raw query text retained for
   audit": see decision 5 below.
+
+## Slack (Phase B, WP B.1)
+
+The second vendor. Slack's Web API is method-shaped — one path segment per
+method, arguments in the query string — and the resource is the **channel**,
+named by the `channel` parameter. Five read methods are mapped, as
+purpose-built tools and, identically, for the `slack_get` passthrough and
+the egress chokepoint (`extractors::slack::extract`). Everything else,
+including every `POST` and every other method name, is `passthrough` +
+`unknown`, which default-deny denies.
+
+| Endpoint | Tool | `normalized_action` | `resource_type` | `resource_scope` source | Allowlisted attributes | Risk | Status |
+|---|---|---|---|---|---|---|---|
+| `GET /conversations.list` | `slack_list_channels` | `list_channels` | `channel` | `scope: collection` | `cursor`, `exclude_archived`, `limit`, `types` | read | **Extractor implemented + tested** |
+| `GET /conversations.info?channel=` | `slack_channel_info` | `read_channel` | `channel` | `channel` query param (**validated**) | — | read | **Extractor implemented + tested** |
+| `GET /conversations.history?channel=` | `slack_channel_history` | `read_channel_history` | `channel` | `channel` query param (**validated**) | `cursor`, `inclusive`, `latest`, `limit`, `oldest` | read | **Extractor implemented + tested** |
+| `GET /conversations.replies?channel=&ts=` | `slack_thread_replies` | `read_thread` | `channel` | `channel` query param (**validated**) | as history, plus `ts` | read | **Extractor implemented + tested** |
+| `GET /search.messages?query=` | `slack_search_messages` | `search_messages` | `channel` | `scope: unscoped` — reaches every channel the token can see | `count`, `page`, `query` (digest), `sort`, `sort_dir` | read | **Extractor implemented + tested** |
+| `GET /users.info`, `GET /users.list` | — (future) | `read_user` / `list_users` | `user` (new type) | `user` query param / collection | — | read | Spec only; not in the incident workflow |
+| `POST /chat.postMessage` | — | passthrough | unknown | — | — | write | Deliberately unmapped: the read-only profile has no writes |
+
+Notes:
+
+- **Channel ids, not names.** Policy names channels by Slack id
+  (`C0INCIDENTS`), because the id is what the request carries and what
+  Slack authorizes on; a name would need a lookup the gateway cannot
+  vouch for. `extractors::slack::is_valid_channel_id` (`[A-Z0-9]{1,64}`)
+  is the single definition shared with `controllers::slack`: the extractor
+  declines to classify anything else (`unknown`/`unscoped`, and the hostile
+  value never enters `canonical_path`), and the controller refuses to
+  dispatch it.
+- **Search is unscoped by construction.** An `in:#channel` modifier is a
+  ranking hint to Slack, not a bound the gateway can rely on, so
+  `search.messages` is `resource_scope: unscoped` and needs its own rule
+  (the shipped profile gives it to incident commanders only). Extracting
+  `in:` clauses as a `constrained_by` is recorded as future work, gated on
+  a review of what Slack actually guarantees.
+- **The query text is a digest** in `query_attributes` (decision 5 below):
+  a search expression can carry anything a person pasted into Slack.
+- **Token type.** `search.messages` works only with a user token; the
+  other four work with a bot token. The read-only profile is written for a
+  bot token; whether the shared identity model (ADR-006) extends to a
+  shared *user* token for search is a Gate A/B question, not a policy one.
 
 ## Jira
 

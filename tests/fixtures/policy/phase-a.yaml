@@ -68,3 +68,32 @@ rules:
     match:
       request_risk: read
       resource_scope: unscoped
+
+  # --- Phase B: Slack (WP B.1/B.2) -----------------------------------------
+  - id: sre-read-incident-channels
+    description: Channel-scoped Slack reads, by channel id.
+    effect: allow
+    subjects: { groups: [SRE] }
+    match:
+      vendor: slack
+      request_risk: read
+      normalized_action: [read_channel, read_channel_history, read_thread]
+      resource_type: channel
+      resource_id: ["C0INCIDENTS"]
+
+  - id: sre-list-channels
+    effect: allow
+    subjects: { groups: [SRE] }
+    match:
+      vendor: slack
+      normalized_action: list_channels
+      resource_scope: collection
+
+  - id: incident-commanders-search
+    description: Search reaches every channel the token can see, so only ICs get it.
+    effect: allow
+    subjects: { groups: [IncidentCommanders] }
+    match:
+      vendor: slack
+      normalized_action: search_messages
+      resource_scope: unscoped

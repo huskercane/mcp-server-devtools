@@ -1,0 +1,46 @@
+# Slack read-only profile (Phase B, WP B.1).
+#
+# The second vendor: the incident-investigation workflow reads what was
+# said in the incident channels alongside the logs it reads from Grafana
+# (see incident-investigation.yaml for the two together). SRE may list
+# channels, read the incident channels' history and threads, and nothing
+# else — no search across the workspace (that reaches every channel the
+# token can see), no writes, no other channel, and no call whose channel id
+# the extractor could not classify.
+#
+# Channel ids are Slack's (`C0123ABCDEF`), not names: find them with
+# `slack_list_channels` and edit the group name and ids below to match your
+# Okta groups and workspace. Validate with:
+#
+#     mcp-devtools policy check deploy/policies/slack-read-only.yaml
+#
+# Schema: src/policy/engine.rs. Matching keys are ANDed; a list is any-of,
+# except resource ids, which are all-of. `*` is the only wildcard.
+version: 1
+default: deny
+rules:
+  - id: sre-list-channels
+    description: Listing the channel collection is its own permission.
+    effect: allow
+    subjects:
+      groups: [SRE]
+    match:
+      vendor: slack
+      normalized_action: list_channels
+      resource_type: channel
+      resource_scope: collection
+
+  - id: sre-read-incident-channels
+    description: >-
+      Read the incident channels: their metadata, their message history, and
+      the threads in them. The channel id is the resource; every call names
+      exactly one, and the id must be one of these.
+    effect: allow
+    subjects:
+      groups: [SRE]
+    match:
+      vendor: slack
+      request_risk: read
+      normalized_action: [read_channel, read_channel_history, read_thread]
+      resource_type: channel
+      resource_id: ["C0INCIDENTS", "C0INCIDENTS2"]

@@ -443,6 +443,12 @@ pub enum NormalizedAction {
     QueryLogs,
     ListDatasources,
     ReadDatasource,
+    /// Slack (WP B.1).
+    ListChannels,
+    ReadChannel,
+    ReadChannelHistory,
+    ReadThread,
+    SearchMessages,
     /// No per-endpoint mapping exists. Paired with
     /// [`ResourceType::Unknown`] this is what default-deny denies.
     Passthrough,

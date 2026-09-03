@@ -32,9 +32,10 @@ pub(crate) use super::args::{
     EdxDiscussionCommentsArgs, EdxDiscussionCourseArgs, EdxDiscussionThreadCreateArgs,
     EdxDiscussionThreadsArgs, EdxDiscussionTopicsArgs, GrafanaListDatasourcesArgs,
     GrafanaQueryLogsArgs, NewRelicQueryArgs, NinjaOneLoginArgs, NinjaOneReadArgs,
-    NinjaOneWriteArgs, ReadArgs, SonarqubeQualityGateArgs, SonarqubeSearchIssuesArgs,
-    SplunkCreateJobArgs, SplunkJobResultsArgs, SplunkListSavedSearchesArgs, SplunkSearchArgs,
-    WriteArgs,
+    NinjaOneWriteArgs, ReadArgs, SlackChannelHistoryArgs, SlackChannelInfoArgs,
+    SlackListChannelsArgs, SlackSearchMessagesArgs, SlackThreadRepliesArgs,
+    SonarqubeQualityGateArgs, SonarqubeSearchIssuesArgs, SplunkCreateJobArgs, SplunkJobResultsArgs,
+    SplunkListSavedSearchesArgs, SplunkSearchArgs, WriteArgs,
 };
 #[cfg(feature = "wrds")]
 pub(crate) use super::args::{
