@@ -148,6 +148,7 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
     let server = crate::bootstrap::ServerBuilder::new()
         .watch_config(true)
         .require_inbound_auth(auth_mode.requires_inbound_auth())
+        .serves_control(role.serves_control())
         .build()?;
     let inbound_auth = match auth_mode {
         AuthMode::Off => None,
@@ -176,6 +177,7 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
     // start; an unreachable receiver does not (ADR-011: asynchronous).
     if role.serves_control() {
         server.start_audit_forwarding(cancel.clone())?;
+        server.start_rollups(cancel.clone())?;
     }
     let pending_audit = server.pending_audit();
     let app = build_app_for_role(
@@ -222,6 +224,8 @@ fn enterprise_inbound_auth(
     let mode = keys.mode();
     let oidc = crate::auth::oidc::OidcSettings::from_config(config, keys)?;
     let settings = InboundAuthSettings::from_config(config, mode, vec![oidc.issuer.clone()])?;
+    let rate_limit = crate::server::rate_limit::RateLimitSettings::from_config(config)
+        .map_err(|error| format!("refusing to start: {error}"))?;
     if config
         .get(crate::bootstrap::AUDIT_JOURNAL_DIR_KEY)
         .map(str::trim)
@@ -310,7 +314,33 @@ fn enterprise_inbound_auth(
             append_timeout: server.audit_append_timeout(),
         });
     }
+    if let Some(settings) = rate_limit {
+        auth = auth.with_rate_limit(Arc::new(crate::server::rate_limit::RateLimiter::new(
+            settings,
+        )));
+    }
     Ok(auth)
+}
+
+/// `GET /metrics` (`MCP_METRICS=on`): the Prometheus page, or 404 when
+/// metrics are off. Unauthenticated, like the health banner: it carries
+/// counts by vendor and tool, never a subject or a token.
+fn metrics(server: &DevtoolsServer, auth: Option<&Arc<InboundAuth>>) -> Response {
+    let rate_limited = auth
+        .and_then(|auth| auth.rate_limiter())
+        .map_or(0, |limiter| limiter.refused());
+    match server.metrics_page(rate_limited) {
+        Some(page) => (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+            )],
+            page,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Build the full Axum app with a caller-owned cancellation token. Tests use
@@ -383,12 +413,20 @@ pub fn build_app_for_role(
     // Control role: health only. Every other path is a 404 — there is no
     // data plane here, and nothing to hand a caller who reached the wrong
     // replica. The cross-cutting guards stay so the surface is uniform.
+    let metrics_server = server.clone();
     Router::new()
         .route(
             "/",
             get(move || {
                 let server = server.clone();
                 async move { health(&server) }
+            }),
+        )
+        .route(
+            "/metrics",
+            get(move || {
+                let server = metrics_server.clone();
+                async move { metrics(&server, None) }
             }),
         )
         .layer(middleware::from_fn(origin_allowlist))
@@ -444,13 +482,24 @@ fn build_app_inner(
     let mut protected = Router::new()
         .route("/artifacts/{id}", get(download_artifact))
         .merge(mcp_routes);
-    let mut public = Router::new().route(
-        "/",
-        get(move || {
-            let server = health_server.clone();
-            async move { health(&server) }
-        }),
-    );
+    let metrics_server = health_server.clone();
+    let metrics_auth = auth.clone();
+    let mut public = Router::new()
+        .route(
+            "/",
+            get(move || {
+                let server = health_server.clone();
+                async move { health(&server) }
+            }),
+        )
+        .route(
+            "/metrics",
+            get(move || {
+                let server = metrics_server.clone();
+                let auth = metrics_auth.clone();
+                async move { metrics(&server, auth.as_ref()) }
+            }),
+        );
     if let Some(auth) = auth {
         watch_revocations(&auth, &manager);
         // Inner layer first: the session binding runs after the bearer
@@ -665,6 +714,11 @@ fn health(server: &DevtoolsServer) -> Response {
         // copy degrades, it does not stop serving (ADR-011).
         if server.forwarding_degraded().is_some() {
             banner.push_str("; audit forwarding is failing; journal retained");
+        }
+        // Rollups are the lossy pipeline: a failing store drops usage,
+        // counted, and never touches a call.
+        if server.rollups_degraded().is_some() {
+            banner.push_str("; usage rollups are failing; usage may be dropped");
         }
         (StatusCode::OK, [content_type], banner).into_response()
     } else {

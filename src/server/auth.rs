@@ -141,6 +141,9 @@ pub struct InboundAuth {
     settings: InboundAuthSettings,
     revocations: Option<Arc<RevocationList>>,
     audit: Option<BundleAudit>,
+    /// Per-principal rate limit (C.6), applied after validation and the
+    /// scope check.
+    rate_limit: Option<Arc<super::rate_limit::RateLimiter>>,
 }
 
 impl InboundAuth {
@@ -151,7 +154,21 @@ impl InboundAuth {
             settings,
             revocations: None,
             audit: None,
+            rate_limit: None,
         }
+    }
+
+    /// Enforce a per-principal rate limit (C.6).
+    #[must_use]
+    pub fn with_rate_limit(mut self, limiter: Arc<super::rate_limit::RateLimiter>) -> Self {
+        self.rate_limit = Some(limiter);
+        self
+    }
+
+    /// The limiter, if one is enforced.
+    #[must_use]
+    pub fn rate_limiter(&self) -> Option<&Arc<super::rate_limit::RateLimiter>> {
+        self.rate_limit.as_ref()
     }
 
     /// Enforce `list` after validation (WP B.4).
@@ -360,6 +377,19 @@ pub async fn require_bearer(
         return auth.insufficient_scope();
     }
 
+    // C.6: a validated, in-scope principal past its budget is refused
+    // with a retry hint. Category only in the log, as above.
+    if let Some(limiter) = &auth.rate_limit
+        && let super::rate_limit::Verdict::Refuse { retry_after_secs } =
+            limiter.check(&principal.subject)
+    {
+        warn!(
+            rejection = "rate_limited",
+            "principal over its rate limit (429)"
+        );
+        return rate_limited(retry_after_secs);
+    }
+
     request.extensions_mut().insert(principal);
     request.extensions_mut().insert(facts);
     next.run(request).await
@@ -405,6 +435,32 @@ impl InboundAuth {
             "the token does not carry the scope required for this resource",
         )
     }
+}
+
+/// `429 Too Many Requests` with `Retry-After`, in the JSON envelope the
+/// other refusals use.
+fn rate_limited(retry_after_secs: u64) -> Response {
+    let body = serde_json::json!({
+        "error": "rate_limited",
+        "error_description": "the principal has exceeded its request rate; retry after the indicated delay",
+    })
+    .to_string();
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+            (
+                header::RETRY_AFTER,
+                HeaderValue::from_str(&retry_after_secs.to_string())
+                    .unwrap_or_else(|_| HeaderValue::from_static("1")),
+            ),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 fn error_response(status: StatusCode, challenge: &str, error: &str, description: &str) -> Response {

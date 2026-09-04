@@ -444,6 +444,60 @@ fn enterprise_request_path_stage() {
     });
 }
 
+/// C.6: the two things the usage side adds to the request path — the
+/// per-principal rate-limit check in the bearer middleware (a hit on a
+/// known subject) and the usage sink's `record` on the tail of a call:
+/// the Prometheus adapter alone, and the fan-out to it plus the rollup
+/// channel. Each is expected allocation-free on the hot path; the event
+/// itself is built by the caller and is not counted.
+fn probe_usage_path() {
+    use mcp_server_devtools::metrics::{FanOutUsageSink, PrometheusUsageSink};
+    use mcp_server_devtools::ports::{BoundedUsageChannel, UsageEvent, UsageSink};
+    use mcp_server_devtools::server::rate_limit::{RateLimitSettings, RateLimiter, Verdict};
+    const ITERS: u32 = 2000;
+
+    let limiter = RateLimiter::new(RateLimitSettings {
+        per_second: 1_000_000.0,
+        burst: 1_000_000.0,
+    });
+    assert_eq!(limiter.check("sre@acme.example"), Verdict::Allow);
+    probe("rate limit check, known subject", ITERS, || {
+        std::hint::black_box(limiter.check("sre@acme.example"))
+    });
+
+    let event = || UsageEvent {
+        timestamp: "2026-09-04T12:00:00Z".to_owned(),
+        tenant: "acme".to_owned(),
+        subject: "sre@acme.example".to_owned(),
+        tool_name: "grafana_query_logs".to_owned(),
+        vendor: "grafana".to_owned(),
+        environment: "qa".to_owned(),
+        decision: "allow".to_owned(),
+        risk: "read".to_owned(),
+        outcome: "success".to_owned(),
+        duration_ms: 12,
+    };
+    // Events are built ahead of the loop so their allocation is not
+    // attributed to `record`; the caller builds the event either way.
+    let prometheus = std::sync::Arc::new(PrometheusUsageSink::new());
+    prometheus.record(event());
+    let mut events: Vec<UsageEvent> = (0..ITERS).map(|_| event()).collect();
+    probe("PrometheusUsageSink::record, known series", ITERS, || {
+        prometheus.record(events.pop().expect("one per iteration"));
+    });
+
+    let (channel, mut receiver) = BoundedUsageChannel::new(ITERS as usize + 8);
+    let fan_out = FanOutUsageSink::new(vec![
+        std::sync::Arc::clone(&prometheus) as std::sync::Arc<dyn UsageSink>,
+        std::sync::Arc::new(channel),
+    ]);
+    let mut events: Vec<UsageEvent> = (0..ITERS).map(|_| event()).collect();
+    probe("FanOut(prometheus + channel)::record", ITERS, || {
+        fan_out.record(events.pop().expect("one per iteration"));
+    });
+    while receiver.try_recv().is_ok() {}
+}
+
 fn main() {
     println!("=== output size: is TOON earning its CPU? ===");
     output_size_comparison();
@@ -461,6 +515,8 @@ fn main() {
 
     // Stage 0 runs once per *tool call*, before any payload work — so unlike the
     // stages below it is paid even by a request that returns two bytes.
+    println!("\n=== stage -1d: usage side of the request path (mean of 2000) — C.6 ===");
+    probe_usage_path();
     println!("\n=== stage 0: per-tool-call config snapshot (mean of 1000) ===");
     let config = realistic_config();
     let handle = ConfigHandle::new(realistic_config());
