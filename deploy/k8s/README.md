@@ -15,6 +15,7 @@ Files:
 | `gateway.yaml` | Deployment (non-root, read-only root filesystem, `/tmp` on `emptyDir`, journal on a PVC), Service, PodDisruptionBudget. |
 | `control.yaml` | Deployment + Service for the control role. |
 | `ingress-nginx.yaml` | ingress-nginx Ingress with TLS via cert-manager and the body limit. No session affinity: see "Sessions" below. |
+| `secrets-csi.yaml` | **Optional** (Phase C, C.2a). Vendor credentials as `file://` references over a mounted Secret or a Secrets Store CSI volume, so a rotation reaches the gateway without a restart and the audit trail names the version. Shows the `gateway.yaml` changes as a commented patch. |
 
 Before applying, produce the keys and signatures on an operator machine
 (never on a gateway) — Phase B, WPs B.3/B.4/B.6:
@@ -90,6 +91,15 @@ curl -sS -H "Authorization: Bearer $TOKEN" \
   of the same guarantee.
 - **Read-only root filesystem.** The only writable paths are `/tmp`
   (response artifacts, diagnostic logs — `HOME=/tmp`) and the journal.
+- **Credentials rotate without a restart** when `secrets-csi.yaml` is
+  applied: a config value such as `file:///secrets/grafana.json#token` is
+  resolved before the port opens (a missing file or key refuses startup)
+  and re-read every `MCP_SECRET_REFRESH_INTERVAL_SECONDS`; the values from
+  one document swap together, every audit record carries the `source` and
+  `version` that acted, and a file that vanishes keeps the last good value
+  in force with the health banner reporting the degraded refresh. As
+  shipped, `gateway.yaml` still injects credentials with `envFrom`, which
+  is fixed for the life of the pod.
 - **Sessions.** Legacy MCP sessions live in the pod that created them,
   and the example runs **one** gateway replica, so nothing more is needed.
   Scaling past one replica needs an affinity mechanism that binds a
@@ -106,4 +116,6 @@ curl -sS -H "Authorization: Bearer $TOKEN" \
 
 Horizontal gateway scaling (session affinity, a shared artifact volume),
 the control plane's admin API, Prometheus metrics, and Helm packaging are
-Phase C (plan §4).
+Phase C (plan §4). Native secret-provider adapters (`vault://`, `awssm://`,
+`azkv://`) are C.2b–d; until they land, the CSI providers in
+`secrets-csi.yaml` are the way to reach those stores.

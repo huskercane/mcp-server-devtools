@@ -49,6 +49,7 @@ fn event() -> AuditEvent {
             vendor: "jira".to_owned(),
             environment: EnvironmentClass::Unclassified,
             authority: UpstreamAuthority::Shared,
+            provenance: None,
         },
         action: None,
         outcome: None,

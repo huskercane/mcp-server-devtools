@@ -22,6 +22,7 @@
 //! and config watcher all at once.
 
 pub mod config_handle;
+pub mod secrets;
 pub mod vendors;
 pub mod watcher;
 
@@ -36,7 +37,7 @@ use crate::config::Config;
 use crate::error::McpError;
 use crate::ports::{
     AllowAll, AuditSink, ConfigCredentialBroker, CredentialBroker, NoopUsageSink,
-    PolicyDecisionPoint, UsageSink,
+    PolicyDecisionPoint, SecretSource, UsageSink,
 };
 use crate::tools::DevtoolsServer;
 use crate::transport::build_client;
@@ -86,6 +87,11 @@ pub struct Components {
     /// Outcome appends that outlived their caller's wait, so a shutdown can
     /// drain them (`DevtoolsServer::pending_audit`).
     pub pending_audit: tokio_util::task::TaskTracker,
+    /// The secret sources compiled into this build (plan §3.8). Consulted
+    /// at startup and by the background refresher, never per call.
+    pub secrets: Arc<crate::secrets::SecretResolver>,
+    /// Whether that refresh is currently failing (health banner).
+    pub secret_health: secrets::SecretHealth,
 }
 
 impl Components {
@@ -112,6 +118,7 @@ pub struct ServerBuilder {
     usage_sink: Option<Arc<dyn UsageSink>>,
     auth_required: bool,
     policy: Option<Arc<dyn PolicyDecisionPoint>>,
+    secret_sources: Option<Vec<Arc<dyn SecretSource>>>,
 }
 
 impl ServerBuilder {
@@ -193,7 +200,21 @@ impl ServerBuilder {
         self
     }
 
+    /// Use these secret sources instead of the compiled-in default set
+    /// (`file://`). Tests pass an [`crate::ports::InMemorySecretSource`].
+    #[must_use]
+    pub fn secret_sources(mut self, sources: Vec<Arc<dyn SecretSource>>) -> Self {
+        self.secret_sources = Some(sources);
+        self
+    }
+
     /// Assemble the server.
+    ///
+    /// Secret references (`file://…`) are **not** resolved here: this is
+    /// synchronous, and a source is network I/O in general. The transport
+    /// calls [`DevtoolsServer::resolve_secrets`] before it binds, as it
+    /// calls `journal_startup`; a configuration whose references were
+    /// never resolved refuses each credential by name at use.
     ///
     /// # Errors
     ///
@@ -252,6 +273,11 @@ impl ServerBuilder {
             policy_file,
             audit_append_timeout,
             pending_audit: tokio_util::task::TaskTracker::new(),
+            secrets: Arc::new(match self.secret_sources {
+                Some(sources) => crate::secrets::SecretResolver::new(sources),
+                None => crate::secrets::SecretResolver::with_defaults(),
+            }),
+            secret_health: secrets::SecretHealth::default(),
         });
 
         if let Some(pending) = watched {
@@ -468,6 +494,7 @@ impl CliRuntime {
     pub fn load() -> Result<Self, McpError> {
         let config = crate::config::load();
         refuse_unaudited_cli(&config)?;
+        refuse_unresolved_references(&config)?;
         Ok(Self {
             config: Arc::new(config),
             client: build_client()?,
@@ -475,6 +502,34 @@ impl CliRuntime {
             workspace_cache: WorkspaceCache::new(),
         })
     }
+}
+
+/// Refuse the one-shot CLI subcommands when the configuration holds secret
+/// references (`file://…`).
+///
+/// Resolving them is an async step the server runs before it binds
+/// ([`DevtoolsServer::resolve_secrets`]); [`CliRuntime::load`] is
+/// synchronous and one-shot. Until the CLI paths share that step, a
+/// reference here would either be sent upstream as if it were the token or
+/// fail at the first call as "credential missing" — neither names the
+/// cause. Refuse up front, by name (CF-28).
+///
+/// # Errors
+///
+/// [`McpError`] naming the first reference.
+pub fn refuse_unresolved_references(config: &Config) -> Result<(), McpError> {
+    if let Some(reference) = config.secret_references().next() {
+        return Err(crate::error::unexpected(
+            format!(
+                "the configuration references a secret ({reference}), and the one-shot CLI \
+                 subcommands do not resolve secret references yet. Use the MCP server \
+                 (`mcp-devtools` stdio/http), or configure the credential as a literal or \
+                 `keychain` for this session."
+            ),
+            None,
+        ));
+    }
+    Ok(())
 }
 
 /// Refuse operational CLI subcommands while a durable audit journal is

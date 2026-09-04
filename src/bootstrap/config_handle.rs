@@ -55,6 +55,19 @@ impl ConfigHandle {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(config);
     }
+
+    /// Derive the next snapshot from the current one under the write lock,
+    /// so two writers (the config watcher and the secret refresher) cannot
+    /// lose each other's update. `derive` must be quick and must not block:
+    /// it runs with the lock held and every request's `snapshot()` waits on
+    /// it.
+    pub fn update(&self, derive: impl FnOnce(&Config) -> Config) {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Arc::new(derive(&guard));
+    }
 }
 
 impl Default for ConfigHandle {

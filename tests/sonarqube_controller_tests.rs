@@ -227,6 +227,7 @@ async fn quality_gate_ce_task_lookup_is_subject_to_egress_policy() {
                 vendor: "sonarqube".to_owned(),
                 environment: EnvironmentClass::Qa,
                 authority: UpstreamAuthority::Shared,
+                provenance: None,
             },
             append_timeout: Duration::from_secs(1),
         }),

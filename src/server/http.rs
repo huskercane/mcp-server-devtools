@@ -146,6 +146,10 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
         AuthMode::Off => None,
         AuthMode::Okta => Some(Arc::new(enterprise_inbound_auth(&config, &server)?)),
     };
+    // Every secret reference resolves before the port opens, or the
+    // process does not start (plan §3.8): a credential it cannot read is
+    // not a credential it can vouch for per call.
+    server.resolve_secrets().await?;
     // The startup evidence — which policy and which revocation list this
     // process runs under — is durable before the port opens. A journal
     // that cannot take these records is a journal that cannot take the
@@ -633,6 +637,10 @@ fn health(server: &DevtoolsServer) -> Response {
         // log (the watcher warns on every failed reload), not to the world.
         if server.policy_degraded().is_some() {
             banner.push_str("; policy reload is failing; last good policy in force");
+        }
+        // Same posture, same reason: the category is all this route says.
+        if server.secrets_degraded().is_some() {
+            banner.push_str("; secret refresh is failing; last good values in force");
         }
         (StatusCode::OK, [content_type], banner).into_response()
     } else {

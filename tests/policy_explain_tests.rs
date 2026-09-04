@@ -50,6 +50,7 @@ fn context(
             vendor: vendor.to_owned(),
             environment,
             authority: UpstreamAuthority::Shared,
+            provenance: None,
         },
     )
 }

@@ -175,6 +175,28 @@ impl DevtoolsServer {
             })
     }
 
+    /// Resolve every secret reference (`file://…`) in the configuration
+    /// and start the background refresher (plan §3.8). A transport calls
+    /// this **before** it binds, next to [`Self::journal_startup`]: a
+    /// gateway that cannot resolve a credential it was configured with does
+    /// not start. A configuration with no references does nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`McpError`] naming the first reference that did not resolve and why
+    /// — the reference and a category, never a value.
+    pub async fn resolve_secrets(&self) -> Result<(), crate::error::McpError> {
+        crate::bootstrap::secrets::resolve_startup(&self.components).await
+    }
+
+    /// The failure category when the secret refresher is failing and the
+    /// last good values are in force; `None` when it is healthy or there
+    /// is nothing to refresh.
+    #[must_use]
+    pub fn secrets_degraded(&self) -> Option<&'static str> {
+        self.components.secret_health.degraded()
+    }
+
     /// Snapshot the current config. Returns an `Arc` so a tool call costs one
     /// atomic increment instead of deep-cloning the credential maps; `&Arc<Config>`
     /// deref-coerces to the `&Config` every context factory takes.
@@ -872,7 +894,7 @@ impl ServerHandler for DevtoolsServer {
         // being handed it. Local mode sets no scope and pays nothing.
         let tool_context =
             rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let result = match &enterprise {
+        let mut result = match &enterprise {
             Some(call) => {
                 crate::policy::CallScope::enter(
                     Arc::clone(&call.scope),
@@ -882,6 +904,12 @@ impl ServerHandler for DevtoolsServer {
             }
             None => self.tool_router.call(tool_context).await,
         };
+        // Plan §3.7: the upstream identity goes in structured result
+        // metadata, never appended to text content. Enterprise mode only;
+        // a local-mode result is byte-for-byte what it was.
+        if let (Some(call), Ok(CallToolResponse::Complete(value))) = (&enterprise, &mut result) {
+            value.meta = upstream_meta(&call.upstream);
+        }
         let outcome = match &result {
             Ok(CallToolResponse::Complete(value)) if value.is_error == Some(true) => "error",
             Ok(CallToolResponse::Complete(_)) => "success",
@@ -1004,12 +1032,32 @@ pub fn vendor_for_tool(tool: &str) -> Option<&'static str> {
     }
 }
 
+/// The `_meta` key under which enterprise responses carry the upstream
+/// identity: which credential slot acted, with what authority, and (for a
+/// referenced secret) from which source and version.
+pub const UPSTREAM_META_KEY: &str = "mcp-devtools/upstream";
+
+/// `_meta` for an enterprise-mode result. Non-secret by construction: the
+/// identity is a label, a vendor, a classification, an authority, and the
+/// secret's provenance — the same fields every journal record carries.
+fn upstream_meta(upstream: &crate::policy::UpstreamIdentity) -> Option<rmcp::model::MetaObject> {
+    let value = serde_json::to_value(upstream).ok()?;
+    let mut meta = rmcp::model::JsonObject::new();
+    meta.insert(UPSTREAM_META_KEY.to_owned(), value);
+    Some(rmcp::model::MetaObject(meta))
+}
+
 pub(crate) fn success_response(resp: &crate::controllers::ControllerResponse) -> CallToolResult {
     let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
     CallToolResult::success(vec![Content::text(text)])
 }
 
 pub(crate) fn error_to_result(err: &crate::error::McpError) -> CallToolResult {
+    // An upstream `401` may mean the credential rotated under us (plan
+    // §3.8): ask for one early, rate-limited refresh of any references.
+    if err.status_code == Some(401) {
+        crate::bootstrap::secrets::note_upstream_unauthorized();
+    }
     let formatted = format_error_for_mcp_tool(err);
     let text = formatted
         .content

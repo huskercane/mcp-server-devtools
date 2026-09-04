@@ -32,8 +32,9 @@ pub async fn run_stdio() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     // HTTP transport: see `shutdown::install`.
     let shutdown_signal = shutdown::install();
     let handler = DevtoolsServer::new().map_err(boxed_err)?;
-    // Durable before the first request is read, as the HTTP transport does
-    // before it binds.
+    // Resolved, then durable, before the first request is read — as the
+    // HTTP transport does before it binds.
+    handler.resolve_secrets().await.map_err(boxed_err)?;
     handler.journal_startup().await.map_err(boxed_err)?;
     let pending_audit = handler.pending_audit();
     let transport = stdio();

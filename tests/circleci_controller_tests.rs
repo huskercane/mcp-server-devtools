@@ -301,6 +301,7 @@ mod enforcement {
                         vendor: vendor.to_owned(),
                         environment: EnvironmentClass::Qa,
                         authority: UpstreamAuthority::Shared,
+                        provenance: None,
                     },
                     append_timeout: Duration::from_secs(1),
                 }),

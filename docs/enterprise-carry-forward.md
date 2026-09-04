@@ -10,7 +10,15 @@ removed only when it is done, not when it is explained.
 
 Status legend: **open** · **blocked** (needs a decision) · **done**.
 
-Last updated: 2026-09-03, after the independent review of the Phase B
+Last updated: 2026-09-04, after C.2a (secret references) landed on
+`feat/phase-c-secret-sources` (plan §0 rev 2.13). Opened CF-28 (the
+one-shot CLI refuses references rather than resolving them), CF-29
+(`NINJAONE_SERVERS` nested credentials take no references), and CF-30 (the
+reserved cloud schemes refuse by name until C.2b–d; the placement question
+in plan §11 item 8 is still open). The allocation baseline below gained
+the C.2a note.
+
+Previously: 2026-09-03, after the independent review of the Phase B
 branch (plan §0 rev 2.8). The review opened CF-23 (checkpoint threat model
 and an external retention boundary), CF-24 (policy and revocation are two
 signed documents, not one bundle), CF-25 (the §7 metrics are proxies),
@@ -345,6 +353,47 @@ malformed-body behaviour, and adversarial tests, reviewed on its own.
 
 ---
 
+### CF-28 · The one-shot CLI does not resolve secret references
+**Open · Phase C (C.2a)**
+
+`DevtoolsServer::resolve_secrets` is the async step that turns `file://…`
+references into values before the server binds; `CliRuntime::load` is
+synchronous and one-shot, so `mcp-devtools jira|bb|conf …` do not run it.
+Rather than send a reference upstream as if it were the token, or fail the
+first call as "credential missing", `bootstrap::refuse_unresolved_references`
+refuses the subcommand up front and names the reference. Closed by giving
+the CLI paths the same startup step (they already share `refuse_unaudited_cli`,
+so the seam exists) — most naturally when CF-7 routes them through the
+audited boundary, since that is the same "the CLI is a client of the
+server's composition" change.
+
+### CF-29 · Credentials nested in `NINJAONE_SERVERS` accept no references
+**Open · Phase C (C.2a)**
+
+The reference syntax applies to every top-level configuration value
+(`Config::secret_references` walks `shared` and every vendor section). A
+per-server `password` or `totpSecret` inside the `NINJAONE_SERVERS` JSON
+value is resolved later through `auth::resolve_configured_secret_async`
+with the raw field value, which the snapshot never saw; a `file://` there is
+refused by name at use, not expanded. Closing it means either teaching the
+reference walk to descend into that one JSON document (the registry
+deliberately does not describe those rows — `auth/secrets.rs` explains why)
+or moving NinjaOne's per-server credentials to top-level keys. Decide when
+NinjaOne gets a read profile, with CF-1/CF-13.
+
+### CF-30 · No `secrets-*` Cargo features exist yet, and the reserved schemes refuse by name
+**Open · Phase C (C.2b–d)**
+
+`vault://`, `awssm://`, and `azkv://` parse today and fail startup with
+`no adapter for `vault://` is compiled into this binary`, which is the
+typed error §3.8 asks for. The `secrets-vault` / `secrets-aws` /
+`secrets-azure` features, the adapters behind them, and the `SecretResolver`
+registration in `bootstrap/` are C.2b–d. §11 item 8 (whether those adapters
+live here under features or in the enterprise crate) is still to decide
+before C.2b starts; C.2a itself — port, `file://`, snapshot, refresher —
+is in the community crate under the CF-18 reading, and is not a tier
+differentiator.
+
 ## Decisions we owe someone
 
 ### CF-10 · ADR-002: the enterprise licence
@@ -636,6 +685,19 @@ and every extractor stage is byte-for-byte what Phase A recorded.
 | 2 `render(Toon)` @ 500 issues | 1736 KB | 19 032 | 19 032 |
 | 3 `truncate_for_ai` | 39 KB | 4 | 4 |
 | 2 `render(Toon)` @ 5000 issues | 16 547 KB | 190 035 | 190 035 |
+
+Re-run after C.2a (2026-09-04, rev 2.13): every stage's byte and
+allocation count is identical to the table below (JWT cache hit 9, journal
+append 6, `ConfigHandle::snapshot()` 0, every extractor and render stage
+unchanged; journal append p50 11 µs, p99 16 µs). C.2a's only request-path
+change is in `Config::get_for`: one byte dispatch to decide "not a
+reference" (`secrets::is_reference`) before returning the borrowed value,
+and a hash lookup into the attached snapshot only for an actual reference —
+no allocation on either branch, which is why stage 0 and the extractor
+rows (all of which read configuration) did not move. Secret fetches run
+on the refresher task and at startup, never per call (§8, "Secret
+resolution (C.2)"). A probe row for "get_for through a resolved
+reference" is worth adding when the probe next gains stages (CF-20).
 
 Notes for the Phase C comparison:
 

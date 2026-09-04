@@ -257,6 +257,7 @@ fn policy_stage() {
         vendor: "grafana".to_owned(),
         environment: EnvironmentClass::Qa,
         authority: UpstreamAuthority::Shared,
+        provenance: None,
     };
     let arguments =
         json!({ "datasourceUid": "loki-qa-main", "query": "{app=\"api\"}", "limit": 100 });
@@ -414,6 +415,7 @@ fn enterprise_request_path_stage() {
                 vendor: "grafana".to_owned(),
                 environment: EnvironmentClass::Qa,
                 authority: UpstreamAuthority::Shared,
+                provenance: None,
             },
             action: None,
             outcome: None,

@@ -69,6 +69,7 @@ fn upstream(environment: EnvironmentClass) -> UpstreamIdentity {
         vendor: "grafana".to_owned(),
         environment,
         authority: UpstreamAuthority::Shared,
+        provenance: None,
     }
 }
 

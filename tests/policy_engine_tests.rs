@@ -71,6 +71,7 @@ fn upstream_for(tool: &str, environment: &str) -> UpstreamIdentity {
         vendor: vendor.to_owned(),
         environment: EnvironmentClass::parse(environment).expect("fixture environment"),
         authority: UpstreamAuthority::Shared,
+        provenance: None,
     }
 }
 

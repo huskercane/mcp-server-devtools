@@ -61,6 +61,7 @@ use crate::auth::keychain::KeychainBackend;
 use crate::auth::{os_keychain, secrets};
 use crate::config::Config;
 use crate::policy::{CredentialLabel, EnvironmentClass, UpstreamAuthority, UpstreamIdentity};
+use crate::secrets::SecretProvenance;
 
 /// Config key holding the environment classification of a vendor account
 /// (`prod` / `staging` / `qa` / `dev`). Vendor-scoped: a `jira` section may
@@ -124,11 +125,12 @@ impl CredentialBroker for ConfigCredentialBroker {
         // to be asked of the keychain and no thread is borrowed to ask it.
         // This is the path every containerized deployment takes.
         match slot_label(config, &NoKeychain, vendor) {
-            Attribution::Slot(label) => {
+            Attribution::Slot(label, provenance) => {
                 return Box::pin(std::future::ready(identity(
                     label,
                     vendor.to_owned(),
                     environment,
+                    provenance,
                 )));
             }
             Attribution::Indeterminate => {
@@ -136,6 +138,7 @@ impl CredentialBroker for ConfigCredentialBroker {
                     CredentialLabel::indeterminate(vendor),
                     vendor.to_owned(),
                     environment,
+                    None,
                 )));
             }
             Attribution::Nothing => {}
@@ -156,12 +159,12 @@ impl CredentialBroker for ConfigCredentialBroker {
                 tracing::warn!(%error, "keychain slot probe failed; attributing as unconfigured");
                 Attribution::Nothing
             });
-            let label = match attribution {
-                Attribution::Slot(label) => label,
-                Attribution::Indeterminate => CredentialLabel::indeterminate(&owned_vendor),
-                Attribution::Nothing => CredentialLabel::unconfigured(&owned_vendor),
+            let (label, provenance) = match attribution {
+                Attribution::Slot(label, provenance) => (label, provenance),
+                Attribution::Indeterminate => (CredentialLabel::indeterminate(&owned_vendor), None),
+                Attribution::Nothing => (CredentialLabel::unconfigured(&owned_vendor), None),
             };
-            identity(label, owned_vendor, environment)
+            identity(label, owned_vendor, environment, provenance)
         })
     }
 }
@@ -172,19 +175,22 @@ fn identity(
     label: CredentialLabel,
     vendor: String,
     environment: EnvironmentClass,
+    provenance: Option<SecretProvenance>,
 ) -> UpstreamIdentity {
     UpstreamIdentity {
         label,
         vendor,
         environment,
         authority: UpstreamAuthority::Shared,
+        provenance,
     }
 }
 
 /// What the broker can say about which slot will act for a vendor.
 enum Attribution {
-    /// This slot resolves and will be the one that acts.
-    Slot(CredentialLabel),
+    /// This slot resolves and will be the one that acts — and, when its
+    /// value came from a secret reference, where from and which version.
+    Slot(CredentialLabel, Option<SecretProvenance>),
     /// A credential will act, but which one is decided by state the broker
     /// cannot observe before dispatch (see
     /// [`secrets::resolution_is_observable`]).
@@ -198,7 +204,7 @@ impl Attribution {
     #[cfg(test)]
     fn label(&self) -> Option<&str> {
         match self {
-            Self::Slot(label) => Some(label.as_str()),
+            Self::Slot(label, _) => Some(label.as_str()),
             _ => None,
         }
     }
@@ -248,10 +254,13 @@ fn slot_label(config: &Config, backend: &dyn KeychainBackend, vendor: &str) -> A
         };
 
         if resolves {
-            return Attribution::Slot(match configured_principal {
-                Some(principal) => CredentialLabel::principal_slot(row, principal),
-                None => CredentialLabel::slot(row),
-            });
+            return Attribution::Slot(
+                match configured_principal {
+                    Some(principal) => CredentialLabel::principal_slot(row, principal),
+                    None => CredentialLabel::slot(row),
+                },
+                config.secret_provenance(vendor, row.secret_key).cloned(),
+            );
         }
 
         // For a vendor whose resolver consults invisible state, only the
@@ -349,6 +358,7 @@ impl CredentialBroker for StaticCredentialBroker {
                 vendor: vendor.to_owned(),
                 environment: EnvironmentClass::Unclassified,
                 authority: UpstreamAuthority::Shared,
+                provenance: None,
             });
         Box::pin(std::future::ready(identity))
     }
@@ -621,6 +631,7 @@ mod tests {
             vendor: "grafana".to_owned(),
             environment: EnvironmentClass::Prod,
             authority: UpstreamAuthority::Shared,
+            provenance: None,
         };
         let broker = StaticCredentialBroker::new().with(VENDOR_GRAFANA, pinned.clone());
         let empty = Config::from_map(HashMap::new());

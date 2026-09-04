@@ -410,6 +410,12 @@ pub struct UpstreamIdentity {
     pub environment: EnvironmentClass,
     /// Shared or delegated authority.
     pub authority: UpstreamAuthority,
+    /// For a credential that came from a secret *reference* (plan §3.8):
+    /// its scheme and the provider's version, flattened into the record as
+    /// `source` and `version`. Absent for a literal or keychain value, so a
+    /// record for those is byte-for-byte what it was.
+    #[serde(flatten)]
+    pub provenance: Option<crate::secrets::SecretProvenance>,
 }
 
 /// Classification of the resource a call addresses.
@@ -1200,6 +1206,7 @@ mod tests {
                 vendor: crate::config::VENDOR_GRAFANA.to_owned(),
                 environment: EnvironmentClass::Prod,
                 authority: UpstreamAuthority::Shared,
+                provenance: None,
             },
         )
     }
@@ -1413,6 +1420,7 @@ mod tests {
             vendor: "jira".to_owned(),
             environment: EnvironmentClass::Unclassified,
             authority: UpstreamAuthority::Shared,
+            provenance: None,
         };
         assert!(!format!("{identity:?}").contains("a@b.example"));
     }

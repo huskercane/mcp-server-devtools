@@ -21,6 +21,7 @@ pub mod ingestion;
 pub mod logger;
 pub mod policy;
 pub mod ports;
+pub mod secrets;
 pub mod server;
 pub mod shell;
 pub mod tools;

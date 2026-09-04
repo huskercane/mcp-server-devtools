@@ -91,9 +91,26 @@ pub fn spawn(components: &Arc<Components>, pending: PendingWatch) {
                 continue;
             }
 
-            components
-                .config
-                .replace(crate::config::load_from_global_path(Some(&path)));
+            // A reloaded configuration may reference secrets the current
+            // snapshot has never seen; resolve them before the swap, and
+            // keep the last good configuration if one does not resolve
+            // (plan §3.8 — the policy-reload contract).
+            let reloaded = crate::config::load_from_global_path(Some(&path));
+            let reloaded =
+                match super::secrets::resolve_reloaded(&components.secrets, reloaded).await {
+                    Ok(config) => config,
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            reference = %error.reference,
+                            failure = error.cause.category(),
+                            "global config changed but a secret reference does not resolve; keeping previous config: {}",
+                            error.cause
+                        );
+                        continue;
+                    }
+                };
+            components.config.replace(reloaded);
             components.workspace_cache.clear();
             tracing::info!(path = %path.display(), "reloaded global config");
         }
@@ -140,6 +157,8 @@ mod tests {
             usage_sink: Arc::new(crate::ports::NoopUsageSink),
             auth_required: false,
             policy: Arc::new(crate::ports::AllowAll),
+            secrets: Arc::new(crate::secrets::SecretResolver::with_defaults()),
+            secret_health: crate::bootstrap::secrets::SecretHealth::default(),
             policy_file: None,
             audit_append_timeout: crate::policy::egress::DEFAULT_AUDIT_APPEND_TIMEOUT,
             pending_audit: tokio_util::task::TaskTracker::new(),

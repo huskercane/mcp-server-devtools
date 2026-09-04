@@ -37,9 +37,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::Value;
 use tracing::{debug, warn};
+
+use crate::secrets::{ResolvedSecret, SecretProvenance, SecretSnapshot};
 
 pub mod global;
 
@@ -136,6 +139,15 @@ pub const VENDOR_WRDS: &str = "wrds";
 pub struct Config {
     shared: HashMap<String, String>,
     by_vendor: BTreeMap<String, HashMap<String, String>>,
+    /// Every secret *reference* among the values above, resolved (plan
+    /// §3.8). Lives on the config rather than beside it so that a tool
+    /// call's config snapshot and its secret snapshot are one `Arc` and
+    /// cannot tear against each other; the accessors expand a resolved
+    /// reference in place, which is how a principal such as
+    /// `ATLASSIAN_USER_EMAIL` can come from the same document as its token.
+    /// Empty until [`Config::with_secrets`] — a configuration with no
+    /// references never allocates one.
+    secrets: Arc<SecretSnapshot>,
 }
 
 /// Outcome of [`Config::resolve`]. Distinguishes "key absent everywhere"
@@ -253,7 +265,11 @@ impl Config {
             shared.insert(k.clone(), v.clone());
         }
 
-        Self { shared, by_vendor }
+        Self {
+            shared,
+            by_vendor,
+            secrets: Arc::default(),
+        }
     }
 
     /// Construct directly from a flat map. The map populates the
@@ -265,7 +281,75 @@ impl Config {
         Self {
             shared: values,
             by_vendor: BTreeMap::new(),
+            secrets: Arc::default(),
         }
+    }
+
+    /// This configuration with a resolved secret snapshot attached. The
+    /// maps are shared with `self` only by clone; the snapshot is shared
+    /// by `Arc`, so attaching the same snapshot to a reloaded configuration
+    /// costs nothing beyond the maps.
+    #[must_use]
+    pub fn with_secrets(mut self, secrets: Arc<SecretSnapshot>) -> Self {
+        self.secrets = secrets;
+        self
+    }
+
+    /// The attached snapshot (empty when nothing was resolved).
+    #[must_use]
+    pub const fn secrets(&self) -> &Arc<SecretSnapshot> {
+        &self.secrets
+    }
+
+    /// Every value that is a secret reference, across `shared` and every
+    /// vendor section, trimmed. What the resolver is handed at startup and
+    /// on every refresh; duplicates are the resolver's problem.
+    pub fn secret_references(&self) -> impl Iterator<Item = &str> {
+        self.shared
+            .values()
+            .chain(self.by_vendor.values().flat_map(HashMap::values))
+            .map(|value| value.trim())
+            .filter(|value| crate::secrets::is_reference(value))
+    }
+
+    /// Where the value behind `key` came from, when it is a resolved
+    /// reference: the scheme and the provider's version, for the audit
+    /// record (plan §3.8, "Attribution"). `None` for a literal, a keychain
+    /// sentinel, an absent key, or a reference that has not resolved.
+    #[must_use]
+    pub fn secret_provenance(&self, vendor: &str, key: &str) -> Option<&SecretProvenance> {
+        let raw = self.raw_for(vendor, key)?.trim();
+        if !crate::secrets::is_reference(raw) {
+            return None;
+        }
+        self.secrets.get(raw).map(ResolvedSecret::provenance)
+    }
+
+    /// The configured text, before reference expansion.
+    fn raw_for(&self, vendor: &str, key: &str) -> Option<&str> {
+        if let Some(v) = self.shared.get(key) {
+            return Some(v.as_str());
+        }
+        self.by_vendor
+            .get(vendor)
+            .and_then(|m| m.get(key))
+            .map(String::as_str)
+    }
+
+    /// A resolved reference becomes its value; anything else is returned
+    /// as it is — a literal, a keychain sentinel, or a reference the
+    /// snapshot does not hold (which the credential cascade then refuses
+    /// by name rather than sending upstream as a token).
+    ///
+    /// On the request path for every lookup, so: one byte dispatch to
+    /// decide "not a reference" for the overwhelmingly common case, and a
+    /// hash lookup only for an actual reference. No allocation either way.
+    fn expand<'a>(&'a self, raw: &'a str) -> &'a str {
+        let trimmed = raw.trim();
+        if !crate::secrets::is_reference(trimmed) {
+            return raw;
+        }
+        self.secrets.get(trimmed).map_or(raw, ResolvedSecret::value)
     }
 
     /// Vendor-neutral lookup. Returns the value when:
@@ -291,12 +375,12 @@ impl Config {
     /// whose vendor sections disagree about a credential.
     pub fn resolve(&self, key: &str) -> Resolved<'_> {
         if let Some(v) = self.shared.get(key) {
-            return Resolved::Resolved(v.as_str());
+            return Resolved::Resolved(self.expand(v));
         }
         let mut hits: Vec<(&str, &str)> = Vec::new();
         for (vendor, vendor_map) in &self.by_vendor {
             if let Some(v) = vendor_map.get(key) {
-                hits.push((vendor.as_str(), v.as_str()));
+                hits.push((vendor.as_str(), self.expand(v)));
             }
         }
         match hits.as_slice() {
@@ -313,13 +397,7 @@ impl Config {
     /// Use this for keys that are vendor-specific by definition
     /// (`BITBUCKET_DEFAULT_WORKSPACE`).
     pub fn get_for(&self, vendor: &str, key: &str) -> Option<&str> {
-        if let Some(v) = self.shared.get(key) {
-            return Some(v.as_str());
-        }
-        self.by_vendor
-            .get(vendor)
-            .and_then(|m| m.get(key))
-            .map(String::as_str)
+        self.raw_for(vendor, key).map(|raw| self.expand(raw))
     }
 
     /// Vendor-scoped lookup with a fallback chain through a caller-supplied
@@ -343,14 +421,14 @@ impl Config {
         key: &str,
     ) -> Option<&str> {
         if let Some(v) = self.shared.get(key) {
-            return Some(v.as_str());
+            return Some(self.expand(v));
         }
         if let Some(v) = self.by_vendor.get(primary).and_then(|m| m.get(key)) {
-            return Some(v.as_str());
+            return Some(self.expand(v));
         }
         for vendor in fallbacks {
             if let Some(v) = self.by_vendor.get(*vendor).and_then(|m| m.get(key)) {
-                return Some(v.as_str());
+                return Some(self.expand(v));
             }
         }
         None

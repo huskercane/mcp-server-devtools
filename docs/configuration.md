@@ -30,6 +30,25 @@ The global file has this shape:
 
 Recognized section names are `bitbucket`, `jira`, `confluence`, `zoom`, `circleci`, `slack`, `postman`, `edx`, `newrelic`, `grafana`, `sonarqube`, `splunk`, `ninjaone`, and `wrds`.
 
+## Secret references
+
+Any configuration value, in any of the three sources, may be a **reference** to a secret instead of the secret itself (`docs/enterprise-product-plan.md` §3.8):
+
+| Form | Meaning |
+|---|---|
+| `keychain` or `keychain://` | The OS keychain slot for this key (`mcp-devtools creds set`). Unchanged from before; read on the request path as it always was. |
+| `file:///path` | The whole file, less one trailing line break. The path is absolute and taken verbatim (no percent-decoding, no `file://host/…`). |
+| `file:///path#key` | The string under `key` in a JSON object held in the file. Several references into one file are served from **one** read, so an email and a token in the same document always change together. |
+| `vault://…`, `awssm://…`, `azkv://…` | Reserved for the native adapters (plan C.2b–d). Recognised, and refused at startup as "no adapter compiled into this binary". Until then, reach those stores through a mounted CSI Secrets Store volume and `file://` (`deploy/k8s/secrets-csi.yaml`). |
+
+Anything else is a literal, byte for byte, so a configuration with no references behaves exactly as it did.
+
+The MCP server resolves every reference **before it starts serving**; a file that is missing, a key that is absent, a value that is empty, or a scheme with no adapter refuses startup with the reference named (never the value). While it runs, the references are re-read every `MCP_SECRET_REFRESH_INTERVAL_SECONDS` (default `30`, clamped to `1`–`3600`), and a changed document is swapped in whole; an upstream `401` triggers one early re-read, at most every 10 s. A refresh that fails keeps the **last good values** in force and the health banner reports `secret refresh is failing; last good values in force` (the reference and the cause go to the operator log) until a refresh succeeds. A global-config reload that introduces a reference which does not resolve is refused, and the previous configuration stays in force.
+
+Where a referenced value acts as a credential, the audit record and the enterprise-mode result metadata (`_meta["mcp-devtools/upstream"]`) carry its `source` (the scheme) and `version` (the provider's version, or `sha256:` plus the first 16 hex characters of the file's content hash) alongside the credential label; a change of `version` between two records is the evidence of a rotation. The value itself never appears anywhere.
+
+Not covered yet: the one-shot CLI subcommands (`mcp-devtools jira|bb|conf …`) refuse to run while the configuration holds a reference, and credentials nested inside `NINJAONE_SERVERS` entries accept literals and `keychain` only (`docs/enterprise-carry-forward.md`, CF-28 and CF-29).
+
 ## Integration settings
 
 | Section | Setting | Required/default | Purpose |
@@ -139,6 +158,7 @@ integration settings, so they may live in the environment, `.env`, or a
 | `MCP_AUDIT_CHECKPOINT_RECORDS` | `256` | Records between checkpoints. Every line extends a SHA-256 chain; a checkpoint records the chain value over everything before it, signed. Also written when this many seconds pass (`MCP_AUDIT_CHECKPOINT_SECONDS`) with unsealed records, and at every clean shutdown. |
 | `MCP_AUDIT_CHECKPOINT_SECONDS` | `60` | Longest a written record stays unsealed by a checkpoint. |
 | `MCP_AUDIT_CHECKPOINT_EXPORT_DIR` | — | Directory each checkpoint is copied to (`checkpoint-<seq>.jsonl`, atomically written), for shipping to object storage or a SIEM. `mcp-devtools audit verify --checkpoints <dir>` compares it to the journal and reports a truncated tail, and reports every journal checkpoint the directory lacks. An export failure is logged (`audit checkpoint export failed`) and never refuses calls; treat the log line as an alert, because until the copy is restored a truncation back to that checkpoint would go unreported. |
+| `MCP_SECRET_REFRESH_INTERVAL_SECONDS` | `30`; clamped to `1`–`3600` | How often secret references (`file://…`, "Secret references" above) are re-read. Not enterprise-only: applies whenever the configuration holds a reference. |
 | `MCP_AUDIT_APPEND_TIMEOUT_MS` | `5000`; clamped to `100`–`60000` | Bound on the wait for durable acknowledgement. Before dispatch, a timeout refuses the call. After dispatch, the outcome record is not abandoned: the caller stops waiting at the bound, the write continues on a tracked task, and a graceful shutdown drains such writes for up to 30 s; see `src/policy/egress.rs` for what an intent without an outcome then means. |
 
 Validated tokens are cached for `min(exp, 5 min)` keyed by the token's
