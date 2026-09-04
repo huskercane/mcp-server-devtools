@@ -1,7 +1,7 @@
 # MCP DevTools enterprise product brief
 
 Status: product hypothesis and proposed direction; circulated to prospective collaborators\
-Last reviewed: August 28, 2026
+Last reviewed: September 3, 2026
 
 ## Executive summary
 
@@ -374,9 +374,15 @@ bet that has not been made yet.
 
 - **The problem is real and getting worse.** Every organization rolling out
   Claude, Copilot, or Cursor hits "who may call what, as whom, against which
-  environment" within weeks. EMA solves provisioning. Nobody has a good answer
-  for cross-vendor policy, credential brokerage, and evidence; today the
-  alternative is distributing personal API tokens and hoping.
+  environment" within weeks. EMA solves provisioning. Credential brokerage
+  and signed audit logs are now each available separately (Okta's Runtime
+  Agent Gateway and Pomerium broker upstream tokens; obsigno and cMCP ship
+  signed, hash-chained ledgers — see
+  [`docs/competitive-landscape.md`](competitive-landscape.md)). Nobody
+  combines resource-aware cross-vendor policy evaluated on the upstream
+  request, brokered identity, and sealed evidence in one self-hosted binary;
+  today the alternative is a protocol proxy plus personal API tokens and
+  hoping.
 - **The data plane is ahead of a from-scratch competitor.** Bounded output,
   resumable artifacts, a credential-partitioned cache, an audit lifecycle, a
   single static binary, a license/advisory gate, and a golden-locked tool
@@ -395,7 +401,8 @@ bet that has not been made yet.
   liability, not an asset.
 - **The gateway layer is where the real competition is.** Kong, Cloudflare,
   Envoy-based vendors, Microsoft, Okta, and a growing set of "MCP gateway"
-  startups are converging on authentication, policy, and audit in front of MCP
+  startups (tracked in [`docs/competitive-landscape.md`](competitive-landscape.md))
+  are converging on authentication, policy, and audit in front of MCP
   servers. Most are protocol gateways: they do not know that a Jira search is a
   `POST`. That semantic layer is the only durable edge, and it is the part not
   yet built.

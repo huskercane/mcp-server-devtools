@@ -4,7 +4,7 @@ Status: proposed execution plan for the direction in the
 [enterprise product brief](enterprise-product-brief.md); revision 2 after independent review
 Owner: Rohit Singh · Source of record: `docs/enterprise-product-plan.md` in the `mcp-devtools` repository
 Classification: internal; share with prospective collaborators under NDA
-Last reviewed: August 29, 2026
+Last reviewed: September 3, 2026
 
 This document turns the brief's thesis — *semantic, default-deny policy for AI
 agents across the engineering stack* — into a sequenced plan with decisions,
@@ -34,6 +34,9 @@ ordered by partner demand and are not scheduled until Gate B passes.
 | 2.7 | 2026-09-03 | Phase B engineering landed on `feat/phase-a-secure-remote-slice`, one commit per WP in dependency order (B.3, B.4, B.6, B.5+B.7, B.1, B.2): signed policy bundles (Ed25519 detached signatures, `MCP_POLICY_PUBLIC_KEY` required in okta mode) with every load/change/rejection journaled and a change committed only after its record is durable; the revocation list as a second signed document (`MCP_REVOCATION_FILE`: subjects, token ids, `not_before` = `revoke all`), enforced after validation regardless of the token cache, with the fresh-token rule for writes; the journal hash chain with signed checkpoints (`MCP_AUDIT_SIGNING_KEY`), a `CheckpointSink` export, and `audit verify`; activity and access-review exports and the §7 metrics; Slack as the second vendor (five purpose-built reads, extractors shared with the passthrough and the egress chokepoint, the incident-investigation profile); `policy explain`. Three new fail-closed startup requirements in okta mode (policy public key, revocation list, audit signing key). CF-8 closed; CF-16's emergency-deny half closed; CF-18's move list grew (see the register). Gate B itself is owner-led | Implementation |
 | 2.8 | 2026-09-03 | Independent review of the Phase B branch, answered in code and in the register: a token whose `iat` is in the future is refused at authentication (it outran every cut-off and counted as fresh for writes); a Slack query naming `channel` twice is not classified (policy judged the first value, Slack could read the second); the verifier reports a journal checkpoint the export lacks (a failed copy was invisible, and a truncation back to it would have stayed so) and duplicate exports; the audit signing key may be group-readable, because a Kubernetes Secret under `fsGroup` is `root:fsGroup 0440` and the owner-only rule made the sample deployment unable to start; a rejected reload is deduplicated only once its record is durable, and by the refused bytes, so distinct bad revisions are distinct records; the `policy_loaded`/`revocation_loaded` records are appended before the port is bound and their failure is a startup failure; key files are installed with a no-replace link and loaded through the handle that was permission-checked, revocation edits serialize on an advisory lock and `init` never replaces; `policy explain` builds its context through the one builder `call_tool` uses, with the live configuration and the real broker; CSV cells that a spreadsheet would evaluate are neutralised; time bounds compare at full precision; four documents corrected. Pushed back: the initialize/revocation interleaving leaves a session object, not access (CF-16). Recorded: the checkpoint threat model and external retention (CF-23), policy and revocation as separate signed documents (CF-24), §7 metrics as proxies (CF-25), the cached `jti` allocation (CF-26), and the remaining unlocked behaviours (CF-27) | Independent review |
 | 2.9 | 2026-09-03 | CF-18 deferred by decision: with the community repository private, ADR-001's boundary has no external party behind it, so the secure remote slice (token validation, file policy, signing, revocation, checkpoints, exports) stays in the community crate and the enterprise crate starts with the control plane in Phase C. ADR-001 stands as written, amended-pending; revisit if the repository is opened, together with the licence (CF-10) | Owner |
+| 2.10 | 2026-09-03 | C.2 (external secret provider) designed and split (§3.8): a `SecretSource` port with a snapshot cache in front, so the request path never calls a provider; secret *references* as URIs (`keychain://`, `file://`, `vault://`, `awssm://`, `azkv://`) generalising the `"keychain"` sentinel; `file://` over a mounted Secret or CSI Secrets Store volume ships first and proves reference syntax, cache, and rotation with zero new dependencies; HashiCorp Vault / OpenBao KV v2 next, tested against a real container in CI and through the published image; AWS Secrets Manager and Azure Key Vault behind Cargo features, with an explicit auth mode each (no credential chain in production) and wiremock contract tests plus a manually triggered OIDC-federated job against real accounts. Multi-part credentials rotate atomically from one JSON secret. Provider auth material joins the redaction test. Where the adapters live (community features vs enterprise crate) is open in §11. Generalised into constraint 8 and §3.9: every infrastructure backend (secrets, rollup database, session store, artifact storage, SIEM, metrics) is behind a domain-owned port with a swappable adapter; C.6's SQLite is the first rollup adapter, not the design | Owner |
+| 2.11 | 2026-09-03 | Identity providers follow constraint 8 without a second validator: `auth/okta.rs` is a generic OIDC JWKS validator with Okta defaults, so additional IdPs are **provider profiles** (defaults for JWKS location, scope-claim shape, subject claim, groups claim and value normalisation) over the one validator, selected by an `oidc` auth mode with `MCP_OIDC_*` keys; `okta` / `MCP_OKTA_*` stay as aliases. Profiles: Okta (exists), Entra, Keycloak (the container-testable one, so the real-IdP CI job stops depending on a mocked JWKS), Auth0. Known claim-shape fixes recorded (§3.9 row): `scp` string-or-array, configurable subject claim (`oid` for Entra), Entra groups overage fails closed, Auth0's trailing-slash issuer, Keycloak's missing `aud` and `/`-prefixed group paths. `PrincipalAuthority::Okta` carrying a vendor name inside the domain is the one constraint-8 violation and is renamed. Scheduled as C.1b | Owner |
+| 2.12 | 2026-09-03 | Competitive survey recorded in [`docs/competitive-landscape.md`](competitive-landscape.md) (sixteen products, seven categories, one matrix): credential brokerage and tamper-evident audit are each available elsewhere (Okta Runtime Agent Gateway, Pomerium, Arcade; obsigno, cMCP), so neither is a differentiator alone — the product is the *combination* of egress enforcement on the owned vendor request, resource-aware policy, brokered identity and sealed evidence in one self-hosted binary, and the pitch leads with that. Consequences applied here: Gate A runs behind the partner's existing gateway and tests the moat hypothesis; C.1's ID-JAG exchange interops against Okta Cross-App Access and D.5 reuses it; a §9 row for gateways and identity vendors absorbing the generic half of Phase A; §11 gains the moat question; the brief's "nobody has a good answer for credential brokerage" corrected | Owner; competitive survey |
 
 Unresolved questions are collected in §11. Work that a phase deliberately
 did **not** finish — deferred fixes, decisions we owe someone, and the
@@ -70,6 +73,15 @@ These are fixed unless a decision below explicitly revisits them.
 7. **Baseline stays pinned.** Rust 1.96 / edition 2024 / exact-pinned deps.
    New deps (JWT, JWKS, policy, journal) are pinned the same way and pass
    `cargo deny`.
+8. **Infrastructure backends are interchangeable.** Every external backend the
+   enterprise build talks to — secret providers, the rollup database, the
+   session store, artifact storage, SIEM sinks, metrics exporters — sits
+   behind a port owned by the domain, with the first production adapter and
+   a test adapter shipping together (§3.9). No backend type, SQL dialect,
+   provider SDK type, or wire format crosses the port; the domain sees the
+   port's own types only. Picking SQLite, Vault, or a local volume is a
+   first-adapter choice recorded in the table, never the design. Added 2026-09-03
+   (rev 2.10).
 
 ## 2. Decisions
 
@@ -175,9 +187,10 @@ implementation or a test seam is real. Each port below has one at day one.
 
 | Port | Impl 1 (ships first) | Impl 2 (real, day one) | Later |
 |---|---|---|---|
-| `TokenValidator` | Okta JWKS validator (`iss`, `aud`, `exp`/`nbf`, scopes, groups) | `StaticValidator` for tests and local dev | Entra; EMA access tokens |
+| `TokenValidator` | Okta JWKS validator (`iss`, `aud`, `exp`/`nbf`, scopes, groups) | `StaticValidator` for tests and local dev | Provider **profiles** over the same validator (Entra, Keycloak, Auth0; C.1b, §3.9) — not a second impl; EMA access tokens |
 | `PolicyDecisionPoint` | File-backed static policy over `ActionContext`, hot-reloaded via the `bootstrap/watcher.rs` pattern | `AllowAll` for `MCP_AUTH_MODE=off` — today's behaviour, made explicit | Cedar compile target; external PDP |
-| `CredentialBroker` | Existing env/config/keychain resolution (`auth/secrets.rs`) wrapped so it returns an `UpstreamIdentity` label with vendor, environment, and `Shared`/`Delegated` — **in the first slice** | In-memory broker for tests | Vault / AWS SM / Azure KV; rotation; delegated OAuth |
+| `CredentialBroker` | Existing env/config/keychain resolution (`auth/secrets.rs`) wrapped so it returns an `UpstreamIdentity` label with vendor, environment, and `Shared`/`Delegated` — **in the first slice** | In-memory broker for tests | Delegated OAuth. (Credential *values* from external providers are §3.8's `SecretSource`, not this port: the broker labels the slot, whatever fills it.) |
+| `SecretSource` (Phase C, §3.8) | `file://` over a mounted Secret or CSI Secrets Store volume, read through a snapshot cache with the `bootstrap/watcher.rs` refresh pattern | In-memory source for tests; the existing `KeychainBackend` wrapped as `keychain://` | Vault / OpenBao KV v2; AWS Secrets Manager; Azure Key Vault — each behind a Cargo feature |
 | `AuditSink` | Durable local journal (ADR-011) | In-memory sink for tests | SIEM forwarders from `control` |
 | `UsageSink` | Bounded channel → rollup store, drop-with-counter | No-op | Prometheus, OTLP |
 
@@ -337,6 +350,130 @@ builder and fuzz-tested:
 | Tool responses | Authority and upstream identity go in **structured** MCP result metadata (`_meta` / annotations), never appended to text content. |
 | `tests/golden/tool_surface.json` | New purpose-built read tools are a deliberate surface change; regenerate and review as its own commit. |
 
+### 3.8 External secret sources (Phase C, C.2)
+
+Decided 2026-09-03 (rev 2.10). The gateway today resolves every credential
+per tool call from the hot-reloaded `Config` snapshot plus the synchronous
+`KeychainBackend` trait, keyed by the `auth/secrets.rs` registry row. That
+already rotates values held in the watched config file without a restart.
+It does **not** rotate the Kubernetes path, where `deploy/k8s/gateway.yaml`
+injects credentials with `envFrom: secretRef` into the process environment:
+an environment variable is fixed for the life of the pod. That is the gap
+C.2 closes.
+
+**Why not put providers behind `KeychainBackend`.** The trait is synchronous,
+carries `set`/`delete` for the CLI, and sits on a request path budgeted in
+microseconds (§8). Vault, Secrets Manager, and Key Vault are network I/O with
+their own authentication lifecycle. They get their own port, and the request
+path never sees them.
+
+**Shape.**
+
+| Element | Decision |
+|---|---|
+| Reference syntax | A secret-bearing config value is either a literal or a **reference URI**: `keychain://` (bare `"keychain"` stays as an alias), `file:///path` (whole file, or `#json-key` into a JSON document), `vault://mount/path#key` (KV v2), `awssm://name-or-arn#json-key`, `azkv://vault-name/secret-name`. The registry row (`VENDOR_SECRETS`) stays the unit; nothing about slots or vendors changes. The `azkv://` form makes the Key Vault name mapping explicit, because Key Vault secret names allow only alphanumerics and hyphens and `ATLASSIAN_API_TOKEN` cannot be used verbatim. |
+| Port | `SecretSource`: async `fetch(reference) -> { value, version, ttl }`. One adapter per scheme. In-memory source for tests. |
+| Snapshot cache | A background refresher (the `bootstrap/watcher.rs` pattern) resolves every referenced secret into a `RwLock<Arc<…>>` snapshot, as `ConfigHandle` does for configuration. The request path reads the snapshot only, so the §8 budgets are unchanged and a provider outage cannot add latency to `/mcp`. Refresh on TTL with jitter; `file://` refreshes on change. |
+| Failure posture | Startup with an unreachable provider or an unresolvable reference **fails closed**: the gateway does not start. At runtime a failed refresh keeps the **last good value** and degrades the health banner, the same contract as policy reload (§3.1, `MCP_POLICY_FILE`). An upstream `401` triggers one early refresh, rate-limited, because rotation windows overlap in practice. |
+| Atomic multi-part credentials | Atlassian email + token, Zoom client id + secret, WRDS user + password, Bitbucket username + app password are fetched as **one** JSON secret and swapped together. Fetching the two halves separately opens a window with the new token and the old principal. |
+| Attribution | The `CredentialBroker` label is the slot, not the source, and is unchanged. Audit and `_meta` gain non-secret `source` (scheme) and `version` (provider version id or file hash) fields; the version change across a rotation is the rotation evidence. |
+| Assignment policy | Which slot acts for which principal and environment remains ADR-006's per-vendor-per-environment rule; C.2 does not introduce per-principal credentials. |
+| Provider authentication | **Explicit mode, never a credential chain in production.** The lesson from the `aquavault` deployments: `DefaultAzureCredential`-style chains behave differently per environment and are for development only. Vault: Kubernetes auth from the projected service-account token (token TTL renewed or re-logged), AppRole outside Kubernetes, token auth for development; `X-Vault-Namespace` for Enterprise. AWS: IRSA / EKS Pod Identity web-identity token, else static keys; read `AWSCURRENT` only (rotation Lambdas stage `AWSPENDING`); region required. Azure: workload identity federation on AKS (`AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, no secret at all), managed identity via IMDS, or a service principal (tenant, client id, client secret). A service principal secret is itself a secret in a Kubernetes Secret — it moves the bootstrap problem, it does not remove it; federation is the recommended mode and the runbook says so. Key Vault is created with `--enable-rbac-authorization`; the role is **Key Vault Secrets User** at vault scope; role assignments propagate over minutes, so a fresh `403` is documented as expected, not a bug. |
+| Errors | Every provider failure maps to one typed, redacted error (`secret_source_unavailable`, with scheme and reference, never the value or the provider token); provider SDK or HTTP errors never reach the MCP error envelope. An unconfigured scheme is a typed error at startup, not a missing implementation. |
+| Redaction | Vault client tokens, Entra access tokens, and AWS session credentials are fixture secrets in the §8 redaction test alongside vendor credentials. |
+| Dependencies | Vault KV v2 and Key Vault are a handful of REST endpoints: hand-rolled over the pinned `reqwest`, no client crate (a second HTTP stack and a licence review for nothing). AWS is the exception: SigV4 is small, but the credential chain (IRSA, Pod Identity, IMDS, env) is where the SDK earns its keep — spike `aws-config` + `aws-sdk-secretsmanager`, record dependency count and binary size in the PR, exact-pin. Each provider behind a Cargo feature (`secrets-vault`, `secrets-aws`, `secrets-azure`); `file://` and `keychain://` are always on. |
+| Licensing note | HashiCorp Vault is BSL-licensed since 1.14; OpenBao is the MPL fork with the same KV v2 API. One adapter serves both, tested against both images. Neither is a Rust dependency, so `cargo deny` is unaffected. |
+
+**Order, and why `file://` is first.** A mounted Kubernetes Secret or a CSI
+Secrets Store volume (Vault, AWS, and Azure all ship CSI providers) is
+refreshed by the kubelet, so `file://` plus the existing watcher gives
+rotation without restart on all three clouds with zero new dependencies. It
+proves the reference syntax, the snapshot cache, the fail-closed startup,
+and the rotation tests before any cloud SDK lands. The native adapters then
+earn their place with what CSI cannot give: non-Kubernetes deployments,
+per-fetch audit in the provider's own log, and no plaintext on a `tmpfs`.
+
+**Tests.**
+
+| Test | Where | Proves |
+|---|---|---|
+| Rotation lock | `tests/`, wiremock upstream | Write v1, start, assert the upstream header; write v2, trigger refresh, assert the header changed with no restart; assert the audit record carries the new `version`. Fails on the unfixed (env-only) code. |
+| Real Vault container | ubuntu CI job with a `services:` block running `openbao/openbao` and `hashicorp/vault` in dev mode; tests skip unless `MCP_TEST_VAULT_ADDR` is set, so the macOS/Windows matrix stays green | Kubernetes/token auth, KV v2 read, TTL refresh, namespace header |
+| Published image | CI job that builds the repo `Dockerfile`, runs the distroless non-root read-only-root image with a `vault://` reference against that container, and asserts `/health` plus one tool call, `--no-default-features` | The image that ships can reach a provider; no `libsecret` in the headless path |
+| AWS / Azure contract | wiremock with captured fixtures | Request shape, auth header, `AWSCURRENT` selection, Key Vault `api-version`, error mapping. No first-party Key Vault emulator exists, so this is the CI-time coverage |
+| AWS / Azure live | Manually triggered job, GitHub Actions OIDC federation, no long-lived keys | The workload-identity path customers are steered to |
+| Redaction | Existing §8 grep, extended | Provider auth material never appears in logs, audit, usage, or envelopes |
+
+### 3.9 Backend-agnostic infrastructure (constraint 8)
+
+Decided 2026-09-03 (rev 2.10). §3.1 already lists the ports for the
+security path. This table extends the same rule to every infrastructure
+backend Phases C and D introduce, so a partner who runs Postgres, Valkey,
+or S3 rather than what we ship first is a new adapter, not a fork. The
+rule of `src/ports/mod.rs` still holds: a port exists only where a second
+implementation or a test seam is real, and here every row has both at day
+one.
+
+| Backend | Port | First adapter | Test adapter | Anticipated second adapter | Must not cross the port |
+|---|---|---|---|---|---|
+| Secret providers (C.2) | `SecretSource` (§3.8) | `file://` over a mounted volume | In-memory | Vault / OpenBao, AWS Secrets Manager, Azure Key Vault | Provider SDK types, HTTP errors, provider tokens |
+| Usage rollups and reports (C.6) | `RollupStore`: append usage rows, run the fixed set of report queries, prune | SQLite (embedded, pinned) | In-memory | PostgreSQL for partners who will not run a file database on `control` | SQL text, dialect-specific types, connection handles; queries are named operations on the port, not SQL passed through it |
+| Session store (§3.4, CF-16) | `SessionStore`: bind, look up, close, close-all-for-principal | In-process map (one gateway replica) | The same map | Redis / Valkey once a second gateway replica is real | Serialization format, client types, TTL mechanics |
+| Artifacts (§3.4) | `ArtifactStore`: put, get by id with owner check, pin, purge | Local volume | `tempfile`-backed | S3-compatible object storage, Azure Blob | Paths, bucket names, storage SDK types |
+| Audit forwarding (C.3) | `AuditForwarder`: deliver a batch of journal records, acknowledge | Syslog (RFC 5424, TLS) | In-memory capture | HTTP (Splunk HEC, generic JSON) | Wire framing, endpoint types; the journal remains the source of truth and acknowledgement is the only thing that comes back |
+| Metrics (C.6) | `UsageSink` (exists, §3.1) | Bounded channel to the rollup store | No-op | Prometheus exposition, OTLP | Exporter types, label formats |
+| Policy distribution (§3.4) | `PolicyBundleSource`: fetch the current signed bundle, watch for change | Local file (exists) | In-memory | Pull from `control` over HTTP | Transport types; signature verification stays in the domain |
+| Identity provider (A.1, C.1b) | `TokenValidator` (exists, §3.1) | The JWKS validator in `auth/okta.rs` with the **Okta profile** | `StaticValidator` | The **same validator** with an Entra, Keycloak, or Auth0 profile; EMA access tokens (C.1) | Vendor names. `PrincipalAuthority::Okta` and `AuthMode::Okta` carry the vendor into the domain and the config surface today; C.1b replaces them with an `oidc` mode plus a `profile` setting and an authority that records the issuer, keeping `okta` / `MCP_OKTA_*` as aliases |
+
+The identity-provider row deserves its own note, because it is the one
+place where "swappable" is a profile rather than an adapter. RS256 over a
+JWKS with `kid` rotation, background refresh, and a validated-token cache is
+the same for every OIDC provider; a second implementation of the trait
+would duplicate 900 lines to change four defaults, which is exactly the
+invented seam the port rule rejects. What differs per provider is small,
+and each item below is a fixture-locked test in `tests/token_validator_tests.rs`:
+
+| Provider | JWKS | Scopes | Subject | Groups | Gotchas the profile encodes |
+|---|---|---|---|---|---|
+| Okta (exists) | `{issuer}/v1/keys` | `scp` array | `sub` | `groups` (custom claim) | — |
+| Entra | discovery document (`.well-known/openid-configuration` → `jwks_uri`) | `scp` **string**, space-separated — today's `Option<Vec<String>>` fails to parse it | `oid`: `sub` is pairwise per application, so subject-keyed policy and revocation entries must bind to `oid` | `groups`, or `roles` for app roles | Groups **overage**: past ~200 groups the token carries `_claim_names` / `_claim_sources` and no `groups`; the validator must fail closed (reject or deny), never read it as "no groups". Audience may be `api://<client-id>`. v1 vs v2 issuer formats |
+| Keycloak | `{issuer}/protocol/openid-connect/certs` | `scope` string | `sub` | `groups` via a Group Membership mapper (values are paths, `/engineering`, unless "full path" is off), or nested `realm_access.roles` | `aud` is **absent** unless an audience mapper is configured (default `aud` is `account`), so the audience check needs an explicit realm setup step in the runbook; the groups claim is nested for realm roles, so the claim setting is a path, not a name; `/`-prefixed paths are normalised |
+| Auth0 | `{issuer}.well-known/jwks.json` | `scope` string | `sub` (`auth0\|…`, `google-oauth2\|…`) | Only a **namespaced custom claim** (`https://example.com/groups`) added by an Action; the claim name has a URL in it | The `iss` claim ends in a **trailing slash** and the configured issuer is trimmed today, so exact comparison fails; `aud` is an array (API identifier plus `userinfo`); the access token is a JWT only when an API audience is requested, otherwise opaque |
+
+How each profile is tested (same pattern as §3.8): Keycloak runs as a real
+container (`quay.io/keycloak/keycloak start-dev` with an imported realm) in
+the ubuntu CI job and replaces the mocked-JWKS path as the real-IdP proof for
+the whole validator, including rotation; Entra and Auth0 are fixture tokens
+in the exact claim shapes above, signed by a test key served from wiremock,
+plus a manually triggered live job against a developer tenant of each.
+
+Rules that apply to every row:
+
+- **Adapter conformance suite.** Each port ships one test module that runs
+  the same behavioural assertions against every adapter (first, test, and
+  any later one), so a new adapter is proven by running the existing suite,
+  not by writing a new one. This is how "swappable" is checked, rather than
+  asserted.
+- **Selection is configuration.** Which adapter runs is a URI-shaped setting
+  (`sqlite:///var/lib/mcp/rollups.db`, `postgres://…`, `redis://…`,
+  `s3://bucket/prefix`), resolved at startup in `bootstrap/`, and only there.
+  A scheme with no adapter compiled in is a typed startup error, so a
+  partner who enables a feature they did not build sees the cause, not a
+  panic.
+- **Features, not forks.** Heavy adapters (cloud SDKs, database drivers) are
+  Cargo features, exact-pinned, passing `cargo deny`; the first adapter of
+  every row is always on. The allocation gate (`benches/response_pipeline`)
+  runs with the default feature set, and any adapter on the request path
+  (session store, artifact store) has its own harness row.
+- **Migrations belong to the adapter.** A schema change is the adapter's
+  concern, versioned and forward-only, applied at startup before the port is
+  handed out. The domain never learns the schema exists.
+- **Same failure posture as §3.8.** Startup fails closed when a configured
+  backend is unreachable; at runtime the port's contract says which
+  operations degrade (rollups may drop with a counter, sessions may miss and
+  force re-initialise) and which never do (audit records, artifact owner
+  checks).
+
 ## 4. Phases and gates
 
 Sizes are relative (S ≈ days, M ≈ 1–2 weeks, L ≈ 3–5 weeks for one engineer
@@ -416,6 +553,12 @@ written before dispatch.
   policy engine move to the private repository or ADR-001 is amended.
 - [ ] Gate A — owner-led: a partner, their IdP, their non-production upstream.
   Steps, what is under test, and the exit are in `docs/gate-a-runbook.md`.
+- [ ] Gate A runs **behind the partner's existing gateway** (Cloudflare One,
+  Kong, agentgateway, or Okta's Runtime Agent Gateway — whichever they
+  already run), so the deployment tested is "the governed backend behind
+  your gateway", not a second ingress. Add the topology to the runbook and
+  one ingress example under `deploy/k8s/`. Rationale:
+  [`docs/competitive-landscape.md` §5](competitive-landscape.md#5-what-the-survey-changes-taken-together).
 - [ ] `SECURITY.md` + disclosure process (security track, before Gate A).
 
 > **Gate A — problem validation.** One partner runs Phase A against their real
@@ -423,7 +566,12 @@ written before dispatch.
 > problem is material; they explicitly accept the shared-identity model
 > (ADR-006: read-only shared accounts, per-vendor-per-environment credentials,
 > no silent fallback, `authority=shared` labelling, upstream-vs-gateway
-> attribution documented); the second vendor is chosen from their workflow.
+> attribution documented); the second vendor is chosen from their workflow;
+> they name which of the products in
+> [`docs/competitive-landscape.md`](competitive-landscape.md) they already
+> run and say, in their words, why they would still buy this (the answer
+> tests the brief's "integrations are not the moat" bet against the Arcade
+> counterexample).
 > If they reject shared identity, one delegated integration moves into Phase B.
 
 ### Phase B — Product differentiation (weeks 9–16)
@@ -477,12 +625,16 @@ measured — and the partner can produce an access-review export themselves.
 
 | WP | Work | Size |
 |---|---|---|
-| C.1 | EMA: re-read the current `ext-auth` stable revision; advertise `io.modelcontextprotocol/enterprise-managed-authorization`; ID-JAG exchange (RFC 7523 + 8693), preferring Okta as the AS; interop matrix Claude web/desktop, Claude Code, VS Code, **Codex** (or narrow the public claim) | L |
-| C.2 | External secret provider (Vault or partner's choice); credential rotation without restart; assignment policy | M |
-| C.3 | SIEM forwarding from `control` (syslog or HTTP) | M |
+| C.1 | EMA: re-read the current `ext-auth` stable revision; advertise `io.modelcontextprotocol/enterprise-managed-authorization`; ID-JAG exchange (RFC 7523 + 8693), preferring Okta as the AS and interoperating with Okta Cross-App Access (`sub` + `act` claims) as the production ID-JAG deployment to test against; interop matrix Claude web/desktop, Claude Code, VS Code, **Codex** (or narrow the public claim) | L |
+| C.1b | OIDC provider profiles (§3.9): `oidc` auth mode with `MCP_OIDC_*` keys and a `profile` setting, `okta` / `MCP_OKTA_*` kept as aliases, `PrincipalAuthority` carries the issuer not a vendor; claim fixes (`scp` string-or-array, configurable subject claim, Entra overage fails closed, Auth0 trailing-slash issuer, Keycloak `aud` and group-path normalisation); Entra, Keycloak, Auth0 profiles with fixture-locked tests; Keycloak container CI job as the real-IdP proof; `docs/configuration.md` re-worded from "required for `okta`"; runbook per provider | M |
+| C.2a | `SecretSource` port, reference-URI syntax (`keychain://` alias, `file://`), snapshot cache with background refresh, fail-closed startup / last-good runtime, atomic multi-part secrets, `source`/`version` in audit and `_meta`, rotation-lock test, CSI Secrets Store example in `deploy/k8s/` (§3.8) | M |
+| C.2b | HashiCorp Vault / OpenBao KV v2 adapter (`vault://`, feature `secrets-vault`): Kubernetes, AppRole, and token auth; TTL renewal; namespace header; real-container CI job and published-image job (§3.8) | M |
+| C.2c | AWS Secrets Manager adapter (`awssm://`, feature `secrets-aws`): SDK spike recorded (deps, binary size), IRSA / Pod Identity, `AWSCURRENT`; wiremock contract tests; OIDC-federated live job | M |
+| C.2d | Azure Key Vault adapter (`azkv://`, feature `secrets-azure`): workload identity federation, managed identity, service principal; RBAC runbook (Secrets User, propagation delay, name mapping); wiremock contract tests; OIDC-federated live job | M |
+| C.3 | SIEM forwarding from `control` behind the `AuditForwarder` port (§3.9): syslog first, HTTP second, conformance suite across both | M |
 | C.4 | Admin API (`/admin/*`, `mcp:admin` scope, separate rate limit): policy read/validate/reload/diff, principal lookup, session list/revoke, artifact list/purge, deny-list, reports, usage | M |
 | C.5 | `mcp-devtools admin` CLI over C.4, `--json` on every command | M |
-| C.6 | Prometheus metrics; per-principal rate limits; usage rollups (SQLite, pinned) | M |
+| C.6 | Prometheus metrics behind `UsageSink`; per-principal rate limits; usage rollups behind the `RollupStore` port (§3.9) with SQLite (pinned) as the first adapter, in-memory for tests, and PostgreSQL scoped when a partner asks; `sqlite://` / `postgres://` selection in configuration | M |
 | C.7 | Helm chart; backup/restore; upgrade + rollback; SBOM (CycloneDX) and signed releases in `release.yml` | M |
 
 ### Phase D — Administration experience (after Phase C; each item behind demonstrated demand)
@@ -493,7 +645,7 @@ measured — and the partner can produce an access-review export themselves.
 | D.2 | Two-person approval for policy change and credential rotation — **enforced in the admin API**; console and CLI merely surface it | M |
 | D.3 | Console v2: policy authoring with validation and diff | L |
 | D.4 | Additional packaging: `.deb`/`.rpm`, compose reference stack, air-gap runbook (pinned JWKS from file, offline licence, mirrorable images, `cargo vendor` tarball), OVA only on request | M |
-| D.5 | Delegated OAuth, one vendor at a time, each behind its own gate | L each |
+| D.5 | Delegated OAuth, one vendor at a time, each behind its own gate; the exchange is C.1's ID-JAG wherever the vendor's authorization server accepts it (an Okta shop hands us a `sub`+`act` assertion and we exchange it downstream), a bespoke per-vendor OAuth flow only where it does not — no second delegation mechanism | L each |
 
 ## 5. Non-engineering tracks (run in parallel)
 
@@ -502,7 +654,7 @@ measured — and the partner can produce an access-review export themselves.
 | Design partners | M0 | GTM / founder | 1 commitment by M0 exit; 2 trials complete by Gate B; trial agreement template (duration, support, metrics, data collected, security terms, conversion rights, post-trial pricing) |
 | Security & compliance | M0 | Security engineer | Threat model (0.2); `SECURITY.md` + disclosure process before Gate A; SBOM (C.7); pen-test before Gate B; SOC 2 readiness plan |
 | Legal | M0 | Counsel | `LICENSE`, ADR-001/002, CLA, trial agreement, DPA template |
-| GTM | Phase A | GTM | Business-plan sections in §6; pricing hypothesis test; pitch deck; competitive matrix |
+| GTM | Phase A | GTM | Business-plan sections in §6; pricing hypothesis test; pitch deck whose positioning is the *combination* (egress enforcement on the owned request, resource-aware policy, brokered identity, sealed evidence, one self-hosted binary), not any single axis; competitive matrix maintained in [`docs/competitive-landscape.md`](competitive-landscape.md) |
 | Docs | Every phase | Engineer on the phase | Admin guide, IdP runbooks, policy authoring guide with the profile files as examples |
 
 ## 6. Business-plan gaps to close before Gate B
@@ -517,7 +669,7 @@ not from this document.
 | Target-market definition | Firm size, regulated status, number of engineering systems, MCP-client adoption, private-cloud requirement | GTM | Gate A |
 | Bottom-up market model | Reachable accounts, expected ACV, penetration assumptions, services revenue | GTM | Gate B |
 | Buyer and procurement map | Economic buyer, security approver, platform owner, daily admin, legal path, sales cycle | GTM | Gate B |
-| Competitive matrix | First-party connectors, protocol gateways, API gateways, identity vendors, this product | GTM + Eng | Gate A |
+| Competitive matrix | First-party connectors, protocol gateways, API gateways, identity vendors, this product; assessed entries and the running matrix live in [`docs/competitive-landscape.md`](competitive-landscape.md) | GTM + Eng | Gate A |
 | Packaging and pricing | Community / Enterprise Core / Enterprise Plus: environments, users, support, secret providers, SIEM paths, deployment options | GTM | Gate B |
 | Design-partner program | Trial terms (see §5) | GTM + Legal | M0 |
 | Operating plan | Engineering, security, support, legal, compliance, docs, sales staffing | Founder | Gate B |
@@ -549,7 +701,9 @@ CI gates from Phase A onward.
 - Threat model (0.2) re-reviewed at each gate; every mitigation maps to a test.
 - Secrets hygiene: tokens and credentials never appear in logs, audit, usage,
   error envelopes, or `Debug` output — enforced by a redaction test that greps
-  every emitted line in the integration suite for fixture secrets.
+  every emitted line in the integration suite for fixture secrets. From C.2
+  the fixture set includes provider authentication material (Vault client
+  tokens, Entra access tokens, AWS session credentials).
 - Default-deny everywhere: policy (`unknown` resource type is denied), admin
   scope, artifact ownership, cache partitioning, bind address.
 - Client identity (`client_name`/`client_version`) is telemetry; it is an
@@ -573,6 +727,7 @@ enterprise mode must not move it noticeably.
 | Durable audit (intent + decision) | < 200 µs p99 on local NVMe; one fsync per writer batch (concurrent appends group-commit), never fewer — an acknowledged record is on disk | Append-only journal; sequence numbers; per-line hash chain; checkpoint every N records or T seconds, signed (a checkpoint is a signature boundary, not a sync boundary). **Never dropped; fail closed if the journal is unwritable** |
 | Usage write | Off the request path | Bounded channel; drop-with-counter |
 | Cache partitioning | No measurable change | Fixed-width principal hash prefix in the key |
+| Secret resolution (C.2) | No provider call on the request path; snapshot read only | Background refresher fills a `RwLock<Arc<…>>` snapshot (§3.8); a provider outage degrades health, never `/mcp` latency |
 | Admin API / console | Never contends with `/mcp` | Separate limiter and task budget; queries hit rollups, not the journal |
 
 Each budget gets a `benches/` harness (`harness = false`) and a CI smoke run
@@ -594,6 +749,13 @@ that fails on a > 20 % regression against the checked-in baseline.
 | Console scope grows ahead of the API | Medium | Rewrites | Console only in Phase D; approval enforced in the API | Product |
 | Usage tracking captures sensitive data | Medium | Privacy breach | Metadata-only schema in the threat model; redaction test covers usage rows | Security |
 | Policy hot-reload races in-flight calls | Medium | Inconsistent decisions | Decisions snapshot the policy `Arc` per call | Eng |
+| Secret provider unreachable | Medium | Gateway cannot act upstream | Fail closed at startup; last good value at runtime with degraded health; `401`-triggered early refresh, rate-limited (§3.8) | Eng |
+| Rotation skew between the halves of a two-part credential | Medium | Upstream auth failures mid-rotation | One JSON secret per multi-part credential, swapped atomically (§3.8) | Eng |
+| Cloud SDKs bloat the binary and the dependency tree | Medium | Slower builds, larger attack surface | Vault and Key Vault hand-rolled over the pinned `reqwest`; AWS SDK spiked and measured before adoption; every provider behind a Cargo feature (§3.8) | Eng |
+| Provider credential chain picks the wrong identity per environment | Medium | Silent misconfiguration, wrong-tenant reads | Explicit auth mode per provider, chains rejected in production; federation recommended and documented (§3.8) | Eng |
+| A backend leaks through its port (SQL in the domain, SDK types in signatures) | Medium | Partner's backend becomes a fork | Constraint 8; per-port adapter conformance suite; review checklist item on every C/D PR (§3.9) | Eng |
+| A second IdP's claim shape is misread (Entra `scp` string, pairwise `sub`, groups overage) | High for Entra | Silent loss of groups or wrong subject binding, so policy allows or denies the wrong people | Profiles with fixture-locked tests per provider; overage fails closed; subject claim explicit (§3.9, C.1b) | Eng |
+| Protocol gateways and identity vendors absorb tool-level policy, credential brokerage and audit (agentgateway, Cloudflare One, Kong, Okta Runtime Agent Gateway, Pomerium; obsigno and cMCP on signed audit) | High | The generic half of Phase A (bearer validation, tool allow-lists, access logs) stops being saleable; a buyer asks "why not the gateway I already run?" | Position as the governed backend behind that gateway (Gate A topology); pitch the combination, never one axis; keep the differentiators the proxies cannot reach — the record names the classified resource and the upstream identity because its writer built the request; track in [`docs/competitive-landscape.md`](competitive-landscape.md) and re-score before each gate | Product + GTM |
 
 ## 10. Definition of done for the committed scope (M0 + A + B)
 
@@ -620,6 +782,8 @@ that fails on a > 20 % regression against the checked-in baseline.
 5. Degraded-read mode when audit is unavailable: offer it at all in v1?
 6. Codex: support claim or drop from the brief?
 7. External references in the brief have not been re-verified since August 2026; verify before external circulation.
+8. C.2 placement: do the `SecretSource` port, cache, and `file://` step live in the community crate with only the three cloud adapters in the enterprise crate, or does everything stay in the community crate under Cargo features per the CF-18 decision (rev 2.9)? The packaging line in §6 lists secret providers as a tier differentiator, which argues for the former; CF-18 argues for the latter while the repository is private. Decide before C.2b starts.
+9. Which moat does the partner believe in — governance over a small, resource-classified tool set (this plan) or catalogue breadth with brokered auth (Arcade, MintMCP)? Asked at Gate A; see [`docs/competitive-landscape.md` §5](competitive-landscape.md#5-what-the-survey-changes-taken-together).
 
 ## 12. Immediate next steps
 
@@ -628,3 +792,6 @@ that fails on a > 20 % regression against the checked-in baseline.
 3. Send the outreach kit to the first two candidate design partners; get one commitment in writing.
 4. Land WP 0.4 (types, `MCP_AUTH_MODE`, fail-closed bind, local-mode-unchanged test) and WP 0.5 (rmcp extensions spike).
 5. Start WP 0.8 with Grafana (datasource extractor) and Jira's `POST /rest/api/3/search/jql` (the canonical example), so the `ActionContext` schema is proven against both a purpose-built and a passthrough tool before it is frozen.
+6. Before Gate A: re-verify the brief's external references (§11 item 7) and
+   re-score the competitive register's placeholder rows (Atlassian managed
+   MCP, Snowflake Cortex AI Gateway, Composio/Nango) from primary material.
