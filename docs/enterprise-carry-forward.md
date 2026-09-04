@@ -10,13 +10,22 @@ removed only when it is done, not when it is explained.
 
 Status legend: **open** · **blocked** (needs a decision) · **done**.
 
-Last updated: 2026-09-04, at the start of `feat/phase-c-operations` (plan
+Last updated: 2026-09-04, after C.3 (SIEM forwarding behind the
+`AuditForwarder` port) landed on `feat/phase-c-operations` (plan §0 rev
+2.17). Opened CF-32 (TCP syslog carries no acknowledgement; the adapter
+detects a closed peer within a grace window and RELP would close the
+residual) and CF-33 (in the split topology the control replica reads the
+gateway's journal volume rather than receiving the push §3.4 sketches;
+one shipper per journal; no prune-after-acknowledgement). The allocation
+baseline below gained the C.3 note.
+
+Previously: 2026-09-04, at the start of `feat/phase-c-operations` (plan
 §0 rev 2.16): C.2c and C.2d are deferred until a partner asks for a native
 cloud adapter, so CF-30 and plan §11 item 8 are now **deferred with
 C.2c–d** rather than open; the CSI Secrets Store provider plus `file://`
 is the supported path on both clouds meanwhile. Nothing else changed.
 
-Previously: 2026-09-04, after C.2b (the `vault://` secret source)
+Before that: 2026-09-04, after C.2b (the `vault://` secret source)
 landed on `feat/phase-c-secret-sources` (plan §0 rev 2.15). CF-30 narrowed
 to the two cloud adapters and their placement (§11 item 8), with the
 `aws-config` spike named as the input that decision needs. Nothing new
@@ -26,14 +35,14 @@ rather than a register item, because no CI environment can supply a
 cluster or an Enterprise server. The allocation baseline below gained the
 C.2b note.
 
-Before that: 2026-09-04, after C.1b (OIDC provider profiles) landed on
+Earlier: 2026-09-04, after C.1b (OIDC provider profiles) landed on
 `feat/phase-c-secret-sources` (plan §0 rev 2.14). Opened CF-31 (the
 manually triggered Entra and Auth0 live jobs against developer tenants are
 not built; those profiles are fixture-locked only). CF-18's reading now
 covers `auth/oidc.rs` as it did `auth/okta.rs`. The allocation baseline
 gained the C.1b note.
 
-Earlier still: 2026-09-04, after C.2a (secret references) landed on
+Before that still: 2026-09-04, after C.2a (secret references) landed on
 `feat/phase-c-secret-sources` (plan §0 rev 2.13). Opened CF-28 (the
 one-shot CLI refuses references rather than resolving them), CF-29
 (`NINJAONE_SERVERS` nested credentials take no references), and CF-30 (the
@@ -446,6 +455,44 @@ before Gate A if the partner is on either provider (plan §11 item 2). Until
 then a claim-shape drift at Entra or Auth0 is found by the partner, not by
 CI.
 
+### CF-32 · TCP syslog has no acknowledgement; RELP would
+**Open · Phase C (C.3); a second syslog adapter when a partner's relay speaks RELP**
+
+The `syslog+tls://` adapter can only know that the peer is still there:
+it checks before writing to a reused connection (a zero-wait read) and
+listens for a close or a TLS alert for 50 ms after every flushed batch
+(`audit::forward::syslog::POST_WRITE_GRACE`), then acknowledges. A
+receiver that takes the bytes and dies inside that window without
+writing them loses that batch, and nothing re-sends it — the shipper's
+cursor has moved. The runbook therefore steers the receiver to a
+**local relay with a disk queue** (rsyslog, syslog-ng), where the window
+holds only what a `close` can carry, and the relay's own retries cover
+the WAN. RELP (rsyslog's Reliable Event Logging Protocol; syslog-ng has
+no client, rsyslog has `omrelp`/`imrelp`) acknowledges per message and is
+the adapter that closes the gap properly: same port, a `relp+tls://`
+scheme, a per-batch ack. HEC and the JSON endpoint already acknowledge
+(`2xx` after the whole body), so this item is syslog-only.
+
+### CF-33 · Split topology: the control replica reads the gateway's journal volume; one shipper per journal; no pruning
+**Open · Phase C (C.7 or when a partner runs the split topology)**
+
+§3.4 sketches the gateway *pushing* audit to `control` and retaining its
+journal until acknowledged. C.3 built the acknowledgement (the control
+side's cursor) and the forwarding, but not the push: in
+`--role control` the shipper reads the gateway's journal *file*
+(`MCP_AUDIT_FORWARD_JOURNAL_DIR`, a read-only mount of the gateway's
+volume; `deploy/k8s/control.yaml` shows it) and keeps its cursor on its
+own volume (`MCP_AUDIT_FORWARD_STATE_DIR`). That needs storage readable
+from another pod — `ReadWriteMany`, or a single node — and it is one
+shipper per journal, so several gateway replicas need several control
+shippers or a fan-in that does not exist. The journal is also one
+append-only file with no rotation, so "retain until acknowledged" is
+"retain": pruning up to the acknowledged sequence — a rotation the
+verifier understands (the chain and checkpoints span files) — is not
+built. Decide with the affinity half of CF-16 when horizontal scaling is
+scoped; until then `--role all` and the single-replica split are the
+tested shapes.
+
 ## Decisions we owe someone
 
 ### CF-10 · ADR-002: the enterprise licence
@@ -772,6 +819,18 @@ startup only, and a `vault://` value is read from the same snapshot a
 `file://` value is (`Config::get_for`, the one-byte scheme dispatch C.2a
 recorded). `SecretResolver::from_config` runs once in
 `ServerBuilder::build`.
+
+Re-run after C.3 (2026-09-04, rev 2.17): every stage's byte and
+allocation count is identical to the table above (JWT cache hit 9 at
+3.7 µs, journal append 6 at p50 11 µs / p99 16 µs / max 101 µs; every
+extractor and render stage unchanged). C.3 adds nothing to the request
+path: the shipper is a background task on the control plane that
+*reads* the journal file, the adapters are called from it only, and the
+append path gained no branch — the one new thing the writer's callers
+see is `Role::serves_control`, evaluated once at startup. The health
+banner reads one more `Mutex<Option<&'static str>>`. The syslog and HTTP
+adapters allocate per batch (one frame buffer, one body), never per
+request. No new probe row: nothing here runs on the request path.
 
 Notes for the Phase C comparison:
 
