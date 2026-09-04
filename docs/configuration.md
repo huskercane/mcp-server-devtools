@@ -172,6 +172,12 @@ integration settings, so they may live in the environment, `.env`, or a
 | `MCP_AUDIT_FORWARD_ORIGIN` | `$HOSTNAME`, else `mcp-server-devtools` | What this process calls itself to the receiver: the syslog `HOSTNAME` field, the HEC `host`. Set it per gateway when several forward to one receiver. |
 | `MCP_AUDIT_FORWARD_CA_FILE` | — | PEM file holding the CA that signed the receiver's certificate, added to the system trust store, for a private CA. |
 | `MCP_AUDIT_FORWARD_CLIENT_CERT` / `MCP_AUDIT_FORWARD_CLIENT_KEY` | — | (syslog) A PEM client certificate and its PKCS#8, SEC1, or PKCS#1 key, for a receiver that requires mutual TLS. Both or neither. |
+| `MCP_ROLLUP_STORE` | — | Usage-rollup backend on a role that serves the control plane: `sqlite:///absolute/path.db` (embedded SQLite) or `memory://` (development/tests). `postgres://` is reserved and refuses startup until that adapter is built. Rows contain usage metadata, including tenant and subject, but never arguments, content, or credentials. In a split `gateway`/`control` topology usage is not yet pushed between roles (CF-33); run `all` for complete rollups. See [`usage-and-metrics-runbook.md`](usage-and-metrics-runbook.md). |
+| `MCP_ROLLUP_RETENTION_DAYS` | `90`; `0` keeps all | Age of usage rows retained by the hourly pruning task. This is independent of the audit journal's evidence retention. |
+| `MCP_USAGE_CHANNEL_CAPACITY` | `4096`; clamped to `64`–`65536` | Capacity of the non-blocking channel from tool calls to the rollup consumer. A full or closed channel drops usage and increments `mcp_usage_events_dropped_total`; it never delays or refuses a tool call. |
+| `MCP_METRICS` | off | `on` or `true` exposes unauthenticated `GET /metrics` in Prometheus text format. Labels are bounded to vendor/tool/decision/outcome and never contain a subject, tenant, token, arguments, or content. Keep the endpoint cluster-internal. |
+| `MCP_RATE_LIMIT_PER_PRINCIPAL` | `0` (off) | Sustained requests per second for each validated subject; positive decimals are accepted. Enforced after bearer validation and the `mcp:tools` scope check. The limiter is in-process and therefore assumes one gateway replica (CF-16). A refusal is HTTP 429 with `Retry-After`. |
+| `MCP_RATE_LIMIT_BURST` | twice the rate, at least `1` | Token-bucket capacity per principal. Must be at least 1 when the rate limit is enabled. |
 | `MCP_SECRET_REFRESH_INTERVAL_SECONDS` | `30`; clamped to `1`–`3600` | How often secret references (`file://…`, "Secret references" above) are re-read. Not enterprise-only: applies whenever the configuration holds a reference. |
 | `MCP_VAULT_ADDR` | — | Enables the `vault://` adapter: the Vault / OpenBao address, `https://vault.example:8200`. Must be `https`, or `http` on loopback (a dev server, or a Vault Agent sidecar on the pod). Read at startup; not hot-reloaded. |
 | `MCP_VAULT_AUTH` | — (required with `MCP_VAULT_ADDR`) | `kubernetes`, `approle`, or `token`. Explicit: the adapter never tries one method and falls back to another. |
@@ -214,4 +220,3 @@ These are read directly from the process environment during startup. They do **n
 | `AUDIT_LOG_RETENTION_MAX_BYTES` | `104857600` (100 MiB) | Total size limit for prior-session audit logs. |
 
 Diagnostic and audit logs are written below `~/.mcp/data`. Diagnostic log retention is fixed at seven days and 50 MiB; audit retention is configurable as shown above.
-

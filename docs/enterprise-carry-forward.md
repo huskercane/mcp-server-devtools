@@ -10,7 +10,15 @@ removed only when it is done, not when it is explained.
 
 Status legend: **open** · **blocked** (needs a decision) · **done**.
 
-Last updated: 2026-09-04, after C.3 (SIEM forwarding behind the
+Last updated: 2026-09-04, after C.6 (usage rollups, Prometheus metrics,
+and per-principal rate limiting) landed on `feat/phase-c-operations`
+(plan §0 rev 2.18). CF-16 now records that the limiter is in-process and
+therefore single-replica. CF-33 now covers gateway-to-control usage
+delivery as well as the existing journal reach/pruning gap. The allocation
+baseline gained stage −1d: limiter and known Prometheus series are
+allocation-free; Prometheus-plus-channel fan-out is 9 allocations.
+
+Previously: 2026-09-04, after C.3 (SIEM forwarding behind the
 `AuditForwarder` port) landed on `feat/phase-c-operations` (plan §0 rev
 2.17). Opened CF-32 (TCP syslog carries no acknowledgement; the adapter
 detects a closed peer within a grace window and RELP would close the
@@ -348,6 +356,11 @@ could not deliver:
   the stale binding. A revocation generation on bindings would close the
   cosmetic gap; do it when session affinity (above) is designed, since
   both touch the binding step.
+- **Rate limiting (C.6).** The per-principal token bucket is deliberately
+  in-process and keyed by validated subject. With several gateway replicas,
+  each replica grants its own budget, so the configured rate is multiplied
+  by replica count. Move it behind the shared session/scaling design (or a
+  dedicated limiter port) before raising the gateway replica count.
 
 ### CF-17 · Credential-provider bootstrap traffic is outside the egress policy
 **Open · Phase B (with the vendor read profiles)**
@@ -473,7 +486,7 @@ the adapter that closes the gap properly: same port, a `relp+tls://`
 scheme, a per-batch ack. HEC and the JSON endpoint already acknowledge
 (`2xx` after the whole body), so this item is syslog-only.
 
-### CF-33 · Split topology: the control replica reads the gateway's journal volume; one shipper per journal; no pruning
+### CF-33 · Split topology: journal and usage delivery to control; one shipper per journal; no pruning
 **Open · Phase C (C.7 or when a partner runs the split topology)**
 
 §3.4 sketches the gateway *pushing* audit to `control` and retaining its
@@ -492,6 +505,15 @@ verifier understands (the chain and checkpoints span files) — is not
 built. Decide with the affinity half of CF-16 when horizontal scaling is
 scoped; until then `--role all` and the single-replica split are the
 tested shapes.
+
+C.6 has the analogous usage gap: only a process that serves the control
+plane attaches the bounded channel to its `RollupStore`, while a pure
+`gateway` process is where tool calls produce usage. There is no push or
+shared queue between them, so a split deployment's control database stays
+empty. `MCP_ROLE=all` is the supported complete-rollup shape until the
+gateway pushes usage to control (bounded and lossy by the `UsageSink`
+contract), or a shared store/queue adapter is selected with the scaling
+work above.
 
 ## Decisions we owe someone
 
@@ -779,6 +801,9 @@ and every extractor stage is byte-for-byte what Phase A recorded.
 | −1b `FilePolicy::evaluate` @ 500 rules (enterprise only) | 0 | 5 | 5 |
 | −1c JWT validate, cache hit (enterprise only; §8 budget 50 µs) | 1 KB | **9** | 8 — 3.7 µs (was 3.5) |
 | −1c journal append, sequential (enterprise only; §8 budget p99 200 µs) | 1 KB | 6 | 6 — p50 11 µs, p99 18–31 µs, max ≈ 100 µs (chain hash per line) |
+| −1d rate-limit check, known subject (enterprise only) | 0 | 0 | new in C.6 |
+| −1d `PrometheusUsageSink::record`, known series (enterprise only) | 0 | 0 | new in C.6 |
+| −1d Prometheus + bounded-channel fan-out (enterprise only) | <1 KB | 9 | new in C.6 |
 | 0 `ConfigHandle::snapshot()` | 0 | 0 | 0 |
 | 1 `apply_jq_filter(None)` | 0 | 0 | 0 |
 | 2 `render(Toon)` @ 500 issues | 1736 KB | 19 032 | 19 032 |
@@ -831,6 +856,19 @@ see is `Role::serves_control`, evaluated once at startup. The health
 banner reads one more `Mutex<Option<&'static str>>`. The syslog and HTTP
 adapters allocate per batch (one frame buffer, one body), never per
 request. No new probe row: nothing here runs on the request path.
+
+Re-run after C.6 (2026-09-04, rev 2.18): every pre-existing stage's byte
+and allocation count is identical to the table above (JWT cache hit 9 at
+3.79 µs; journal append 6 at p50 12 µs / p99 37 µs / max 149 µs; every
+extractor and render stage unchanged). Stage −1d adds the three C.6
+request-path operations: a token-bucket check for an existing subject is
+0 bytes / 0 allocations; recording into an existing Prometheus series is
+0 / 0; fan-out to Prometheus plus the bounded rollup channel is <1 KB / 9
+allocations. The fan-out cost is the owned usage event sent across the
+task boundary (tenant, subject, tool, vendor, environment, decision, risk,
+and outcome); it is new functionality rather than growth in an existing
+stage, and remains non-blocking. No pre-existing row moved, so the 20 %
+regression gate passes.
 
 Notes for the Phase C comparison:
 

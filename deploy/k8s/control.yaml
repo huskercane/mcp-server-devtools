@@ -1,6 +1,6 @@
 # The control role. Phase A: health only. Phase C adds SIEM forwarding here
-# (C.3, below); the admin API, rollups, and the console follow behind this
-# same Service.
+# (C.3, below) and owns the rollup database (C.6); the admin API and the
+# console follow behind this same Service.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -50,6 +50,14 @@ spec:
             #- { name: MCP_AUDIT_FORWARD_JOURNAL_DIR, value: "/gateway-journal" }
             #- { name: MCP_AUDIT_FORWARD_STATE_DIR, value: "/forward-state" }
             #- { name: MCP_AUDIT_FORWARD_ORIGIN, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            # --- Usage rollups and Prometheus metrics (WP C.6) ------------
+            # In the current split-role topology gateways do not yet push
+            # usage here (CF-33), so apply these settings to MCP_ROLE=all
+            # until that transport lands.
+            #- { name: MCP_ROLLUP_STORE, value: "sqlite:///var/lib/mcp-devtools/usage.db" }
+            #- { name: MCP_ROLLUP_RETENTION_DAYS, value: "90" }
+            #- { name: MCP_USAGE_CHANNEL_CAPACITY, value: "4096" }
+            #- { name: MCP_METRICS, value: "on" }
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -62,6 +70,7 @@ spec:
             #- { name: gateway-journal, mountPath: /gateway-journal, readOnly: true }
             #- { name: forward-state, mountPath: /forward-state }
             #- { name: forward-tls, mountPath: /forward-tls, readOnly: true }
+            #- { name: rollups, mountPath: /var/lib/mcp-devtools }
           readinessProbe:
             exec: { command: ["/mcp-devtools", "health"] }
             periodSeconds: 10
@@ -77,6 +86,8 @@ spec:
         #  persistentVolumeClaim: { claimName: mcp-devtools-forward-state }
         #- name: forward-tls
         #  secret: { secretName: mcp-devtools-forward-tls }
+        #- name: rollups
+        #  persistentVolumeClaim: { claimName: mcp-devtools-rollups }
 ---
 apiVersion: v1
 kind: Service
