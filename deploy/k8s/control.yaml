@@ -1,5 +1,6 @@
-# The control role. Phase A: health only. Phases C/D add the admin API,
-# rollups, SIEM forwarding, and the console behind this same Service.
+# The control role. Phase A: health only. Phase C adds SIEM forwarding here
+# (C.3, below); the admin API, rollups, and the console follow behind this
+# same Service.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -34,12 +35,33 @@ spec:
             # it an admin API of its own.
             - { name: MCP_AUTH_MODE, value: "off" }
             - { name: MCP_BIND_ADDR, value: "127.0.0.1" }
+            # --- Audit forwarding to a SIEM (WP C.3) -----------------------
+            # The control role ships the gateway's journal to the receiver
+            # named here; the gateway never does (its budget is the request
+            # path). The journal it reads is the gateway's volume, mounted
+            # read-only below; the cursor lives on the control replica's own
+            # volume. Uncomment one receiver. See docs/siem-forwarding-runbook.md.
+            #- { name: MCP_AUDIT_FORWARD_URL, value: "syslog+tls://syslog-relay.logging.svc:6514" }
+            #- { name: MCP_AUDIT_FORWARD_CA_FILE, value: "/forward-tls/ca.pem" }
+            #- { name: MCP_AUDIT_FORWARD_CLIENT_CERT, value: "/forward-tls/tls.crt" }
+            #- { name: MCP_AUDIT_FORWARD_CLIENT_KEY, value: "/forward-tls/tls.key" }
+            #- { name: MCP_AUDIT_FORWARD_URL, value: "https://splunk-hec.example:8088/services/collector/event" }
+            #- { name: MCP_AUDIT_FORWARD_TOKEN, value: "file:///forward-secrets/hec-token" }
+            #- { name: MCP_AUDIT_FORWARD_JOURNAL_DIR, value: "/gateway-journal" }
+            #- { name: MCP_AUDIT_FORWARD_STATE_DIR, value: "/forward-state" }
+            #- { name: MCP_AUDIT_FORWARD_ORIGIN, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: { drop: ["ALL"] }
           volumeMounts:
             - { name: tmp, mountPath: /tmp }
+            # For forwarding: the gateway's journal (ReadWriteMany, or the
+            # same node's volume in a single-node cluster), the cursor
+            # directory, and the receiver's TLS material.
+            #- { name: gateway-journal, mountPath: /gateway-journal, readOnly: true }
+            #- { name: forward-state, mountPath: /forward-state }
+            #- { name: forward-tls, mountPath: /forward-tls, readOnly: true }
           readinessProbe:
             exec: { command: ["/mcp-devtools", "health"] }
             periodSeconds: 10
@@ -49,6 +71,12 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        #- name: gateway-journal
+        #  persistentVolumeClaim: { claimName: mcp-devtools-journal, readOnly: true }
+        #- name: forward-state
+        #  persistentVolumeClaim: { claimName: mcp-devtools-forward-state }
+        #- name: forward-tls
+        #  secret: { secretName: mcp-devtools-forward-tls }
 ---
 apiVersion: v1
 kind: Service

@@ -117,7 +117,12 @@ curl -sS -H "Authorization: Bearer $TOKEN" \
 
 Horizontal gateway scaling (session affinity, a shared artifact volume),
 the control plane's admin API, Prometheus metrics, and Helm packaging are
-Phase C (plan §4). The native Vault / OpenBao adapter (`vault://`,
+Phase C (plan §4). SIEM forwarding landed in C.3: the commented block in
+`control.yaml` shows the control replica shipping the gateway's journal
+(mounted read-only) to a syslog relay or a Splunk collector; the split
+topology needs the journal volume readable from the control pod, which
+means `ReadWriteMany` storage or a single node (CF-33 in the
+carry-forward register). The native Vault / OpenBao adapter (`vault://`,
 `secrets-vault.yaml`) landed in C.2b; the native AWS and Azure adapters
 (`awssm://`, `azkv://`, C.2c–d) are deferred until a partner asks for
 them, so the CSI providers in `secrets-csi.yaml` are the supported way to

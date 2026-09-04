@@ -153,6 +153,55 @@ jobs:
       if: failure()
       run: docker logs vault
 
+  siem:
+    # The real-receiver proof for audit forwarding (plan §3.9, WP C.3):
+    # `tests/siem_live_tests.rs` writes a real journal, ships it through
+    # the syslog adapter to a syslog-ng container over **mutual TLS**
+    # (`tests/fixtures/syslog-ng/syslog-ng.conf`, certificates from
+    # `tests/fixtures/tls/`), reads the receiver's output file back, and
+    # checks the lines are the journal's own bytes, in order, once — then
+    # restarts the shipper and checks the resume sends only what is new.
+    # The HEC and generic-JSON adapters are proven against wiremock in
+    # `tests/audit_forwarding_tests.rs` on every OS. Skips itself unless
+    # `MCP_TEST_SYSLOG_ADDR` is set; ubuntu only, because it needs Docker.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Show toolchain
+      run: rustc --version && cargo --version
+    - name: Install Linux keyring build deps
+      run: |
+        set -eu
+        sudo find /etc/apt/sources.list.d -type f \
+          -exec grep -qE 'packages\.microsoft\.com|azure-cli' {} \; \
+          -exec rm -vf {} \; 2>/dev/null || true
+        sudo apt-get update
+        sudo apt-get install -y libsecret-1-dev libdbus-1-dev
+    - name: Start syslog-ng with the test configuration
+      # Pinned to an exact image; bump deliberately and re-run the live
+      # test, because the receiver's framing and TLS defaults are what it
+      # proves. `--no-caps` because the container runs unprivileged.
+      run: |
+        set -eu
+        mkdir -p "$RUNNER_TEMP/mcp-audit" && chmod 777 "$RUNNER_TEMP/mcp-audit"
+        docker run -d --name syslog-ng -p 127.0.0.1:6514:6514 \
+          -v "$PWD/tests/fixtures/syslog-ng/syslog-ng.conf:/etc/syslog-ng/syslog-ng.conf:ro" \
+          -v "$PWD/tests/fixtures/tls:/etc/syslog-ng/tls:ro" \
+          -v "$RUNNER_TEMP/mcp-audit:/var/log/mcp-audit" \
+          balabit/syslog-ng:4.10.1 -F --no-caps
+    - name: Build the live test while the receiver boots
+      run: cargo test --test siem_live_tests --no-run
+    - name: Run the live test
+      env:
+        MCP_TEST_SYSLOG_ADDR: syslog+tls://127.0.0.1:6514
+        MCP_TEST_SYSLOG_OUTPUT: ${{ runner.temp }}/mcp-audit/messages
+      run: cargo test --test siem_live_tests -- --nocapture
+    - name: Receiver logs and output on failure
+      if: failure()
+      run: |
+        docker logs syslog-ng || true
+        cat "$RUNNER_TEMP/mcp-audit/messages" || true
+
   image:
     # The published-image proof (plan §3.8, "Published image"): build the
     # repository Dockerfile — the same image `release.yml` publishes — and
