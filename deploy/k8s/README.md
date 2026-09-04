@@ -16,6 +16,7 @@ Files:
 | `control.yaml` | Deployment + Service for the control role. |
 | `ingress-nginx.yaml` | ingress-nginx Ingress with TLS via cert-manager and the body limit. No session affinity: see "Sessions" below. |
 | `secrets-csi.yaml` | **Optional** (Phase C, C.2a). Vendor credentials as `file://` references over a mounted Secret or a Secrets Store CSI volume, so a rotation reaches the gateway without a restart and the audit trail names the version. Shows the `gateway.yaml` changes as a commented patch. |
+| `secrets-vault.yaml` | **Optional** (Phase C, C.2b). Vendor credentials as `vault://` references the gateway resolves itself, authenticating to Vault / OpenBao with its projected service-account token (Kubernetes auth). No plaintext on a volume; every read is in Vault's audit log under the gateway's identity. Vault-side setup in `docs/secret-sources-runbook.md`. |
 
 Before applying, produce the keys and signatures on an operator machine
 (never on a gateway) — Phase B, WPs B.3/B.4/B.6:
@@ -116,6 +117,7 @@ curl -sS -H "Authorization: Bearer $TOKEN" \
 
 Horizontal gateway scaling (session affinity, a shared artifact volume),
 the control plane's admin API, Prometheus metrics, and Helm packaging are
-Phase C (plan §4). Native secret-provider adapters (`vault://`, `awssm://`,
-`azkv://`) are C.2b–d; until they land, the CSI providers in
-`secrets-csi.yaml` are the way to reach those stores.
+Phase C (plan §4). The native Vault / OpenBao adapter (`vault://`,
+`secrets-vault.yaml`) landed in C.2b; the AWS and Azure adapters
+(`awssm://`, `azkv://`) are C.2c–d, and until they land the CSI providers
+in `secrets-csi.yaml` are the way to reach those stores.

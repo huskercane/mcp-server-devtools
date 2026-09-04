@@ -111,3 +111,81 @@ jobs:
     - name: Keycloak logs on failure
       if: failure()
       run: docker logs keycloak
+
+  vault:
+    # The real-provider proof for the `vault://` secret source (plan §3.8,
+    # WP C.2b): `tests/vault_live_tests.rs` sets up a policy, an AppRole,
+    # and a KV v2 secret on a real server in dev mode, then reads through
+    # the adapter with token and AppRole auth, renews a short lease,
+    # rotates the secret, and checks the failure categories. Skips itself
+    # unless `MCP_TEST_VAULT_ADDR` is set. Runs against HashiCorp Vault and
+    # OpenBao — one adapter, both servers — each pinned to an exact image.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["hashicorp/vault:1.21.4", "openbao/openbao:2.6.2"]
+    steps:
+    - uses: actions/checkout@v4
+    - name: Show toolchain
+      run: rustc --version && cargo --version
+    - name: Install Linux keyring build deps
+      run: |
+        set -eu
+        sudo find /etc/apt/sources.list.d -type f \
+          -exec grep -qE 'packages\.microsoft\.com|azure-cli' {} \; \
+          -exec rm -vf {} \; 2>/dev/null || true
+        sudo apt-get update
+        sudo apt-get install -y libsecret-1-dev libdbus-1-dev
+    - name: Start ${{ matrix.image }} in dev mode
+      run: |
+        set -eu
+        docker run -d --name vault -p 127.0.0.1:8200:8200 "${{ matrix.image }}" \
+          server -dev -dev-root-token-id=root -dev-listen-address=0.0.0.0:8200
+    - name: Build the live test while the server boots
+      run: cargo test --test vault_live_tests --no-run
+    - name: Run the live test
+      env:
+        MCP_TEST_VAULT_ADDR: http://127.0.0.1:8200
+        MCP_TEST_VAULT_TOKEN: root
+      run: cargo test --test vault_live_tests -- --nocapture
+    - name: Server logs on failure
+      if: failure()
+      run: docker logs vault
+
+  image:
+    # The published-image proof (plan §3.8, "Published image"): build the
+    # repository Dockerfile — the same image `release.yml` publishes — and
+    # run it with a `vault://` reference against a real Vault, asserting the
+    # health banner, one tool call whose upstream saw the secret from Vault,
+    # and the fail-closed refusal for an unresolvable reference. This is
+    # what proves the distroless, non-root, read-only, keychain-off image
+    # can reach a provider at all.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: docker/setup-buildx-action@v3
+    - name: Build the image
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        load: true
+        push: false
+        tags: mcp-devtools:ci
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    - name: Start Vault in dev mode
+      run: |
+        set -eu
+        docker run -d --name vault -p 127.0.0.1:8200:8200 hashicorp/vault:1.21.4 \
+          server -dev -dev-root-token-id=root -dev-listen-address=0.0.0.0:8200
+    - name: Smoke-test the image against Vault
+      env:
+        VAULT_ADDR: http://127.0.0.1:8200
+        VAULT_TOKEN: root
+      run: scripts/ci/image-vault-smoke.sh mcp-devtools:ci
+    - name: Logs on failure
+      if: failure()
+      run: |
+        docker logs vault || true
+        docker logs mcp-smoke || true
