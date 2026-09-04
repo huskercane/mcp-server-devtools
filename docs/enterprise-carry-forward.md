@@ -10,7 +10,13 @@ removed only when it is done, not when it is explained.
 
 Status legend: **open** · **blocked** (needs a decision) · **done**.
 
-Last updated: 2026-09-04, after C.2b (the `vault://` secret source)
+Last updated: 2026-09-04, at the start of `feat/phase-c-operations` (plan
+§0 rev 2.16): C.2c and C.2d are deferred until a partner asks for a native
+cloud adapter, so CF-30 and plan §11 item 8 are now **deferred with
+C.2c–d** rather than open; the CSI Secrets Store provider plus `file://`
+is the supported path on both clouds meanwhile. Nothing else changed.
+
+Previously: 2026-09-04, after C.2b (the `vault://` secret source)
 landed on `feat/phase-c-secret-sources` (plan §0 rev 2.15). CF-30 narrowed
 to the two cloud adapters and their placement (§11 item 8), with the
 `aws-config` spike named as the input that decision needs. Nothing new
@@ -20,14 +26,14 @@ rather than a register item, because no CI environment can supply a
 cluster or an Enterprise server. The allocation baseline below gained the
 C.2b note.
 
-Previously: 2026-09-04, after C.1b (OIDC provider profiles) landed on
+Before that: 2026-09-04, after C.1b (OIDC provider profiles) landed on
 `feat/phase-c-secret-sources` (plan §0 rev 2.14). Opened CF-31 (the
 manually triggered Entra and Auth0 live jobs against developer tenants are
 not built; those profiles are fixture-locked only). CF-18's reading now
 covers `auth/oidc.rs` as it did `auth/okta.rs`. The allocation baseline
 gained the C.1b note.
 
-Before that: 2026-09-04, after C.2a (secret references) landed on
+Earlier still: 2026-09-04, after C.2a (secret references) landed on
 `feat/phase-c-secret-sources` (plan §0 rev 2.13). Opened CF-28 (the
 one-shot CLI refuses references rather than resolving them), CF-29
 (`NINJAONE_SERVERS` nested credentials take no references), and CF-30 (the
@@ -399,7 +405,14 @@ or moving NinjaOne's per-server credentials to top-level keys. Decide when
 NinjaOne gets a read profile, with CF-1/CF-13.
 
 ### CF-30 · The cloud secret schemes refuse by name until C.2c–d, and their placement is undecided
-**Open · Phase C (C.2c–d)**
+**Deferred with C.2c–d · 2026-09-04 (plan rev 2.16); reopens when a partner asks for a native adapter**
+
+C.2c and C.2d are deferred until a design partner asks for `awssm://` or
+`azkv://` natively. Until then the supported path on both clouds is the
+CSI Secrets Store provider plus `file://` (`deploy/k8s/secrets-csi.yaml`),
+which rotates without a restart. The placement decision below (plan §11
+item 8) is deferred with them; the `aws-config` spike stays the input it
+needs. The rest of this entry is kept as the state it reopens into.
 
 `awssm://` and `azkv://` parse today and fail startup with
 `no adapter for `awssm://` is compiled into this binary`, which is the

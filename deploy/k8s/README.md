@@ -118,6 +118,7 @@ curl -sS -H "Authorization: Bearer $TOKEN" \
 Horizontal gateway scaling (session affinity, a shared artifact volume),
 the control plane's admin API, Prometheus metrics, and Helm packaging are
 Phase C (plan §4). The native Vault / OpenBao adapter (`vault://`,
-`secrets-vault.yaml`) landed in C.2b; the AWS and Azure adapters
-(`awssm://`, `azkv://`) are C.2c–d, and until they land the CSI providers
-in `secrets-csi.yaml` are the way to reach those stores.
+`secrets-vault.yaml`) landed in C.2b; the native AWS and Azure adapters
+(`awssm://`, `azkv://`, C.2c–d) are deferred until a partner asks for
+them, so the CSI providers in `secrets-csi.yaml` are the supported way to
+reach those stores.

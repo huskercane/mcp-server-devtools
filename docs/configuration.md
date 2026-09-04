@@ -40,7 +40,7 @@ Any configuration value, in any of the three sources, may be a **reference** to 
 | `file:///path` | The whole file, less one trailing line break. The path is absolute and taken verbatim (no percent-decoding, no `file://host/…`). |
 | `file:///path#key` | The string under `key` in a JSON object held in the file. Several references into one file are served from **one** read, so an email and a token in the same document always change together. |
 | `vault://<mount>/<path>#<key>` | The string under `key` in the KV v2 secret at `<mount>/data/<path>` on the HashiCorp Vault / OpenBao server named by `MCP_VAULT_ADDR` (feature `secrets-vault`, on by default; the `MCP_VAULT_*` settings below). The first path segment is the mount; the version is Vault's own version number. `#key` is required — a KV secret is a document of keys. Several references into one secret are served from **one** read. Vault-side setup is in [`secret-sources-runbook.md`](secret-sources-runbook.md). |
-| `awssm://…`, `azkv://…` | Reserved for the native adapters (plan C.2c–d). Recognised, and refused at startup as "no adapter compiled into this binary". Until then, reach those stores through a mounted CSI Secrets Store volume and `file://` (`deploy/k8s/secrets-csi.yaml`). |
+| `awssm://…`, `azkv://…` | Reserved for the native adapters (plan C.2c–d, **deferred** until a design partner asks — rev 2.16). Recognised, and refused at startup as "no adapter compiled into this binary". The supported path is a mounted CSI Secrets Store volume and `file://` (`deploy/k8s/secrets-csi.yaml`). |
 
 Anything else is a literal, byte for byte, so a configuration with no references behaves exactly as it did.
 

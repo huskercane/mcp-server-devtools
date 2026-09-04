@@ -28,8 +28,8 @@ CSI Secrets Store volume backed by Vault, AWS, or Azure
 (`deploy/k8s/secrets-csi.yaml`), is re-projected by the kubelet on change;
 the gateway re-reads it on the refresh interval. This is the path that
 works on every cloud with no native adapter, and the one to reach for when
-the native adapter for a provider does not exist yet (`awssm://`,
-`azkv://`).
+the native adapter for a provider is deferred (`awssm://`, `azkv://`;
+see below).
 
 ## HashiCorp Vault and OpenBao (`vault://`)
 
@@ -150,6 +150,9 @@ image against the same server.
 
 ## AWS Secrets Manager and Azure Key Vault
 
-Not built yet (C.2c, C.2d). Use a CSI Secrets Store volume and `file://`
+Deferred (plan rev 2.16): the native `awssm://` and `azkv://` adapters
+(C.2c, C.2d) are built when a design partner asks for them. The supported
+path on both clouds is a CSI Secrets Store volume and `file://`
 (`deploy/k8s/secrets-csi.yaml` shows the Vault provider; the AWS and Azure
-providers differ only in their `SecretProviderClass`).
+providers differ only in their `SecretProviderClass`). The two schemes stay
+reserved and are refused at startup by name.
