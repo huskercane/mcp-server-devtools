@@ -26,6 +26,7 @@ pub mod checkpoint_sink;
 pub mod command_runner;
 pub mod credential_broker;
 pub mod policy_decision_point;
+pub mod rollup_store;
 pub mod secret_source;
 pub mod token_validator;
 pub mod usage_sink;
@@ -42,6 +43,10 @@ pub use checkpoint_sink::{CheckpointSink, DirectoryCheckpointSink, InMemoryCheck
 pub use command_runner::{CommandOutput, CommandRunner};
 pub use credential_broker::{ConfigCredentialBroker, CredentialBroker, StaticCredentialBroker};
 pub use policy_decision_point::{AllowAll, PolicyDecisionPoint};
+pub use rollup_store::{
+    Bucket, GroupRow, InMemoryRollupStore, Report, ReportQuery, RollupError, RollupFuture,
+    RollupStore, TimelineRow, Totals, UsageRow, Window,
+};
 pub use secret_source::{
     FetchedSecret, InMemorySecretSource, Scheme, SecretFetchFuture, SecretLocator, SecretSource,
     SecretSourceError,

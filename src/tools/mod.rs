@@ -230,6 +230,71 @@ impl DevtoolsServer {
         Arc::clone(&self.components.forward_health)
     }
 
+    /// Start the usage-rollup consumer (`MCP_ROLLUP_STORE`, C.6) on the
+    /// roles that serve the control plane. Returns the store's name, or
+    /// `None` when nothing is configured.
+    ///
+    /// # Errors
+    ///
+    /// [`McpError`] when there is no runtime to spawn on.
+    pub fn start_rollups(
+        &self,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<&'static str>, crate::error::McpError> {
+        crate::bootstrap::rollups::spawn_consumer(&self.components, cancel)
+    }
+
+    /// The failure category while rollup appends are failing; `None` when
+    /// healthy or not configured.
+    #[must_use]
+    pub fn rollups_degraded(&self) -> Option<&'static str> {
+        self.components.rollup_health.degraded()
+    }
+
+    /// The rollup health handle, for tests.
+    #[must_use]
+    pub fn rollup_health(&self) -> Arc<crate::rollups::RollupHealth> {
+        Arc::clone(&self.components.rollup_health)
+    }
+
+    /// The rollup store, for the admin API's reports.
+    #[must_use]
+    pub fn rollup_store(&self) -> Option<Arc<dyn crate::ports::RollupStore>> {
+        self.components.rollup_store.clone()
+    }
+
+    /// The Prometheus page (`MCP_METRICS=on`), or `None` when metrics are
+    /// off. `rate_limited` is the limiter's refusal count, which lives on
+    /// the auth stack rather than here.
+    #[must_use]
+    pub fn metrics_page(&self, rate_limited: u64) -> Option<String> {
+        let sink = self.components.usage_metrics.as_ref()?;
+        let gauges = crate::metrics::Gauges {
+            audit_journal_available: self
+                .components
+                .audit_sink
+                .as_ref()
+                .map(|sink| sink.is_available()),
+            audit_forward_acknowledged_seq: Some(self.components.forward_health.acknowledged()),
+            audit_forward_degraded: Some(self.components.forward_health.degraded().is_some()),
+            rollups_degraded: self
+                .components
+                .rollup_store
+                .as_ref()
+                .map(|_| self.components.rollup_health.degraded().is_some()),
+            rollups_appended: self
+                .components
+                .rollup_store
+                .as_ref()
+                .map(|_| self.components.rollup_health.appended()),
+            usage_events_dropped: self.components.usage_sink.dropped(),
+            rate_limited_total: rate_limited,
+            secrets_degraded: Some(self.components.secret_health.degraded().is_some()),
+            policy_degraded: Some(self.components.policy.degraded().is_some()),
+        };
+        Some(crate::metrics::render(sink, &gauges))
+    }
+
     /// Snapshot the current config. Returns an `Arc` so a tool call costs one
     /// atomic increment instead of deep-cloning the credential maps; `&Arc<Config>`
     /// deref-coerces to the `&Config` every context factory takes.
@@ -581,6 +646,8 @@ struct EnterpriseCall {
     upstream: crate::policy::UpstreamIdentity,
     /// The tool-level decision (WP A.7), repeated on the outcome record.
     decision: PolicyDecision,
+    /// The call's risk class, for the usage row (C.6).
+    risk: crate::policy::RequestRisk,
     /// The call scope the dispatch runs inside (WP A.4/A.5): it carries the
     /// principal, the digested client identity and request id, and the
     /// egress enforcement (WP A.7).
@@ -691,6 +758,7 @@ impl DevtoolsServer {
             };
         }
         let append_timeout = self.components.audit_append_timeout;
+        let risk = action.request_risk();
 
         let intent = AuditEvent {
             timestamp: crate::logger::iso_timestamp(),
@@ -735,6 +803,7 @@ impl DevtoolsServer {
                 rule = decision.rule_id.as_deref().unwrap_or("-"),
                 "tool call denied by policy"
             );
+            self.record_denied_usage(intent.timestamp, principal, tool, vendor, &upstream, risk);
             return Err(Refusal::PolicyDenied(decision));
         }
 
@@ -752,9 +821,34 @@ impl DevtoolsServer {
             vendor,
             upstream,
             decision,
+            risk,
             scope: Arc::new(scope),
             append_timeout,
         }))
+    }
+
+    /// A denial is usage too: reports count it without dispatching.
+    fn record_denied_usage(
+        &self,
+        timestamp: String,
+        principal: &Principal,
+        tool: &str,
+        vendor: &str,
+        upstream: &crate::policy::UpstreamIdentity,
+        risk: crate::policy::RequestRisk,
+    ) {
+        self.components.usage_sink.record(UsageEvent {
+            timestamp,
+            tenant: principal.tenant.clone(),
+            subject: principal.subject.clone(),
+            tool_name: tool.to_owned(),
+            vendor: vendor.to_owned(),
+            environment: upstream.environment.as_str().to_owned(),
+            decision: "deny".to_owned(),
+            risk: risk.as_str().to_owned(),
+            outcome: "policy_denied".to_owned(),
+            duration_ms: 0,
+        });
     }
 
     /// The risk class the server itself declares for a tool through its
@@ -794,6 +888,7 @@ impl DevtoolsServer {
     /// on a path that is about to wait for a disk sync anyway.
     async fn record_outcome(&self, call: EnterpriseCall, outcome: &str, duration_ms: u128) {
         let tool_name = call.scope.tool_name().to_owned();
+        let environment = call.upstream.environment.as_str();
         // One timestamp for the outcome event and the usage event
         // (CLAUDE.md perf guidelines: no repeated formatting work).
         let completed_at = crate::logger::iso_timestamp();
@@ -861,8 +956,13 @@ impl DevtoolsServer {
         }
         self.components.usage_sink.record(UsageEvent {
             timestamp: completed_at,
+            tenant: call.scope.principal().tenant.clone(),
+            subject: call.scope.principal().subject.clone(),
             tool_name,
             vendor: call.vendor.to_owned(),
+            environment: environment.to_owned(),
+            decision: "allow".to_owned(),
+            risk: call.risk.as_str().to_owned(),
             outcome: outcome.to_owned(),
             duration_ms,
         });

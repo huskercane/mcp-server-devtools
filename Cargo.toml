@@ -108,6 +108,13 @@ serde_norway        = "=0.9.42"
 # the lockfile had resolved and adds no second crypto stack.
 aws-lc-rs           = "=1.18.0"
 
+# Usage rollups (plan §3.9, WP C.6): the first `RollupStore` adapter is
+# SQLite, embedded and exact-pinned. `bundled` compiles SQLite into the
+# binary (public-domain C; `libsqlite3-sys` is MIT), so the distroless image
+# needs no shared library and every platform runs the same SQLite. Talks to
+# the domain only through the port's own types — no SQL crosses it.
+rusqlite            = { version = "=0.40.2", default-features = false, features = ["bundled", "cache"] }
+
 # --- WRDS (feature = "wrds") --------------------------------------------------
 # WRDS is PostgreSQL-only; these back the `wrds_*` tools. `with-serde_json-1`
 # lets Postgres do all type -> JSON conversion server-side (via `to_jsonb`), so

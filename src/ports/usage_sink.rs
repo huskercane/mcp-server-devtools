@@ -17,13 +17,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
 
-/// One usage event. Metadata only — no arguments, no content, no secrets,
-/// no principal PII beyond what dashboards need (none, in M0).
+/// One usage event. Metadata only — no arguments, no content, no secrets.
+/// The subject and tenant are here since C.6, because per-principal usage
+/// (who calls what, how often, how often denied) is what the rollups are
+/// for; both are already on every audit record, and rollup retention
+/// bounds how long they stay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UsageEvent {
     pub timestamp: String,
+    pub tenant: String,
+    pub subject: String,
     pub tool_name: String,
     pub vendor: String,
+    /// `prod` … `unclassified` — the upstream account's classification.
+    pub environment: String,
+    /// `allow` or `deny`: the tool-level decision.
+    pub decision: String,
+    /// `read`, `write`, or `destructive`.
+    pub risk: String,
     pub outcome: String,
     pub duration_ms: u128,
 }
@@ -96,8 +107,13 @@ mod tests {
     fn event(tool: &str) -> UsageEvent {
         UsageEvent {
             timestamp: "2026-09-01T00:00:00.000Z".to_owned(),
+            tenant: "acme".to_owned(),
+            subject: "alice".to_owned(),
             tool_name: tool.to_owned(),
             vendor: "jira".to_owned(),
+            environment: "qa".to_owned(),
+            decision: "allow".to_owned(),
+            risk: "read".to_owned(),
             outcome: "success".to_owned(),
             duration_ms: 5,
         }

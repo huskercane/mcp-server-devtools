@@ -235,6 +235,18 @@ pub enum EnvironmentClass {
 }
 
 impl EnvironmentClass {
+    /// The serialised name (`prod`, `staging`, `qa`, `dev`, `unclassified`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prod => "prod",
+            Self::Staging => "staging",
+            Self::Qa => "qa",
+            Self::Dev => "dev",
+            Self::Unclassified => "unclassified",
+        }
+    }
+
     /// Parse a configured classification. Unknown strings are `None` so the
     /// caller can fail loudly instead of silently mapping a typo (`"pord"`)
     /// to something permissive.
@@ -521,6 +533,16 @@ pub enum RequestRisk {
 }
 
 impl RequestRisk {
+    /// The serialised name (`read`, `write`, `destructive`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Destructive => "destructive",
+        }
+    }
+
     /// Conservative derivation from the HTTP method, for passthrough calls
     /// with no finer-grained mapping. `POST` is `Write` even when the
     /// endpoint is semantically a search — a per-endpoint extractor must

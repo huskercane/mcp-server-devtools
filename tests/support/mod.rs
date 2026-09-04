@@ -4,5 +4,6 @@
 
 pub mod audit_forwarder_conformance;
 pub mod fake_vault;
+pub mod rollup_store_conformance;
 pub mod secret_source_conformance;
 pub mod tls_syslog_receiver;
