@@ -258,6 +258,21 @@ impl ServerBuilder {
             }
         };
 
+        // Adapters are configured before the port is handed out: a
+        // misconfigured provider is a startup refusal with a reason.
+        let secrets = Arc::new(match self.secret_sources {
+            Some(sources) => crate::secrets::SecretResolver::new(sources),
+            None => crate::secrets::SecretResolver::from_config(&config).map_err(|error| {
+                crate::error::unexpected(
+                    format!(
+                        "cannot configure the secret source {error}; refusing to start (fail \
+                         closed, plan §1.2)"
+                    ),
+                    None,
+                )
+            })?,
+        });
+
         let components = Arc::new(Components {
             config: ConfigHandle::new(config),
             client,
@@ -273,10 +288,7 @@ impl ServerBuilder {
             policy_file,
             audit_append_timeout,
             pending_audit: tokio_util::task::TaskTracker::new(),
-            secrets: Arc::new(match self.secret_sources {
-                Some(sources) => crate::secrets::SecretResolver::new(sources),
-                None => crate::secrets::SecretResolver::with_defaults(),
-            }),
+            secrets,
             secret_health: secrets::SecretHealth::default(),
         });
 

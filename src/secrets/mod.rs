@@ -23,6 +23,9 @@
 //!   `#key` taken from that same fetch.
 //! - [`file`] is the first adapter: a file on a mounted volume, which is
 //!   what a Kubernetes Secret or a CSI Secrets Store volume presents.
+//! - [`vault`] (feature `secrets-vault`, on by default) is the second:
+//!   `HashiCorp` Vault / `OpenBao` KV v2, with Kubernetes, `AppRole`, or
+//!   token authentication.
 //!
 //! The background refresh and the health signal live in
 //! [`crate::bootstrap::secrets`], because when to refresh is a composition
@@ -32,8 +35,12 @@ pub mod file;
 pub mod reference;
 pub mod resolver;
 pub mod snapshot;
+#[cfg(feature = "secrets-vault")]
+pub mod vault;
 
 pub use file::FileSecretSource;
 pub use reference::{ReferenceError, SecretReference, is_keychain_sentinel, is_reference};
 pub use resolver::{ResolveCause, SecretResolveError, SecretResolver};
 pub use snapshot::{ResolvedSecret, SecretProvenance, SecretSnapshot};
+#[cfg(feature = "secrets-vault")]
+pub use vault::{VaultAuth, VaultSecretSource, VaultSettings};

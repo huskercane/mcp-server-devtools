@@ -17,6 +17,8 @@
 //!   swap together;
 //! - the community path: no references, no snapshot, no `_meta`.
 
+mod support;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,6 +42,7 @@ use mcp_server_devtools::vendor::grafana::GrafanaVendor;
 use mcp_server_devtools::vendor::jira::JiraVendor;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
+use support::secret_source_conformance::{Fixture, conformance};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
@@ -51,14 +54,6 @@ const LOKI_PATH: &str = "/api/datasources/proxy/uid/loki-qa/loki/api/v1/query_ra
 // ---------------------------------------------------------------------------
 // Conformance suite: every adapter, the same assertions
 // ---------------------------------------------------------------------------
-
-/// How a test writes a document behind an adapter.
-trait Fixture {
-    fn source(&self) -> Arc<dyn SecretSource>;
-    fn put(&self, target: &str, document: &str);
-    fn remove(&self, target: &str);
-    fn target(&self, name: &str) -> String;
-}
 
 struct FileFixture {
     dir: tempfile::TempDir,
@@ -115,46 +110,6 @@ fn write_atomically(path: &Path, document: &str) {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, document).unwrap();
     std::fs::rename(&tmp, path).unwrap();
-}
-
-async fn conformance(fixture: &dyn Fixture) {
-    let source = fixture.source();
-    let target = fixture.target("token");
-    let locator = SecretLocator::new(Scheme::File, target.clone());
-
-    // Absent → NotFound, naming the locator, never anything else.
-    let missing = source.fetch(&locator).await.unwrap_err();
-    assert!(
-        matches!(missing, SecretSourceError::NotFound { .. }),
-        "{missing:?}"
-    );
-    assert!(missing.to_string().contains(&locator.to_string()));
-
-    // Present → the document, with a version.
-    fixture.put(&target, "secret-v1\n");
-    let first = source.fetch(&locator).await.unwrap();
-    assert_eq!(first.document(), "secret-v1\n");
-    assert!(!first.version().is_empty());
-    assert!(
-        !format!("{first:?}").contains("secret-v1"),
-        "Debug leaks the document"
-    );
-
-    // Same bytes → same version; new bytes → new version.
-    let again = source.fetch(&locator).await.unwrap();
-    assert_eq!(again.version(), first.version());
-    fixture.put(&target, "secret-v2\n");
-    let second = source.fetch(&locator).await.unwrap();
-    assert_eq!(second.document(), "secret-v2\n");
-    assert_ne!(second.version(), first.version());
-
-    // Removed → NotFound again (a rotation that deleted the file is a
-    // refresh failure, not a value of "").
-    fixture.remove(&target);
-    assert!(matches!(
-        source.fetch(&locator).await.unwrap_err(),
-        SecretSourceError::NotFound { .. }
-    ));
 }
 
 #[tokio::test]
@@ -461,7 +416,13 @@ async fn startup_fails_closed_on_every_unresolvable_reference() {
     let present = grafana_reference(dir.path());
     let missing_file = format!("file://{}", file_target(&dir.path().join("absent")));
     let missing_key = present.replace("#token", "#nope");
-    let cases: [(&str, &str, &str); 3] = [
+    let vault_without_address =
+        if mcp_server_devtools::secrets::SecretResolver::compiled_in(Scheme::Vault) {
+            "compiled in but not configured"
+        } else {
+            "compiled into this binary"
+        };
+    let cases: [(&str, &str, &str); 4] = [
         (&missing_file, "secret_source_not_found", "does not exist"),
         (
             &missing_key,
@@ -471,6 +432,11 @@ async fn startup_fails_closed_on_every_unresolvable_reference() {
         (
             "vault://secret/mcp#token",
             "vault://",
+            vault_without_address,
+        ),
+        (
+            "awssm://prod/mcp#token",
+            "awssm://",
             "compiled into this binary",
         ),
     ];
@@ -747,4 +713,93 @@ fn keychain_uri_is_an_alias_of_the_sentinel() {
         .unwrap();
         assert_eq!(value.as_deref(), Some("from-keychain"), "{spelling}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The same gateway over `vault://` (C.2b): rotation evidence is Vault's own
+// version, and a sealed Vault degrades health with the last good in force.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "secrets-vault")]
+#[tokio::test]
+async fn vault_rotation_lock_a_new_kv_version_changes_the_upstream_header_and_a_sealed_vault_degrades()
+ {
+    use support::fake_vault::{FakeVault, Lease};
+    let vault = FakeVault::start().await;
+    vault.accept_token("hvs.test-root", Lease::default());
+    vault.write_kv("secret/mcp/grafana", json!({ "token": "glsa_v1" }));
+    let addr = vault.addr();
+    let gateway = gateway(
+        tempfile::tempdir().unwrap(),
+        &[
+            ("MCP_VAULT_ADDR", addr.as_str()),
+            ("MCP_VAULT_AUTH", "token"),
+            ("MCP_VAULT_TOKEN", "hvs.test-root"),
+            ("GRAFANA_TOKEN", "vault://secret/mcp/grafana#token"),
+        ],
+        grafana_vendors,
+    )
+    .await
+    .expect("references resolve at startup");
+    mount_loki(&gateway.upstream).await;
+
+    let response = query_logs(&gateway.base).await;
+    assert_eq!(
+        last_authorization(&gateway.upstream).await,
+        "Bearer glsa_v1",
+        "{response}"
+    );
+    let meta_v1 = response["result"]["_meta"][UPSTREAM_META_KEY].clone();
+    assert_eq!(meta_v1["source"], "vault");
+    assert_eq!(meta_v1["version"], "1", "Vault's KV version, not a hash");
+    assert_eq!(last_intent_identity(&gateway.sink)["version"], "1");
+
+    // A new KV version: picked up by the refresher, no restart.
+    vault.write_kv("secret/mcp/grafana", json!({ "token": "glsa_v2" }));
+    let response = call_until_bearer(&gateway, "glsa_v2").await;
+    assert_eq!(
+        response["result"]["_meta"][UPSTREAM_META_KEY]["version"],
+        "2"
+    );
+    assert_eq!(last_intent_identity(&gateway.sink)["version"], "2");
+
+    // Vault seals: refreshes fail, the last good value keeps serving, and
+    // the health banner says so — with the category, never the token.
+    vault.with(|state| state.sealed = true);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while gateway.server.secrets_degraded().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "health never degraded"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        gateway.server.secrets_degraded(),
+        Some("secret_source_unavailable")
+    );
+    let banner = health(&gateway.base).await;
+    // The unauthenticated banner says that refreshes fail, not why: the
+    // category and the reference go to the operator log.
+    assert!(banner.contains("secret refresh is failing"), "{banner}");
+    assert!(!banner.contains("hvs."), "{banner}");
+    assert_ne!(
+        query_logs(&gateway.base).await["result"]["isError"],
+        Value::Bool(true)
+    );
+    assert_eq!(
+        last_authorization(&gateway.upstream).await,
+        "Bearer glsa_v2"
+    );
+
+    // Unsealed: the next refresh recovers.
+    vault.with(|state| state.sealed = false);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while gateway.server.secrets_degraded().is_some() {
+        assert!(std::time::Instant::now() < deadline, "did not recover");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let journal = serde_json::to_string(&gateway.sink.events()).unwrap();
+    assert!(!journal.contains("glsa_v"), "journal leaked a token");
+    assert!(!journal.contains("hvs."), "journal leaked the Vault token");
 }

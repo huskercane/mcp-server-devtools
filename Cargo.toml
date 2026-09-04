@@ -22,7 +22,7 @@ path = "src/main.rs"
 # for headless Linux (CI, SSH, containers): keyring + libsecret aren't useful
 # without a logged-in desktop session, and disabling avoids the libsecret
 # build dep entirely.
-default  = ["keychain", "wrds"]
+default  = ["keychain", "wrds", "secrets-vault"]
 # `wrds` activates the WRDS (Wharton Research Data Services) integration. WRDS
 # has no REST API — it is a PostgreSQL database — so this is the one vendor that
 # does not ride the shared `reqwest`/`Vendor` HTTP path. The feature pulls in a
@@ -39,6 +39,13 @@ wrds     = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:rustls", "de
 # `keyring` falls back to a mock store that silently no-ops `set` and returns
 # `NoEntry` on `get`.
 keychain = ["dep:keyring"]
+# `secrets-vault` compiles the HashiCorp Vault / OpenBao KV v2 secret source
+# (`vault://…` references, plan §3.8 C.2b). No extra dependencies — KV v2 is
+# a handful of JSON endpoints over the pinned `reqwest` — so it is on by
+# default; the feature exists so a build can prove the "no adapter compiled
+# in" path and so the cloud adapters (`secrets-aws`, `secrets-azure`, which
+# do pull SDKs) follow the same shape.
+secrets-vault = []
 
 [dependencies]
 rmcp                = { version = "=3.1.2", features = ["transport-io", "transport-streamable-http-server"] }

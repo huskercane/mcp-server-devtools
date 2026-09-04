@@ -30,6 +30,41 @@ impl SecretResolver {
         Self::new(vec![Arc::new(super::file::FileSecretSource)])
     }
 
+    /// The default sources plus every compiled-in adapter the configuration
+    /// enables: `vault://` when `MCP_VAULT_ADDR` is set (feature
+    /// `secrets-vault`). Building an adapter does no network I/O; its
+    /// settings are validated here, so a misconfigured provider is a
+    /// startup refusal with a reason rather than a failed first fetch.
+    ///
+    /// # Errors
+    ///
+    /// The adapter's own configuration error, prefixed with its scheme.
+    pub fn from_config(config: &crate::config::Config) -> Result<Self, String> {
+        let mut sources: Vec<Arc<dyn SecretSource>> = vec![Arc::new(super::file::FileSecretSource)];
+        #[cfg(feature = "secrets-vault")]
+        if super::vault::VaultSettings::is_configured(config) {
+            let vault = super::vault::VaultSecretSource::from_config(config)
+                .map_err(|error| format!("vault://: {error}"))?;
+            sources.push(Arc::new(vault));
+        }
+        #[cfg(not(feature = "secrets-vault"))]
+        {
+            let _ = (config, &mut sources);
+        }
+        Ok(Self::new(sources))
+    }
+
+    /// Whether this build carries an adapter for `scheme`, configured or
+    /// not.
+    #[must_use]
+    pub const fn compiled_in(scheme: Scheme) -> bool {
+        match scheme {
+            Scheme::File => true,
+            Scheme::Vault => cfg!(feature = "secrets-vault"),
+            Scheme::AwsSecretsManager | Scheme::AzureKeyVault => false,
+        }
+    }
+
     #[must_use]
     pub fn source_for(&self, scheme: Scheme) -> Option<&Arc<dyn SecretSource>> {
         self.sources.iter().find(|source| source.scheme() == scheme)
@@ -83,9 +118,14 @@ impl SecretResolver {
 
         let pending = by_locator.values().map(|(locator, references)| async move {
             let Some(source) = self.source_for(locator.scheme()) else {
+                let scheme = locator.scheme();
                 return Err(SecretResolveError {
                     reference: references[0].to_string(),
-                    cause: ResolveCause::NoSource(locator.scheme()),
+                    cause: if Self::compiled_in(scheme) {
+                        ResolveCause::Unconfigured(scheme)
+                    } else {
+                        ResolveCause::NoSource(scheme)
+                    },
                 });
             };
             source
@@ -165,6 +205,9 @@ fn extract(document: &str, fragment: Option<&str>) -> Result<String, ResolveCaus
 pub enum ResolveCause {
     Invalid(ReferenceError),
     NoSource(Scheme),
+    /// The adapter is compiled in but the configuration does not enable it
+    /// (no `MCP_VAULT_ADDR`, say).
+    Unconfigured(Scheme),
     Source(SecretSourceError),
     NotJsonObject,
     MissingKey(String),
@@ -180,6 +223,7 @@ impl ResolveCause {
         match self {
             Self::Invalid(_) => "secret_reference_invalid",
             Self::NoSource(_) => "secret_source_not_compiled",
+            Self::Unconfigured(_) => "secret_source_unconfigured",
             Self::Source(error) => error.category(),
             Self::NotJsonObject | Self::MissingKey(_) | Self::NotAString(_) | Self::Empty => {
                 "secret_document_malformed"
@@ -195,6 +239,15 @@ impl fmt::Display for ResolveCause {
             Self::NoSource(scheme) => write!(
                 formatter,
                 "no adapter for `{scheme}://` is compiled into this binary"
+            ),
+            Self::Unconfigured(scheme) => write!(
+                formatter,
+                "the `{scheme}://` adapter is compiled in but not configured (set {})",
+                match scheme {
+                    Scheme::Vault => "MCP_VAULT_ADDR and MCP_VAULT_AUTH",
+                    Scheme::File | Scheme::AwsSecretsManager | Scheme::AzureKeyVault =>
+                        "its address",
+                }
             ),
             Self::Source(error) => write!(formatter, "{error}"),
             Self::NotJsonObject => formatter
@@ -293,7 +346,15 @@ mod tests {
             ("file:///json#s", "secret_document_malformed"),
             ("file:///text#k", "secret_document_malformed"),
             ("file:///json#", "secret_reference_invalid"),
-            ("vault://secret/x#k", "secret_source_not_compiled"),
+            (
+                "vault://secret/x#k",
+                if SecretResolver::compiled_in(Scheme::Vault) {
+                    "secret_source_unconfigured"
+                } else {
+                    "secret_source_not_compiled"
+                },
+            ),
+            ("awssm://prod/x#k", "secret_source_not_compiled"),
         ] {
             let error = resolver.resolve([reference]).await.unwrap_err();
             assert_eq!(error.cause.category(), expected, "{reference}");

@@ -74,6 +74,12 @@ impl SecretReference {
         if fragment == Some("") {
             return Err(ReferenceError::EmptyFragment { scheme });
         }
+        // A KV v2 secret is a document of keys; without a `#key` there is
+        // no value to send anywhere, so the reference is refused here
+        // rather than turned into a JSON blob pretending to be a token.
+        if scheme == Scheme::Vault && fragment.is_none() {
+            return Err(ReferenceError::FragmentRequired { scheme });
+        }
         Ok(Some(Self {
             locator: SecretLocator::new(scheme, target),
             fragment: fragment.map(str::to_owned),
@@ -109,8 +115,16 @@ impl fmt::Display for SecretReference {
 /// A value that names a scheme but cannot be a reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReferenceError {
-    EmptyTarget { scheme: Scheme },
-    EmptyFragment { scheme: Scheme },
+    EmptyTarget {
+        scheme: Scheme,
+    },
+    EmptyFragment {
+        scheme: Scheme,
+    },
+    /// The scheme names documents of keys, so a `#key` is not optional.
+    FragmentRequired {
+        scheme: Scheme,
+    },
 }
 
 impl fmt::Display for ReferenceError {
@@ -122,6 +136,10 @@ impl fmt::Display for ReferenceError {
             Self::EmptyFragment { scheme } => write!(
                 formatter,
                 "`{scheme}://…#` ends in `#` with no key after it"
+            ),
+            Self::FragmentRequired { scheme } => write!(
+                formatter,
+                "`{scheme}://` names a document of keys; add `#<key>` to say which one"
             ),
         }
     }
@@ -200,6 +218,12 @@ mod tests {
             .unwrap();
         assert_eq!(azure.scheme(), Scheme::AzureKeyVault);
         assert_eq!(azure.fragment(), None);
+        assert_eq!(
+            SecretReference::parse("vault://secret/mcp/grafana"),
+            Err(ReferenceError::FragmentRequired {
+                scheme: Scheme::Vault
+            })
+        );
     }
 
     #[test]
