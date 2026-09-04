@@ -67,3 +67,47 @@ jobs:
       run: cargo clippy --all-targets -- -D warnings
     - name: Run tests
       run: cargo test --verbose
+
+  keycloak:
+    # The real-identity-provider proof for the OIDC validator (plan §3.9,
+    # WP C.1b): `tests/keycloak_live_tests.rs` obtains tokens from a real
+    # Keycloak realm — imported from `tests/fixtures/keycloak/` — and
+    # validates them through the Keycloak profile, including a key rotation
+    # and withdrawal driven through the admin API. Every other validator
+    # test signs its own tokens; this one is the check that a provider's
+    # actual claim shapes match what those fixtures assume. The test skips
+    # itself unless `MCP_KEYCLOAK_URL` is set, so `cargo test` elsewhere
+    # stays hermetic; ubuntu only, because it needs Docker.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Show toolchain
+      run: rustc --version && cargo --version
+    - name: Install Linux keyring build deps
+      run: |
+        set -eu
+        sudo find /etc/apt/sources.list.d -type f \
+          -exec grep -qE 'packages\.microsoft\.com|azure-cli' {} \; \
+          -exec rm -vf {} \; 2>/dev/null || true
+        sudo apt-get update
+        sudo apt-get install -y libsecret-1-dev libdbus-1-dev
+    - name: Start Keycloak with the test realm
+      # Pinned to an exact image so a Keycloak release cannot change the
+      # token shape under the test unnoticed; bump deliberately, and re-read
+      # the Keycloak row of docs/identity-provider-runbook.md when you do.
+      run: |
+        set -eu
+        docker run -d --name keycloak -p 127.0.0.1:8080:8080 \
+          -e KC_BOOTSTRAP_ADMIN_USERNAME=admin \
+          -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+          -v "$PWD/tests/fixtures/keycloak:/opt/keycloak/data/import:ro" \
+          quay.io/keycloak/keycloak:26.5.7 start-dev --import-realm
+    - name: Build the live test while Keycloak boots
+      run: cargo test --test keycloak_live_tests --no-run
+    - name: Run the live test
+      env:
+        MCP_KEYCLOAK_URL: http://127.0.0.1:8080
+      run: cargo test --test keycloak_live_tests -- --nocapture
+    - name: Keycloak logs on failure
+      if: failure()
+      run: docker logs keycloak

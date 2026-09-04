@@ -876,8 +876,11 @@ async fn keycloak_profile_requires_a_mapped_audience_and_normalises_group_paths(
     let validator = validator(profile_settings(Profile::Keycloak, &issuer));
 
     let now = get_current_timestamp();
+    // The shape Keycloak 26 emits without an audience mapper (locked
+    // against the real realm in `tests/keycloak_live_tests.rs`): no `aud`
+    // at all, `azp` naming the client the token was issued *to*.
     let mut default_token = json!({
-        "iss": issuer, "aud": "account", "azp": "mcp-devtools",
+        "iss": issuer, "azp": "mcp-devtools",
         "iat": now, "exp": now + 300, "typ": "Bearer",
         "sub": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
         "preferred_username": "alice",
@@ -887,9 +890,15 @@ async fn keycloak_profile_requires_a_mapped_audience_and_normalises_group_paths(
     });
     assert_eq!(
         validator.validate(&sign(&default_token)).await.unwrap_err(),
-        TokenRejection::WrongAudience,
-        "without an audience mapper the token names no audience of ours; \
+        TokenRejection::MissingClaim("aud"),
+        "without an audience mapper the token names no audience at all; \
          `azp` is who asked for the token, not who it is for"
+    );
+    // Older realms add the `account` client as the audience instead.
+    default_token["aud"] = json!("account");
+    assert_eq!(
+        validator.validate(&sign(&default_token)).await.unwrap_err(),
+        TokenRejection::WrongAudience
     );
 
     // With the mapper: `aud` gains our audience (Keycloak keeps `account`).

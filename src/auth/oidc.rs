@@ -984,38 +984,40 @@ impl OidcJwksValidator {
         }
         let admitted = snapshot.keys.get(&kid).ok_or(TokenRejection::UnknownKey)?;
 
-        let data =
-            decode::<Claims>(token, &admitted.key, &self.validation).map_err(
-                |error| match error.kind() {
-                    ErrorKind::ExpiredSignature => TokenRejection::Expired,
-                    ErrorKind::ImmatureSignature => TokenRejection::NotYetValid,
-                    ErrorKind::InvalidIssuer => TokenRejection::WrongIssuer,
-                    ErrorKind::InvalidAudience => {
-                        if self.settings.profile == Profile::Keycloak {
-                            tracing::debug!(
-                                "audience mismatch: a Keycloak token carries no `aud` beyond \
-                                 `account` until the client has an audience mapper (see \
-                                 docs/identity-provider-runbook.md)"
-                            );
-                        }
-                        TokenRejection::WrongAudience
-                    }
-                    ErrorKind::InvalidSignature => TokenRejection::InvalidSignature,
-                    ErrorKind::InvalidAlgorithm | ErrorKind::InvalidAlgorithmName => {
-                        TokenRejection::UnsupportedAlgorithm
-                    }
-                    ErrorKind::MissingRequiredClaim(claim) => {
-                        TokenRejection::MissingClaim(match claim.as_str() {
-                            "iss" => "iss",
-                            "aud" => "aud",
-                            "sub" => "sub",
-                            "exp" => "exp",
-                            _ => "claim",
-                        })
-                    }
-                    _ => TokenRejection::Malformed,
-                },
-            )?;
+        let data = decode::<Claims>(token, &admitted.key, &self.validation).map_err(|error| {
+            let rejection = match error.kind() {
+                ErrorKind::ExpiredSignature => TokenRejection::Expired,
+                ErrorKind::ImmatureSignature => TokenRejection::NotYetValid,
+                ErrorKind::InvalidIssuer => TokenRejection::WrongIssuer,
+                ErrorKind::InvalidAudience => TokenRejection::WrongAudience,
+                ErrorKind::InvalidSignature => TokenRejection::InvalidSignature,
+                ErrorKind::InvalidAlgorithm | ErrorKind::InvalidAlgorithmName => {
+                    TokenRejection::UnsupportedAlgorithm
+                }
+                ErrorKind::MissingRequiredClaim(claim) => {
+                    TokenRejection::MissingClaim(match claim.as_str() {
+                        "iss" => "iss",
+                        "aud" => "aud",
+                        "sub" => "sub",
+                        "exp" => "exp",
+                        _ => "claim",
+                    })
+                }
+                _ => TokenRejection::Malformed,
+            };
+            if self.settings.profile == Profile::Keycloak
+                && matches!(
+                    rejection,
+                    TokenRejection::WrongAudience | TokenRejection::MissingClaim("aud")
+                )
+            {
+                tracing::debug!(
+                    "audience rejected: a Keycloak token carries no `aud` of ours until the \
+                     client has an audience mapper (see docs/identity-provider-runbook.md)"
+                );
+            }
+            rejection
+        })?;
         let (authenticated, exp) = self.principal_from(data.claims)?;
         Ok(Verified {
             authenticated,
