@@ -10,14 +10,24 @@ removed only when it is done, not when it is explained.
 
 Status legend: **open** · **blocked** (needs a decision) · **done**.
 
-Last updated: 2026-09-04, after C.1b (OIDC provider profiles) landed on
+Last updated: 2026-09-04, after C.2b (the `vault://` secret source)
+landed on `feat/phase-c-secret-sources` (plan §0 rev 2.15). CF-30 narrowed
+to the two cloud adapters and their placement (§11 item 8), with the
+`aws-config` spike named as the input that decision needs. Nothing new
+opened: Kubernetes auth and the namespace header are contract-tested
+rather than live-tested, which the plan's §3.8 test table now records
+rather than a register item, because no CI environment can supply a
+cluster or an Enterprise server. The allocation baseline below gained the
+C.2b note.
+
+Previously: 2026-09-04, after C.1b (OIDC provider profiles) landed on
 `feat/phase-c-secret-sources` (plan §0 rev 2.14). Opened CF-31 (the
 manually triggered Entra and Auth0 live jobs against developer tenants are
 not built; those profiles are fixture-locked only). CF-18's reading now
 covers `auth/oidc.rs` as it did `auth/okta.rs`. The allocation baseline
-below gained the C.1b note.
+gained the C.1b note.
 
-Previously: 2026-09-04, after C.2a (secret references) landed on
+Before that: 2026-09-04, after C.2a (secret references) landed on
 `feat/phase-c-secret-sources` (plan §0 rev 2.13). Opened CF-28 (the
 one-shot CLI refuses references rather than resolving them), CF-29
 (`NINJAONE_SERVERS` nested credentials take no references), and CF-30 (the
@@ -25,7 +35,7 @@ reserved cloud schemes refuse by name until C.2b–d; the placement question
 in plan §11 item 8 is still open). The allocation baseline below gained
 the C.2a note.
 
-Before that: 2026-09-03, after the independent review of the Phase B
+Earlier: 2026-09-03, after the independent review of the Phase B
 branch (plan §0 rev 2.8). The review opened CF-23 (checkpoint threat model
 and an external retention boundary), CF-24 (policy and revocation are two
 signed documents, not one bundle), CF-25 (the §7 metrics are proxies),
@@ -388,18 +398,21 @@ deliberately does not describe those rows — `auth/secrets.rs` explains why)
 or moving NinjaOne's per-server credentials to top-level keys. Decide when
 NinjaOne gets a read profile, with CF-1/CF-13.
 
-### CF-30 · No `secrets-*` Cargo features exist yet, and the reserved schemes refuse by name
-**Open · Phase C (C.2b–d)**
+### CF-30 · The cloud secret schemes refuse by name until C.2c–d, and their placement is undecided
+**Open · Phase C (C.2c–d)**
 
-`vault://`, `awssm://`, and `azkv://` parse today and fail startup with
-`no adapter for `vault://` is compiled into this binary`, which is the
-typed error §3.8 asks for. The `secrets-vault` / `secrets-aws` /
-`secrets-azure` features, the adapters behind them, and the `SecretResolver`
-registration in `bootstrap/` are C.2b–d. §11 item 8 (whether those adapters
-live here under features or in the enterprise crate) is still to decide
-before C.2b starts; C.2a itself — port, `file://`, snapshot, refresher —
-is in the community crate under the CF-18 reading, and is not a tier
-differentiator.
+`awssm://` and `azkv://` parse today and fail startup with
+`no adapter for `awssm://` is compiled into this binary`, which is the
+typed error §3.8 asks for. C.2b (rev 2.15) closed the Vault third of this
+item: the `secrets-vault` feature exists, is on by default, and
+`SecretResolver::from_config` registers the adapter from `MCP_VAULT_*`.
+The `secrets-aws` / `secrets-azure` features and the adapters behind them
+are C.2c–d, and §11 item 8 — features in the community crate, or the
+enterprise crate — is still to decide before C.2c starts. Vault did not
+force the question because it added no dependency; the AWS and Azure SDK
+trees are the case where it matters, and the `aws-config` spike C.2c
+opens with (dependency count, binary size) is the input the decision
+needs.
 
 ### CF-31 · Entra and Auth0 profiles are proven against fixtures, not tenants
 **Open · Phase C (C.1b); needs a developer tenant of each**
@@ -736,6 +749,16 @@ the cache hit did not move to 10), and claim-shape work (scope string
 splitting, group-path normalisation, discovery) runs on the uncached
 validation path and the key fetch only. The `Profile` comparison for the
 Keycloak audience hint sits on the rejection path.
+
+Re-run after C.2b (2026-09-04, rev 2.15): every stage's byte and
+allocation count is identical to the table above (JWT cache hit 9 at
+3.8 µs, journal append 6 at p50 11 µs / p99 15 µs / max 91 µs; every
+extractor and render stage unchanged). C.2b adds nothing to the request
+path at all: the Vault adapter is called from the refresher and at
+startup only, and a `vault://` value is read from the same snapshot a
+`file://` value is (`Config::get_for`, the one-byte scheme dispatch C.2a
+recorded). `SecretResolver::from_config` runs once in
+`ServerBuilder::build`.
 
 Notes for the Phase C comparison:
 
