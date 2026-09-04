@@ -81,7 +81,7 @@ fn context_for(row: &Row) -> ActionContext {
         subject: row.principal.subject.clone(),
         groups: row.principal.groups.clone(),
         scopes: vec!["mcp:tools".to_owned()],
-        authority: PrincipalAuthority::Okta,
+        authority: PrincipalAuthority::oidc("https://acme.okta.com/oauth2/default"),
     };
     // Tools with no extractor take the server-declared risk; the fixture
     // rows that hit that path are writes, and it does not change their

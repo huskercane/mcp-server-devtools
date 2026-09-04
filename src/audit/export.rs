@@ -469,7 +469,7 @@ pub fn access_review(policy: &FilePolicy, groups: &GroupsFile, tenant: &str) -> 
             subject: subject.clone(),
             groups: member_of.clone(),
             scopes: vec![crate::server::auth::DEFAULT_REQUIRED_SCOPE.to_owned()],
-            authority: PrincipalAuthority::Okta,
+            authority: PrincipalAuthority::oidc("https://acme.okta.com/oauth2/default"),
         };
         for rule in policy.rules_for(&principal) {
             rows.push(row_for(&subject, &member_of, rule));

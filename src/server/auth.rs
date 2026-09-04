@@ -88,6 +88,7 @@ impl InboundAuthSettings {
     /// plaintext metadata URL is worse than no challenge.
     pub fn from_config(
         config: &crate::config::Config,
+        auth_mode: &str,
         authorization_servers: Vec<String>,
     ) -> Result<Self, String> {
         let public_url = config
@@ -96,8 +97,8 @@ impl InboundAuthSettings {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
                 format!(
-                    "{PUBLIC_URL_KEY} is required when MCP_AUTH_MODE=okta: it is the RFC 9728 \
-                     resource identifier clients are told to obtain a token for"
+                    "{PUBLIC_URL_KEY} is required when MCP_AUTH_MODE={auth_mode}: it is the \
+                     RFC 9728 resource identifier clients are told to obtain a token for"
                 )
             })?
             .trim_end_matches('/')
@@ -482,6 +483,7 @@ mod tests {
         };
         let settings = InboundAuthSettings::from_config(
             &config(&[("MCP_PUBLIC_URL", "https://mcp.acme.example/")]),
+            "okta",
             vec!["https://acme.okta.com/oauth2/default".to_owned()],
         )
         .unwrap();
@@ -492,10 +494,13 @@ mod tests {
             "https://mcp.acme.example/.well-known/oauth-protected-resource"
         );
 
-        assert!(InboundAuthSettings::from_config(&config(&[]), Vec::new()).is_err());
+        let missing =
+            InboundAuthSettings::from_config(&config(&[]), "oidc", Vec::new()).unwrap_err();
+        assert!(missing.contains("MCP_AUTH_MODE=oidc"), "{missing}");
         assert!(
             InboundAuthSettings::from_config(
                 &config(&[("MCP_PUBLIC_URL", "http://mcp.acme.example")]),
+                "okta",
                 Vec::new()
             )
             .is_err()
@@ -505,6 +510,7 @@ mod tests {
                 ("MCP_PUBLIC_URL", "http://127.0.0.1:3000"),
                 ("MCP_REQUIRED_SCOPE", "mcp:read"),
             ]),
+            "okta",
             Vec::new(),
         )
         .unwrap();

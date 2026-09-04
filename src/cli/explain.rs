@@ -155,32 +155,57 @@ pub async fn run(opts: &ExplainOpts) -> Result<(), McpError> {
 }
 
 /// The principal as the bearer middleware would build it from a token
-/// with these claims: tenant from configuration the way the Okta settings
-/// derive it, the default required scope when none is given.
+/// with these claims: tenant and issuer from configuration the way the
+/// OIDC settings derive them (under whichever key family `MCP_AUTH_MODE`
+/// selects, or either when the mode is not set), the default required
+/// scope when none is given.
 fn principal(opts: &ExplainOpts, config: &crate::config::Config) -> Principal {
     let mut scopes = opts.scopes.clone();
     if scopes.is_empty() {
         scopes.push(crate::server::auth::DEFAULT_REQUIRED_SCOPE.to_owned());
     }
+    let settings = configured_oidc(config);
     let tenant = opts.tenant.clone().unwrap_or_else(|| {
-        crate::auth::okta::OktaSettings::from_config(config).map_or_else(
-            |_| {
+        settings.as_ref().map_or_else(
+            || {
                 config
-                    .get(crate::auth::okta::TENANT_KEY)
+                    .get(crate::auth::oidc::TENANT_KEY)
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map_or_else(|| "tenant".to_owned(), str::to_owned)
             },
-            |settings| settings.tenant,
+            |settings| settings.tenant.clone(),
         )
     });
+    // No issuer configured is a what-if against a policy alone; the
+    // placeholder is a reserved name (RFC 2606) that no real token carries.
+    let issuer = settings
+        .as_ref()
+        .map_or("https://issuer.example", |settings| {
+            settings.issuer.as_str()
+        });
     Principal {
         tenant,
         subject: opts.subject.clone(),
         groups: opts.groups.clone(),
         scopes,
-        authority: PrincipalAuthority::Okta,
+        authority: PrincipalAuthority::oidc(issuer),
     }
+}
+
+/// The OIDC settings this configuration would start with, if it would.
+fn configured_oidc(config: &crate::config::Config) -> Option<crate::auth::oidc::OidcSettings> {
+    use crate::config::{AuthMode, OidcKeys};
+    let families: &[OidcKeys] = match AuthMode::parse(config.get("MCP_AUTH_MODE")) {
+        Ok(AuthMode::Oidc(keys)) => match keys {
+            OidcKeys::Oidc => &[OidcKeys::Oidc],
+            OidcKeys::Okta => &[OidcKeys::Okta],
+        },
+        _ => &[OidcKeys::Okta, OidcKeys::Oidc],
+    };
+    families
+        .iter()
+        .find_map(|keys| crate::auth::oidc::OidcSettings::from_config(config, *keys).ok())
 }
 
 fn label<T: serde::Serialize>(value: &T) -> String {

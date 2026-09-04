@@ -289,7 +289,7 @@ mod enforcement {
             subject: "alice@acme.example".to_owned(),
             groups: vec!["SRE".to_owned()],
             scopes: vec!["mcp:tools".to_owned()],
-            authority: PrincipalAuthority::Okta,
+            authority: PrincipalAuthority::oidc("https://acme.okta.com/oauth2/default"),
         };
         Arc::new(
             CallScope::new(principal, ClientIdentity::default(), tool, "sha256:test")

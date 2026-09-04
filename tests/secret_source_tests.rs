@@ -202,7 +202,7 @@ fn principal() -> Principal {
         subject: "alice@acme.example".to_owned(),
         groups: vec!["SRE".to_owned()],
         scopes: vec!["mcp:tools".to_owned()],
-        authority: PrincipalAuthority::Okta,
+        authority: PrincipalAuthority::oidc("https://acme.okta.com/oauth2/default"),
     }
 }
 
@@ -213,6 +213,7 @@ fn inbound_auth() -> Arc<InboundAuth> {
             "MCP_PUBLIC_URL".to_owned(),
             "https://mcp.acme.example".to_owned(),
         )])),
+        "okta",
         vec!["https://acme.okta.com/oauth2/default".to_owned()],
     )
     .unwrap();

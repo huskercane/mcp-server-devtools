@@ -140,11 +140,11 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
     // the server's audit sink.
     let server = crate::bootstrap::ServerBuilder::new()
         .watch_config(true)
-        .require_inbound_auth(matches!(auth_mode, AuthMode::Okta))
+        .require_inbound_auth(auth_mode.requires_inbound_auth())
         .build()?;
     let inbound_auth = match auth_mode {
         AuthMode::Off => None,
-        AuthMode::Okta => Some(Arc::new(enterprise_inbound_auth(&config, &server)?)),
+        AuthMode::Oidc(keys) => Some(Arc::new(enterprise_inbound_auth(&config, &server, keys)?)),
     };
     // Every secret reference resolves before the port opens, or the
     // process does not start (plan §3.8): a credential it cannot read is
@@ -196,22 +196,27 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
 /// Assemble the enterprise inbound-auth stack from configuration, refusing
 /// anything incomplete (plan §1.2: no "temporarily permissive" mode).
 ///
-/// Required together: the Okta issuer and audience, the public URL clients
-/// are told to obtain a token for, and the durable audit journal — evidence
-/// is the product, so enterprise mode without a journal is not a mode.
+/// Required together: the issuer and audience (under whichever key family
+/// `MCP_AUTH_MODE` selected), the public URL clients are told to obtain a
+/// token for, and the durable audit journal — evidence is the product, so
+/// enterprise mode without a journal is not a mode.
 fn enterprise_inbound_auth(
     config: &Config,
     server: &DevtoolsServer,
+    keys: crate::config::OidcKeys,
 ) -> Result<InboundAuth, String> {
-    let okta = crate::auth::okta::OktaSettings::from_config(config)?;
-    let settings = InboundAuthSettings::from_config(config, vec![okta.issuer.clone()])?;
+    let mode = keys.mode();
+    let oidc = crate::auth::oidc::OidcSettings::from_config(config, keys)?;
+    let settings = InboundAuthSettings::from_config(config, mode, vec![oidc.issuer.clone()])?;
     if config
         .get(crate::bootstrap::AUDIT_JOURNAL_DIR_KEY)
         .map(str::trim)
         .is_none_or(str::is_empty)
     {
         return Err(format!(
-            "refusing to start: MCP_AUTH_MODE=okta requires {} — enterprise mode without a              durable audit journal would authorize calls it cannot evidence (fail-closed;              see docs/enterprise-product-plan.md §1.2)",
+            "refusing to start: MCP_AUTH_MODE={mode} requires {} — enterprise mode without a \
+             durable audit journal would authorize calls it cannot evidence (fail-closed; \
+             see docs/enterprise-product-plan.md §1.2)",
             crate::bootstrap::AUDIT_JOURNAL_DIR_KEY
         ));
     }
@@ -221,7 +226,7 @@ fn enterprise_inbound_auth(
         .is_none_or(str::is_empty)
     {
         return Err(format!(
-            "refusing to start: MCP_AUTH_MODE=okta requires {} — enterprise mode with no \
+            "refusing to start: MCP_AUTH_MODE={mode} requires {} — enterprise mode with no \
              policy loaded would authenticate every caller and then allow everything \
              (fail-closed; see docs/enterprise-product-plan.md §1.2)",
             crate::policy::engine::POLICY_FILE_KEY
@@ -233,7 +238,7 @@ fn enterprise_inbound_auth(
         .is_none_or(str::is_empty)
     {
         return Err(format!(
-            "refusing to start: MCP_AUTH_MODE=okta requires {} — enterprise mode applies only \
+            "refusing to start: MCP_AUTH_MODE={mode} requires {} — enterprise mode applies only \
              signed policy bundles, so a gateway with no verifying key could not tell an \
              authored policy from a planted one (fail-closed; plan §4 B.3). Generate a key \
              pair with `mcp-devtools policy keygen` and sign the policy with \
@@ -247,7 +252,7 @@ fn enterprise_inbound_auth(
         .is_none_or(str::is_empty)
     {
         return Err(format!(
-            "refusing to start: MCP_AUTH_MODE=okta requires {} — the audit journal's \
+            "refusing to start: MCP_AUTH_MODE={mode} requires {} — the audit journal's \
              checkpoints are signed so tampering is detectable offline, and an unsigned \
              journal is evidence only for whoever holds the disk (plan §3.3, B.6). Generate \
              a key with `mcp-devtools audit keygen`",
@@ -260,7 +265,7 @@ fn enterprise_inbound_auth(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             format!(
-                "refusing to start: MCP_AUTH_MODE=okta requires {} — the revocation list is \
+                "refusing to start: MCP_AUTH_MODE={mode} requires {} — the revocation list is \
                  the emergency stop (deny by subject, by token id, or `revoke all`), and a \
                  gateway without one has no way to cut a compromised token off before it \
                  expires (plan §3.6, B.4). Create an empty, signed list with \
@@ -283,7 +288,7 @@ fn enterprise_inbound_auth(
         )
     })?;
     let client = crate::transport::build_client().map_err(|error| error.message)?;
-    let validator = Arc::new(crate::auth::okta::OktaJwksValidator::new(okta, client));
+    let validator = Arc::new(crate::auth::oidc::OidcJwksValidator::new(oidc, client));
     let mut auth = InboundAuth::new(Arc::new(validator), settings).with_revocations(revocations);
     if let Some(sink) = server.audit_sink() {
         auth = auth.with_audit(BundleAudit {
@@ -847,7 +852,7 @@ fn validate_startup_security(auth_mode: AuthMode, addr: &SocketAddr) -> Result<(
              docs/enterprise-product-plan.md §1.2)",
             addr.ip()
         )),
-        AuthMode::Okta => Ok(()),
+        AuthMode::Oidc(_) => Ok(()),
     }
 }
 
@@ -931,7 +936,10 @@ mod startup_security_tests {
     fn okta_mode_accepts_any_bind_at_this_gate() {
         for addr in ["127.0.0.1:3000", "0.0.0.0:8443", "[::]:3000"] {
             let addr: SocketAddr = addr.parse().unwrap();
-            assert_eq!(validate_startup_security(AuthMode::Okta, &addr), Ok(()));
+            assert_eq!(
+                validate_startup_security(AuthMode::Oidc(crate::config::OidcKeys::Okta), &addr),
+                Ok(())
+            );
         }
     }
 }

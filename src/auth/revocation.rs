@@ -331,7 +331,7 @@ mod tests {
                 subject: subject.to_owned(),
                 groups: Vec::new(),
                 scopes: Vec::new(),
-                authority: PrincipalAuthority::Okta,
+                authority: PrincipalAuthority::oidc("https://acme.okta.com/oauth2/default"),
             },
             token: TokenFacts {
                 issued_at: iat,

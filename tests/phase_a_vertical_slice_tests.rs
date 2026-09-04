@@ -7,7 +7,7 @@
 //! > before dispatch.
 //!
 //! Every component is the production one: RS256 tokens signed with the
-//! test key and validated by `OktaJwksValidator` against a wiremock JWKS;
+//! test key and validated by `OidcJwksValidator` against a wiremock JWKS;
 //! the real bearer middleware and router; the file policy compiled from
 //! the shipped read-only profile plus a group-B row; the durable
 //! `JournalAuditSink` on disk; Grafana's Loki proxy on wiremock. The TLS
@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode, get_current_timestamp};
 use mcp_server_devtools::audit::journal::{JOURNAL_FILE_NAME, JournalAuditSink};
-use mcp_server_devtools::auth::okta::{OktaJwksValidator, OktaSettings};
+use mcp_server_devtools::auth::oidc::{JwksLocation, OidcJwksValidator, OidcSettings, Profile};
 use mcp_server_devtools::bootstrap::{ServerBuilder, Vendors};
 use mcp_server_devtools::config::Config;
 use mcp_server_devtools::policy::{ActionContext, FilePolicy, PolicyDecision, PolicyEffect};
@@ -156,17 +156,14 @@ async fn spawn_slice(policy: Arc<dyn PolicyDecisionPoint>) -> Slice {
         .build()
         .expect("build server");
 
-    let settings = OktaSettings {
-        issuer: ISSUER.to_owned(),
-        audience: AUDIENCE.to_owned(),
-        jwks_url: format!("{}/keys", jwks.uri()),
-        groups_claim: "groups".to_owned(),
-        clock_skew: Duration::from_mins(1),
-        tenant: "acme".to_owned(),
-        jwks_refresh: Duration::from_mins(10),
-        jwks_min_refetch_interval: Duration::from_secs(30),
-    };
-    let validator = Arc::new(OktaJwksValidator::new(settings, reqwest::Client::new()));
+    let settings = OidcSettings::new(
+        Profile::Okta,
+        ISSUER,
+        AUDIENCE,
+        JwksLocation::Direct(format!("{}/keys", jwks.uri())),
+    )
+    .with_tenant("acme");
+    let validator = Arc::new(OidcJwksValidator::new(settings, reqwest::Client::new()));
     let auth = Arc::new(InboundAuth::new(
         Arc::new(validator),
         InboundAuthSettings::from_config(
@@ -174,6 +171,7 @@ async fn spawn_slice(policy: Arc<dyn PolicyDecisionPoint>) -> Slice {
                 "MCP_PUBLIC_URL".to_owned(),
                 "https://mcp.acme.example".to_owned(),
             )])),
+            "okta",
             vec![ISSUER.to_owned()],
         )
         .unwrap(),
@@ -307,7 +305,7 @@ async fn group_a_is_allowed_group_b_is_denied_and_both_are_in_the_journal_first(
     assert_eq!(allow_intent["kind"], "tool_call_intent");
     assert_eq!(allow_intent["principal"]["subject"], "alice@acme.example");
     assert_eq!(allow_intent["principal"]["groups"], json!(["SRE"]));
-    assert_eq!(allow_intent["principal"]["authority"], "okta");
+    assert_eq!(allow_intent["principal"]["authority"], ISSUER);
     assert_eq!(allow_intent["decision"]["effect"], "allow");
     assert_eq!(
         allow_intent["decision"]["rule_id"],
@@ -739,7 +737,9 @@ async fn allow_all_with_a_journal_records_but_never_denies() {
                 subject: "x".to_owned(),
                 groups: Vec::new(),
                 scopes: vec!["mcp:tools".to_owned()],
-                authority: mcp_server_devtools::policy::PrincipalAuthority::Okta,
+                authority: mcp_server_devtools::policy::PrincipalAuthority::oidc(
+                    "https://acme.okta.com/oauth2/default",
+                ),
             },
         )),
         InboundAuthSettings::from_config(
@@ -747,6 +747,7 @@ async fn allow_all_with_a_journal_records_but_never_denies() {
                 "MCP_PUBLIC_URL".to_owned(),
                 "https://mcp.acme.example".to_owned(),
             )])),
+            "okta",
             vec![ISSUER.to_owned()],
         )
         .unwrap(),

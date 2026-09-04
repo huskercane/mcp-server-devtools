@@ -21,7 +21,7 @@ use crate::config::Config;
 use crate::error::{McpError, auth_invalid, auth_missing};
 
 pub mod keychain;
-pub mod okta;
+pub mod oidc;
 pub mod revocation;
 pub mod secrets;
 

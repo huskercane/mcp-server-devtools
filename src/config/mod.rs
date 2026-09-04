@@ -676,27 +676,37 @@ pub fn vendor_aliases(package_name: &str) -> Vec<(&'static str, Vec<String>)> {
 /// Inbound authentication mode (`MCP_AUTH_MODE`).
 ///
 /// `Off` is the community default: no inbound authentication, with the
-/// stdio pipe or loopback bind as the trust boundary. `Okta` opts into the
-/// enterprise inbound-auth path (Phase A). Parsing is fail-closed: an
-/// unrecognised value is an error, never silently mapped to `Off`, because
-/// "typo disables authentication" is exactly the failure mode
-/// `docs/enterprise-product-plan.md` §1.2 forbids.
+/// stdio pipe or loopback bind as the trust boundary. `Oidc` opts into the
+/// enterprise inbound-auth path (Phase A; provider profiles in C.1b): RS256
+/// bearer tokens validated against an OIDC issuer's JWKS. The
+/// variant carries the [`OidcKeys`] family the operator chose, because
+/// `okta` is kept as an alias of `oidc` that reads the original `MCP_OKTA_*`
+/// keys and implies the Okta profile — a deployment configured before the
+/// `oidc` mode existed keeps working, byte for byte, and its error messages
+/// keep naming the keys it actually set.
+///
+/// Parsing is fail-closed: an unrecognised value is an error, never
+/// silently mapped to `Off`, because "typo disables authentication" is
+/// exactly the failure mode `docs/enterprise-product-plan.md` §1.2 forbids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AuthMode {
     /// No inbound authentication (community default).
     #[default]
     Off,
-    /// Okta-validated inbound bearer tokens (enterprise, Phase A).
-    Okta,
+    /// OIDC-validated inbound bearer tokens (enterprise). The payload says
+    /// which configuration keys the mode was selected with.
+    Oidc(OidcKeys),
 }
 
 impl AuthMode {
     /// Parse the raw `MCP_AUTH_MODE` value. Absent or empty means [`Off`]
-    /// (the documented default); anything not exactly `off`/`okta`
+    /// (the documented default); `oidc` and its alias `okta` select
+    /// [`Oidc`] with the matching key family; anything else
     /// (ASCII-case-insensitive) is an error the server must refuse to start
     /// on.
     ///
     /// [`Off`]: AuthMode::Off
+    /// [`Oidc`]: AuthMode::Oidc
     ///
     /// # Errors
     ///
@@ -705,11 +715,121 @@ impl AuthMode {
         match raw.map(str::trim) {
             None | Some("") => Ok(Self::Off),
             Some(value) if value.eq_ignore_ascii_case("off") => Ok(Self::Off),
-            Some(value) if value.eq_ignore_ascii_case("okta") => Ok(Self::Okta),
+            Some(value) if value.eq_ignore_ascii_case("oidc") => Ok(Self::Oidc(OidcKeys::Oidc)),
+            Some(value) if value.eq_ignore_ascii_case("okta") => Ok(Self::Oidc(OidcKeys::Okta)),
             Some(other) => Err(format!(
-                "unrecognised MCP_AUTH_MODE {other:?} (expected \"off\" or \"okta\"); \
-                 refusing to guess an authentication mode"
+                "unrecognised MCP_AUTH_MODE {other:?} (expected \"off\", \"oidc\", or its \
+                 alias \"okta\"); refusing to guess an authentication mode"
             )),
+        }
+    }
+
+    /// Whether every request must carry a validated inbound principal.
+    #[must_use]
+    pub const fn requires_inbound_auth(self) -> bool {
+        matches!(self, Self::Oidc(_))
+    }
+}
+
+/// Which family of configuration keys an [`AuthMode::Oidc`] deployment
+/// reads. The two families are the same settings under two prefixes;
+/// `MCP_OKTA_*` is the spelling from before provider profiles existed
+/// (plan §3.9, C.1b) and stays valid indefinitely. A deployment sets one
+/// family: mixing them is refused at startup rather than resolved by
+/// precedence, so "which issuer is in force" is never a question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OidcKeys {
+    /// `MCP_AUTH_MODE=oidc`: `MCP_OIDC_*`, with `MCP_OIDC_PROFILE` naming
+    /// the provider profile.
+    Oidc,
+    /// `MCP_AUTH_MODE=okta`: `MCP_OKTA_*`, the Okta profile implied.
+    Okta,
+}
+
+impl OidcKeys {
+    /// The `MCP_AUTH_MODE` value that selects this family.
+    #[must_use]
+    pub const fn mode(self) -> &'static str {
+        match self {
+            Self::Oidc => "oidc",
+            Self::Okta => "okta",
+        }
+    }
+
+    /// The issuer URL key (required).
+    #[must_use]
+    pub const fn issuer(self) -> &'static str {
+        match self {
+            Self::Oidc => "MCP_OIDC_ISSUER",
+            Self::Okta => "MCP_OKTA_ISSUER",
+        }
+    }
+
+    /// The audience key (required).
+    #[must_use]
+    pub const fn audience(self) -> &'static str {
+        match self {
+            Self::Oidc => "MCP_OIDC_AUDIENCE",
+            Self::Okta => "MCP_OKTA_AUDIENCE",
+        }
+    }
+
+    /// The JWKS URL override key.
+    #[must_use]
+    pub const fn jwks_url(self) -> &'static str {
+        match self {
+            Self::Oidc => "MCP_OIDC_JWKS_URL",
+            Self::Okta => "MCP_OKTA_JWKS_URL",
+        }
+    }
+
+    /// The groups-claim override key.
+    #[must_use]
+    pub const fn groups_claim(self) -> &'static str {
+        match self {
+            Self::Oidc => "MCP_OIDC_GROUPS_CLAIM",
+            Self::Okta => "MCP_OKTA_GROUPS_CLAIM",
+        }
+    }
+
+    /// The clock-skew key.
+    #[must_use]
+    pub const fn clock_skew_seconds(self) -> &'static str {
+        match self {
+            Self::Oidc => "MCP_OIDC_CLOCK_SKEW_SECONDS",
+            Self::Okta => "MCP_OKTA_CLOCK_SKEW_SECONDS",
+        }
+    }
+
+    /// Every key of this family, for detecting a mixed configuration.
+    #[must_use]
+    pub const fn all(self) -> &'static [&'static str] {
+        match self {
+            Self::Oidc => &[
+                "MCP_OIDC_ISSUER",
+                "MCP_OIDC_AUDIENCE",
+                "MCP_OIDC_JWKS_URL",
+                "MCP_OIDC_GROUPS_CLAIM",
+                "MCP_OIDC_CLOCK_SKEW_SECONDS",
+                "MCP_OIDC_PROFILE",
+                "MCP_OIDC_SUBJECT_CLAIM",
+            ],
+            Self::Okta => &[
+                "MCP_OKTA_ISSUER",
+                "MCP_OKTA_AUDIENCE",
+                "MCP_OKTA_JWKS_URL",
+                "MCP_OKTA_GROUPS_CLAIM",
+                "MCP_OKTA_CLOCK_SKEW_SECONDS",
+            ],
+        }
+    }
+
+    /// The family this one must not be combined with.
+    #[must_use]
+    pub const fn other(self) -> Self {
+        match self {
+            Self::Oidc => Self::Okta,
+            Self::Okta => Self::Oidc,
         }
     }
 }
@@ -795,16 +915,28 @@ mod streaming_config_tests {
 
 #[cfg(test)]
 mod auth_mode_tests {
-    use super::AuthMode;
+    use super::{AuthMode, OidcKeys};
 
     #[test]
-    fn absent_or_off_is_off_and_okta_is_okta() {
+    fn absent_or_off_is_off_and_oidc_or_its_okta_alias_is_oidc() {
         assert_eq!(AuthMode::parse(None), Ok(AuthMode::Off));
         assert_eq!(AuthMode::parse(Some("")), Ok(AuthMode::Off));
         assert_eq!(AuthMode::parse(Some("off")), Ok(AuthMode::Off));
         assert_eq!(AuthMode::parse(Some(" OFF ")), Ok(AuthMode::Off));
-        assert_eq!(AuthMode::parse(Some("okta")), Ok(AuthMode::Okta));
-        assert_eq!(AuthMode::parse(Some("Okta")), Ok(AuthMode::Okta));
+        assert_eq!(
+            AuthMode::parse(Some("oidc")),
+            Ok(AuthMode::Oidc(OidcKeys::Oidc))
+        );
+        assert_eq!(
+            AuthMode::parse(Some("okta")),
+            Ok(AuthMode::Oidc(OidcKeys::Okta))
+        );
+        assert_eq!(
+            AuthMode::parse(Some("Okta")),
+            Ok(AuthMode::Oidc(OidcKeys::Okta))
+        );
+        assert!(AuthMode::Oidc(OidcKeys::Okta).requires_inbound_auth());
+        assert!(!AuthMode::Off.requires_inbound_auth());
     }
 
     #[test]

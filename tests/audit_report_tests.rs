@@ -56,7 +56,7 @@ fn principal(subject: &str, groups: &[&str]) -> Principal {
         subject: subject.to_owned(),
         groups: groups.iter().map(|group| (*group).to_owned()).collect(),
         scopes: vec!["mcp:tools".to_owned()],
-        authority: PrincipalAuthority::Okta,
+        authority: PrincipalAuthority::oidc("https://acme.okta.com/oauth2/default"),
     }
 }
 

@@ -246,7 +246,7 @@ fn policy_stage() {
         subject: "sre@acme.example".to_owned(),
         groups: vec!["SRE".to_owned(), "Developers".to_owned()],
         scopes: vec!["mcp:tools".to_owned()],
-        authority: PrincipalAuthority::Okta,
+        authority: PrincipalAuthority::oidc("https://acme.okta.com/oauth2/default"),
     };
     let upstream = UpstreamIdentity {
         label: CredentialLabel::slot(
@@ -320,7 +320,7 @@ fn enterprise_request_path_stage() {
     use std::sync::Arc;
 
     use mcp_server_devtools::audit::journal::{JOURNAL_FILE_NAME, JournalAuditSink};
-    use mcp_server_devtools::auth::okta::{OktaJwksValidator, OktaSettings};
+    use mcp_server_devtools::auth::oidc::{JwksLocation, OidcJwksValidator, OidcSettings, Profile};
     use mcp_server_devtools::ports::{AuditEvent, AuditEventKind, AuditSink, TokenValidator};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -342,17 +342,14 @@ fn enterprise_request_path_stage() {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [jwk] })))
             .mount(&jwks)
             .await;
-        let validator = Arc::new(OktaJwksValidator::new(
-            OktaSettings {
-                issuer: ISSUER.to_owned(),
-                audience: AUDIENCE.to_owned(),
-                jwks_url: format!("{}/keys", jwks.uri()),
-                groups_claim: "groups".to_owned(),
-                clock_skew: std::time::Duration::from_secs(60),
-                tenant: "acme".to_owned(),
-                jwks_refresh: std::time::Duration::from_secs(600),
-                jwks_min_refetch_interval: std::time::Duration::from_secs(30),
-            },
+        let validator = Arc::new(OidcJwksValidator::new(
+            OidcSettings::new(
+                    Profile::Okta,
+                    ISSUER,
+                    AUDIENCE,
+                    JwksLocation::Direct(format!("{}/keys", jwks.uri())),
+                )
+                .with_tenant("acme"),
             reqwest::Client::new(),
         ));
         let now = jsonwebtoken::get_current_timestamp();
@@ -398,7 +395,7 @@ fn enterprise_request_path_stage() {
                 subject: "sre@acme.example".to_owned(),
                 groups: vec!["SRE".to_owned()],
                 scopes: vec!["mcp:tools".to_owned()],
-                authority: PrincipalAuthority::Okta,
+                authority: PrincipalAuthority::oidc("https://acme.okta.com/oauth2/default"),
             },
             client: ClientIdentity::default(),
             decision: mcp_server_devtools::policy::PolicyDecision::by_rule(
