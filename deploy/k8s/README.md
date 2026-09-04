@@ -46,7 +46,7 @@ kubectl apply -f deploy/k8s/control.yaml
 kubectl apply -f deploy/k8s/ingress-nginx.yaml
 ```
 
-Then, from a client with an Okta-issued token:
+Then, from a client with a token from the configured identity provider:
 
 ```bash
 curl -sS https://mcp.example.com/.well-known/oauth-protected-resource

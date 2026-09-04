@@ -10,7 +10,7 @@
 #
 # Channel ids are Slack's (`C0123ABCDEF`), not names: find them with
 # `slack_list_channels` and edit the group name and ids below to match your
-# Okta groups and workspace. Validate with:
+# identity-provider groups and workspace. Validate with:
 #
 #     mcp-devtools policy check deploy/policies/slack-read-only.yaml
 #

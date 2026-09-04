@@ -5,9 +5,14 @@ metadata:
   name: mcp-devtools-config
   namespace: mcp-devtools
 data:
-  MCP_AUTH_MODE: "okta"
-  MCP_OKTA_ISSUER: "https://YOUR-ORG.okta.com/oauth2/default"
-  MCP_OKTA_AUDIENCE: "api://mcp-devtools"
+  # Identity provider: one of okta, entra, keycloak, auth0, generic — see
+  # docs/identity-provider-runbook.md for each provider's issuer, audience,
+  # and provider-side setup. (`MCP_AUTH_MODE: "okta"` with `MCP_OKTA_*` keys
+  # is the pre-profile spelling and still works.)
+  MCP_AUTH_MODE: "oidc"
+  MCP_OIDC_PROFILE: "okta"
+  MCP_OIDC_ISSUER: "https://YOUR-ORG.okta.com/oauth2/default"
+  MCP_OIDC_AUDIENCE: "api://mcp-devtools"
   MCP_PUBLIC_URL: "https://mcp.example.com"
   MCP_REQUIRED_SCOPE: "mcp:tools"
   MCP_POLICY_FILE: "/policy/policy.yaml"

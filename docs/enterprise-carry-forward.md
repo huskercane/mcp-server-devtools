@@ -10,7 +10,14 @@ removed only when it is done, not when it is explained.
 
 Status legend: **open** · **blocked** (needs a decision) · **done**.
 
-Last updated: 2026-09-04, after C.2a (secret references) landed on
+Last updated: 2026-09-04, after C.1b (OIDC provider profiles) landed on
+`feat/phase-c-secret-sources` (plan §0 rev 2.14). Opened CF-31 (the
+manually triggered Entra and Auth0 live jobs against developer tenants are
+not built; those profiles are fixture-locked only). CF-18's reading now
+covers `auth/oidc.rs` as it did `auth/okta.rs`. The allocation baseline
+below gained the C.1b note.
+
+Previously: 2026-09-04, after C.2a (secret references) landed on
 `feat/phase-c-secret-sources` (plan §0 rev 2.13). Opened CF-28 (the
 one-shot CLI refuses references rather than resolving them), CF-29
 (`NINJAONE_SERVERS` nested credentials take no references), and CF-30 (the
@@ -18,7 +25,7 @@ reserved cloud schemes refuse by name until C.2b–d; the placement question
 in plan §11 item 8 is still open). The allocation baseline below gained
 the C.2a note.
 
-Previously: 2026-09-03, after the independent review of the Phase B
+Before that: 2026-09-03, after the independent review of the Phase B
 branch (plan §0 rev 2.8). The review opened CF-23 (checkpoint threat model
 and an external retention boundary), CF-24 (policy and revocation are two
 signed documents, not one bundle), CF-25 (the §7 metrics are proxies),
@@ -394,6 +401,25 @@ before C.2b starts; C.2a itself — port, `file://`, snapshot, refresher —
 is in the community crate under the CF-18 reading, and is not a tier
 differentiator.
 
+### CF-31 · Entra and Auth0 profiles are proven against fixtures, not tenants
+**Open · Phase C (C.1b); needs a developer tenant of each**
+
+§3.9 asks for the Keycloak container *and* "a manually triggered live job
+against a developer tenant of each" for Entra and Auth0. The container
+job exists (`tests/keycloak_live_tests.rs`, the `keycloak` job in
+`rust.yml`) and paid for itself on its first run — the Keycloak fixture
+had assumed `aud: "account"` and the real realm emits no `aud` at all.
+The Entra and Auth0 profiles are locked against wiremock fixtures written
+from the documented claim shapes (`tests/token_validator_tests.rs`), which
+is exactly the position the Keycloak fixture was in. Closing this needs a
+developer tenant of each with a client credential in a repository secret,
+a `workflow_dispatch` job that obtains a real token (client credentials
+for Entra with an app role; an M2M application for Auth0 with the API
+audience) and validates it through the profile, and a run against each
+before Gate A if the partner is on either provider (plan §11 item 2). Until
+then a claim-shape drift at Entra or Auth0 is found by the partner, not by
+CI.
+
 ## Decisions we owe someone
 
 ### CF-10 · ADR-002: the enterprise licence
@@ -410,7 +436,7 @@ carries a real SPDX `license` field.
 ### CF-11 · WP 0.2 and WP 0.3
 **Open** — still unstarted from the M0 work-package list.
 
-### CF-18 · Where the Okta validator and the file policy engine live (ADR-001)
+### CF-18 · Where the OIDC validator and the file policy engine live (ADR-001)
 **Deferred · decided 2026-09-03: option 2 in practice while the repository is private · revisit at open-sourcing, with CF-10**
 
 **Decision 2026-09-03.** The community repository is private for now, so
@@ -698,6 +724,18 @@ rows (all of which read configuration) did not move. Secret fetches run
 on the refresher task and at startup, never per call (§8, "Secret
 resolution (C.2)"). A probe row for "get_for through a resolved
 reference" is worth adding when the probe next gains stages (CF-20).
+
+Re-run after C.1b (2026-09-04, rev 2.14): every stage's byte and
+allocation count is identical to the table above (JWT cache hit 9 at
+3.7 µs, journal append 6 at p50 11 µs / p99 19 µs / max 86 µs; every
+extractor and render stage unchanged). C.1b's request-path changes are
+in the validator's cached-principal clone and nowhere else: the principal's
+`authority` is now an `Arc<str>` issuer shared by every principal the
+validator produces (a refcount increment, not an allocation — which is why
+the cache hit did not move to 10), and claim-shape work (scope string
+splitting, group-path normalisation, discovery) runs on the uncached
+validation path and the key fetch only. The `Profile` comparison for the
+Keycloak audience hint sits on the rejection path.
 
 Notes for the Phase C comparison:
 
