@@ -7,6 +7,7 @@
 
 pub mod checkpoint;
 pub mod export;
+pub mod forward;
 pub mod journal;
 pub mod metrics;
 pub mod reader;

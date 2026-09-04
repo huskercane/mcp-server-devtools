@@ -94,6 +94,13 @@ impl Role {
     pub const fn serves_gateway(self) -> bool {
         matches!(self, Self::All | Self::Gateway)
     }
+
+    /// Whether this role runs the control plane's background work: audit
+    /// forwarding (C.3), and the rollups and admin API to come.
+    #[must_use]
+    pub const fn serves_control(self) -> bool {
+        matches!(self, Self::All | Self::Control)
+    }
 }
 
 /// Boot the streamable-HTTP server on `127.0.0.1:${PORT:-3000}`.
@@ -162,6 +169,13 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
                 crate::ports::AuditFailure::classify(&error)
             )
         })?;
+    }
+    // Forwarding the journal to a SIEM is the control plane's job (§3.4):
+    // it starts here, after the startup records are durable, and only on
+    // a role that serves the control plane. A misconfiguration refuses to
+    // start; an unreachable receiver does not (ADR-011: asynchronous).
+    if role.serves_control() {
+        server.start_audit_forwarding(cancel.clone())?;
     }
     let pending_audit = server.pending_audit();
     let app = build_app_for_role(
@@ -647,6 +661,11 @@ fn health(server: &DevtoolsServer) -> Response {
         if server.secrets_degraded().is_some() {
             banner.push_str("; secret refresh is failing; last good values in force");
         }
+        // Forwarding is a copy of durable evidence; failing to make the
+        // copy degrades, it does not stop serving (ADR-011).
+        if server.forwarding_degraded().is_some() {
+            banner.push_str("; audit forwarding is failing; journal retained");
+        }
         (StatusCode::OK, [content_type], banner).into_response()
     } else {
         (
@@ -875,6 +894,9 @@ mod startup_security_tests {
         assert!(Role::All.serves_gateway());
         assert!(Role::Gateway.serves_gateway());
         assert!(!Role::Control.serves_gateway());
+        assert!(Role::All.serves_control());
+        assert!(Role::Control.serves_control());
+        assert!(!Role::Gateway.serves_control());
     }
 
     #[test]

@@ -159,6 +159,7 @@ mod tests {
             policy: Arc::new(crate::ports::AllowAll),
             secrets: Arc::new(crate::secrets::SecretResolver::with_defaults()),
             secret_health: crate::bootstrap::secrets::SecretHealth::default(),
+            forward_health: Arc::default(),
             policy_file: None,
             audit_append_timeout: crate::policy::egress::DEFAULT_AUDIT_APPEND_TIMEOUT,
             pending_audit: tokio_util::task::TaskTracker::new(),

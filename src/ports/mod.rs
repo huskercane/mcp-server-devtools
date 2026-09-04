@@ -20,6 +20,7 @@
 //! is therefore a type parameter on the one function that needs it — not a
 //! heap allocation on every request.
 
+pub mod audit_forwarder;
 pub mod audit_sink;
 pub mod checkpoint_sink;
 pub mod command_runner;
@@ -29,6 +30,10 @@ pub mod secret_source;
 pub mod token_validator;
 pub mod usage_sink;
 
+pub use audit_forwarder::{
+    AuditForwarder, CapturedRecord, DeliverFuture, ForwardError, ForwardRecord,
+    InMemoryAuditForwarder,
+};
 pub use audit_sink::{
     AuditEvent, AuditEventKind, AuditFailure, AuditSink, ControlEvent, ControlEventKind,
     InMemoryAuditSink, SignatureStatus,

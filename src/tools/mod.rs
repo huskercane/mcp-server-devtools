@@ -197,6 +197,39 @@ impl DevtoolsServer {
         self.components.secret_health.degraded()
     }
 
+    /// Start forwarding the journal to the configured SIEM receiver
+    /// (`MCP_AUDIT_FORWARD_URL`, WP C.3). Called by the HTTP transport on
+    /// the roles that serve the control plane, after `journal_startup`.
+    /// Returns the adapter's name, or `None` when nothing is configured.
+    ///
+    /// # Errors
+    ///
+    /// [`McpError`] when the configuration cannot become a running
+    /// shipper (unknown scheme, unreadable certificate, unwritable state
+    /// directory); the transport refuses to start. An unreachable
+    /// receiver is not an error here: the journal is retained and the
+    /// health banner reports the failure.
+    pub fn start_audit_forwarding(
+        &self,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<&'static str>, crate::error::McpError> {
+        crate::bootstrap::forwarding::spawn_configured(&self.components, cancel)
+    }
+
+    /// The failure category while audit forwarding is failing (the
+    /// journal is retained and delivery retried); `None` when it is
+    /// healthy or not configured.
+    #[must_use]
+    pub fn forwarding_degraded(&self) -> Option<&'static str> {
+        self.components.forward_health.degraded()
+    }
+
+    /// The forwarding health handle, for tests that wait on rounds.
+    #[must_use]
+    pub fn forward_health(&self) -> Arc<crate::audit::forward::ForwardHealth> {
+        Arc::clone(&self.components.forward_health)
+    }
+
     /// Snapshot the current config. Returns an `Arc` so a tool call costs one
     /// atomic increment instead of deep-cloning the credential maps; `&Arc<Config>`
     /// deref-coerces to the `&Config` every context factory takes.

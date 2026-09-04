@@ -33,7 +33,7 @@ default  = ["keychain", "wrds", "secrets-vault"]
 # keychain` to drop the Postgres dependency tree entirely (headless / non-WRDS
 # deployments). At runtime the connection is lazy: nothing dials WRDS until a
 # `wrds_*` tool is actually called.
-wrds     = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
+wrds     = ["dep:tokio-postgres", "dep:tokio-postgres-rustls"]
 # `dep:keyring` activates the optional `keyring` dep declared per-target below.
 # We pick an explicit credential-store feature on each OS — without one,
 # `keyring` falls back to a mock store that silently no-ops `set` and returns
@@ -117,8 +117,17 @@ aws-lc-rs           = "=1.18.0"
 # default provider, already in the tree via reqwest) supplies the crypto.
 tokio-postgres        = { version = "=0.7.18", optional = true, features = ["with-serde_json-1"] }
 tokio-postgres-rustls = { version = "=0.14.0", optional = true }
-rustls                = { version = "=0.23.39", optional = true }
-rustls-native-certs   = { version = "=0.8.4", optional = true }
+
+# --- TLS stack used directly (WRDS, and the syslog audit forwarder) --------
+# All four were already in the tree through `reqwest` (`rustls`,
+# `rustls-native-certs`, `rustls-pki-types`, `tokio-rustls`), so naming them
+# here pins the versions the lockfile had resolved and adds no crate.
+# `rustls-pki-types` reads the PEM CA and client-certificate files an
+# operator points `MCP_AUDIT_FORWARD_*` at (WP C.3).
+rustls                = { version = "=0.23.39", default-features = false, features = ["aws_lc_rs", "tls12", "logging", "std"] }
+rustls-native-certs   = "=0.8.4"
+rustls-pki-types      = { version = "=1.15.1", features = ["std"] }
+tokio-rustls          = { version = "=0.26.4", default-features = false, features = ["aws_lc_rs", "tls12", "logging"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "=4.1.6", optional = true, default-features = false, features = ["apple-native-keyring-store", "v1"] }

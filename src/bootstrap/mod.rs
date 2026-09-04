@@ -22,6 +22,7 @@
 //! and config watcher all at once.
 
 pub mod config_handle;
+pub mod forwarding;
 pub mod secrets;
 pub mod vendors;
 pub mod watcher;
@@ -92,6 +93,9 @@ pub struct Components {
     pub secrets: Arc<crate::secrets::SecretResolver>,
     /// Whether that refresh is currently failing (health banner).
     pub secret_health: secrets::SecretHealth,
+    /// Whether audit forwarding (WP C.3) is keeping up, when the control
+    /// plane runs here. Shared with the shipper task.
+    pub forward_health: Arc<crate::audit::forward::ForwardHealth>,
 }
 
 impl Components {
@@ -290,6 +294,7 @@ impl ServerBuilder {
             pending_audit: tokio_util::task::TaskTracker::new(),
             secrets,
             secret_health: secrets::SecretHealth::default(),
+            forward_health: Arc::default(),
         });
 
         if let Some(pending) = watched {
