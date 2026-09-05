@@ -33,7 +33,10 @@ struct Admin {
     mutations: Arc<tokio::sync::Mutex<()>>,
 }
 
-/// Compose the standard backend, preserving the public router API.
+/// Compose the file-backed policy backend, preserving the public router API.
+/// The HTTP adapter picks this default itself so that it never reaches into
+/// the composition root; embedders inject another backend via
+/// [`router_with_policy`].
 pub fn router(
     server: DevtoolsServer,
     auth: &InboundAuth,
@@ -41,8 +44,21 @@ pub fn router(
     artifacts: Option<Arc<dyn ArtifactStore>>,
     reports: Option<Arc<dyn crate::ports::activity_reports::ActivityReports>>,
 ) -> Router {
-    let policy = crate::bootstrap::admin_policy(&server);
+    let policy = file_policy_admin(&server);
     router_with_policy(server, auth, sessions, artifacts, reports, policy)
+}
+
+fn file_policy_admin(
+    server: &DevtoolsServer,
+) -> Option<Arc<dyn crate::ports::policy_admin::PolicyAdmin>> {
+    let policy = server.policy_file()?;
+    let audit = server.audit_sink().map(|sink| BundleAudit {
+        sink,
+        append_timeout: server.audit_append_timeout(),
+    });
+    Some(Arc::new(crate::policy::admin::FilePolicyAdmin::new(
+        policy, audit,
+    )))
 }
 
 /// Build the HTTP boundary with an explicitly supplied policy backend.

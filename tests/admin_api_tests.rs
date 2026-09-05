@@ -478,8 +478,10 @@ async fn durable_journal_activity_adapter_reads_control_evidence() {
     assert!(result.stopped.is_none());
 }
 
-#[tokio::test]
-async fn activity_projection_matches_file_adapter_without_querying_journal() {
+/// Project `count` control records whose subject is `subject_len` bytes long,
+/// then compare the projection with the journal adapter row for row. Every
+/// sequence must appear once, and later polls must not replay the reused batch.
+async fn project_and_compare(subject_len: usize, count: usize) {
     use mcp_server_devtools::{
         audit::{
             activity_sqlite::SqliteActivityReports,
@@ -493,11 +495,9 @@ async fn activity_projection_matches_file_adapter_without_querying_journal() {
     let mut event = ControlEvent::now(ControlEventKind::AdminMutation);
     event.source = Some("policy/reload".into());
     let mut principal = Principal::local();
-    principal.subject = "s".repeat(2048);
+    principal.subject = "s".repeat(subject_len);
     event.principal = Some(principal);
-    // Cross both the row-count and payload-byte batch limits. Every sequence
-    // must appear once, and subsequent polls must not replay the reused batch.
-    for _ in 0..1001 {
+    for _ in 0..count {
         sink.append_control(&event).await.unwrap();
     }
     let source = directory.path().join(JOURNAL_FILE_NAME);
@@ -526,9 +526,23 @@ async fn activity_projection_matches_file_adapter_without_querying_journal() {
     std::fs::remove_file(directory.path().join(JOURNAL_FILE_NAME)).unwrap();
     assert_eq!(
         store.activity(&filter).await.unwrap().rows.len(),
-        1001,
+        count,
         "query reads the projection"
     );
+}
+
+#[tokio::test]
+async fn activity_projection_spans_row_count_batches() {
+    // Short records: 1,001 rows stay far below the payload budget, so the
+    // 1,000-row limit is the batch terminator and the last row is its own poll.
+    project_and_compare(1, 1001).await;
+}
+
+#[tokio::test]
+async fn activity_projection_spans_payload_byte_batches() {
+    // A 2 KiB subject makes the 1 MiB retained-payload limit bind after a few
+    // hundred rows, well before the row count would.
+    project_and_compare(2048, 1001).await;
 }
 
 #[tokio::test]

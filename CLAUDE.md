@@ -32,8 +32,9 @@ The Rust workflow's Linux `quality` job enforces formatting and dependency
 checks using cargo-deny 0.19.4. `deny.toml` rejects new duplicate dependency
 versions; its exact-version exceptions record incompatible versions required
 by the pinned upstream graph. Those exceptions never suppress license,
-advisory, or source checks. Remove them when the corresponding versions leave
-`Cargo.lock`; do not replace them with broad duplicate allowances.
+advisory, or source checks. When a duplicate leaves `Cargo.lock`, the gate
+fails with `error[unmatched-skip]` until its `skip` line is deleted; delete
+that line rather than adding a broad duplicate allowance.
 
 ## Profiling (not a CI gate)
 

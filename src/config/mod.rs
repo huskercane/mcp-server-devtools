@@ -397,7 +397,8 @@ impl Config {
         if let Some(v) = self.shared.get(key) {
             return Resolved::Resolved(self.expand(v));
         }
-        let mut hits: Vec<(&str, &str)> = Vec::with_capacity(self.by_vendor.len());
+        // Most lookups miss every vendor section; stay allocation-free until a hit.
+        let mut hits: Vec<(&str, &str)> = Vec::new();
         for (vendor, vendor_map) in &self.by_vendor {
             if let Some(v) = vendor_map.get(key) {
                 hits.push((vendor.as_str(), self.expand(v)));

@@ -72,12 +72,14 @@ impl SqliteActivityReports {
                     (batch, result)
                 })
                 .await;
+                // A panicked ingest loses the batch it owned; replace it and
+                // retry on the usual cadence instead of retiring the projection.
                 let result = if let Ok((returned_batch, result)) = outcome {
                     batch = returned_batch;
                     result
                 } else {
-                    store.ready.store(false, Ordering::Release);
-                    return;
+                    batch = Vec::with_capacity(INGEST_BATCH_ROWS);
+                    Err(ActivityUnavailable)
                 };
                 match result {
                     Ok((next, caught_up)) => {

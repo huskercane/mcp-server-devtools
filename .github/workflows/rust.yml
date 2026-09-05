@@ -19,9 +19,20 @@ jobs:
     - uses: actions/checkout@v4
     - name: Check formatting
       run: cargo fmt --all -- --check
+    - name: Restore pinned dependency auditor
+      # Building cargo-deny from source costs minutes per run; the binary is
+      # keyed on its exact version so a bump rebuilds it and nothing else.
+      id: cargo-deny
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/cargo-deny
+        key: cargo-deny-0.19.4-${{ runner.os }}
     - name: Install pinned dependency auditor
+      if: steps.cargo-deny.outputs.cache-hit != 'true'
       run: cargo install cargo-deny --version 0.19.4 --locked
     - name: Audit dependencies
+      # `--deny warnings` also turns an unmatched `[bans] skip` entry into a
+      # failure, so a duplicate leaving Cargo.lock must have its skip removed.
       run: cargo deny --locked check --deny warnings
 
   build:

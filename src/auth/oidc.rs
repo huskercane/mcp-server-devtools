@@ -1064,7 +1064,8 @@ impl TokenValidator for Arc<OidcJwksValidator> {
 /// document order.
 fn admit_keys(set: &JwkSet) -> HashMap<String, AdmittedKey> {
     let mut keys: HashMap<String, AdmittedKey> = HashMap::with_capacity(set.keys.len());
-    let mut ambiguous: Vec<&str> = Vec::with_capacity(set.keys.len());
+    // Duplicate kids are the exception; do not allocate for them up front.
+    let mut ambiguous: Vec<&str> = Vec::new();
     for jwk in &set.keys {
         let Some(kid) = jwk.common.key_id.as_deref() else {
             continue;
