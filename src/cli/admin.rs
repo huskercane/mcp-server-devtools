@@ -62,9 +62,20 @@ pub enum Command {
 #[derive(Debug, Subcommand)]
 pub enum Policy {
     Read,
-    Validate { file: PathBuf },
-    Diff { file: PathBuf },
+    Validate {
+        file: PathBuf,
+    },
+    Diff {
+        file: PathBuf,
+    },
     Reload,
+    /// Install a signed policy: the exact file bytes and the detached
+    /// signature produced by `policy sign`.
+    Install {
+        file: PathBuf,
+        #[arg(long)]
+        signature: PathBuf,
+    },
 }
 #[derive(Debug, Subcommand)]
 pub enum Inventory {
@@ -113,6 +124,15 @@ impl Command {
                 }
                 .into(),
                 Some(json!({"document":text_file(file).await?})),
+            ),
+            Self::Policy {
+                command: Policy::Install { file, signature },
+            } => (
+                Put,
+                "policy".into(),
+                Some(
+                    json!({"document":text_file(file).await?,"signature":text_file(signature).await?.trim()}),
+                ),
             ),
             Self::Principals { tenant, subject } => (
                 Post,

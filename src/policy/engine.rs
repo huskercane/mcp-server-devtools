@@ -682,10 +682,17 @@ fn compile_subjects(
 /// and `signature` come from the bundle.
 pub type FilePolicy = SignedBundle<CompiledPolicy>;
 
+impl CompiledPolicy {
+    #[must_use]
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
+}
+
 impl SignedBundle<CompiledPolicy> {
     #[must_use]
     pub fn rule_count(&self) -> usize {
-        self.snapshot().document.rules.len()
+        self.snapshot().document.rule_count()
     }
 
     /// Every rule, as data, in document order (WP B.5 access review, WP

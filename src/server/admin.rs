@@ -358,6 +358,9 @@ impl Admin {
             (&Method::PUT, "deny-list") => {
                 return self.replace_deny_list(principal, body).await;
             }
+            (&Method::PUT, "policy") => {
+                return self.install_policy(principal, body).await;
+            }
             (&Method::POST, "principals/lookup") => {
                 let input: Lookup = decode(body)?;
                 let rows = self
@@ -441,6 +444,35 @@ impl Admin {
         Ok(Outcome::Applied(applied))
     }
 
+    /// `PUT /admin/policy`: the mirror of the deny-list replacement for the
+    /// policy (plan §3.10.3). The candidate is verified before the gate sees
+    /// it, so a proposal binds to bytes that would install; the adapter
+    /// verifies again under its lock when it installs.
+    async fn install_policy(&self, principal: &Principal, body: &[u8]) -> Result<Outcome, Error> {
+        let input: SignedDocument = decode(body)?;
+        let policy = self.policy()?;
+        let verified = policy
+            .verify(&input.document, &input.signature)
+            .await
+            .map_err(policy_error)?;
+        let intent = MutationIntent {
+            kind: MutationKind::PolicyInstall,
+            principal,
+            target: Some(&verified.version),
+            candidate: Some(input.document.as_bytes()),
+        };
+        if let Some(deferred) = self.admit(&intent).await? {
+            return Ok(deferred);
+        }
+        let installed = policy
+            .install(principal, input.document, input.signature)
+            .await
+            .map_err(policy_error)?;
+        Ok(Outcome::Applied(
+            json!({"audit_seq": installed.audit_seq, "version": installed.version}),
+        ))
+    }
+
     async fn replace_deny_list(
         &self,
         principal: &Principal,
@@ -473,21 +505,13 @@ impl Admin {
         let seq = self
             .record(principal, "deny-list/replace", Some(version))
             .await?;
-        let path = list.path().to_owned();
-        // Both files are atomically replaced. A crash between them leaves an
-        // invalid signature pair and startup fails closed; never accepts a
-        // partially installed document. Watcher shares this bundle lock.
+        let files = list.clone();
+        // Both files are atomically replaced under the bundle lock the
+        // watcher shares; a crash between them fails closed at startup.
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            use std::io::Write as _;
             let signature = crate::policy::signing::Signature::from_base64(&input.signature)
                 .map_err(std::io::Error::other)?;
-            crate::policy::signing::write_detached(&path, &signature)?;
-            atomicwrites::AtomicFile::new(&path, atomicwrites::AllowOverwrite)
-                .write(|file| {
-                    file.write_all(input.document.as_bytes())?;
-                    file.sync_all()
-                })
-                .map_err(std::io::Error::other)
+            files.install_signed(input.document.as_bytes(), &signature)
         })
         .await
         .map_err(|_| UNAVAILABLE)?

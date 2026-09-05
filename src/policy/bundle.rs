@@ -47,7 +47,7 @@ use crate::ports::audit_sink::{
     AuditFailure, AuditSink, ControlEvent, ControlEventKind, SignatureStatus,
 };
 
-use super::signing::{Domain, VerifyingKey};
+use super::signing::{Domain, Signature, VerifyingKey};
 
 /// How often the watcher looks at the file.
 pub const WATCH_INTERVAL: Duration = Duration::from_millis(500);
@@ -298,6 +298,27 @@ impl<D: BundleDocument> SignedBundle<D> {
             },
             bytes: bytes.to_vec(),
         })
+    }
+
+    /// Write a verified candidate and its detached signature to this
+    /// bundle's path, each file atomically, signature first. Callers hold
+    /// [`Self::mutation`] across this and the [`Self::commit`] that follows,
+    /// so the watcher never sees the pair mid-update. A crash between the
+    /// two files leaves a mismatched pair, which the next startup refuses:
+    /// a partially installed document is never accepted.
+    ///
+    /// # Errors
+    ///
+    /// When either file cannot be written.
+    pub fn install_signed(&self, bytes: &[u8], signature: &Signature) -> std::io::Result<()> {
+        use std::io::Write as _;
+        super::signing::write_detached(&self.path, signature)?;
+        atomicwrites::AtomicFile::new(&self.path, atomicwrites::AllowOverwrite)
+            .write(|file| {
+                file.write_all(bytes)?;
+                file.sync_all()
+            })
+            .map_err(std::io::Error::other)
     }
 
     /// The document in force. One `Arc` clone; readers keep their snapshot

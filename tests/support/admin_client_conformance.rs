@@ -40,7 +40,7 @@ pub async fn conformance(client: &dyn AdminClient, admin: &str, tools: &str) -> 
             admin,
             AdminRequest {
                 method: AdminMethod::Put,
-                operation: "policy",
+                operation: "policy/reload",
                 body: None,
             },
         )

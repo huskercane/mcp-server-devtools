@@ -29,6 +29,8 @@ use tokio_util::sync::CancellationToken;
 
 struct Fixture {
     _dir: tempfile::TempDir,
+    key: SigningKey,
+    policy: std::path::PathBuf,
     url: String,
     app: axum::Router,
     sink: Arc<InMemoryAuditSink>,
@@ -111,6 +113,8 @@ async fn fixture(gate: Option<Arc<dyn MutationGate>>, settings: &[(&str, &str)])
     });
     Fixture {
         _dir: dir,
+        key,
+        policy,
         url,
         app,
         sink,
@@ -410,6 +414,54 @@ async fn deny_list_replacement_is_admitted_on_the_verified_candidate() {
         .await
         .unwrap();
     assert_eq!(response.status, 400);
+    assert_eq!(gate.seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn policy_install_is_admitted_on_the_verified_candidate() {
+    let gate = ScriptedGate::new(Admission::Deferred {
+        proposal: "p-3".into(),
+    });
+    let f = fixture(Some(gate.clone()), &[]).await;
+    let candidate = "version: 2\nrules: []\n";
+    let signature = f
+        .key
+        .sign(Domain::PolicyBundle, candidate.as_bytes())
+        .to_base64();
+    let (status, body) = mutate(
+        &f,
+        AdminMethod::Put,
+        "policy",
+        json!({"document": candidate, "signature": signature}),
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(
+        body,
+        json!({"data": {"proposal": "p-3", "state": "pending", "operation": "policy/install"}})
+    );
+    {
+        let seen = gate.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, MutationKind::PolicyInstall);
+        assert_eq!(seen[0].1, "alice");
+        assert!(seen[0].2.is_some(), "the verified candidate's version");
+        assert_eq!(seen[0].3.as_deref(), Some(candidate.as_bytes()));
+    }
+    assert!(f.sink.events().is_empty());
+    assert_eq!(
+        std::fs::read(&f.policy).unwrap(),
+        b"version: 1\nrules: []\n".to_vec()
+    );
+    // An unverifiable candidate never reaches the gate at all.
+    let (status, _) = mutate(
+        &f,
+        AdminMethod::Put,
+        "policy",
+        json!({"document": candidate, "signature": "AAAA"}),
+    )
+    .await;
+    assert_eq!(status, 400);
     assert_eq!(gate.seen.lock().unwrap().len(), 1);
 }
 

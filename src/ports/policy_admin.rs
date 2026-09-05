@@ -37,6 +37,13 @@ pub struct PolicyDiff {
     pub current_rules: Vec<RuleDescription>,
     pub candidate_rules: Vec<RuleDescription>,
 }
+/// What [`PolicyAdmin::install`] reports: the durable intent's sequence and
+/// the version now in force.
+#[derive(Serialize)]
+pub struct PolicyInstall {
+    pub audit_seq: u64,
+    pub version: String,
+}
 #[derive(Serialize)]
 pub struct PolicyReload {
     pub audit_seq: u64,
@@ -53,6 +60,25 @@ pub trait PolicyAdmin: Send + Sync {
     /// Serialize reloads with the watcher; durably audit before changing state.
     /// Callers must let the future finish once started, even on disconnect.
     fn reload<'a>(&'a self, principal: &'a Principal) -> AdminFuture<'a, PolicyReload>;
+    /// Verify a signed candidate against the same trust anchor as file
+    /// reloads and compile it, without changing state: what [`Self::install`]
+    /// would put in force. `signature_verified` is `true` on success.
+    /// Borrowed so the caller keeps the bytes for its admission intent.
+    fn verify<'a>(
+        &'a self,
+        document: &'a str,
+        signature: &'a str,
+    ) -> AdminFuture<'a, PolicyValidation>;
+    /// Install exact candidate bytes and their detached signature as the
+    /// policy: verified again under the reload lock, journaled as a durable
+    /// `policy/install` intent, written beside the file the watcher reads,
+    /// then committed. Callers must let the future finish once started.
+    fn install<'a>(
+        &'a self,
+        principal: &'a Principal,
+        document: String,
+        signature: String,
+    ) -> AdminFuture<'a, PolicyInstall>;
     fn access_review(
         &self,
         groups: BTreeMap<String, Vec<String>>,

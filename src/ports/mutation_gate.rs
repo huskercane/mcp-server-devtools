@@ -1,7 +1,7 @@
 //! Admission of an administrative mutation (plan §3.10.1, WP D.0).
 //!
-//! Every mutation the admin HTTP boundary performs — reloading the policy,
-//! replacing the deny-list, revoking a session, purging an artifact — asks
+//! Every mutation the admin HTTP boundary performs — reloading or installing
+//! the policy, replacing the deny-list, revoking a session, purging an artifact — asks
 //! this port whether it may proceed **before** it appends its durable
 //! `admin_mutation` intent. The community adapter, [`DirectGate`], always
 //! admits: that is the behaviour the boundary had before the port existed,
@@ -19,6 +19,8 @@ use std::{future::Future, pin::Pin};
 pub enum MutationKind {
     /// `POST /admin/policy/reload`.
     PolicyReload,
+    /// `PUT /admin/policy`.
+    PolicyInstall,
     /// `PUT /admin/deny-list`.
     DenyListReplace,
     /// `POST /admin/sessions/revoke`.
@@ -33,6 +35,7 @@ impl MutationKind {
     pub const fn operation(self) -> &'static str {
         match self {
             Self::PolicyReload => "policy/reload",
+            Self::PolicyInstall => "policy/install",
             Self::DenyListReplace => "deny-list/replace",
             Self::SessionRevoke => "sessions/revoke",
             Self::ArtifactPurge => "artifacts/purge",

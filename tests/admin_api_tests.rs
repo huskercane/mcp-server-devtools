@@ -3,7 +3,7 @@ use mcp_server_devtools::{
     bootstrap::ServerBuilder,
     config::Config,
     policy::{
-        Principal, PrincipalAuthority,
+        FilePolicy, Principal, PrincipalAuthority,
         signing::{Domain, SigningKey, write_detached},
     },
     ports::{InMemoryAuditSink, StaticValidator},
@@ -407,6 +407,90 @@ async fn signed_deny_list_replace_is_audited_persistent_and_enforced() {
 }
 
 #[tokio::test]
+async fn signed_policy_install_is_audited_persistent_and_in_force() {
+    let f = fixture(Role::All).await;
+    let client = reqwest::Client::new();
+    let original = std::fs::read_to_string(&f.policy).unwrap();
+    let candidate = "version: 2\nrules: []\n";
+    let put = |body: Value| {
+        client
+            .put(format!("{}/admin/policy", f.url))
+            .bearer_auth("admin")
+            .json(&body)
+            .send()
+    };
+    // A candidate that does not verify or does not compile is refused
+    // before it becomes an intent: no record, nothing on disk.
+    let wrong_domain = f
+        .key
+        .sign(Domain::RevocationList, candidate.as_bytes())
+        .to_base64();
+    let broken = "version: 2\nrules: [\n";
+    let broken_signature = f
+        .key
+        .sign(Domain::PolicyBundle, broken.as_bytes())
+        .to_base64();
+    for body in [
+        json!({"document": candidate, "signature": "AAAA"}),
+        json!({"document": candidate, "signature": wrong_domain}),
+        json!({"document": broken, "signature": broken_signature}),
+        json!({"document": candidate}),
+    ] {
+        let response = put(body.clone()).await.unwrap();
+        assert_eq!(response.status(), 400, "{body}");
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"],
+            "invalid_request"
+        );
+    }
+    assert!(f.sink.events().is_empty());
+    assert_eq!(std::fs::read_to_string(&f.policy).unwrap(), original);
+    // The intent must be durable before anything is written.
+    let request = json!({"document": candidate, "signature": f.key.sign(Domain::PolicyBundle, candidate.as_bytes()).to_base64()});
+    f.sink.set_failing(true);
+    assert_eq!(put(request.clone()).await.unwrap().status(), 503);
+    assert_eq!(std::fs::read_to_string(&f.policy).unwrap(), original);
+    f.sink.set_failing(false);
+    let response = put(request).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["data"].as_object().unwrap().len(), 2);
+    let events = f.sink.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["kind"], "admin_mutation");
+    assert_eq!(events[0]["source"], "policy/install");
+    assert_eq!(events[0]["seq"], body["data"]["audit_seq"]);
+    assert_eq!(events[0]["version"], body["data"]["version"]);
+    assert_eq!(events[0]["principal"]["subject"], "alice");
+    // On disk: the exact bytes and a signature the offline loader accepts.
+    assert_eq!(std::fs::read_to_string(&f.policy).unwrap(), candidate);
+    let reloaded = FilePolicy::load_verified(&f.policy, f.key.verifying_key()).unwrap();
+    assert_eq!(reloaded.version(), body["data"]["version"]);
+    // In force, with its verified signature.
+    let read: Value = client
+        .get(format!("{}/admin/policy", f.url))
+        .bearer_auth("admin")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(read["data"]["document"], candidate);
+    assert_eq!(read["data"]["version"], body["data"]["version"]);
+    assert_eq!(read["data"]["signature"]["verified"], true);
+    // The file the watcher reads is the document in force: a reload has
+    // nothing to change.
+    let reload = post(&f, "policy/reload", json!({}))
+        .await
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(reload["data"]["changed"], false, "{reload}");
+    assert_eq!(reload["data"]["version"], body["data"]["version"]);
+}
+
+#[tokio::test]
 async fn artifact_purge_uses_real_pin_aware_backend_and_fails_closed() {
     use mcp_server_devtools::transport::raw_response;
     let f = fixture(Role::All).await;
@@ -600,6 +684,38 @@ async fn admin_cli_uses_the_audited_http_boundary_and_json_errors() {
         serde_json::from_slice::<Value>(&output.stdout).unwrap(),
         json!({"error":"audit_unavailable","error_description":"audit_unavailable"})
     );
+    // `policy install` sends the file's exact bytes and the detached
+    // signature `policy sign` wrote beside it.
+    f.sink.set_failing(false);
+    let candidate = f.dir.path().join("candidate.yaml");
+    std::fs::write(&candidate, "version: 2\nrules: []\n").unwrap();
+    let signature = write_detached(
+        &candidate,
+        &f.key.sign(Domain::PolicyBundle, b"version: 2\nrules: []\n"),
+    )
+    .unwrap();
+    let output = run(&[
+        "policy",
+        "install",
+        candidate.to_str().unwrap(),
+        "--signature",
+        signature.to_str().unwrap(),
+        "--json",
+    ])
+    .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let events = f.sink.events();
+    assert_eq!(events.last().unwrap()["source"], "policy/install");
+    assert_eq!(events.last().unwrap()["seq"], body["data"]["audit_seq"]);
+    assert_eq!(
+        std::fs::read_to_string(&f.policy).unwrap(),
+        "version: 2\nrules: []\n"
+    );
 }
 
 #[test]
@@ -610,6 +726,13 @@ fn every_admin_command_accepts_json() {
         &["policy", "validate", "policy.yaml"],
         &["policy", "diff", "policy.yaml"],
         &["policy", "reload"],
+        &[
+            "policy",
+            "install",
+            "policy.yaml",
+            "--signature",
+            "policy.sig",
+        ],
         &["principals", "--tenant", "t", "--subject", "s"],
         &["sessions", "list"],
         &["sessions", "remove", "s"],

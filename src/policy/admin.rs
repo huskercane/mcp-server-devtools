@@ -5,8 +5,8 @@ use crate::{
     ports::{
         ControlEvent, ControlEventKind,
         policy_admin::{
-            AdminFuture, PolicyAdmin, PolicyAdminError, PolicyDiff, PolicyDocument, PolicyReload,
-            PolicyValidation,
+            AdminFuture, PolicyAdmin, PolicyAdminError, PolicyDiff, PolicyDocument, PolicyInstall,
+            PolicyReload, PolicyValidation,
         },
     },
 };
@@ -94,6 +94,77 @@ impl PolicyAdmin for FilePolicyAdmin {
             Ok(PolicyReload {
                 audit_seq,
                 changed,
+                version: self.policy.version(),
+            })
+        })
+    }
+    fn verify<'a>(
+        &'a self,
+        document: &'a str,
+        signature: &'a str,
+    ) -> AdminFuture<'a, PolicyValidation> {
+        Box::pin(async move {
+            // One copy each for the blocking worker; an admin call, not the
+            // request path.
+            let (document, signature) = (document.to_owned(), signature.to_owned());
+            let policy = self.policy.clone();
+            let staged = tokio::task::spawn_blocking(move || {
+                policy.stage_candidate(document.as_bytes(), &signature)
+            })
+            .await
+            .map_err(|_| Unavailable)?
+            .map_err(|_| Invalid)?;
+            Ok(PolicyValidation {
+                valid: true,
+                version: staged.version().to_owned(),
+                rules: staged.document().rule_count(),
+                signature_verified: true,
+            })
+        })
+    }
+    fn install<'a>(
+        &'a self,
+        principal: &'a Principal,
+        document: String,
+        signature: String,
+    ) -> AdminFuture<'a, PolicyInstall> {
+        Box::pin(async move {
+            // Same lock discipline as `reload`: staging, the durable intent,
+            // the file writes, and the commit are one critical section the
+            // watcher cannot interleave with.
+            let _guard = self.policy.mutation.lock().await;
+            let staging = self.policy.clone();
+            let (document, signature, staged) = tokio::task::spawn_blocking(move || {
+                let staged = staging.stage_candidate(document.as_bytes(), &signature)?;
+                let signature = super::signing::Signature::from_base64(&signature)
+                    .map_err(|_| super::BundleError::new("invalid signature"))?;
+                Ok::<_, super::BundleError>((document, signature, staged))
+            })
+            .await
+            .map_err(|_| Unavailable)?
+            .map_err(|_| Invalid)?;
+            let mut event = ControlEvent::now(ControlEventKind::AdminMutation);
+            event.principal = Some(principal.clone());
+            event.source = Some("policy/install".into());
+            event.version = Some(staged.version().to_owned());
+            let audit = self.audit.as_ref().ok_or(AuditUnavailable)?;
+            let audit_seq = super::egress::append_control_bounded(
+                audit.sink.as_ref(),
+                &event,
+                audit.append_timeout,
+            )
+            .await
+            .map_err(|_| AuditUnavailable)?;
+            let files = self.policy.clone();
+            tokio::task::spawn_blocking(move || {
+                files.install_signed(document.as_bytes(), &signature)
+            })
+            .await
+            .map_err(|_| Unavailable)?
+            .map_err(|_| Unavailable)?;
+            self.policy.commit(staged);
+            Ok(PolicyInstall {
+                audit_seq,
                 version: self.policy.version(),
             })
         })

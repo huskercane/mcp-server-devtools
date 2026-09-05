@@ -22,6 +22,7 @@ Unknown request fields are rejected for endpoint-specific request types.
 | Method and path | Request | `data` |
 |---|---|---|
 | GET `/admin/policy` | No body | `version`, exact loaded `document`, `signature` |
+| PUT `/admin/policy` | `{"document":"YAML","signature":"base64 Ed25519 signature"}` | `audit_seq`, `version` |
 | POST `/admin/policy/validate` | `{"document":"YAML"}` | `valid`, `version`, `rules`, `signature_verified:false` |
 | POST `/admin/policy/diff` | `{"document":"YAML"}` | `current_version`, `candidate_version`, `current_rules`, `candidate_rules` |
 | POST `/admin/policy/reload` | `{}` | `audit_seq`, `changed`, `version` |
@@ -39,7 +40,13 @@ Unknown request fields are rejected for endpoint-specific request types.
 Validation and diff compile candidate policy bytes but do not establish a
 signature or change policy. Reload reads the configured signed bundle and uses
 the same verifier as the file watcher. Administrative reload and watcher
-stage/journal/commit sequences share one lock.
+stage/journal/commit sequences share one lock. Policy install (`PUT`) is the
+mirror of the deny-list replacement below: the exact document bytes and their
+detached signature, verified with the configured policy public key and
+compiled, are journaled as a `policy/install` intent, written as the configured
+policy file and its `.sig` (each atomically, under the same lock), and put in
+force — so the watcher finds a file that matches the policy already loaded.
+Sign with `mcp-devtools policy sign`; the API never receives the private key.
 
 Deny-list edits replace a complete signed document, preserving the B.4 trust
 model: author and sign it with the existing offline revocation tooling, then
@@ -57,8 +64,8 @@ default, `off`, admits every mutation, which is the behaviour described above.
 When an adapter holds a mutation for a second administrator (plan §3.10.3,
 `required`), the endpoint answers `202 Accepted` with
 `{"data":{"proposal":"<id>","state":"pending","operation":"…"}}`, where
-`operation` is `policy/reload`, `deny-list/replace`, `sessions/revoke`, or
-`artifacts/purge`, and appends **no** `admin_mutation` record: nothing has
+`operation` is `policy/reload`, `policy/install`, `deny-list/replace`,
+`sessions/revoke`, or `artifacts/purge`, and appends **no** `admin_mutation` record: nothing has
 changed, and the adapter journals the proposal itself. When the gate refuses,
 the endpoint answers `409 Conflict` in the ordinary error shape with the gate's
 cause as `error` (`approval_self`, `approval_expired`), again with no record.
@@ -111,6 +118,7 @@ mcp-devtools admin --url https://mcp.example.com --token-file /run/admin-token p
 mcp-devtools admin --url https://mcp.example.com --token-file /run/admin-token policy validate policy.yaml --json
 mcp-devtools admin --url https://mcp.example.com --token-file /run/admin-token policy diff policy.yaml --json
 mcp-devtools admin --url https://mcp.example.com --token-file /run/admin-token policy reload --json
+mcp-devtools admin --url https://mcp.example.com --token-file /run/admin-token policy install policy.yaml --signature policy.yaml.sig --json
 ```
 
 Every command supports `--json`, including after the leaf command. Successful
