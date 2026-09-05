@@ -47,6 +47,7 @@ ordered by partner demand and are not scheduled until Gate B passes.
 | 2.20 | 2026-09-04 | C.5 landed locally: `mcp-devtools admin` calls the C.4 audited HTTP boundary for every operation; all 14 command forms support `--json`. Explicit bearer-token file, HTTPS except loopback, redirects disabled, bounded inputs/responses, structured runtime errors. Real CLI-to-server mutation/audit-failure tests; all 1,066 tests and landing gates passed. CF-7 is closed for admin commands; direct vendor commands and CF-28 vendor-reference resolution remain open. No dependencies or request-path allocation changes | Implementation |
 | 2.21 | 2026-09-04 | C.7 landed locally: Helm chart mirrors gateway/control deployment and hardening with explicit CF-16/33 limits; quiesced journal/checkpoint/SQLite backup and atomic restore verify hashes, SQLite integrity, and signed audit evidence. Native Helm and real local backend tests passed; all 1,068 tests and landing gates passed. Release workflow emits a CycloneDX source SBOM and signs/verifies image digests and file bundles with Sigstore. Signing cannot be exercised locally and remains external evidence (CF-34). Upgrade/rollback runbook added; allocation counts unchanged | Implementation |
 | 2.22 | 2026-09-04 | C.1 implementation landed locally after fetching and reading stable ext-auth at `fb374c7db2b34f18ca9183882e0beecdf661892b`: opt-in EMA advertisement and AS profile discovery, RFC 8693 then RFC 7523 exchanges against external issuers, Unix file-based `auth exchange` helper, ID-JAG-as-bearer refusal, and signed Okta-style subject/actor fixtures through the same OIDC validator. Nine new tests; all 1,077 tests and landing gates passed. Exact 16-check matrix for each requested client is documented and unrun (CF-35); no client interoperability claim. No dependencies added; actor-chain cache benchmark added | Implementation |
+| 2.23 | 2026-09-05 | Phase C merged to `main` (PR #16, `1448b3a`) after the compliance and re-review rounds; CF-34 (release signing evidence) and CF-35 (EMA client/tenant evidence) stay open as the external-evidence items. Phase D planned: §3.10 is the design, §4 Phase D the work packages. Two decisions proposed for the owner: ADR-012 (placement — all of Phase D lands in this repository under features and configuration, since nothing is in the enterprise repository and there is still one binary; D.2/D.3 join CF-18's would-move list) before D.0 and ADR-013 (console browser authentication: OIDC authorization code + PKCE at the console, token held server-side, the admin API stays the only enforcement surface). Order: D.0 composition seam → D.2 approvals API-first → D.1 read-only console → D.4 packaging → D.3 authoring → D.5 delegated identity behind §11 item 4. htmx re-checked 2026-09-05: 4.0.0 is still the newest 4.x release, so ADR-007's "adopt the current 4.x patch" resolves to 4.0.0 unless a patch lands before D.1 vendors it. Gate B is still unrecorded; Phase D runs on the same "behind demonstrated demand" footing Phase C did | Owner + implementation |
 | 2.12 | 2026-09-03 | Competitive survey recorded in [`docs/competitive-landscape.md`](competitive-landscape.md) (sixteen products, seven categories, one matrix): credential brokerage and tamper-evident audit are each available elsewhere (Okta Runtime Agent Gateway, Pomerium, Arcade; obsigno, cMCP), so neither is a differentiator alone — the product is the *combination* of egress enforcement on the owned vendor request, resource-aware policy, brokered identity and sealed evidence in one self-hosted binary, and the pitch leads with that. Consequences applied here: Gate A runs behind the partner's existing gateway and tests the moat hypothesis; C.1's ID-JAG exchange interops against Okta Cross-App Access and D.5 reuses it; a §9 row for gateways and identity vendors absorbing the generic half of Phase A; §11 gains the moat question; the brief's "nobody has a good answer for credential brokerage" corrected | Owner; competitive survey |
 
 Unresolved questions are collected in §11. Work that a phase deliberately
@@ -112,6 +113,8 @@ hypothesis to be confirmed at a gate, **D** decided.
 | ADR-009 | Operator interfaces | One admin REST API; two thin clients — console and `mcp-devtools admin` CLI in the existing `clap` tree. **All controls, including two-person approval, are enforced in the API**, never in a client. | P | Anything clickable must be scriptable; nothing scriptable may bypass a control. |
 | ADR-010 | Process topology on Kubernetes | One image, two roles: `gateway ×N` (data plane) and `control ×1` (admin, rollups, reports, console). `--role all` for single-host. See §3.4. | P | Multi-process is natural on k8s; the split is a runtime flag, not a second codebase. |
 | ADR-011 | Audit durability | Local append-only journal with sequence numbers and periodic signed checkpoints, written before dispatch; forwarded to SIEM asynchronously. Audit unavailable ⇒ fail closed by default; a documented degraded-read mode is opt-in. | P | The product sells decision evidence. |
+| ADR-012 | Phase D placement | **All of Phase D lands in this repository**, the reading CF-18 has applied since rev 2.9: the console behind a `console` Cargo feature (it is the only item with new dependencies), approvals and delegation selected by configuration like every other enterprise-mode control. The enterprise repository stays empty. The [licensing policy](licensing.md) names approval workflows and centralised policy management as *possible* proprietary extensions, so D.2 and D.3 join CF-18's "would move" list: each sits behind a port (`MutationGate`, `AdminClient`) so that a later move is a file move — but it must happen **before** the repository is opened, because whatever is public here is Apache-2.0. | P — owner confirms; stated 2026-09-05 that nothing is in the enterprise repo | A second binary, CI, release train, and image are the cost CF-18 priced, and there is still no external party on the other side of the boundary. Segmentation today is a licence label, not an engineering fact; the ports keep it cheap to make it one later. |
+| ADR-013 | Console browser authentication | OIDC **authorization code + PKCE** at the console, against the issuer and profile the bearer boundary already validates (`MCP_OIDC_*`), requesting the same audience (`MCP_PUBLIC_URL`) and `mcp:admin`. The access token is held server-side in a bounded in-memory console session keyed by an opaque `HttpOnly; Secure; SameSite=Strict` cookie and presented to the admin API as the bearer of every render. The console holds no authority of its own and never mints tokens; a proxy-injected bearer (oauth2-proxy style) also works because the console only needs a bearer per request. | P — owner decides before D.1 | ADR-009: nothing clickable bypasses a control. The token the console uses is the token the CLI would use, so `admin_mutation` records name the person, never the console. Sessions live on `control ×1` (ADR-010) and are lost on restart, which means re-login, not lost work. |
 
 ### 2.1 Policy engine options
 
@@ -510,6 +513,184 @@ Rules that apply to every row:
   force re-initialise) and which never do (audit records, artifact owner
   checks).
 
+### 3.10 Console, approvals, packaging, and delegated identity (Phase D)
+
+Planned 2026-09-05 (rev 2.23). Phase C left one admin surface — the JSON
+API in `server::admin` — and one client, the CLI. Phase D adds the second
+client (the console), the first control that needs state of its own
+(two-person approval), the first controls a later enterprise edition might own (ADR-012), packaging for
+hosts that are not Kubernetes, and per-user upstream identity. Each item
+sits behind a port already named here or one added below; nothing in this
+section adds an HTML endpoint to the admin API (ADR-007).
+
+#### 3.10.1 Seams (D.0)
+
+Everything in Phase D lands in this crate (ADR-012). D.0 is therefore not
+a second binary; it is the two ports the later packages share, each with
+two adapters from its first commit so neither is an invented seam:
+
+| Port | Adapter one | Adapter two | Where it is consulted |
+|---|---|---|---|
+| `ports::MutationGate` — `fn admit(&self, intent: &MutationIntent) -> Future<Admission>`, `Admission::{Apply, Deferred(proposal_id), Refused(cause)}` | `Direct`: always `Apply` — today's behaviour, byte-identical, selected when `MCP_ADMIN_APPROVALS` is unset or `off` | D.2's approval adapter, selected by `MCP_ADMIN_APPROVALS=required` | Every admin mutation in `server::admin` (`src/server/admin.rs:65`), **before** its durable `admin_mutation` intent; the existing admin tests run under `Direct` unchanged |
+| `ports::AdminClient` — `fn call(&self, op: AdminOp, bearer: &str, body: Option<Value>) -> Future<AdminResponse>` | HTTP, extracted from `cli::admin` (`src/cli/admin.rs:92`); the CLI becomes its caller with no behaviour change | In-process (`tower::ServiceExt::oneshot` against the admin `Router`), used by the console: same JSON, same limiter, same audit, no loopback socket | The console (D.1) and the CLI; one conformance suite across both, on the `tests/support/secret_source_conformance.rs` pattern |
+
+`admin::router` keeps its signature and picks `Direct` itself, as it picks
+the file policy backend today; `router_with_policy` gains the gate as an
+explicit parameter for embedders. If the owner later moves D.2/D.3 out
+(ADR-012), the approval adapter, its endpoints, and the CLI group are the
+files that move, and `router_with_policy` is the composition they attach
+to. No parity test is needed while there is one binary.
+
+#### 3.10.2 Console (D.1, D.3)
+
+The console is an askama-rendered client of the admin API, served by the
+roles that serve the control plane, behind the `console` Cargo feature.
+
+- **Assets.** `console/htmx.min.js` is the one vendored script, exact
+  version and SHA-256 recorded in `console/VENDORED.md`, embedded with
+  `rust-embed`, and a test hashes the embedded bytes against the recorded
+  digest so an unreviewed replacement fails CI. D.3 adds no editor widget
+  in its first cut (a `<textarea>` with server-side validation on a debounced
+  `hx-trigger`); CodeMirror is scoped only if a partner asks, as ADR-007
+  allowed. `askama` (0.16.x) and `rust-embed` (8.12.x) are the two new
+  dependencies, exact-pinned, and their dependency trees and the binary
+  size delta are recorded in D.1's summary.
+- **Headers.** `Content-Security-Policy: default-src 'none'; script-src
+  'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action
+  'self'; frame-ancestors 'none'; base-uri 'none'` with `htmx.config.allowEval
+  = false` set from the embedded configuration, no inline script or style;
+  `Referrer-Policy: no-referrer`; `X-Content-Type-Options: nosniff`;
+  `Cache-Control: no-store` on every rendered page. HSTS stays at the
+  ingress (ADR-004). A test asserts every header on every route.
+- **Sessions and CSRF (ADR-013).** Login is the authorization-code + PKCE
+  flow against the configured OIDC profile's authorization endpoint
+  (discovery already exists in `auth::oidc` and `auth::ema`), with
+  `state` and `nonce` bound to a pre-session cookie. The access token lives
+  in a bounded in-memory map on `control` (cap, TTL = token `exp`, 256-bit
+  random id, never on disk); the cookie is `HttpOnly; Secure; SameSite=Strict;
+  Path=/console`. Every non-GET checks `Sec-Fetch-Site` / `Origin` against
+  `MCP_PUBLIC_URL`; `HX-Request` is telemetry, not a control. Logout drops
+  the session; a revoked or expired token surfaces as the admin API's own
+  401 and forces re-login. New keys: `MCP_CONSOLE_CLIENT_ID`,
+  `MCP_CONSOLE_REDIRECT_PATH` (default `/console/callback`); the IdP-side
+  registration is a runbook section per profile
+  (`docs/identity-provider-runbook.md`).
+- **Pages (D.1, read-only).** Each page is one API response rendered: policy
+  (document, version, key id) with an explain form; activity search with
+  the API's 10,000-row cap and `stopped` rendered as a banner, never as a
+  complete result; access review (group snapshot upload); usage (C.6
+  reports); sessions and artifacts with `scope:process` and
+  `admin_backend_unavailable` rendered honestly; health. `policy explain`
+  is CLI-only today, so D.1 adds the one read-only endpoint the console
+  needs, `POST /admin/policy/explain` (an `ActionContext` in, the firing
+  rule out, the B.2 logic unchanged), and the CLI gains the same call.
+- **Budget.** Console calls are admin calls, so they run behind the admin
+  limiter and task budget and never contend with `/mcp` (§8). A new probe
+  stage −1f renders the activity page at 1,000 rows so a template change
+  that allocates per row is visible at the phase gate.
+- **Proof.** Real-HTTP tests with a real bearer from a wiremock JWKS: the
+  login flow against a wiremock authorization server (redirect, PKCE
+  verifier checked at the token endpoint, `state` mismatch refused), header
+  and cookie attributes, CSRF refusal, a 401 from the API ending the
+  session, every page's markup through a small HTML assertion helper, and
+  the `AdminClient` conformance suite across both adapters. No headless
+  browser and no npm: htmx is a vendored dependency whose behaviour is
+  trusted, and the server's HTML is what is tested.
+
+#### 3.10.3 Two-person approval (D.2) — enforced in the API
+
+A proposal is `{ id, operation, candidate_digest, proposer: {tenant,
+subject}, created, expires, state }`; `operation` is `policy_install` or
+`deny_list_replace`; `candidate_digest` is the SHA-256 of the exact
+document bytes and detached signature submitted. Flow, with
+`MCP_ADMIN_APPROVALS=required`:
+
+1. The proposer submits the signed candidate to the existing endpoint. The
+   approval adapter verifies the signature exactly as today, journals an
+   `admin_proposal` control record (the journal is the source of truth, as
+   C.4's activity projection already assumes), and answers `202` with the
+   proposal id instead of applying (`Admission::Deferred`).
+2. A **different** validated subject in the same tenant calls
+   `POST /admin/proposals/{id}/approve` with a token that satisfies the
+   B.4 fresh-token rule for writes. The adapter journals `admin_approval`,
+   re-checks the stored digest, then applies the exact stored bytes through
+   the ordinary mutation path, so what is applied is what was approved,
+   not what is on disk now. Self-approval is `approval_self`; a second
+   approval is idempotent; `reject` and expiry (default 24 h,
+   `MCP_ADMIN_APPROVAL_TTL_SECONDS`) journal their own records.
+3. Pending state is a projection rebuilt from the control journal at
+   startup, so a `control` restart loses no proposal and adds no backend.
+
+Gated: policy install — which needs the endpoint reload lacks today, a
+`PUT /admin/policy` taking signed bundle bytes plus detached signature,
+the mirror of the deny-list `PUT` (community, D.2's first commit, gated
+by `Direct` until the adapter exists) — and deny-list replacement. **Not
+gated, by decision:** `mcp-devtools revoke` (the break-glass emergency deny
+of §3.6 stays one-person and offline-signed), session revoke, and artifact
+purge (bounded blast radius, already journaled). The D.2 row's "credential
+rotation" has no API target because rotation happens in the secret source
+(§3.8); it is recorded in the register at D.2 exit rather than invented
+here. CLI: `admin proposals list|show|approve|reject`, `--json` throughout.
+The console page comes after D.1 and is the last part of D.2. The adapter, its endpoints, and the CLI group are self-contained files so they can move under ADR-012 if the owner ever decides they should.
+
+#### 3.10.4 Packaging and air-gap (D.4)
+
+- **`.deb` / `.rpm`** built in `release.yml` by `cargo-deb` and
+  `cargo-generate-rpm`, each pinned by version and checksum the way the
+  `operations` job pins Helm. The unit runs with `DynamicUser=yes`,
+  `StateDirectory=mcp-devtools`, `ProtectSystem=strict`, `NoNewPrivileges=yes`,
+  an empty `CapabilityBoundingSet`, and `EnvironmentFile=/etc/mcp-devtools/env`
+  at mode 0600. CI installs each package into a Debian and a UBI container,
+  starts the unit, reads the health banner, and proves the fail-closed
+  refusal for a non-loopback bind without auth.
+- **Compose reference stack** in `deploy/compose/`: `--role all` behind a
+  TLS-terminating proxy, named volumes for journal, rollups, and policies,
+  an optional syslog-ng profile reusing `tests/fixtures/syslog-ng/`.
+  Smoke-tested in the `image` job.
+- **Air-gap.** `JwksLocation::File` (`src/auth/oidc.rs:241`,
+  `MCP_OIDC_JWKS_FILE`) reloaded on change like the policy watcher, with a
+  `mcp-devtools auth jwks fetch` helper to capture a JWKS where the network
+  exists; images are already digest-pinned, so the runbook documents the
+  copy; a `cargo vendor` tarball with checksum is attached to each release
+  and an `--offline` build of it is a release-workflow step. The offline
+  licence file is enterprise-only and waits for the licence text (CF-10).
+  OVA stays "on request". Runbook: `docs/air-gap-runbook.md`.
+
+#### 3.10.5 Delegated upstream identity (D.5)
+
+`CredentialBroker::upstream_identity` (`src/ports/credential_broker.rs:81`)
+already returns the identity with `authority=shared`. D.5 adds a second
+adapter, `DelegatedBroker`, selected per vendor per environment by
+configuration, that returns `authority=delegated` with the principal's own
+upstream credential and **never** falls back to the shared one (the
+brief's rule). One port, two acquisition paths:
+
+1. **ID-JAG downstream** where the vendor's authorization server accepts
+   RFC 8693 / 7523: reuse `auth::ema::OidcExchange::exchange`
+   (`src/auth/ema.rs:179`) with the vendor's issuer as the resource
+   issuer. The exchanged token lives only in a bounded per-(principal,
+   vendor) cache with TTL = its `exp`; nothing new is stored.
+2. **Vendor OAuth 2.0 authorization code** where there is no exchange:
+   consent served from the control plane (console or CLI URL), and the
+   refresh token is a **new class of secret at rest**. `SecretSource` is a
+   read-only fetch port, so this is a new `DelegatedTokenStore` port:
+   first adapter SQLite beside the rollups, rows sealed with AES-GCM under
+   a key that is itself a secret reference (`MCP_DELEGATED_TOKEN_KEY`);
+   Vault KV write as the second adapter when a partner runs Vault. v1 is
+   `--role all` only, because consent happens on `control` and the token is
+   used on the gateway (CF-16/CF-33 apply).
+
+Policy gains one matcher, `authority: delegated | shared`, so a rule can
+require the user's own identity for a resource class; it compiles to Cedar
+without loss (ADR-003). The audit record already carries `authority`. The
+first vendor is decided by §11 item 4; the feasibility order is Slack
+(user-token OAuth v2, scopes map one-to-one onto the five B.1 reads),
+then Atlassian (3LO on `api.atlassian.com/ex/…`, which changes the
+canonical host and so touches §3.5). Grafana has no per-user OAuth for its
+HTTP API, so the Grafana-first workflow keeps shared authority — which is
+what ADR-006 accepted. Each vendor is its own gate and its own work
+package; nothing here builds a second delegation mechanism.
+
 ## 4. Phases and gates
 
 Sizes are relative (S ≈ days, M ≈ 1–2 weeks, L ≈ 3–5 weeks for one engineer
@@ -673,15 +854,60 @@ measured — and the partner can produce an access-review export themselves.
 | C.6 | **Landed (rev 2.18).** Prometheus metrics behind `UsageSink`; per-principal rate limits; usage rollups behind the `RollupStore` port (§3.9) with SQLite (pinned) as the first adapter, in-memory for tests, and PostgreSQL scoped when a partner asks; `sqlite://` selection and a typed refusal for reserved `postgres://`; usage-and-metrics runbook | M |
 | C.7 | **Landed (rev 2.21), external signing evidence pending (CF-34).** Helm chart, quiesced journal/checkpoint/SQLite backup and restore with `audit verify`, upgrade/rollback runbook, CycloneDX source SBOM, Sigstore image/file signing and verification in `release.yml`. Native Helm and real local backend tests pass; no local signing or cluster rollout claimed | M |
 
+**Status 2026-09-05:** merged to `main` in PR #16 (`1448b3a`) after the
+2026-09-05 compliance round and the PR re-review (six branch-review
+findings, six compliance fixes, three P2s — all answered in code with
+regression tests; 1,084 tests at merge). Open at exit: CF-34 (release
+signing runs only in the release workflow — external evidence), CF-35
+(EMA client/tenant matrix E01–E16 unrun), CF-16/CF-33 (split-topology
+state and delivery), CF-28/CF-29/CF-30/CF-31/CF-32 as recorded. C.2c/C.2d
+remain deferred until a partner asks. Gate B is still owner-led and
+unrecorded.
+
 ### Phase D — Administration experience (after Phase C; each item behind demonstrated demand)
 
-| WP | Work | Size |
-|---|---|---|
-| D.1 | Console v1, read-only: policy viewer + explain, audit search, activity and access-review reports, session/artifact management | L |
-| D.2 | Two-person approval for policy change and credential rotation — **enforced in the admin API**; console and CLI merely surface it | M |
-| D.3 | Console v2: policy authoring with validation and diff | L |
-| D.4 | Additional packaging: `.deb`/`.rpm`, compose reference stack, air-gap runbook (pinned JWKS from file, offline licence, mirrorable images, `cargo vendor` tarball), OVA only on request | M |
-| D.5 | Delegated OAuth, one vendor at a time, each behind its own gate; the exchange is C.1's ID-JAG wherever the vendor's authorization server accepts it (an Okta shop hands us a `sub`+`act` assertion and we exchange it downstream), a bespoke per-vendor OAuth flow only where it does not — no second delegation mechanism | L each |
+Planned 2026-09-05 (rev 2.23); the design is §3.10. Two owner decisions
+precede engineering: ADR-012 (placement — everything here, one binary)
+before D.0 and ADR-013 (console authentication) before D.1. Order below
+is dependency order with the highest-value, lowest-dependency item first; the owner reorders on partner
+demand, and D.4 can run in parallel with anything since it touches only
+`release.yml`, `deploy/`, and one `JwksLocation` variant.
+
+| WP | Work | Where (ADR-012) | Size |
+|---|---|---|---|
+| D.0 | Seams (§3.10.1): `ports::MutationGate` with the `Direct` adapter on every admin mutation, selected by `MCP_ADMIN_APPROVALS`; `ports::AdminClient` with the HTTP adapter extracted from `cli::admin` and the in-process adapter; conformance suite across both adapters; existing admin tests unchanged under `Direct` | This repo | S |
+| D.2 | Two-person approval (§3.10.3), **API first**: `PUT /admin/policy` (signed bundle + signature; `Direct`-gated until the adapter exists), the approval `MutationGate` adapter with `admin_proposal` / `admin_approval` / `admin_rejection` control records and the startup projection, `POST /admin/proposals/{id}/approve` and `…/reject`, `GET /admin/proposals`, proposer ≠ approver, fresh-token rule, digest re-check, TTL; `admin proposals` CLI group; console page last (after D.1). Locked JSON shapes; journal record shapes locked by tests | This repo; on CF-18's would-move list | M |
+| D.1 | Console v1, read-only (§3.10.2): `console` feature, askama + `rust-embed`, vendored htmx 4.x with digest test, PKCE login and bounded in-memory sessions, strict CSP and CSRF checks, pages for policy + explain, activity, access review, usage, sessions/artifacts, health; `POST /admin/policy/explain` for both clients; probe stage −1f; IdP client-registration runbook sections | This repo (`console` feature) | L |
+| D.4 | Packaging (§3.10.4): `.deb`/`.rpm` with a hardened systemd unit and container-install CI proof; compose reference stack; air-gap: `JwksLocation::File`, `auth jwks fetch`, `cargo vendor` tarball with an `--offline` build step, mirrored-image runbook. Offline licence waits on CF-10; OVA on request | This repo | M |
+| D.3 | Console v2, policy authoring (§3.10.2): textarea editor with debounced server-side validate and diff (existing endpoints), candidate download for offline signing, signed-bundle upload that becomes a D.2 proposal; no editor widget unless asked | This repo (`console` feature); on CF-18's would-move list | M (L with an editor widget) |
+| D.5 | Delegated upstream identity (§3.10.5), one vendor per gate: **D.5a** `DelegatedBroker` behind `CredentialBroker`, the ID-JAG downstream path over `OidcExchange`, bounded token cache, `authority` policy matcher, audit unchanged; **D.5b** first authorization-code vendor (Slack by feasibility; decided by §11 item 4) with the `DelegatedTokenStore` port and its SQLite adapter, consent flow on `control`, `--role all` only | This repo | D.5a M; D.5b L per vendor |
+
+**Done when:** an administrator logs into the console with their own IdP
+identity, reads the active policy and explains a denial, proposes a signed
+policy change that the API refuses to apply until a second administrator
+approves it with a fresh token — every step a journal record the offline
+verifier accepts — while the CLI performs the identical sequence with
+`--json`; a `.deb` install on a host with no network reaches healthy on a
+file JWKS; and, if D.5b ships, one vendor's read tool runs under the
+caller's own upstream identity with `authority=delegated` in the record.
+
+**Phase exit gates (in addition to the landing gates in `CLAUDE.md`):**
+
+- [ ] Allocation probe: every existing stage unchanged; new stage −1f
+      (activity page render at 1,000 rows) recorded as the Phase D baseline
+      in the register; the two new dependencies' trees and the binary-size
+      delta recorded in D.1's summary.
+- [ ] CF-18's would-move list updated with the D.2/D.3 files, so a later
+      segmentation is a recorded file move.
+- [ ] Header and CSRF test on every console route; the htmx digest test.
+- [ ] Every mutation still appends its durable intent before effect, gated
+      or not (`tests/admin_api_tests.rs` extended, not replaced).
+- [ ] Register entries for everything scoped out at each WP exit (the D.2
+      "credential rotation" gap; split-topology console inventory; the
+      vendors D.5 did not do).
+
+**Status 2026-09-05:** planned; nothing landed. ADR-012 and ADR-013 await
+the owner. Gate B remains unrecorded, as it was for Phase C.
 
 ## 5. Non-engineering tracks (run in parallel)
 
@@ -792,6 +1018,9 @@ that fails on a > 20 % regression against the checked-in baseline.
 | A backend leaks through its port (SQL in the domain, SDK types in signatures) | Medium | Partner's backend becomes a fork | Constraint 8; per-port adapter conformance suite; review checklist item on every C/D PR (§3.9) | Eng |
 | A second IdP's claim shape is misread (Entra `scp` string, pairwise `sub`, groups overage) | High for Entra | Silent loss of groups or wrong subject binding, so policy allows or denies the wrong people | Profiles with fixture-locked tests per provider; overage fails closed; subject claim explicit (§3.9, C.1b) | Eng |
 | Protocol gateways and identity vendors absorb tool-level policy, credential brokerage and audit (agentgateway, Cloudflare One, Kong, Okta Runtime Agent Gateway, Pomerium; obsigno and cMCP on signed audit) | High | The generic half of Phase A (bearer validation, tool allow-lists, access logs) stops being saleable; a buyer asks "why not the gateway I already run?" | Position as the governed backend behind that gateway (Gate A topology); pitch the combination, never one axis; keep the differentiators the proxies cannot reach — the record names the classified resource and the upstream identity because its writer built the request; track in [`docs/competitive-landscape.md`](competitive-landscape.md) and re-score before each gate | Product + GTM |
+| Console session token exposed through the browser (XSS, leaked page) | Medium | An admin bearer in the wrong hands | Token never rendered into HTML; strict CSP with no inline script and `allowEval=false`; `HttpOnly; Secure; SameSite=Strict` cookie; bounded in-memory sessions on `control` only; the API's own 401 ends the session (§3.10.2) | Eng + Security |
+| Phase D controls become Apache-2.0 by default if the repository is opened | Medium | A paid feature given away | ADR-012: D.2/D.3 on CF-18's would-move list behind `MutationGate` / `AdminClient`; the move is a gate on open-sourcing, checked with CF-10 | Owner |
+| Delegated refresh tokens become a second credential store to protect | Medium | Upstream account takeover | `DelegatedTokenStore` rows sealed under a key that is itself a secret reference; Vault adapter where a partner runs Vault; `authority=delegated` never falls back to shared; one vendor per gate (§3.10.5) | Eng + Security |
 
 ## 10. Definition of done for the committed scope (M0 + A + B)
 
@@ -820,6 +1049,9 @@ that fails on a > 20 % regression against the checked-in baseline.
 7. External references in the brief have not been re-verified since August 2026; verify before external circulation.
 8. C.2 placement: the `SecretSource` port, cache, `file://`, and now the `vault://` adapter (rev 2.15) are in the community crate under the CF-18 reading — Vault added no dependency, so the feature costs nothing and the question did not bite. It remains a question only for the two cloud SDK adapters (C.2c, C.2d), where the SDK dependency trees are the real weight: community crate under Cargo features, or the enterprise crate? The packaging line in §6 lists secret providers as a tier differentiator, which argues for the enterprise crate; CF-18 argues for features while the repository is private. **Deferred with C.2c/d (rev 2.16):** decided when a partner asks for a native adapter, with the `aws-config` spike (dependency count, binary size) as the input (CF-30).
 9. Which moat does the partner believe in — governance over a small, resource-classified tool set (this plan) or catalogue breadth with brokered auth (Arcade, MintMCP)? Asked at Gate A; see [`docs/competitive-landscape.md` §5](competitive-landscape.md#5-what-the-survey-changes-taken-together).
+10. ADR-012: confirm that Phase D lands here under features and configuration (the owner said on 2026-09-05 that nothing is in the enterprise repository). The only irreversible consequence is at open-sourcing: anything not moved out first is Apache-2.0, so the would-move list in CF-18 is checked with CF-10 before the repository opens.
+11. ADR-013: can the partner's IdP register the console as a public PKCE client that receives the same audience (`MCP_PUBLIC_URL`) and `mcp:admin` the CLI token carries? Entra's `api://` audience with a SPA registration, Okta's native-app type, and Keycloak's public client each say yes on paper; the runbook section per profile is D.1's to prove.
+12. D.5's first vendor (depends on item 4). Slack by feasibility, Atlassian if the workflow is planning/delivery; Grafana keeps shared authority because its HTTP API has no per-user OAuth.
 
 ## 12. Immediate next steps
 
