@@ -926,6 +926,159 @@ async fn an_unreachable_receiver_does_not_stop_startup() {
     cancel.cancel();
 }
 
+/// A collector that accepts exactly one token — the one currently
+/// expected — and answers HEC's `Invalid token` for any other, the way a
+/// receiver behaves once the old token is revoked.
+struct RevokingCollector {
+    expected: Arc<std::sync::Mutex<String>>,
+    acknowledged: Arc<std::sync::Mutex<Vec<(u64, String)>>>,
+}
+
+impl wiremock::Respond for RevokingCollector {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let presented = request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let expected = format!("Splunk {}", self.expected.lock().unwrap());
+        if presented != expected {
+            return ResponseTemplate::new(403)
+                .set_body_json(json!({"text": "Invalid token", "code": 4}));
+        }
+        let mut acknowledged = self.acknowledged.lock().unwrap();
+        for line in request.body.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let event: Value = serde_json::from_slice(line).expect("one HEC event per line");
+            acknowledged.push((event["event"]["seq"].as_u64().unwrap(), presented.clone()));
+        }
+        ResponseTemplate::new(200).set_body_json(json!({"text": "Success", "code": 0}))
+    }
+}
+
+/// `/abs/path` on Unix, `/C:/abs/path` on Windows, as `file:///` spells it.
+fn file_target(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    if text.starts_with('/') {
+        text
+    } else {
+        format!("/{text}")
+    }
+}
+
+fn write_atomically(path: &Path, document: &str) {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, document).unwrap();
+    std::fs::rename(&tmp, path).unwrap();
+}
+
+#[tokio::test]
+async fn a_rotated_forwarding_token_reaches_the_collector_without_a_restart() {
+    // The receiver's token is a `file://` reference. It is rotated under
+    // the running shipper and the old one revoked at the collector; the
+    // next delivery must carry the new one, or forwarding is stuck until
+    // someone restarts the control plane.
+    let secrets = tempfile::tempdir().unwrap();
+    let token_file = secrets.path().join("hec.json");
+    write_atomically(&token_file, r#"{"token":"hec-v1"}"#);
+    let token_ref = format!("file://{}#token", file_target(&token_file));
+
+    let expected = Arc::new(std::sync::Mutex::new("hec-v1".to_owned()));
+    let acknowledged = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let collector = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/collector/event"))
+        .respond_with(RevokingCollector {
+            expected: Arc::clone(&expected),
+            acknowledged: Arc::clone(&acknowledged),
+        })
+        .mount(&collector)
+        .await;
+
+    // The journal is written by the test alone (the control-replica
+    // topology: the shipper reads a journal it does not write).
+    let journal = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    write_journal(journal.path(), &[ControlEventKind::PolicyLoaded]).await;
+
+    let server = ServerBuilder::new()
+        .config(config(&[
+            ("MCP_SECRET_REFRESH_INTERVAL_SECONDS", "1"),
+            (
+                "MCP_AUDIT_FORWARD_URL",
+                &format!("{}/services/collector/event", collector.uri()),
+            ),
+            ("MCP_AUDIT_FORWARD_TOKEN", &token_ref),
+            (
+                "MCP_AUDIT_FORWARD_JOURNAL_DIR",
+                journal.path().to_str().unwrap(),
+            ),
+            (
+                "MCP_AUDIT_FORWARD_STATE_DIR",
+                state.path().to_str().unwrap(),
+            ),
+            ("MCP_AUDIT_FORWARD_ORIGIN", "control-0"),
+            ("MCP_AUDIT_FORWARD_INTERVAL_SECONDS", "1"),
+        ]))
+        .build()
+        .unwrap();
+    server.resolve_secrets().await.unwrap();
+    let cancel = CancellationToken::new();
+    assert_eq!(
+        server.start_audit_forwarding(cancel.clone()).unwrap(),
+        Some("splunk-hec")
+    );
+    let health = server.forward_health();
+
+    let received_with = |count: usize| {
+        let acknowledged = Arc::clone(&acknowledged);
+        async move {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let seen = acknowledged.lock().unwrap().clone();
+                    if seen.len() >= count {
+                        return seen;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("the collector acknowledged the records")
+        }
+    };
+    // The record plus the checkpoint that sealed the journal, in one batch.
+    let before = received_with(2).await;
+    assert!(
+        before.iter().all(|(_, auth)| auth == "Splunk hec-v1"),
+        "{before:?}"
+    );
+
+    // Rotate: the collector revokes v1 and the file now says v2. No
+    // restart, no signal — the refresher picks the file up.
+    *expected.lock().unwrap() = "hec-v2".to_owned();
+    write_atomically(&token_file, r#"{"token":"hec-v2"}"#);
+    let rotated = write_journal(journal.path(), &[ControlEventKind::PolicyLoaded]).await;
+
+    let seen = received_with(before.len() + 1).await;
+    let after: Vec<&(u64, String)> = seen.iter().filter(|(seq, _)| *seq >= rotated[0]).collect();
+    assert!(!after.is_empty(), "{seen:?}");
+    assert!(
+        after.iter().all(|(_, auth)| auth == "Splunk hec-v2"),
+        "records written after the rotation carry the new token: {seen:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while health.degraded().is_some() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("forwarding recovered");
+    cancel.cancel();
+}
+
 // ---------------------------------------------------------------------------
 // 4. The binary boundary: the role decides
 // ---------------------------------------------------------------------------

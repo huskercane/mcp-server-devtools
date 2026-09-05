@@ -7,6 +7,11 @@
 //! and retries with backoff; the channel keeps filling, and past its
 //! capacity the sink drops with a counter — lossy by contract (§3.3), and
 //! the health banner says so.
+//!
+//! Retention runs on its own timer, not on traffic: a control plane that
+//! goes quiet (a weekend, a gateway that stopped sending) still prunes on
+//! the cadence, so expired rows never outlive the retention window just
+//! because nothing new arrived.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -23,7 +28,7 @@ pub const BATCH: usize = 256;
 pub const LINGER: Duration = Duration::from_millis(500);
 /// The longest a failing store is left alone between retries.
 pub const MAX_BACKOFF: Duration = Duration::from_mins(1);
-/// How often retention is applied.
+/// How often retention is applied, with or without traffic.
 pub const PRUNE_INTERVAL: Duration = Duration::from_hours(1);
 
 /// Whether rollups are keeping up, for the health banner and tests.
@@ -94,6 +99,7 @@ pub struct Consumer {
     receiver: Receiver<UsageEvent>,
     health: Arc<RollupHealth>,
     retention: Option<Duration>,
+    prune_interval: Duration,
 }
 
 impl Consumer {
@@ -110,21 +116,38 @@ impl Consumer {
             receiver,
             health,
             retention,
+            prune_interval: PRUNE_INTERVAL,
         }
+    }
+
+    /// Apply retention every `interval` instead of [`PRUNE_INTERVAL`]
+    /// (tests).
+    #[must_use]
+    pub const fn prune_every(mut self, interval: Duration) -> Self {
+        self.prune_interval = interval;
+        self
     }
 
     /// Run until the channel closes (every sender dropped) or `cancel`
     /// fires; on either, what is buffered is appended before returning.
+    /// Retention is applied every `prune_interval` whether or not events
+    /// arrive.
     pub async fn run(mut self, cancel: tokio_util::sync::CancellationToken) {
         let mut pending: Vec<UsageRow> = Vec::with_capacity(BATCH);
         let mut failures: u32 = 0;
-        let mut prune_at = tokio::time::Instant::now() + PRUNE_INTERVAL;
+        let prune_timer = tokio::time::sleep(self.prune_interval);
+        tokio::pin!(prune_timer);
         loop {
             if pending.is_empty() {
-                // Block for the first event of a batch.
+                // Block for the first event of a batch — or the prune
+                // timer, which must not wait for one.
                 let first = tokio::select! {
                     () = cancel.cancelled() => None,
                     event = self.receiver.recv() => event,
+                    () = &mut prune_timer, if self.retention.is_some() => {
+                        self.prune_and_reschedule(prune_timer.as_mut()).await;
+                        continue;
+                    }
                 };
                 let Some(first) = first else {
                     // Closed or cancelled: append whatever is buffered and
@@ -177,13 +200,18 @@ impl Consumer {
                     () = tokio::time::sleep(wait) => {}
                 }
             }
-            if let Some(retention) = self.retention
-                && tokio::time::Instant::now() >= prune_at
-            {
-                prune_at = tokio::time::Instant::now() + PRUNE_INTERVAL;
-                self.prune(retention).await;
+            if self.retention.is_some() && prune_timer.is_elapsed() {
+                self.prune_and_reschedule(prune_timer.as_mut()).await;
             }
         }
+    }
+
+    /// Apply retention now and arm the timer for the next cadence.
+    async fn prune_and_reschedule(&self, timer: std::pin::Pin<&mut tokio::time::Sleep>) {
+        if let Some(retention) = self.retention {
+            self.prune(retention).await;
+        }
+        timer.reset(tokio::time::Instant::now() + self.prune_interval);
     }
 
     /// Append `pending` and clear it on success; keep it on failure.

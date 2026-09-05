@@ -22,8 +22,15 @@
 //! `https` is required, or `http` on a loopback host (a local collector, a
 //! test). The token is a header, never part of the URL, and appears in no
 //! error or log line.
+//!
+//! The token is read from its [`TokenSource`] for **each** delivery, not
+//! copied once at startup: when `MCP_AUDIT_FORWARD_TOKEN` is a secret
+//! reference, the refresher swaps a new snapshot in and the next batch
+//! carries the rotated value, so a receiver that revoked the old token
+//! stops rejecting without a restart.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::ports::{AuditForwarder, DeliverFuture, ForwardError, ForwardRecord};
@@ -63,12 +70,16 @@ impl HttpFormat {
     }
 }
 
+/// Where the token comes from at delivery time. Returns the configured
+/// value as it stands now; `None` when none is configured.
+pub type TokenSource = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 /// The HTTP adapter.
 pub struct HttpForwarder {
     client: reqwest::Client,
     url: url::Url,
     format: HttpFormat,
-    token: Option<String>,
+    token: TokenSource,
     origin: String,
 }
 
@@ -79,24 +90,49 @@ impl std::fmt::Debug for HttpForwarder {
             .debug_struct("HttpForwarder")
             .field("url", &self.url.as_str())
             .field("format", &self.format)
-            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("token", &normalize((self.token)()).map(|_| "<redacted>"))
             .field("origin", &self.origin)
             .finish_non_exhaustive()
     }
 }
 
 impl HttpForwarder {
-    /// Build the adapter. No network I/O.
+    /// Build the adapter with a fixed token. No network I/O.
     ///
     /// # Errors
     ///
-    /// When the URL is not `https` (or `http` on loopback), carries
-    /// user-info, or HEC is selected without a token; when the CA file
-    /// cannot be read; when the client cannot be built.
+    /// As [`Self::with_token_source`].
     pub fn new(
         url: &str,
         format: Option<HttpFormat>,
         token: Option<String>,
+        origin: String,
+        ca_file: Option<&Path>,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        let token = normalize(token);
+        Self::with_token_source(
+            url,
+            format,
+            Arc::new(move || token.clone()),
+            origin,
+            ca_file,
+            timeout,
+        )
+    }
+
+    /// Build the adapter, reading the token from `token` at each delivery.
+    /// No network I/O.
+    ///
+    /// # Errors
+    ///
+    /// When the URL is not `https` (or `http` on loopback), carries
+    /// user-info, or HEC is selected without a token configured right now;
+    /// when the CA file cannot be read; when the client cannot be built.
+    pub fn with_token_source(
+        url: &str,
+        format: Option<HttpFormat>,
+        token: TokenSource,
         origin: String,
         ca_file: Option<&Path>,
         timeout: Duration,
@@ -120,10 +156,7 @@ impl HttpForwarder {
             other => return Err(format!("{url}: no HTTP forwarder for `{other}://`")),
         }
         let format = format.unwrap_or_else(|| HttpFormat::infer(&url));
-        let token = token
-            .map(|token| token.trim().to_owned())
-            .filter(|token| !token.is_empty());
-        if format == HttpFormat::SplunkHec && token.is_none() {
+        if format == HttpFormat::SplunkHec && normalize(token()).is_none() {
             return Err(format!(
                 "{}: Splunk HEC needs the collector token",
                 super::TOKEN_KEY
@@ -213,6 +246,19 @@ impl HttpForwarder {
     }
 }
 
+/// A configured token, trimmed; `None` when absent or blank.
+fn normalize(token: Option<String>) -> Option<String> {
+    let mut token = token?;
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() != token.len() {
+        token = trimmed.to_owned();
+    }
+    Some(token)
+}
+
 /// `seconds.millis` for HEC's `time`, from the journal's RFC 3339 stamp.
 fn hec_time(timestamp: &str) -> Option<String> {
     let parsed = chrono::DateTime::parse_from_rfc3339(timestamp).ok()?;
@@ -233,13 +279,22 @@ impl AuditForwarder for HttpForwarder {
 
     fn deliver<'a>(&'a self, batch: &'a [ForwardRecord<'a>]) -> DeliverFuture<'a> {
         Box::pin(async move {
+            // The token as configured *now*, so a rotation reaches the
+            // receiver on the next batch rather than the next restart.
+            let token = normalize((self.token)());
+            if self.format == HttpFormat::SplunkHec && token.is_none() {
+                return Err(ForwardError::new(
+                    ForwardError::REJECTED,
+                    "collector token is no longer configured",
+                ));
+            }
             let body = self.body(batch);
             let mut request = self
                 .client
                 .post(self.url.clone())
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(body);
-            if let Some(token) = &self.token {
+            if let Some(token) = token {
                 let value = match self.format {
                     HttpFormat::SplunkHec => format!("Splunk {token}"),
                     HttpFormat::Json => format!("Bearer {token}"),

@@ -180,6 +180,44 @@ async fn consumer_prunes_by_retention() {
 }
 
 #[tokio::test]
+async fn the_consumer_prunes_on_its_cadence_while_no_events_arrive() {
+    // Retention must not wait for traffic: a quiet control plane still
+    // applies it, or expired rows outlive the window indefinitely.
+    let store = Arc::new(InMemoryRollupStore::new());
+    store.append(&fixture_rows()).await.unwrap();
+    let (sink, receiver) = BoundedUsageChannel::new(8);
+    let health = Arc::new(RollupHealth::default());
+    let cancel = CancellationToken::new();
+    let consumer = Consumer::new(
+        Arc::clone(&store) as Arc<dyn RollupStore>,
+        receiver,
+        Arc::clone(&health),
+        Some(Duration::from_secs(1)),
+    )
+    .prune_every(Duration::from_millis(50));
+    let task = tokio::spawn(consumer.run(cancel.clone()));
+
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let expected = fixture_rows()
+        .iter()
+        .filter(|row| row.timestamp < now)
+        .count() as u64;
+    assert!(expected > 0, "the fixture has rows to prune");
+    // Nothing is recorded; the sink is only kept alive so the channel does
+    // not close and end the consumer.
+    wait_until(Duration::from_secs(5), || health.pruned() >= expected).await;
+    assert_eq!(store.count().await.unwrap(), 7 - health.pruned());
+    assert_eq!(health.appended(), 0, "no traffic was needed");
+
+    drop(sink);
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn channel_overflow_drops_with_a_counter_and_never_blocks() {
     let (sink, _receiver) = BoundedUsageChannel::new(2);
     for _ in 0..5 {

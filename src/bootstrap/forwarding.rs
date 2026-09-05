@@ -9,7 +9,11 @@
 //! token, the CA file, the client certificate, the origin, the timeout) is
 //! read here from the configuration cascade, after secret references were
 //! resolved, so `MCP_AUDIT_FORWARD_TOKEN` may be a `file://` or `vault://`
-//! reference like any other credential.
+//! reference like any other credential. The token is not copied into the
+//! adapter: the running shipper's forwarder reads it from the components'
+//! *current* configuration snapshot at each delivery, so a rotation the
+//! secret refresher (or a config reload) swaps in reaches the receiver on
+//! the next batch, not the next restart.
 //!
 //! The shipper runs on the roles that serve the control plane (`all`,
 //! `control`), never on a pure `gateway` replica: forwarding is the
@@ -20,10 +24,10 @@
 //! when the transport's cancellation token fires.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use super::Components;
-use crate::audit::forward::http::{HttpFormat, HttpForwarder};
+use crate::audit::forward::http::{HttpFormat, HttpForwarder, TokenSource};
 use crate::audit::forward::syslog::{SyslogForwarder, SyslogSettings, TlsOptions};
 use crate::audit::forward::{self, Shipper};
 use crate::config::Config;
@@ -40,13 +44,37 @@ pub struct ForwardingSettings {
     pub interval: std::time::Duration,
 }
 
-/// Build the adapter the URL names, with every setting it needs.
+/// Build the adapter the URL names, with every setting it needs, the token
+/// fixed to the value `config` holds now.
+///
+/// The running shipper is built by [`spawn_configured`], which reads the
+/// token live instead; this is the one-shot form (validation, tests).
 ///
 /// # Errors
 ///
 /// A message naming the setting at fault: an unknown scheme, a malformed
 /// URL, a missing token, a CA or certificate file that does not load.
 pub fn forwarder_from_config(config: &Config) -> Result<Option<Arc<dyn AuditForwarder>>, String> {
+    let token = config.get(forward::TOKEN_KEY).map(str::to_owned);
+    build_forwarder(config, Arc::new(move || token.clone()))
+}
+
+/// The token as the components' current configuration has it, read at
+/// each delivery. `None` once the server is gone.
+fn live_token_source(components: &Arc<Components>) -> TokenSource {
+    let weak: Weak<Components> = Arc::downgrade(components);
+    Arc::new(move || {
+        let components = weak.upgrade()?;
+        let config = components.config();
+        config.get(forward::TOKEN_KEY).map(str::to_owned)
+    })
+}
+
+/// Build the adapter the URL names, taking the token from `token`.
+fn build_forwarder(
+    config: &Config,
+    token: TokenSource,
+) -> Result<Option<Arc<dyn AuditForwarder>>, String> {
     let Some(url) = configured(config, forward::URL_KEY) else {
         return Ok(None);
     };
@@ -69,10 +97,16 @@ pub fn forwarder_from_config(config: &Config) -> Result<Option<Arc<dyn AuditForw
             let format = configured(config, forward::FORMAT_KEY)
                 .map(HttpFormat::parse)
                 .transpose()?;
-            let token = config.get(forward::TOKEN_KEY).map(str::to_owned);
             Arc::new(
-                HttpForwarder::new(url, format, token, origin, ca_file.as_deref(), timeout)
-                    .map_err(|error| format!("{}: {error}", forward::URL_KEY))?,
+                HttpForwarder::with_token_source(
+                    url,
+                    format,
+                    token,
+                    origin,
+                    ca_file.as_deref(),
+                    timeout,
+                )
+                .map_err(|error| format!("{}: {error}", forward::URL_KEY))?,
             )
         }
         "syslog" | "syslog+tcp" | "syslog+udp" => {
@@ -148,7 +182,9 @@ pub fn spawn_configured(
     let Some(settings) = settings_from_config(&config).map_err(refuse)? else {
         return Ok(None);
     };
-    let Some(forwarder) = forwarder_from_config(&config).map_err(refuse)? else {
+    let Some(forwarder) =
+        build_forwarder(&config, live_token_source(components)).map_err(refuse)?
+    else {
         return Ok(None);
     };
     let name = forwarder.name();

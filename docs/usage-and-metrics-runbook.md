@@ -69,6 +69,17 @@ The token bucket keys on the validated subject after the required-scope check.
 Unauthenticated traffic cannot spend another principal's budget. A refusal is
 HTTP 429 with an integer `Retry-After` header.
 
+The limiter tracks at most 10,000 subjects per process. At that bound a request
+from a subject not yet tracked first sweeps buckets idle for over a minute
+(at most one sweep per second). If none is idle, the request is refused with
+`Retry-After: 1` and the subject is not tracked; already-tracked subjects are
+unaffected. This is fail closed on purpose: admitting the 10,001st subject
+untracked would give a holder of many validated tokens an unlimited lane. The
+log line `rate limiter is tracking its maximum of active principals` marks the
+condition, and it is emitted at most once per second. A legitimate deployment
+reaching it has more than 10,000 distinct principals active within one minute
+on one replica, which is the shared-limiter scaling item (CF-16).
+
 The limiter and its counters are in-process. The supported C.6 deployment is
 one gateway replica; several replicas would each grant a separate budget
 (CF-16). Likewise, a pure `gateway` role does not attach a rollup channel,
