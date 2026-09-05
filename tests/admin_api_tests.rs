@@ -207,6 +207,7 @@ async fn reload_is_fail_closed_and_candidate_shapes_are_locked() {
         diff["data"]["current_version"],
         diff["data"]["candidate_version"]
     );
+    f.sink.set_failing(true);
     std::fs::write(&f.policy, candidate).unwrap();
     assert_eq!(post(&f, "policy/reload", json!({})).await.status(), 400);
     write_detached(
@@ -214,7 +215,6 @@ async fn reload_is_fail_closed_and_candidate_shapes_are_locked() {
         &f.key.sign(Domain::PolicyBundle, candidate.as_bytes()),
     )
     .unwrap();
-    f.sink.set_failing(true);
     assert_eq!(
         post(&f, "policy/reload", json!({}))
             .await
@@ -223,19 +223,46 @@ async fn reload_is_fail_closed_and_candidate_shapes_are_locked() {
             .unwrap(),
         json!({"error":"audit_unavailable", "error_description":"audit_unavailable"})
     );
+    let unchanged: Value = reqwest::Client::new()
+        .get(format!("{}/admin/policy", f.url))
+        .bearer_auth("admin")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        unchanged["data"]["version"],
+        diff["data"]["current_version"]
+    );
     f.sink.set_failing(false);
     let result = post(&f, "policy/reload", json!({}))
         .await
         .json::<Value>()
         .await
         .unwrap();
-    assert_eq!(result["data"]["changed"], true);
     assert_eq!(result["data"]["version"], diff["data"]["candidate_version"]);
     let records = f.sink.events();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0]["kind"], "admin_mutation");
-    assert_eq!(records[0]["principal"]["subject"], "alice");
-    assert_eq!(result["data"]["audit_seq"], records[0]["seq"]);
+    let admin = records
+        .iter()
+        .find(|record| record["seq"] == result["data"]["audit_seq"])
+        .unwrap();
+    assert_eq!(admin["kind"], "admin_mutation");
+    assert_eq!(admin["principal"]["subject"], "alice");
+    if result["data"]["changed"] == true {
+        assert_eq!(admin["version"], diff["data"]["candidate_version"]);
+    } else {
+        // The watcher may legitimately win after audit recovers. Its durable
+        // change record must precede the administrator's no-change intent.
+        assert!(
+            records
+                .iter()
+                .any(|record| record["kind"] == "policy_changed"
+                    && record["version"] == diff["data"]["candidate_version"]
+                    && record["seq"].as_u64().unwrap() < admin["seq"].as_u64().unwrap())
+        );
+    }
 }
 #[tokio::test]
 async fn reports_sqlite_and_inventory_are_live() {

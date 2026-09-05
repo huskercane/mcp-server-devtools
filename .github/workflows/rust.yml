@@ -238,3 +238,25 @@ jobs:
       run: |
         docker logs vault || true
         docker logs mcp-smoke || true
+
+  operations:
+    name: Helm and verified restore
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install checksum-pinned Helm
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mcp-helm"
+          cd "$RUNNER_TEMP/mcp-helm"
+          curl -fsSL https://get.helm.sh/helm-v3.19.0-linux-amd64.tar.gz -o helm.tar.gz
+          printf '%s  %s\n' a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496 helm.tar.gz | sha256sum --check
+          tar -xzf helm.tar.gz
+          echo "MCP_TEST_HELM_BIN=$RUNNER_TEMP/mcp-helm/linux-amd64/helm" >> "$GITHUB_ENV"
+      - name: Restore and verify signed evidence; render Helm security contracts
+        run: cargo test --locked --no-default-features --test operations_tests

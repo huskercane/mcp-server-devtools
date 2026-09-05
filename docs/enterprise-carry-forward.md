@@ -10,7 +10,12 @@ removed only when it is done, not when it is explained.
 
 Status legend: **open** · **blocked** (needs a decision) · **done**.
 
-Last updated: 2026-09-04, after C.5 (admin CLI) landed locally on
+Last updated: 2026-09-04, after C.7 (rev 2.21). Native Helm, real SQLite
+and signed-journal restore tests and all landing gates passed. Docker daemon
+was unavailable; no cluster rollout was run. Sigstore signing cannot be
+exercised locally: CF-34 tracks external release evidence. CF-16/33 remain.
+
+Previously updated:  2026-09-04, after C.5 (admin CLI) landed locally on
 `feat/phase-c-operations` (plan rev 2.20). CF-7 is closed for the admin
 commands; direct vendor CLI operations remain open. CF-28 remains scoped
 to those vendor commands. All 1,066 tests and every landing gate passed;
@@ -556,6 +561,20 @@ work above.
 
 ## Decisions we owe someone
 
+### CF-34 · External release signing and deployment evidence
+**Open · next authorized release / deployment**
+
+C.7 implements CycloneDX source inventory and Sigstore signing plus immediate
+verification of the container digest and release files in `release.yml`.
+Signing cannot be exercised locally; no signature, publication, or external
+verification is claimed. On the next authorized release, retain the workflow
+run, SBOM and bundles, then independently run `cosign verify` with the exact
+workflow certificate identity and GitHub OIDC issuer, plus `verify-blob` for
+archives/SBOM. See `docs/release-operations-runbook.md`. Helm lint/render and
+real local journal/checkpoint/SQLite restore pass; a real cluster rollout,
+upgrade and rollback remain deployment evidence. CF-16/33 are not closed by
+packaging: the chart enforces one replica and documents split-state gaps.
+
 ### CF-10 · ADR-002: the enterprise licence
 **Blocked · counsel · hard M0 exit criterion**
 
@@ -987,3 +1006,13 @@ remain identical to C.4, including stage −1e at zero. The new CLI is a
 one-shot HTTP client and adds no work to the MCP request path. JWT cache hit was 5.48 µs (9 allocations); journal append was p50 17 µs,
 p99 62 µs, max 578 µs (6 allocations). Both absolute p99/cache-hit budgets
 hold; no allocation regression was observed.
+
+
+Re-run after C.7 (2026-09-04, rev 2.21): all allocation counts and bytes
+remain identical to C.5; no production Rust request-path changes. JWT cache
+hit: 9 allocations / 15.97 µs; journal: 6 allocations, p50 45 µs / p99 133 µs /
+max 251 µs. Known principal, limiter and Prometheus series remain zero.
+Absolute cache-hit and journal p99 budgets pass; timings are observations.
+The full gate exposed a C.4 test race: the watcher can legitimately reload
+before the admin request. The corrected test proves the failed append keeps
+the old policy and that whichever reload wins has earlier durable evidence.

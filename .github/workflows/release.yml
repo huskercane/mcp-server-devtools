@@ -19,8 +19,30 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  validate:
+    name: Validate release source
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Require the tag to match Cargo.toml
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          python3 - <<'PYTHON'
+          import os, pathlib, re
+          text = pathlib.Path('Cargo.toml').read_text()
+          version = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M).group(1)
+          if os.environ['RELEASE_TAG'] != 'v' + version:
+              raise SystemExit('release tag must match the Cargo.toml package version')
+          PYTHON
+
   build:
     name: Build ${{ matrix.target }}
+    needs: validate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -45,6 +67,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -115,25 +139,51 @@ jobs:
             ${{ matrix.asset }}.${{ matrix.archive }}.sha256
           if-no-files-found: error
 
+  sbom:
+    name: Source dependency SBOM
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: CycloneDX source dependency inventory
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0, verified 2026-09-04
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: mcp-devtools-source.cdx.json
+          artifact-name: mcp-devtools-source-sbom
+          upload-release-assets: false
+
   container:
     # One image, every role (plan ADR-010, WP A.9). Built from the same
     # Dockerfile an operator can build locally, published to GHCR, and its
     # digest becomes a release asset so a deployment can pin by digest.
     name: Build and publish container
+    needs: validate
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     runs-on: ubuntu-latest
     outputs:
       digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Resolve tag
         id: tag
         shell: bash
+        env:
+          REQUESTED_TAG: ${{ github.event.inputs.tag }}
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           else
-            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "name=${REQUESTED_TAG}" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: docker/setup-buildx-action@v3
@@ -165,6 +215,20 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+        with:
+          cosign-release: v3.0.6
+
+      - name: Sign and verify immutable image
+        env:
+          IMAGE_REF: ghcr.io/${{ github.repository_owner }}/mcp-devtools@${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "$IMAGE_REF"
+          cosign verify --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com "$IMAGE_REF"
+
       - name: Record digest
         shell: bash
         run: |
@@ -185,7 +249,10 @@ jobs:
 
   release:
     name: Publish release
-    needs: [build, container]
+    needs: [build, container, sbom]
+    permissions:
+      contents: write
+      id-token: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -196,12 +263,34 @@ jobs:
       - name: Resolve tag
         id: tag
         shell: bash
+        env:
+          REQUESTED_TAG: ${{ github.event.inputs.tag }}
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           else
-            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "name=${REQUESTED_TAG}" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+        with:
+          cosign-release: v3.0.6
+
+      - name: Sign release files and verify bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+          for artifact in artifacts/*; do
+            case "$artifact" in
+              *.tar.gz|*.zip|*.tgz|*.cdx.json|*.txt)
+                cosign sign-blob --yes --bundle "${artifact}.sigstore.json" "$artifact"
+                cosign verify-blob --bundle "${artifact}.sigstore.json" \
+                  --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+                  --certificate-oidc-issuer https://token.actions.githubusercontent.com "$artifact"
+                ;;
+            esac
+          done
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
