@@ -1,45 +1,57 @@
 # CLAUDE.md compliance follow-up
 
 Reviewed on 2026-09-05 against `feat/phase-c-operations`. This closes the six
-findings from the branch review and records the additional collection review.
+findings in the [original branch review](reviews/2026-09-05-claude-branch-review.md),
+written against pre-fix commit `66f5de1`, and records the additional collection review.
 It is not a claim that every performance suggestion has been mechanically
 proved for every function: frame size, contention, monomorphization, and CPU
 budgets require representative workload measurements as well as inspection.
 
+## Original findings
+
+1. **F1 — High:** deny-list reads acquired the same mutex twice, hanging requests and exhausting the admin permit budget.
+2. **F2 — Medium:** CI omitted the required formatting and dependency-audit gates.
+3. **F3 — Medium:** the config watcher performed synchronous file reads on a Tokio worker.
+4. **F4 — Medium:** activity ingestion held the shared SQLite mutex during journal I/O and JSON preparation.
+5. **F5 — Medium:** admin orchestration depended on concrete `FilePolicy` operations, and the credential-broker port contained its concrete adapter.
+6. **F6 — Low:** cargo-deny emitted 17 duplicate-dependency warning groups despite the documented zero-warning requirement.
+
 ## Corrections
 
-- Removed the duplicate deny-list mutex acquisition. The new HTTP regression
+- **F1:** Removed the duplicate deny-list mutex acquisition. The new HTTP regression
   test failed on the previous implementation with a two-second timeout. It
   performs five reads (more than the four admin permits), checks the response
   contract, and then replaces the list to verify the mutation lock is free.
-- Added Linux CI gates for formatting and cargo-deny 0.19.4. Warnings fail the
+- **F2, F6:** Added Linux CI gates for formatting and cargo-deny 0.19.4. Warnings fail the
   dependency gate. New duplicate versions are rejected; exact-version
   exceptions record the incompatible versions already required by the pinned
   graph. These are duplication exceptions only, not advisory or license
   exceptions. No existing dependency pin was loosened.
-- Config reload parses the exact global-file bytes observed by the watcher.
+- **F3:** Config reload parses the exact global-file bytes observed by the watcher.
   JSON parsing, dotenv reads, and process-config loading run on a blocking
   worker. Invalid JSON keeps the last good snapshot. The watcher no longer
   validates one read and then loads a different read of the same file.
-- SQLite projection prepares journal records before acquiring the connection
+- **F4:** SQLite projection prepares journal records before acquiring the connection
   mutex. Its worker reuses a preallocated batch, limited to 1,000 rows or about
   1 MiB of retained field/string payload (plus the record that reaches that
   threshold and vector metadata). This bounds the memory/lock-scope tradeoff.
   The projection integration test spans batch boundaries and compares every
   row with the journal adapter, including a subsequent query after journal
   removal.
-- Policy read/validate/diff/reload/access-review operations now use the
+- **F5:** Policy read/validate/diff/reload/access-review operations now use the
   application-owned `PolicyAdmin` port. File parsing, bundle locking,
   verification, and durable reload intent live in its file adapter. A second
   implementation in an HTTP integration test proves injection and error
   mapping without a local policy file. The original public router signature
   remains available.
-- Credential broker implementations live under `auth`, and report DTOs are
+- **F5:** Credential broker implementations live under `auth`, and report DTOs are
   owned by the report port. Compatibility re-exports preserve downstream
   library imports. The policy adapter deliberately retains its async mutation
   lock across staging, audit append, and commit: releasing it in between would
-  allow the watcher to invalidate the recorded intent. This correctness
-  exception is documented at the lock.
+  allow the watcher to invalidate the recorded intent. Holding a
+  `tokio::sync::Mutex` across these awaits is the intended pattern, explicitly
+  sanctioned by [CLAUDE.md's async synchronization guidance](../CLAUDE.md#async-synchronization--locking).
+  The reason for this lock scope is documented at the lock.
 
 ## Collection and allocation guidance
 
@@ -71,7 +83,7 @@ save hashing time can create an API break larger than the unmeasured benefit.
 - `cargo fmt --all -- --check`: passed.
 - `cargo deny --locked check --deny warnings`: passed with refreshed advisories,
   no warnings, and no dependency-version changes.
-- Full test suite: 1,080 passed, two ignored (including doc-test summaries).
+- Full test suite: 1,080 passed, two ignored across all test binaries and doctests.
   Environment-gated live-provider tests were not independently provisioned.
 - The deny-list regression failed on the unfixed code and passes after the fix.
 - Allocation probe: all existing stage allocation counts and reported KB values
