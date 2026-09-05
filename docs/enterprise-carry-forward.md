@@ -10,7 +10,13 @@ removed only when it is done, not when it is explained.
 
 Status legend: **open** · **blocked** (needs a decision) · **done**.
 
-Last updated: 2026-09-04, after C.4 (admin API) landed locally on
+Last updated: 2026-09-04, after C.5 (admin CLI) landed locally on
+`feat/phase-c-operations` (plan rev 2.20). CF-7 is closed for the admin
+commands; direct vendor CLI operations remain open. CF-28 remains scoped
+to those vendor commands. All 1,066 tests and every landing gate passed;
+no dependencies or request-path allocation changes.
+
+Previously: 2026-09-04, after C.4 (admin API) landed locally on
 `feat/phase-c-operations` (plan rev 2.19). The API has durable mutation
 intents, independent scope/rate/task budgets, signed document operations,
 process inventories, projected activity reports, and RollupStore usage.
@@ -256,7 +262,16 @@ journal cannot accept records, so a gateway that will refuse every call is
 not reported healthy. Local mode without a journal is byte-identical.
 
 ### CF-7 · Route CLI subcommands through the audited boundary
-**Open · Phase A/B**
+**Open for direct vendor operations · Admin commands done in C.5 (rev 2.20)**
+
+`mcp-devtools admin` now calls C.4 over HTTP, including mutations and
+reports, and supports `--json` on every command. A real CLI-to-server test
+proves its mutation has the server’s durable control record, and journal
+failure reaches the CLI as JSON plus a nonzero exit status. It does not
+instantiate server handlers or vendor runtimes. This closes CF-7 for admin
+commands. The direct vendor operations below remain refused in enterprise
+mode until they use an audited boundary.
+
 
 `mcp-devtools jira post …` reaches the same vendor APIs as the MCP tools with
 no journal record. M0 closes the hole by **refusing** operational CLI
@@ -418,6 +433,12 @@ malformed-body behaviour, and adversarial tests, reviewed on its own.
 
 ### CF-28 · The one-shot CLI does not resolve secret references
 **Open · Phase C (C.2a)**
+
+C.5 amendment (rev 2.20): admin commands read their explicit bearer-token
+file on each invocation and call the authenticated server; they never load
+vendor configuration. Tests run them with enterprise mode and an unresolved
+vendor reference present. They need no duplicate SecretSource resolver.
+The direct vendor commands described below remain open.
 
 `DevtoolsServer::resolve_secrets` is the async step that turns `file://…`
 references into values before the server binds; `CliRuntime::load` is
@@ -959,3 +980,10 @@ principal-inventory request-path operation: a known unchanged principal is
 lookups and deterministic bounded eviction; only new/changed metadata is
 cloned. Admin requests, projection ingestion, and initial inventory fills
 are outside that steady-state probe.
+
+
+Re-run after C.5 (2026-09-04, rev 2.20): all allocation counts and bytes
+remain identical to C.4, including stage −1e at zero. The new CLI is a
+one-shot HTTP client and adds no work to the MCP request path. JWT cache hit was 5.48 µs (9 allocations); journal append was p50 17 µs,
+p99 62 µs, max 578 µs (6 allocations). Both absolute p99/cache-hit budgets
+hold; no allocation regression was observed.

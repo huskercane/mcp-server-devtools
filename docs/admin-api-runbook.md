@@ -72,3 +72,42 @@ query and explicitly names a limit when the window needs narrowing; never
 present a truncated report as complete. `records_read` counts projection rows
 considered by the query. Access review uses the supplied group snapshot and
 active policy, as B.5 does; it is not an IdP membership fetch.
+
+## Command-line client
+
+`mcp-devtools admin` calls this HTTP API. Supply the service origin with
+`--url` (or `MCP_ADMIN_URL`) and a file containing the bearer token with
+`--token-file`. The token must have `mcp:admin`. HTTPS is required except
+for loopback HTTP; redirects are disabled. The CLI reads the token file on
+each invocation, so a projected token can rotate without a persistent CLI
+cache. It does not load vendor credentials or resolve vendor secret references.
+
+```sh
+mcp-devtools admin --url https://mcp.example.com --token-file /run/admin-token policy read --json
+mcp-devtools admin --url https://mcp.example.com --token-file /run/admin-token policy validate policy.yaml --json
+mcp-devtools admin --url https://mcp.example.com --token-file /run/admin-token policy diff policy.yaml --json
+mcp-devtools admin --url https://mcp.example.com --token-file /run/admin-token policy reload --json
+```
+
+Every command supports `--json`, including after the leaf command. Successful
+JSON output is the API response envelope, with no prose. API and client runtime
+failures produce JSON and a nonzero exit code. Without `--json`, output is pretty
+JSON. Standard clap help and argument-usage diagnostics remain text.
+
+The remaining commands, following the same connection options, are:
+
+- `principals --tenant TENANT --subject SUBJECT`
+- `sessions list` / `sessions remove ID` (revokes the session)
+- `artifacts list` / `artifacts remove ID` (purges the artifact)
+- `deny-list read` / `deny-list replace list.yaml --signature list.yaml.sig`
+- `report activity --request query.json`
+- `report access-review --request query.json`
+- `usage --request query.json`
+
+Report request files contain the JSON objects in the API table above. The CLI
+limits input files to 1 MB and response bodies to 32 MB; narrow a report window
+if its response exceeds that cap. Legacy direct vendor CLI commands retain
+their existing enterprise-mode refusal; CF-7 is closed for these admin commands,
+not for unaudited direct vendor operations. CF-28's vendor-reference resolution
+work remains open; the admin client only needs its explicitly supplied token
+file and the server's authenticated boundary.

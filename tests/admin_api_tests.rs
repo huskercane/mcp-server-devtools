@@ -515,3 +515,84 @@ async fn session_inventory_lists_and_closes_real_rmcp_sessions() {
     assert!(manager.list().await.unwrap().is_empty());
     assert!(manager.revoke(id.as_ref()).await.is_err());
 }
+
+#[tokio::test]
+async fn admin_cli_uses_the_audited_http_boundary_and_json_errors() {
+    let f = fixture(Role::All).await;
+    let token = f.dir.path().join("admin-token");
+    std::fs::write(&token, "admin\n").unwrap();
+    let run = |args: &[&str]| {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_mcp-devtools"));
+        command
+            .env("MCP_AUTH_MODE", "oidc")
+            .env("GRAFANA_TOKEN", "vault://unconfigured/vendor#token");
+        command
+            .args(["admin", "--url", &f.url, "--token-file"])
+            .arg(&token)
+            .args(args);
+        async move { command.output().await.unwrap() }
+    };
+    let output = run(&["policy", "read", "--json"]).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["data"]["document"], "version: 1\nrules: []\n");
+    let output = run(&["policy", "reload", "--json"]).await;
+    assert!(output.status.success());
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["data"]["audit_seq"], f.sink.events()[0]["seq"]);
+    assert_eq!(f.sink.events()[0]["source"], "policy/reload");
+    f.sink.set_failing(true);
+    let output = run(&["policy", "reload", "--json"]).await;
+    assert!(!output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({"error":"audit_unavailable","error_description":"audit_unavailable"})
+    );
+}
+
+#[test]
+fn every_admin_command_accepts_json() {
+    use clap::Parser as _;
+    let commands: &[&[&str]] = &[
+        &["policy", "read"],
+        &["policy", "validate", "policy.yaml"],
+        &["policy", "diff", "policy.yaml"],
+        &["policy", "reload"],
+        &["principals", "--tenant", "t", "--subject", "s"],
+        &["sessions", "list"],
+        &["sessions", "remove", "s"],
+        &["artifacts", "list"],
+        &["artifacts", "remove", "a"],
+        &["deny-list", "read"],
+        &[
+            "deny-list",
+            "replace",
+            "list.yaml",
+            "--signature",
+            "list.sig",
+        ],
+        &["report", "activity", "--request", "q.json"],
+        &["report", "access-review", "--request", "q.json"],
+        &["usage", "--request", "q.json"],
+    ];
+    for command in commands {
+        let mut args = vec![
+            "mcp-devtools",
+            "admin",
+            "--url",
+            "https://mcp.example",
+            "--token-file",
+            "token",
+        ];
+        args.extend_from_slice(command);
+        args.push("--json");
+        assert!(
+            mcp_server_devtools::cli::Cli::try_parse_from(args).is_ok(),
+            "{command:?}"
+        );
+    }
+}
