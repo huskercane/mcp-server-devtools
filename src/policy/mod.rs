@@ -25,6 +25,7 @@
 //! legacy `AUDIT_LOG` JSONL keeps its camelCase shape untouched — that
 //! surface is parity-locked; this one is new.)
 
+pub mod admin;
 pub mod bundle;
 pub mod canonical;
 pub mod egress;

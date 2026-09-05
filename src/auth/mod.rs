@@ -20,6 +20,7 @@ use reqwest::header::{AUTHORIZATION, HeaderName};
 use crate::config::Config;
 use crate::error::{McpError, auth_invalid, auth_missing};
 
+pub mod credential_broker;
 pub mod ema;
 pub mod keychain;
 pub mod oidc;

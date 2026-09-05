@@ -20,9 +20,10 @@ pub enum OutputFormat {
 
 impl OutputFormat {
     pub fn parse(value: Option<&str>) -> Self {
-        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-            Some("json") => Self::Json,
-            _ => Self::Toon,
+        if value.is_some_and(|value| value.trim().eq_ignore_ascii_case("json")) {
+            Self::Json
+        } else {
+            Self::Toon
         }
     }
 }
@@ -49,4 +50,38 @@ pub fn to_pretty_json(value: &Value) -> String {
 
 fn encode_toon(value: &Value) -> Option<String> {
     serde_toon::to_string(value).ok()
+}
+
+/// Join borrowed strings with one exactly sized output allocation. Empty
+/// elements still contribute separators, matching `slice::join` byte for byte.
+pub(crate) fn join_strings<'a>(
+    items: impl Iterator<Item = &'a str> + Clone,
+    separator: &str,
+) -> String {
+    let (count, bytes) = items
+        .clone()
+        .fold((0usize, 0usize), |(count, bytes), item| {
+            (count + 1, bytes + item.len())
+        });
+    let mut output = String::with_capacity(bytes + count.saturating_sub(1) * separator.len());
+    for (index, item) in items.enumerate() {
+        if index != 0 {
+            output.push_str(separator);
+        }
+        output.push_str(item);
+    }
+    output
+}
+
+#[cfg(test)]
+mod join_tests {
+    #[test]
+    fn empty_elements_and_unicode_keep_their_separators() {
+        for values in [vec![], vec![""], vec!["", "", "é", ""]] {
+            assert_eq!(
+                super::join_strings(values.iter().copied(), ";"),
+                values.join(";")
+            );
+        }
+    }
 }

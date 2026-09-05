@@ -56,7 +56,7 @@ const DURATION_BUCKETS: [(&str, u128); 12] = [
 #[derive(Debug, Default)]
 struct ToolCounters {
     /// (decision, outcome) → count. Small: a handful of pairs per tool.
-    by_result: Vec<(String, String, u64)>,
+    by_result: smallvec::SmallVec<[(String, String, u64); 4]>,
 }
 
 #[derive(Debug, Default)]

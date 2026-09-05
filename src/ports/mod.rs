@@ -27,6 +27,7 @@ pub mod audit_sink;
 pub mod checkpoint_sink;
 pub mod command_runner;
 pub mod credential_broker;
+pub mod policy_admin;
 pub mod policy_decision_point;
 pub mod rollup_store;
 pub mod secret_source;

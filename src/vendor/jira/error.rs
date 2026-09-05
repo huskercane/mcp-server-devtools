@@ -113,7 +113,7 @@ pub fn parse_error_body(body_text: &str) -> ParsedError {
     if let Some(obj) = parsed.get("errors").and_then(Value::as_object)
         && !obj.is_empty()
     {
-        let mut field_pairs: Vec<String> = Vec::new();
+        let mut field_pairs: Vec<String> = Vec::with_capacity(obj.len());
         for (k, v) in obj {
             if let Some(s) = v.as_str() {
                 field_pairs.push(format!("{k}: {s}"));

@@ -492,7 +492,14 @@ async fn activity_projection_matches_file_adapter_without_querying_journal() {
     let sink = JournalAuditSink::open(directory.path()).unwrap();
     let mut event = ControlEvent::now(ControlEventKind::AdminMutation);
     event.source = Some("policy/reload".into());
-    sink.append_control(&event).await.unwrap();
+    let mut principal = Principal::local();
+    principal.subject = "s".repeat(2048);
+    event.principal = Some(principal);
+    // Cross both the row-count and payload-byte batch limits. Every sequence
+    // must appear once, and subsequent polls must not replay the reused batch.
+    for _ in 0..1001 {
+        sink.append_control(&event).await.unwrap();
+    }
     let source = directory.path().join(JOURNAL_FILE_NAME);
     let file = JournalActivityReports::new(source.clone());
     let store = SqliteActivityReports::open(&directory.path().join("reports.sqlite")).unwrap();
@@ -519,7 +526,7 @@ async fn activity_projection_matches_file_adapter_without_querying_journal() {
     std::fs::remove_file(directory.path().join(JOURNAL_FILE_NAME)).unwrap();
     assert_eq!(
         store.activity(&filter).await.unwrap().rows.len(),
-        1,
+        1001,
         "query reads the projection"
     );
 }
@@ -622,4 +629,40 @@ fn every_admin_command_accepts_json() {
             "{command:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn deny_list_reads_release_the_lock_and_admin_budget() {
+    let f = fixture(Role::Control).await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    // More reads than the four-permit admin budget also catch leaked permits.
+    for _ in 0..5 {
+        let response = client
+            .get(format!("{}/admin/deny-list", f.url))
+            .bearer_auth("admin")
+            .send()
+            .await
+            .expect("deny-list read must finish without reacquiring its own mutex");
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(
+            body["data"]["document"],
+            "version: 1\nsubjects: []\ntoken_ids: []\n"
+        );
+        assert_eq!(body["data"]["signature"]["verified"], true);
+        assert_eq!(body["data"].as_object().unwrap().len(), 3);
+    }
+    let document = "version: 2\nsubjects: []\ntoken_ids: []\n";
+    let response = client
+        .put(format!("{}/admin/deny-list", f.url))
+        .bearer_auth("admin")
+        .json(&json!({"document": document, "signature": f.key.sign(Domain::RevocationList, document.as_bytes()).to_base64()}))
+        .send()
+        .await
+        .expect("reads must leave the mutation lock available");
+    assert_eq!(response.status(), 200);
+    assert_eq!(f.sink.events()[0]["source"], "deny-list/replace");
 }

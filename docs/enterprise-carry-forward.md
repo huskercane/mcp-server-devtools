@@ -1061,3 +1061,23 @@ allocation. The signed chain is an Arc slice, so cache hits share it rather
 than cloning actor strings. Tokens without actors carry None. TokenFacts has
 an additional optional Arc field; KB reporting is rounded down, not exact
 byte equality. Initial verification/exchange/SSO are outside this hit probe.
+
+
+Re-run after the CLAUDE.md compliance follow-up (2026-09-05): every existing
+stage allocation count and reported KB value matches C.1 and the table above.
+JWT validation cache hit: 9 allocations / 1 KB / 3.69 µs; cached actor-chain
+authentication: 8 / 1 KB / 3.99 µs. Journal append: 6 / 1 KB, p50 11 µs,
+p99 15 µs, max 71 µs. Both absolute budgets hold. Known rate-limit subjects,
+metric series, unchanged principals, config snapshots, and no-filter jq
+remain 0 bytes / 0 allocations; fan-out stays at 9 allocations. TOON rendering
+remains 19,032 allocations / 1,736 KB for 500 issues and 190,035 / 16,547 KB
+for 5,000 issues; truncation remains 4 / 39 KB. No measured allocation
+regression crosses the 20% phase-exit threshold.
+
+The follow-up adds no MCP-facing schema/description changes. It moves trusted
+integer quota maps to FxHashMap and small metric outcome collections to
+SmallVec; both crates were already in the lockfile at the exact versions now
+pinned directly. Admin projection batching is bounded and reuses its vector;
+its contention/peak memory are outside the response-pipeline probe.
+See the [full fresh output](benchmarks/2026-09-05-claude-compliance.txt) and
+[compliance review](claude-compliance-review.md) for scope and validation.

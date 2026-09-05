@@ -183,6 +183,26 @@ pub(crate) fn load_from_global_path(global_path: Option<&Path>) -> Config {
     )
 }
 
+/// Load one observed global snapshot without reopening its path. The dotenv
+/// cascade still reads the filesystem; call from a blocking worker.
+pub(crate) fn load_from_global_bytes(contents: Option<&[u8]>) -> std::io::Result<Config> {
+    let by_vendor = contents
+        .map(|bytes| {
+            let root: Value = serde_json::from_slice(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            Ok::<_, std::io::Error>(extract_all_vendor_sections(
+                &root,
+                crate::constants::PACKAGE_NAME,
+            ))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let mut config =
+        Config::load_from_sources(None, Some(Path::new(".env")), &env_map_from_process());
+    config.by_vendor = by_vendor;
+    Ok(config)
+}
+
 impl Config {
     /// Internal streaming acquisition ceiling. This is deliberately absent
     /// from public tool schemas and is clamped to the planner's hard ceiling.
@@ -231,7 +251,7 @@ impl Config {
         dotenv_path: Option<&Path>,
         process_env: &HashMap<String, String>,
     ) -> Self {
-        let mut shared: HashMap<String, String> = HashMap::new();
+        let mut shared: HashMap<String, String> = HashMap::with_capacity(process_env.len());
         let mut by_vendor: BTreeMap<String, HashMap<String, String>> = BTreeMap::new();
 
         // Global config: vendor-scoped sections.
@@ -377,7 +397,7 @@ impl Config {
         if let Some(v) = self.shared.get(key) {
             return Resolved::Resolved(self.expand(v));
         }
-        let mut hits: Vec<(&str, &str)> = Vec::new();
+        let mut hits: Vec<(&str, &str)> = Vec::with_capacity(self.by_vendor.len());
         for (vendor, vendor_map) in &self.by_vendor {
             if let Some(v) = vendor_map.get(key) {
                 hits.push((vendor.as_str(), self.expand(v)));

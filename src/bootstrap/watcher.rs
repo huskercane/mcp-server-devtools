@@ -9,7 +9,7 @@
 //! Holds only a [`Weak`] reference to [`Components`], so the task stops on its
 //! own when the server is dropped and never keeps the graph alive.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -85,17 +85,34 @@ pub fn spawn(components: &Arc<Components>, pending: PendingWatch) {
             if contents == last_contents {
                 continue;
             }
-            last_contents = contents;
-
-            if !reloadable(&path) {
-                continue;
-            }
+            // Parse the exact bytes observed above. The remaining cascade
+            // reads .env and process configuration on a blocking worker.
+            let loaded = tokio::task::spawn_blocking(move || {
+                let result = crate::config::load_from_global_bytes(contents.as_deref());
+                (contents, result)
+            })
+            .await;
+            let reloaded = match loaded {
+                Ok((contents, result)) => {
+                    last_contents = contents;
+                    match result {
+                        Ok(config) => config,
+                        Err(error) => {
+                            tracing::warn!(path = %path.display(), %error, "invalid global config; keeping previous config");
+                            continue;
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "config loader failed; retrying next tick");
+                    continue;
+                }
+            };
 
             // A reloaded configuration may reference secrets the current
             // snapshot has never seen; resolve them before the swap, and
             // keep the last good configuration if one does not resolve
             // (plan §3.8 — the policy-reload contract).
-            let reloaded = crate::config::load_from_global_path(Some(&path));
             let reloaded =
                 match super::secrets::resolve_reloaded(&components.secrets, reloaded).await {
                     Ok(config) => config,
@@ -115,21 +132,6 @@ pub fn spawn(components: &Arc<Components>, pending: PendingWatch) {
             tracing::info!(path = %path.display(), "reloaded global config");
         }
     });
-}
-
-/// An editor may briefly expose a partially-written file. Keep the last
-/// known-good snapshot and retry when the bytes change again.
-fn reloadable(path: &Path) -> bool {
-    if !path.exists() {
-        return true;
-    }
-    match crate::config::global::read_all_vendors(path, crate::constants::PACKAGE_NAME) {
-        Ok(_) => true,
-        Err(err) => {
-            tracing::warn!(path = %path.display(), error = %err, "global config changed but is not valid JSON; keeping previous config");
-            false
-        }
-    }
 }
 
 #[cfg(test)]

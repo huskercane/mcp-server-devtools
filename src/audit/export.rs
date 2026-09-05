@@ -22,7 +22,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::Path;
 
-use serde::Serialize;
+// Preserve existing library imports while ports own the report vocabulary.
+pub use crate::ports::activity_reports::{AccessRow, ActivityExport, ActivityFilter, ActivityRow};
 use serde_json::Value;
 
 use super::reader::JournalReader;
@@ -33,51 +34,6 @@ use crate::policy::{FilePolicy, Principal, PrincipalAuthority, RuleDescription};
 pub enum Format {
     Jsonl,
     Csv,
-}
-
-/// Which records to export.
-#[derive(Debug, Clone, Default)]
-pub struct ActivityFilter {
-    /// RFC 3339 lower bound (inclusive) on `timestamp`.
-    pub since: Option<String>,
-    /// RFC 3339 upper bound (exclusive).
-    pub until: Option<String>,
-    pub subject: Option<String>,
-    pub vendor: Option<String>,
-    /// Record kinds to keep; empty keeps every kind except checkpoints.
-    pub kinds: Vec<String>,
-}
-
-/// One journal record, flattened.
-#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
-pub struct ActivityRow {
-    pub seq: u64,
-    pub timestamp: String,
-    pub kind: String,
-    pub request_id: Option<String>,
-    pub subject: Option<String>,
-    pub tenant: Option<String>,
-    pub groups: Option<String>,
-    pub tool: Option<String>,
-    pub vendor: Option<String>,
-    pub environment: Option<String>,
-    pub normalized_action: Option<String>,
-    pub resource_type: Option<String>,
-    pub resource_scope: Option<String>,
-    pub request_risk: Option<String>,
-    pub effect: Option<String>,
-    pub rule_id: Option<String>,
-    pub policy_version: Option<String>,
-    pub reason: Option<String>,
-    pub upstream_label: Option<String>,
-    pub upstream_authority: Option<String>,
-    pub outcome: Option<String>,
-    pub duration_ms: Option<u64>,
-    pub egress_allowed: Option<u64>,
-    pub egress_denied: Option<u64>,
-    pub egress_attempted: Option<u64>,
-    /// Control records: the document version the record is about.
-    pub version: Option<String>,
 }
 
 /// CSV column order for [`ActivityRow`].
@@ -110,16 +66,6 @@ pub const ACTIVITY_COLUMNS: &[&str] = &[
     "version",
 ];
 
-/// The rows, plus why the read stopped early if it did.
-#[derive(Debug, Default, Serialize)]
-pub struct ActivityExport {
-    pub rows: Vec<ActivityRow>,
-    /// Records read, including the ones the filter dropped.
-    pub records_read: u64,
-    /// Set when the journal could not be read to the end.
-    pub stopped: Option<String>,
-}
-
 fn text(value: &Value, path: &[&str]) -> Option<String> {
     let mut cursor = value;
     for key in path {
@@ -139,13 +85,10 @@ fn joined(value: &Value, path: &[&str]) -> Option<String> {
         cursor = cursor.get(key)?;
     }
     let items = cursor.as_array()?;
-    Some(
-        items
-            .iter()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>()
-            .join(";"),
-    )
+    Some(crate::format::join_strings(
+        items.iter().filter_map(Value::as_str),
+        ";",
+    ))
 }
 
 fn scope_label(value: &Value) -> Option<String> {
@@ -156,11 +99,7 @@ fn scope_label(value: &Value) -> Option<String> {
             scope
                 .get("ids")
                 .and_then(Value::as_array)
-                .map(|ids| ids
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(";"))
+                .map(|ids| crate::format::join_strings(ids.iter().filter_map(Value::as_str), ";"))
                 .unwrap_or_default()
         )),
         other => Some(other.to_owned()),
@@ -456,17 +395,6 @@ impl GroupsFile {
             .map(|(subject, groups)| (subject, groups.into_iter().collect()))
             .collect()
     }
-}
-
-/// One (subject, rule) pair the policy would consider.
-#[derive(Debug, Clone, Serialize)]
-pub struct AccessRow {
-    pub subject: String,
-    pub groups: Vec<String>,
-    pub rule_id: String,
-    pub effect: String,
-    /// The rule's match keys (`vendor`, `environment`, `resource_id`, …).
-    pub matches: BTreeMap<&'static str, Vec<String>>,
 }
 
 /// CSV column order for [`AccessRow`]; the match keys follow.

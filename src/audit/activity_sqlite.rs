@@ -16,6 +16,19 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+const INGEST_BATCH_ROWS: usize = 1000;
+const INGEST_BATCH_BYTES: usize = 1024 * 1024;
+
+// Reused by the one projection worker; no per-poll batch allocation.
+type PreparedRow = (
+    i64,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+);
+
 pub struct SqliteActivityReports {
     connection: Arc<Mutex<Connection>>,
     ready: AtomicBool,
@@ -43,6 +56,7 @@ impl SqliteActivityReports {
         tokio::spawn(async move {
             let mut position = Position::start();
             let mut first = true;
+            let mut batch = Vec::with_capacity(INGEST_BATCH_ROWS);
             loop {
                 if cancel.is_cancelled() {
                     return;
@@ -52,11 +66,21 @@ impl SqliteActivityReports {
                 };
                 let worker = store.clone();
                 let source = source.clone();
-                let outcome =
-                    tokio::task::spawn_blocking(move || worker.ingest(&source, position, first))
-                        .await;
-                match outcome {
-                    Ok(Ok((next, caught_up))) => {
+                let outcome = tokio::task::spawn_blocking(move || {
+                    let result = worker.ingest(&source, position, first, &mut batch);
+                    batch.clear();
+                    (batch, result)
+                })
+                .await;
+                let result = if let Ok((returned_batch, result)) = outcome {
+                    batch = returned_batch;
+                    result
+                } else {
+                    store.ready.store(false, Ordering::Release);
+                    return;
+                };
+                match result {
+                    Ok((next, caught_up)) => {
                         position = next;
                         first = false;
                         store.ready.store(caught_up, Ordering::Release);
@@ -77,20 +101,12 @@ impl SqliteActivityReports {
         source: &Path,
         start: Position,
         first: bool,
+        batch: &mut Vec<PreparedRow>,
     ) -> Result<(Position, bool), ActivityUnavailable> {
         let mut reader = JournalReader::resume(source, start).map_err(|_| ActivityUnavailable)?;
-        let mut connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let transaction = connection.transaction().map_err(|_| ActivityUnavailable)?;
-        if first {
-            transaction
-                .execute("DELETE FROM activity_v1", [])
-                .map_err(|_| ActivityUnavailable)?;
-        }
         let mut caught_up = false;
-        for _ in 0..1000 {
+        let mut bytes = 0;
+        for _ in 0..INGEST_BATCH_ROWS {
             let Some(record) = reader.next() else {
                 caught_up = true;
                 break;
@@ -101,8 +117,33 @@ impl SqliteActivityReports {
             }
             let row = flatten(record.seq, &record.kind, &record.value);
             let json = serde_json::to_string(&row).map_err(|_| ActivityUnavailable)?;
+            let seq = i64::try_from(row.seq).map_err(|_| ActivityUnavailable)?;
+            let timestamp = instant(&row.timestamp);
+            bytes += json.len()
+                + row.kind.len()
+                + row.subject.as_ref().map_or(0, String::len)
+                + row.vendor.as_ref().map_or(0, String::len);
+            batch.push((seq, timestamp, row.subject, row.vendor, row.kind, json));
+            // Bound retained payload as well as row count. One source record
+            // may exceed this budget, but is never combined with another batch.
+            if bytes >= INGEST_BATCH_BYTES {
+                break;
+            }
+        }
+        // Journal I/O and JSON preparation finish before readers are excluded.
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction().map_err(|_| ActivityUnavailable)?;
+        if first {
+            transaction
+                .execute("DELETE FROM activity_v1", [])
+                .map_err(|_| ActivityUnavailable)?;
+        }
+        for (seq, timestamp, subject, vendor, kind, json) in batch.iter() {
             transaction.execute("INSERT INTO activity_v1(seq,ts,subject,vendor,kind,row_json) VALUES (?1,?2,?3,?4,?5,?6)",
-                params![i64::try_from(row.seq).map_err(|_| ActivityUnavailable)?, instant(&row.timestamp), row.subject, row.vendor, row.kind, json]).map_err(|_| ActivityUnavailable)?;
+                params![seq, timestamp, subject, vendor, kind, json]).map_err(|_| ActivityUnavailable)?;
         }
         transaction.commit().map_err(|_| ActivityUnavailable)?;
         Ok((reader.position(), caught_up))

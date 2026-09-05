@@ -650,3 +650,16 @@ pub fn refuse_unaudited_cli(config: &Config) -> Result<(), McpError> {
     }
     Ok(())
 }
+
+pub(crate) fn admin_policy(
+    server: &DevtoolsServer,
+) -> Option<Arc<dyn crate::ports::policy_admin::PolicyAdmin>> {
+    let policy = server.policy_file()?;
+    let audit = server.audit_sink().map(|sink| crate::policy::BundleAudit {
+        sink,
+        append_timeout: server.audit_append_timeout(),
+    });
+    Some(Arc::new(crate::policy::admin::FilePolicyAdmin::new(
+        policy, audit,
+    )))
+}

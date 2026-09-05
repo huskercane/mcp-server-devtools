@@ -30,7 +30,8 @@ mod response_cache;
 /// [`crate::vendor::bitbucket::error`].
 pub use crate::vendor::bitbucket::error as bitbucket_error;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use rustc_hash::FxHashMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -251,8 +252,10 @@ struct StreamingDiskState {
     peak: u64,
     next_reservation: u64,
     next_waiter: u64,
-    transactions: HashMap<u64, TransactionReservation>,
-    reservations: HashMap<u64, OwnedReservation>,
+    // IDs are generated internally, never selected by callers; collision
+    // attack resistance is unnecessary for these two integer maps.
+    transactions: FxHashMap<u64, TransactionReservation>,
+    reservations: FxHashMap<u64, OwnedReservation>,
     waiters: VecDeque<ReservationWaiter>,
 }
 

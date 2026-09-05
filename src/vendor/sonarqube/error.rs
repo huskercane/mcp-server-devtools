@@ -104,10 +104,11 @@ pub fn parse_error_body(body_text: &str) -> ParsedError {
         .get("errors")
         .and_then(Value::as_array)
         .map(|errs| {
-            errs.iter()
-                .filter_map(|e| e.get("msg").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("; ")
+            crate::format::join_strings(
+                errs.iter()
+                    .filter_map(|e| e.get("msg").and_then(Value::as_str)),
+                "; ",
+            )
         })
         .filter(|s| !s.is_empty())
         .or_else(|| {

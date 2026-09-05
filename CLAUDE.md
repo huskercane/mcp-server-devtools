@@ -24,9 +24,16 @@ cargo build                                   # default features (keychain on)
 cargo build --no-default-features             # headless / keychain-off path
 cargo clippy --all-targets -- -D warnings     # warnings are errors; pedantic is on
 cargo test                                    # full suite (integration-heavy)
-cargo fmt --all                               # rustfmt is the formatter of record
-cargo deny check                              # license + advisory gate (deny.toml)
+cargo fmt --all -- --check                    # rustfmt gate (use cargo fmt --all to fix)
+cargo deny --locked check --deny warnings     # license + advisory + duplication gate
 ```
+
+The Rust workflow's Linux `quality` job enforces formatting and dependency
+checks using cargo-deny 0.19.4. `deny.toml` rejects new duplicate dependency
+versions; its exact-version exceptions record incompatible versions required
+by the pinned upstream graph. Those exceptions never suppress license,
+advisory, or source checks. Remove them when the corresponding versions leave
+`Cargo.lock`; do not replace them with broad duplicate allowances.
 
 ## Profiling (not a CI gate)
 

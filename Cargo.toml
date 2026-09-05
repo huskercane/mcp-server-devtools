@@ -48,6 +48,11 @@ keychain = ["dep:keyring"]
 secrets-vault = []
 
 [dependencies]
+# Already present transitively at these versions. FxHashMap is restricted to
+# server-generated integer identifiers; externally influenced keys retain the
+# standard randomized hasher. SmallVec holds the handful of metric outcomes.
+rustc-hash          = "=2.1.3"
+smallvec            = "=1.15.2"
 rmcp                = { version = "=3.1.2", features = ["transport-io", "transport-streamable-http-server"] }
 #rmcp-macros         = "=3.1.0"
 tokio               = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "signal", "io-std", "fs", "sync", "time", "process"] }

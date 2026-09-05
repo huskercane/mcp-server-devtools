@@ -1064,7 +1064,7 @@ impl TokenValidator for Arc<OidcJwksValidator> {
 /// document order.
 fn admit_keys(set: &JwkSet) -> HashMap<String, AdmittedKey> {
     let mut keys: HashMap<String, AdmittedKey> = HashMap::with_capacity(set.keys.len());
-    let mut ambiguous: Vec<String> = Vec::new();
+    let mut ambiguous: Vec<&str> = Vec::with_capacity(set.keys.len());
     for jwk in &set.keys {
         let Some(kid) = jwk.common.key_id.as_deref() else {
             continue;
@@ -1077,7 +1077,7 @@ fn admit_keys(set: &JwkSet) -> HashMap<String, AdmittedKey> {
         };
         let admitted = AdmittedKey { key, fingerprint };
         if keys.insert(kid.to_owned(), admitted).is_some() {
-            ambiguous.push(kid.to_owned());
+            ambiguous.push(kid);
         }
     }
     for kid in ambiguous {
@@ -1085,7 +1085,7 @@ fn admit_keys(set: &JwkSet) -> HashMap<String, AdmittedKey> {
             kid,
             "JWKS publishes more than one RSA signing key under this kid; admitting neither"
         );
-        keys.remove(&kid);
+        keys.remove(kid);
     }
     keys
 }

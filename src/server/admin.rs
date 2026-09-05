@@ -2,7 +2,7 @@
 //! callers. Expensive work has an independent, bounded task budget.
 use super::auth::{InboundAuth, require_bearer};
 use crate::{
-    policy::{BundleAudit, FilePolicy, Principal},
+    policy::{BundleAudit, Principal},
     ports::{
         ControlEvent, ControlEventKind,
         admin_inventory::{ArtifactStore, SessionStore},
@@ -28,16 +28,31 @@ struct Admin {
     sessions: Option<Arc<dyn SessionStore>>,
     artifacts: Option<Arc<dyn ArtifactStore>>,
     reports: Option<Arc<dyn crate::ports::activity_reports::ActivityReports>>,
+    policy: Option<Arc<dyn crate::ports::policy_admin::PolicyAdmin>>,
     budget: Arc<tokio::sync::Semaphore>,
     mutations: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// Compose the standard backend, preserving the public router API.
 pub fn router(
     server: DevtoolsServer,
     auth: &InboundAuth,
     sessions: Option<Arc<dyn SessionStore>>,
     artifacts: Option<Arc<dyn ArtifactStore>>,
     reports: Option<Arc<dyn crate::ports::activity_reports::ActivityReports>>,
+) -> Router {
+    let policy = crate::bootstrap::admin_policy(&server);
+    router_with_policy(server, auth, sessions, artifacts, reports, policy)
+}
+
+/// Build the HTTP boundary with an explicitly supplied policy backend.
+pub fn router_with_policy(
+    server: DevtoolsServer,
+    auth: &InboundAuth,
+    sessions: Option<Arc<dyn SessionStore>>,
+    artifacts: Option<Arc<dyn ArtifactStore>>,
+    reports: Option<Arc<dyn crate::ports::activity_reports::ActivityReports>>,
+    policy: Option<Arc<dyn crate::ports::policy_admin::PolicyAdmin>>,
 ) -> Router {
     let auth = Arc::new(auth.for_admin());
     let state = Admin {
@@ -46,6 +61,7 @@ pub fn router(
         sessions,
         artifacts,
         reports,
+        policy,
         budget: Arc::new(tokio::sync::Semaphore::new(4)),
         mutations: Arc::new(tokio::sync::Mutex::new(())),
     };
@@ -152,8 +168,8 @@ async fn dispatch(State(state): State<Admin>, request: Request) -> Result<Json<V
 }
 
 impl Admin {
-    fn policy(&self) -> Result<Arc<FilePolicy>, Error> {
-        self.server.policy_file().ok_or(UNAVAILABLE)
+    fn policy(&self) -> Result<&dyn crate::ports::policy_admin::PolicyAdmin, Error> {
+        self.policy.as_deref().ok_or(UNAVAILABLE)
     }
     fn audit(&self) -> Result<BundleAudit, Error> {
         Ok(BundleAudit {
@@ -190,56 +206,31 @@ impl Admin {
         body: &[u8],
     ) -> Result<Value, Error> {
         match (method, op) {
-            (&Method::GET, "policy") => {
-                let policy = self.policy()?;
-                let _guard = policy.mutation.lock().await;
-                Ok(
-                    json!({"version": policy.version(), "document": String::from_utf8(policy.document_bytes()).map_err(|_| UNAVAILABLE)?, "signature": policy.signature()}),
-                )
-            }
+            (&Method::GET, "policy") => encode(self.policy()?.read().await.map_err(policy_error)?),
             (&Method::POST, "policy/validate" | "policy/diff") => {
                 let input: Document = decode(body)?;
                 let policy = self.policy()?;
-                let candidate = tokio::task::spawn_blocking(move || {
-                    FilePolicy::from_bytes(input.document.as_bytes())
-                })
-                .await
-                .map_err(|_| UNAVAILABLE)?
-                .map_err(|_| INVALID)?;
                 if op == "policy/validate" {
-                    Ok(
-                        json!({"valid": true, "version": candidate.version(), "rules": candidate.rule_count(), "signature_verified": false}),
+                    encode(
+                        policy
+                            .validate(input.document)
+                            .await
+                            .map_err(policy_error)?,
                     )
                 } else {
-                    let _guard = policy.mutation.lock().await;
-                    Ok(
-                        json!({"current_version": policy.version(), "candidate_version": candidate.version(), "current_rules": policy.describe_rules(), "candidate_rules": candidate.describe_rules()}),
-                    )
+                    encode(policy.diff(input.document).await.map_err(policy_error)?)
                 }
             }
             (&Method::POST, "policy/reload") => {
                 if !decode::<std::collections::BTreeMap<String, Value>>(body)?.is_empty() {
                     return Err(INVALID);
                 }
-                let policy = self.policy()?;
-                let _guard = policy.mutation.lock().await;
-                let staging = policy.clone();
-                let staged = tokio::task::spawn_blocking(move || staging.stage())
-                    .await
-                    .map_err(|_| UNAVAILABLE)?
-                    .map_err(|_| INVALID)?;
-                let seq = self
-                    .record(
-                        principal,
-                        op,
-                        staged.as_ref().map(|s| s.version().to_owned()),
-                    )
-                    .await?;
-                let changed = staged.is_some();
-                if let Some(staged) = staged {
-                    policy.commit(staged);
-                }
-                Ok(json!({"audit_seq": seq, "changed": changed, "version": policy.version()}))
+                encode(
+                    self.policy()?
+                        .reload(principal)
+                        .await
+                        .map_err(policy_error)?,
+                )
             }
             (&Method::GET, "sessions") => {
                 let rows = self
@@ -293,7 +284,6 @@ impl Admin {
             (&Method::GET, "deny-list") => {
                 let list = self.auth.revocations().ok_or(UNAVAILABLE)?;
                 let _guard = list.mutation.lock().await;
-                let _guard = list.mutation.lock().await;
                 Ok(
                     json!({"version": list.version(), "document": String::from_utf8(list.document_bytes()).map_err(|_| UNAVAILABLE)?, "signature": list.signature()}),
                 )
@@ -324,16 +314,11 @@ impl Admin {
             }
             (&Method::POST, "reports/access-review") => {
                 let input: AccessReview = decode(body)?;
-                let policy = self.policy()?;
-                let rows = tokio::task::spawn_blocking(move || {
-                    crate::audit::export::access_review(
-                        &policy,
-                        &crate::audit::export::GroupsFile(input.groups),
-                        &input.tenant,
-                    )
-                })
-                .await
-                .map_err(|_| UNAVAILABLE)?;
+                let rows = self
+                    .policy()?
+                    .access_review(input.groups, input.tenant)
+                    .await
+                    .map_err(policy_error)?;
                 Ok(json!({"rows": rows}))
             }
             (&Method::POST, "reports/activity") => {
@@ -441,5 +426,17 @@ fn inventory_error(error: crate::ports::admin_inventory::InventoryError) -> Erro
     match error {
         crate::ports::admin_inventory::InventoryError::NotFound => NOT_FOUND,
         crate::ports::admin_inventory::InventoryError::Unavailable => UNAVAILABLE,
+    }
+}
+
+fn encode(value: impl serde::Serialize) -> Result<Value, Error> {
+    serde_json::to_value(value).map_err(|_| UNAVAILABLE)
+}
+fn policy_error(error: crate::ports::policy_admin::PolicyAdminError) -> Error {
+    use crate::ports::policy_admin::PolicyAdminError;
+    match error {
+        PolicyAdminError::Invalid => INVALID,
+        PolicyAdminError::Unavailable => UNAVAILABLE,
+        PolicyAdminError::AuditUnavailable => AUDIT_FAILED,
     }
 }

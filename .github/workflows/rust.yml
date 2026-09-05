@@ -13,6 +13,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+    - name: Install pinned dependency auditor
+      run: cargo install cargo-deny --version 0.19.4 --locked
+    - name: Audit dependencies
+      run: cargo deny --locked check --deny warnings
+
   build:
     # Three-OS matrix. Sharp edges in this codebase (keychain backend
     # selection, atomic-replace semantics) are target-specific, so we

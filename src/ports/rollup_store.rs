@@ -325,7 +325,6 @@ fn totals(rows: &[UsageRow], window: &Window) -> Totals {
     // (subject, vendor) → environments with an allowed call.
     let mut allowed_envs: BTreeMap<(&str, &str), std::collections::BTreeSet<&str>> =
         BTreeMap::new();
-    let mut denied: Vec<&UsageRow> = Vec::new();
     for row in rows.iter().filter(|row| window.contains(&row.timestamp)) {
         out.rows += 1;
         subjects.insert(row.subject.as_str());
@@ -342,7 +341,6 @@ fn totals(rows: &[UsageRow], window: &Window) -> Totals {
                 .insert(&row.environment);
         } else {
             out.denied += 1;
-            denied.push(row);
         }
         if out
             .first_timestamp
@@ -367,8 +365,10 @@ fn totals(rows: &[UsageRow], window: &Window) -> Totals {
     if out.allowed > 0 {
         out.mean_duration_ms = Some(ratio(duration_total, out.allowed));
     }
-    out.cross_environment_attempts = denied
+    // A second borrowed scan avoids allocating one pointer per denied row.
+    out.cross_environment_attempts = rows
         .iter()
+        .filter(|row| window.contains(&row.timestamp) && !is_allow(row))
         .filter(|row| {
             allowed_envs
                 .get(&(row.subject.as_str(), row.vendor.as_str()))
