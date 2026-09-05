@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Health</h1>
+<section id="banner" hx-get="/console/health" hx-trigger="every 30s" hx-select="#banner" hx-swap="outerHTML">
+<p class="banner {% if ok %}ok{% else %}deny{% endif %}">{{ banner }}</p>
+<p class="muted">The same text the unauthenticated health route (<code>GET /</code>) answers; categories only, never a reason.</p>
+</section>
+{% endblock %}

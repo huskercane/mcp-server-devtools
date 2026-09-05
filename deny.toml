@@ -5,6 +5,10 @@
 
 [graph]
 all-features = false
+# The console (`console`, off by default) is the one feature with
+# dependencies of its own; the gate checks its tree too, so an unreviewed
+# licence or advisory cannot hide behind an optional feature.
+features = ["console"]
 
 [output]
 feature-depth = 1

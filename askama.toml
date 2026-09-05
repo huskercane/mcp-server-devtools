@@ -1,0 +1,5 @@
+# askama (feature `console`): templates live beside the vendored assets,
+# not in a top-level `templates/` directory, so everything the console
+# ships is under `console/`.
+[general]
+dirs = ["console/templates"]

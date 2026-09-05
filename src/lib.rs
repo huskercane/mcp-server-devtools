@@ -15,6 +15,8 @@ pub mod auth;
 pub mod bootstrap;
 pub mod cli;
 pub mod config;
+#[cfg(feature = "console")]
+pub mod console;
 pub mod constants;
 pub mod controllers;
 pub mod error;

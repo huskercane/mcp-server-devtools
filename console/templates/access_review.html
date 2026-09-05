@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Access review</h1>
+<p class="muted">Which rules apply to which subjects under the supplied group snapshot and the policy in force. The snapshot is what you upload; this is not an identity-provider fetch.</p>
+<form class="inline" method="post" action="/console/access-review" hx-post="/console/access-review" hx-target="#results" hx-select="#results" hx-swap="outerHTML">
+<label>Tenant <input name="tenant" value="{{ tenant }}" required></label>
+<label>Group snapshot (JSON object: group → [subjects]) <textarea name="groups">{{ groups }}</textarea></label>
+<div><button type="submit">Review</button></div>
+</form>
+<section id="results">
+{% if let Some(error) = error %}
+<p class="banner deny">{{ error }}</p>
+{% endif %}
+{% if let Some(rows) = rows %}
+<p class="muted">{{ rows.len() }} rows</p>
+<table>
+<thead><tr><th>Subject</th><th>Groups</th><th>Rule</th><th>Effect</th><th>Matches</th></tr></thead>
+<tbody>
+{% for row in rows %}
+<tr><td>{{ row.subject }}</td><td>{{ row.groups }}</td><td><code>{{ row.rule_id }}</code></td><td>{{ row.effect }}</td><td>{{ row.matches }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+</section>
+{% endblock %}

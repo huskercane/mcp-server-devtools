@@ -46,6 +46,14 @@ keychain = ["dep:keyring"]
 # in" path and so the cloud adapters (`secrets-aws`, `secrets-azure`, which
 # do pull SDKs) follow the same shape.
 secrets-vault = []
+# `console` compiles the administration console (plan §3.10.2, WP D.1;
+# ADR-007/012/013): askama-rendered pages served by the roles that serve
+# the control plane, as a client of the admin API through
+# `ports::AdminClient`. Off by default: it is the one Phase D item with
+# dependencies of its own (`askama`, `rust-embed`), and a gateway-only
+# image has no reason to carry a template engine. Nothing else changes
+# shape with it on — the admin API has no HTML endpoint either way.
+console = ["dep:askama", "dep:rust-embed"]
 
 [dependencies]
 # Already present transitively at these versions. FxHashMap is restricted to
@@ -123,6 +131,16 @@ aws-lc-rs           = "=1.18.0"
 # needs no shared library and every platform runs the same SQLite. Talks to
 # the domain only through the port's own types — no SQL crosses it.
 rusqlite            = { version = "=0.40.2", default-features = false, features = ["bundled", "cache"] }
+
+# --- Console (feature = "console") -------------------------------------------
+# Compile-time templates (`console/templates`, see `askama.toml`) and the
+# embedded static assets (`console/static`: the one vendored htmx build and
+# the stylesheet). `debug-embed` embeds in debug builds too, so tests see the
+# bytes the binary ships rather than the working tree. Both are exact-pinned;
+# their dependency trees and the binary-size delta are recorded in D.1's
+# summary (plan decision log rev 2.26).
+askama              = { version = "=0.16.1", optional = true }
+rust-embed          = { version = "=8.12.0", optional = true, features = ["debug-embed"] }
 
 # --- WRDS (feature = "wrds") --------------------------------------------------
 # WRDS is PostgreSQL-only; these back the `wrds_*` tools. `with-serde_json-1`

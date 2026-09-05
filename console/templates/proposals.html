@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Proposals</h1>
+<p class="muted">Two-person approval (plan §3.10.3). Read-only here: approve or reject with <code>mcp-devtools admin proposals</code>.</p>
+<section id="proposals" hx-get="/console/proposals" hx-trigger="every 30s" hx-select="#proposals" hx-swap="outerHTML">
+{% if let Some(unavailable) = unavailable %}
+<p class="banner warn">{{ unavailable }}</p>
+{% else %}
+<p class="muted">{{ rows.len() }} proposals in your tenant</p>
+<table>
+<thead><tr><th>Id</th><th>Operation</th><th>Target</th><th>Proposer</th><th>Created</th><th>Expires</th><th>State</th><th>Decided by</th><th>Reason</th><th>Applied seq</th></tr></thead>
+<tbody>
+{% for row in rows %}
+<tr><td><code>{{ row.id }}</code></td><td>{{ row.operation }}</td><td>{{ row.target }}</td><td>{{ row.proposer }}</td><td>{{ row.created }}</td><td>{{ row.expires }}</td><td>{{ row.state }}</td><td>{{ row.decided_by }}</td><td>{{ row.reason }}</td><td>{{ row.applied_seq }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+</section>
+{% endblock %}

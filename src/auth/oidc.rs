@@ -399,6 +399,56 @@ impl OidcSettings {
     }
 }
 
+/// GET a JSON document with the fetch timeout and a byte bound enforced on
+/// the declared length *and* while the body streams. Shared by the key
+/// fetch and the console's discovery.
+async fn fetch_bounded(
+    client: &reqwest::Client,
+    url: &str,
+    max_bytes: usize,
+    what: &str,
+) -> Result<Vec<u8>, String> {
+    let mut response = client
+        .get(url)
+        // Covers the body read too, so a slow chunked stream is bounded
+        // in time as well as in bytes.
+        .timeout(JWKS_FETCH_TIMEOUT)
+        .send()
+        .await
+        .map_err(|error| format!("{what} fetch failed: {}", redacted_reqwest_error(&error)))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("{what} fetch returned HTTP {}", status.as_u16()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(format!("{what} document too large"));
+    }
+    // Read chunk by chunk and stop at the bound: `Content-Length` is
+    // optional, and a chunked response must not be buffered whole before
+    // it is measured.
+    let mut body: Vec<u8> = Vec::with_capacity(
+        response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(4096)
+            .min(max_bytes),
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| format!("{what} body could not be read"))?
+    {
+        if body.len() + chunk.len() > max_bytes {
+            return Err(format!("{what} document too large"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Keys are only as trustworthy as the channel they arrive over, so the
 /// issuer and JWKS URLs must be `https` — except on loopback, where a local
 /// JWKS mirror (air-gapped deployments, tests) is the same trust boundary
@@ -477,11 +527,67 @@ fn string_or_array<'de, D: serde::Deserializer<'de>>(
     })
 }
 
-/// The part of a discovery document the validator uses.
+/// The part of a discovery document the validator and the console use.
 #[derive(Deserialize)]
 struct Discovery {
     issuer: Option<String>,
     jwks_uri: Option<String>,
+    authorization_endpoint: Option<String>,
+    token_endpoint: Option<String>,
+}
+
+/// The endpoints of the authorization-code flow, as the provider's
+/// discovery document advertises them (the console's sign-in, ADR-013).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizationEndpoints {
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+}
+
+/// Read `{issuer}/.well-known/openid-configuration` and return the
+/// authorization and token endpoints. The document must name `issuer`,
+/// and each endpoint is held to the same channel rule as a configured
+/// URL: `https`, or `http` on loopback.
+///
+/// # Errors
+///
+/// A message naming what was wrong with the document; never a token.
+pub async fn discover_endpoints(
+    client: &reqwest::Client,
+    issuer: &str,
+) -> Result<AuthorizationEndpoints, String> {
+    let issuer = issuer.trim_end_matches('/');
+    let body = fetch_bounded(
+        client,
+        &format!("{issuer}/.well-known/openid-configuration"),
+        DISCOVERY_MAX_BYTES,
+        "discovery",
+    )
+    .await?;
+    let document: Discovery =
+        serde_json::from_slice(&body).map_err(|_| "discovery document is not valid".to_owned())?;
+    let named = document
+        .issuer
+        .ok_or_else(|| "discovery document names no issuer".to_owned())?;
+    if named.trim_end_matches('/') != issuer {
+        return Err(
+            "discovery document names a different issuer than the one configured".to_owned(),
+        );
+    }
+    let endpoint = |value: Option<String>, name: &str| -> Result<String, String> {
+        let value = value.ok_or_else(|| format!("discovery document names no {name}"))?;
+        let parsed = url::Url::parse(&value)
+            .map_err(|_| format!("discovery document's {name} is not a URL"))?;
+        require_https_unless_loopback(&parsed, &format!("the discovery document's {name}"))?;
+        Ok(value)
+    };
+    Ok(AuthorizationEndpoints {
+        authorization_endpoint: endpoint(
+            document.authorization_endpoint,
+            "authorization_endpoint",
+        )?,
+        token_endpoint: endpoint(document.token_endpoint, "token_endpoint")?,
+    })
 }
 
 /// Entra's signal that the groups did not fit in the token: `_claim_names`
@@ -692,46 +798,7 @@ impl OidcJwksValidator {
         max_bytes: usize,
         what: &str,
     ) -> Result<Vec<u8>, String> {
-        let mut response = self
-            .client
-            .get(url)
-            // Covers the body read too, so a slow chunked stream is bounded
-            // in time as well as in bytes.
-            .timeout(JWKS_FETCH_TIMEOUT)
-            .send()
-            .await
-            .map_err(|error| format!("{what} fetch failed: {}", redacted_reqwest_error(&error)))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(format!("{what} fetch returned HTTP {}", status.as_u16()));
-        }
-        if response
-            .content_length()
-            .is_some_and(|length| length > max_bytes as u64)
-        {
-            return Err(format!("{what} document too large"));
-        }
-        // Read chunk by chunk and stop at the bound: `Content-Length` is
-        // optional, and a chunked response must not be buffered whole before
-        // it is measured.
-        let mut body: Vec<u8> = Vec::with_capacity(
-            response
-                .content_length()
-                .and_then(|length| usize::try_from(length).ok())
-                .unwrap_or(4096)
-                .min(max_bytes),
-        );
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| format!("{what} body could not be read"))?
-        {
-            if body.len() + chunk.len() > max_bytes {
-                return Err(format!("{what} document too large"));
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(body)
+        fetch_bounded(&self.client, url, max_bytes, what).await
     }
 
     /// Make `keys` the current set and evict every cached validation whose

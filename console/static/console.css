@@ -1,0 +1,84 @@
+/* mcp-devtools console. One stylesheet, referenced from the base template;
+   the page's CSP is `style-src 'self'`, so nothing is styled inline. */
+:root {
+  --ink: #1b1f23;
+  --muted: #5a6470;
+  --line: #d9dee3;
+  --paper: #ffffff;
+  --panel: #f4f6f8;
+  --accent: #0b5fff;
+  --allow: #0a7a3d;
+  --deny: #b3261e;
+  --warn: #8a5a00;
+  --warn-bg: #fff4d6;
+  --deny-bg: #fde8e6;
+}
+html { color-scheme: light; }
+body {
+  margin: 0;
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: var(--paper);
+}
+header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+header .brand { font-weight: 600; margin-right: 0.5rem; }
+header nav a {
+  color: var(--ink);
+  text-decoration: none;
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+}
+header nav a[aria-current="page"] { background: var(--paper); border: 1px solid var(--line); }
+header form { margin-left: auto; }
+main { padding: 1rem; max-width: 1200px; }
+h1 { font-size: 1.25rem; margin: 0 0 0.75rem; }
+h2 { font-size: 1rem; margin: 1.25rem 0 0.5rem; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; }
+pre {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  padding: 0.75rem;
+  overflow: auto;
+  max-height: 32rem;
+  font-size: 12px;
+}
+code { font-size: 12px; }
+form.inline { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 0.5rem 1rem; align-items: end; margin-bottom: 1rem; }
+form.inline label { display: flex; flex-direction: column; gap: 0.2rem; font-size: 12px; color: var(--muted); }
+form.inline textarea { min-height: 6rem; grid-column: 1 / -1; }
+input, select, textarea, button {
+  font: inherit;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--paper);
+}
+button { cursor: pointer; background: var(--accent); color: #fff; border-color: var(--accent); }
+button.quiet { background: var(--paper); color: var(--ink); border-color: var(--line); }
+.banner { padding: 0.6rem 0.8rem; border-radius: 4px; margin: 0.5rem 0 1rem; border: 1px solid var(--line); background: var(--panel); }
+.banner.warn { background: var(--warn-bg); border-color: var(--warn); color: var(--warn); }
+.banner.deny { background: var(--deny-bg); border-color: var(--deny); color: var(--deny); }
+.banner.ok { border-color: var(--allow); color: var(--allow); }
+.muted { color: var(--muted); }
+.verdict { font-weight: 700; }
+.verdict.allow { color: var(--allow); }
+.verdict.deny { color: var(--deny); }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.2rem 1rem; margin: 0.5rem 0; }
+dt { color: var(--muted); }
+dd { margin: 0; }
+ul.rules { list-style: none; padding: 0; }
+ul.rules li { padding: 0.2rem 0; }
+.login { max-width: 28rem; margin: 4rem auto; text-align: center; }
+.login a.button { display: inline-block; padding: 0.5rem 1rem; background: var(--accent); color: #fff; border-radius: 4px; text-decoration: none; }
+/* htmx 4 indicator rules, carried here because includeIndicatorCSS is off. */
+.htmx-indicator { opacity: 0; visibility: hidden; }
+.htmx-request .htmx-indicator, .htmx-request.htmx-indicator { opacity: 1; visibility: visible; }

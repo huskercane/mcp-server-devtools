@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Usage</h1>
+<p class="muted">Rollups are telemetry: lossy under back-pressure, never evidence. The journal is the record.</p>
+<form class="inline" method="get" action="/console/usage" hx-get="/console/usage" hx-target="#results" hx-select="#results" hx-swap="outerHTML">
+<label>Report
+<select name="report">
+{% for report in reports %}
+<option value="{{ report.0 }}"{% if query.report == report.0 %} selected{% endif %}>{{ report.1 }}</option>
+{% endfor %}
+</select></label>
+<label>Since <input name="since" value="{{ query.since }}"></label>
+<label>Until <input name="until" value="{{ query.until }}"></label>
+<label>Bucket (timeline)
+<select name="bucket">
+<option value="day"{% if query.bucket == "day" %} selected{% endif %}>day</option>
+<option value="hour"{% if query.bucket == "hour" %} selected{% endif %}>hour</option>
+</select></label>
+<div><button type="submit">Run</button></div>
+</form>
+<section id="results">
+{% if let Some(unavailable) = unavailable %}
+<p class="banner warn">{{ unavailable }}</p>
+{% endif %}
+{% if let Some(totals) = totals %}
+<dl>
+<dt>Rows</dt><dd>{{ totals.rows }}</dd>
+<dt>Allowed</dt><dd>{{ totals.allowed }}</dd>
+<dt>Denied</dt><dd>{{ totals.denied }}</dd>
+<dt>Failed (allowed, not success)</dt><dd>{{ totals.failed }}</dd>
+<dt>Subjects</dt><dd>{{ totals.subjects }}</dd>
+<dt>Vendors</dt><dd>{{ totals.vendors }}</dd>
+</dl>
+{% endif %}
+{% if let Some(rows) = groups %}
+<table>
+<thead><tr><th>Key</th><th>Rows</th><th>Allowed</th><th>Denied</th><th>Failed</th><th>First</th><th>Last</th></tr></thead>
+<tbody>
+{% for row in rows %}
+<tr><td>{{ row.key }}</td><td>{{ row.rows }}</td><td>{{ row.allowed }}</td><td>{{ row.denied }}</td><td>{{ row.failed }}</td><td>{% if let Some(v) = row.first_timestamp %}{{ v }}{% endif %}</td><td>{% if let Some(v) = row.last_timestamp %}{{ v }}{% endif %}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+{% if let Some(rows) = timeline %}
+<table>
+<thead><tr><th>Bucket</th><th>Rows</th><th>Allowed</th><th>Denied</th></tr></thead>
+<tbody>
+{% for row in rows %}
+<tr><td>{{ row.bucket }}</td><td>{{ row.rows }}</td><td>{{ row.allowed }}</td><td>{{ row.denied }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+</section>
+{% endblock %}

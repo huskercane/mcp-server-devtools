@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="htmx-config" content='{"includeIndicatorCSS":false,"history":false}'>
+<title>{{ page.title }} · mcp-devtools console</title>
+<link rel="stylesheet" href="/console/static/console.css">
+<script src="/console/static/htmx.min.js" defer></script>
+</head>
+<body>
+<header>
+<span class="brand">mcp-devtools console</span>
+{% if page.signed_in %}
+<nav>
+<a href="/console/policy"{% if page.active == "policy" %} aria-current="page"{% endif %}>Policy</a>
+<a href="/console/activity"{% if page.active == "activity" %} aria-current="page"{% endif %}>Activity</a>
+<a href="/console/access-review"{% if page.active == "access-review" %} aria-current="page"{% endif %}>Access review</a>
+<a href="/console/usage"{% if page.active == "usage" %} aria-current="page"{% endif %}>Usage</a>
+<a href="/console/sessions"{% if page.active == "sessions" %} aria-current="page"{% endif %}>Sessions</a>
+<a href="/console/artifacts"{% if page.active == "artifacts" %} aria-current="page"{% endif %}>Artifacts</a>
+<a href="/console/proposals"{% if page.active == "proposals" %} aria-current="page"{% endif %}>Proposals</a>
+<a href="/console/health"{% if page.active == "health" %} aria-current="page"{% endif %}>Health</a>
+</nav>
+<form method="post" action="/console/logout"><button class="quiet" type="submit">Sign out</button></form>
+{% endif %}
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

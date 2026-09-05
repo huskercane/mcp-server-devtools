@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p class="banner deny">{{ status }} · {{ detail }}</p>
+{% if !page.signed_in %}<p><a href="/console">Back to sign-in</a></p>{% endif %}
+{% endblock %}

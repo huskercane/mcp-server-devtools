@@ -49,6 +49,29 @@ use crate::tools::DevtoolsServer;
 const BODY_LIMIT_BYTES: usize = 1_000_000;
 const DEFAULT_PORT: u16 = 3000;
 
+/// What the composition needs to mount the console (feature `console`,
+/// plan §3.10.2): its validated settings and provider client, or nothing.
+/// A unit type without the feature, so every composition path has one
+/// shape and the feature adds routes, not signatures.
+#[cfg(feature = "console")]
+pub type ConsoleSetup = Option<crate::console::Mount>;
+/// No console in this build; a unit struct so the composition paths keep
+/// one shape without unit-value arguments.
+#[cfg(not(feature = "console"))]
+#[derive(Debug, Clone, Copy)]
+pub struct ConsoleSetup;
+
+/// "Mount no console": what every composition path other than
+/// [`build_app_for_role_with_console`] passes.
+#[cfg(feature = "console")]
+const fn no_console() -> ConsoleSetup {
+    None
+}
+#[cfg(not(feature = "console"))]
+const fn no_console() -> ConsoleSetup {
+    ConsoleSetup
+}
+
 /// Config key selecting the process role (plan ADR-010, WP A.9).
 pub const ROLE_KEY: &str = "MCP_ROLE";
 
@@ -154,10 +177,14 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
         .require_inbound_auth(auth_mode.requires_inbound_auth())
         .serves_control(role.serves_control())
         .build()?;
-    let inbound_auth = match auth_mode {
-        AuthMode::Off => None,
-        AuthMode::Oidc(keys) => Some(Arc::new(enterprise_inbound_auth(&config, &server, keys)?)),
+    let (inbound_auth, oidc) = match auth_mode {
+        AuthMode::Off => (None, None),
+        AuthMode::Oidc(keys) => {
+            let (auth, oidc) = enterprise_inbound_auth(&config, &server, keys)?;
+            (Some(Arc::new(auth)), Some(oidc))
+        }
     };
+    let console = console_setup(&config, role, inbound_auth.as_deref(), oidc.as_ref())?;
     if ema {
         let auth = inbound_auth.as_ref().expect("EMA requires OIDC");
         crate::auth::ema::OidcExchange::new()?
@@ -190,10 +217,11 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
         server.start_rollups(cancel.clone())?;
     }
     let pending_audit = server.pending_audit();
-    let app = build_app_for_role(
+    let app = build_app_for_role_with_console(
         role,
         server,
         inbound_auth,
+        console,
         DEFAULT_IDLE_TTL,
         DEFAULT_SWEEP_INTERVAL,
         cancel.clone(),
@@ -250,12 +278,64 @@ fn enterprise_inbound_auth(
     config: &Config,
     server: &DevtoolsServer,
     keys: crate::config::OidcKeys,
-) -> Result<InboundAuth, String> {
+) -> Result<(InboundAuth, crate::auth::oidc::OidcSettings), String> {
     let mode = keys.mode();
     let oidc = crate::auth::oidc::OidcSettings::from_config(config, keys)?;
     let settings = enterprise_resource_settings(config, keys, &oidc)?;
     let rate_limit = crate::server::rate_limit::RateLimitSettings::from_config(config)
         .map_err(|error| format!("refusing to start: {error}"))?;
+    require_enterprise_evidence(config, mode)?;
+    let revocation_path = config
+        .get(crate::auth::revocation::REVOCATION_FILE_KEY)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "refusing to start: MCP_AUTH_MODE={mode} requires {} — the revocation list is \
+                 the emergency stop (deny by subject, by token id, or `revoke all`), and a \
+                 gateway without one has no way to cut a compromised token off before it \
+                 expires (plan §3.6, B.4). Create an empty, signed list with \
+                 `mcp-devtools revoke init`",
+                crate::auth::revocation::REVOCATION_FILE_KEY
+            )
+        })?;
+    let verifier = crate::bootstrap::configured_policy_public_key(config)
+        .map_err(|error| error.message)?
+        .ok_or_else(|| "MCP_POLICY_PUBLIC_KEY is required".to_owned())?;
+    let revocations = crate::auth::revocation::RevocationList::load_verified(
+        std::path::Path::new(revocation_path),
+        verifier,
+    )
+    .map_err(|error| {
+        format!(
+            "cannot load the revocation list in {}={revocation_path}: {error}; refusing to \
+             start (fail closed, plan §1.2)",
+            crate::auth::revocation::REVOCATION_FILE_KEY
+        )
+    })?;
+    let client = crate::transport::build_client().map_err(|error| error.message)?;
+    let validator = Arc::new(crate::auth::oidc::OidcJwksValidator::new(
+        oidc.clone(),
+        client,
+    ));
+    let mut auth = InboundAuth::new(Arc::new(validator), settings).with_revocations(revocations);
+    if let Some(sink) = server.audit_sink() {
+        auth = auth.with_audit(BundleAudit {
+            sink,
+            append_timeout: server.audit_append_timeout(),
+        });
+    }
+    if let Some(settings) = rate_limit {
+        auth = auth.with_rate_limit(Arc::new(crate::server::rate_limit::RateLimiter::new(
+            settings,
+        )));
+    }
+    Ok((auth, oidc))
+}
+
+/// The settings enterprise mode cannot run without, each with the reason
+/// (plan §1.2: no "temporarily permissive" mode).
+fn require_enterprise_evidence(config: &Config, mode: &str) -> Result<(), String> {
     if config
         .get(crate::bootstrap::AUDIT_JOURNAL_DIR_KEY)
         .map(str::trim)
@@ -307,49 +387,101 @@ fn enterprise_inbound_auth(
             crate::audit::journal::CheckpointPolicy::SIGNING_KEY_KEY
         ));
     }
-    let revocation_path = config
-        .get(crate::auth::revocation::REVOCATION_FILE_KEY)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            format!(
-                "refusing to start: MCP_AUTH_MODE={mode} requires {} — the revocation list is \
-                 the emergency stop (deny by subject, by token id, or `revoke all`), and a \
-                 gateway without one has no way to cut a compromised token off before it \
-                 expires (plan §3.6, B.4). Create an empty, signed list with \
-                 `mcp-devtools revoke init`",
-                crate::auth::revocation::REVOCATION_FILE_KEY
-            )
-        })?;
-    let verifier = crate::bootstrap::configured_policy_public_key(config)
-        .map_err(|error| error.message)?
-        .ok_or_else(|| "MCP_POLICY_PUBLIC_KEY is required".to_owned())?;
-    let revocations = crate::auth::revocation::RevocationList::load_verified(
-        std::path::Path::new(revocation_path),
-        verifier,
-    )
-    .map_err(|error| {
-        format!(
-            "cannot load the revocation list in {}={revocation_path}: {error}; refusing to \
-             start (fail closed, plan §1.2)",
-            crate::auth::revocation::REVOCATION_FILE_KEY
-        )
-    })?;
-    let client = crate::transport::build_client().map_err(|error| error.message)?;
-    let validator = Arc::new(crate::auth::oidc::OidcJwksValidator::new(oidc, client));
-    let mut auth = InboundAuth::new(Arc::new(validator), settings).with_revocations(revocations);
-    if let Some(sink) = server.audit_sink() {
-        auth = auth.with_audit(BundleAudit {
-            sink,
-            append_timeout: server.audit_append_timeout(),
-        });
+    Ok(())
+}
+
+/// The console's startup configuration (feature `console`): read when the
+/// role serves the control plane and inbound authentication is on, refused
+/// when malformed, and `None` when `MCP_CONSOLE_CLIENT_ID` is unset. A
+/// gateway-only role never mounts it.
+#[cfg(feature = "console")]
+fn console_setup(
+    config: &Config,
+    role: Role,
+    auth: Option<&InboundAuth>,
+    oidc: Option<&crate::auth::oidc::OidcSettings>,
+) -> Result<ConsoleSetup, String> {
+    let (Some(auth), Some(oidc)) = (auth, oidc) else {
+        return Ok(None);
+    };
+    if !role.serves_control() {
+        if config.get(crate::console::CLIENT_ID_KEY).is_some() {
+            info!(
+                "{} is set but this role does not serve the control plane; the console is not mounted",
+                crate::console::CLIENT_ID_KEY
+            );
+        }
+        return Ok(None);
     }
-    if let Some(settings) = rate_limit {
-        auth = auth.with_rate_limit(Arc::new(crate::server::rate_limit::RateLimiter::new(
-            settings,
-        )));
+    let Some(settings) =
+        crate::console::ConsoleSettings::from_config(config, oidc, &auth.settings().public_url)?
+    else {
+        return Ok(None);
+    };
+    let http = reqwest::Client::builder()
+        .user_agent(format!(
+            "{}/{}",
+            crate::constants::UNSCOPED_PACKAGE_NAME,
+            VERSION
+        ))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("console: cannot build the provider HTTP client: {error}"))?;
+    info!(
+        redirect_uri = settings.redirect_uri(),
+        profile = ?settings.profile,
+        "console enabled"
+    );
+    Ok(Some(crate::console::Mount { settings, http }))
+}
+
+#[cfg(not(feature = "console"))]
+#[allow(clippy::unnecessary_wraps)]
+fn console_setup(
+    config: &Config,
+    _: Role,
+    _: Option<&InboundAuth>,
+    _: Option<&crate::auth::oidc::OidcSettings>,
+) -> Result<ConsoleSetup, String> {
+    if config.get("MCP_CONSOLE_CLIENT_ID").is_some() {
+        warn!(
+            "MCP_CONSOLE_CLIENT_ID is set but this binary was built without the `console` feature"
+        );
     }
-    Ok(auth)
+    Ok(ConsoleSetup)
+}
+
+/// The console's router, or an empty one: mounted when the composition
+/// was handed a setup, over the in-process admin client so every render
+/// passes the bearer check, the admin limiter, and the audit exactly as a
+/// remote caller would (plan §3.10.1).
+#[cfg(feature = "console")]
+fn console_router(
+    setup: ConsoleSetup,
+    admin: &Router,
+    server: &DevtoolsServer,
+    auth: Option<&Arc<InboundAuth>>,
+) -> Router {
+    let (Some(mount), Some(_)) = (setup, auth) else {
+        return Router::new();
+    };
+    let client = Arc::new(crate::admin::LocalAdminClient::new(admin.clone()));
+    let banner_server = server.clone();
+    let console = crate::console::Console::new(mount, client, move || {
+        let (ok, text) = health_banner(&banner_server);
+        crate::console::HealthBanner { ok, text }
+    });
+    crate::console::router(Arc::new(console))
+}
+
+#[cfg(not(feature = "console"))]
+fn console_router(
+    _: ConsoleSetup,
+    _: &Router,
+    _: &DevtoolsServer,
+    _: Option<&Arc<InboundAuth>>,
+) -> Router {
+    Router::new()
 }
 
 /// `GET /metrics` (`MCP_METRICS=on`): the Prometheus page, or 404 when
@@ -395,6 +527,7 @@ pub fn build_app_with_cancel(
         true,
         shared_server,
         None,
+        no_console(),
         idle_ttl,
         sweep_interval,
         cancel,
@@ -410,7 +543,15 @@ pub fn build_app_with_server(
     sweep_interval: Duration,
     cancel: CancellationToken,
 ) -> Router {
-    build_app_inner(true, server, None, idle_ttl, sweep_interval, cancel)
+    build_app_inner(
+        true,
+        server,
+        None,
+        no_console(),
+        idle_ttl,
+        sweep_interval,
+        cancel,
+    )
 }
 
 /// Like [`build_app_with_server`], with inbound bearer authentication in
@@ -425,15 +566,47 @@ pub fn build_app_with_server_and_auth(
     sweep_interval: Duration,
     cancel: CancellationToken,
 ) -> Router {
-    build_app_inner(true, server, Some(auth), idle_ttl, sweep_interval, cancel)
+    build_app_inner(
+        true,
+        server,
+        Some(auth),
+        no_console(),
+        idle_ttl,
+        sweep_interval,
+        cancel,
+    )
 }
 
 /// The router for a [`Role`]. `All` and `Gateway` are the full data plane;
-/// `Control` serves only the health banner in Phase A (see [`Role`]).
+/// `Control` serves the health banner, the admin API, and — with the
+/// `console` feature and a setup — the console (see [`Role`]).
 pub fn build_app_for_role(
     role: Role,
     server: DevtoolsServer,
     auth: Option<Arc<InboundAuth>>,
+    idle_ttl: Duration,
+    sweep_interval: Duration,
+    cancel: CancellationToken,
+) -> Router {
+    build_app_for_role_with_console(
+        role,
+        server,
+        auth,
+        no_console(),
+        idle_ttl,
+        sweep_interval,
+        cancel,
+    )
+}
+
+/// [`build_app_for_role`] with the console mounted when `console` is a
+/// setup and the role serves the control plane. Without the `console`
+/// feature the setup is `()` and this is the same router.
+pub fn build_app_for_role_with_console(
+    role: Role,
+    server: DevtoolsServer,
+    auth: Option<Arc<InboundAuth>>,
+    console: ConsoleSetup,
     idle_ttl: Duration,
     sweep_interval: Duration,
     cancel: CancellationToken,
@@ -443,26 +616,30 @@ pub fn build_app_for_role(
             role.serves_control(),
             server,
             auth,
+            console,
             idle_ttl,
             sweep_interval,
             cancel,
         );
     }
-    // Control role: health only. Every other path is a 404 — there is no
-    // data plane here, and nothing to hand a caller who reached the wrong
-    // replica. The cross-cutting guards stay so the surface is uniform.
+    // Control role: health, admin, console. Every other path is a 404 —
+    // there is no data plane here, and nothing to hand a caller who
+    // reached the wrong replica. The cross-cutting guards stay so the
+    // surface is uniform; the console mounts outside them (it carries its
+    // own origin check, and must not reflect origins).
     let metrics_server = server.clone();
-    let admin = auth.map_or_else(Router::new, |auth| {
+    let admin = auth.as_ref().map_or_else(Router::new, |auth| {
         let manager = Arc::new(ReapingSessionManager::new(idle_ttl));
-        watch_revocations(&auth, &manager);
+        watch_revocations(auth, &manager);
         super::admin::router(
             server.clone(),
-            &auth,
+            auth,
             None,
             None,
             admin_reports(&server, cancel.clone()),
         )
     });
+    let console = console_router(console, &admin, &server, auth.as_ref());
     Router::new()
         .merge(admin)
         .route(
@@ -480,6 +657,7 @@ pub fn build_app_for_role(
             }),
         )
         .layer(middleware::from_fn(origin_allowlist))
+        .merge(console)
 }
 
 fn admin_reports(
@@ -504,6 +682,7 @@ fn build_app_inner(
     serves_control: bool,
     shared_server: DevtoolsServer,
     auth: Option<Arc<InboundAuth>>,
+    console: ConsoleSetup,
     idle_ttl: Duration,
     sweep_interval: Duration,
     cancel: CancellationToken,
@@ -520,6 +699,11 @@ fn build_app_inner(
                 admin_reports(&shared_server, cancel.clone()),
             )
         })
+    } else {
+        Router::new()
+    };
+    let console = if serves_control {
+        console_router(console, &admin, &shared_server, auth.as_ref())
     } else {
         Router::new()
     };
@@ -613,6 +797,7 @@ fn build_app_inner(
         .merge(protected)
         .layer(middleware::from_fn(origin_allowlist))
         .layer(cors)
+        .merge(console)
 }
 
 /// Start the revocation-list watcher (WP B.4). On every change: cached
@@ -776,11 +961,9 @@ pub fn build_app(idle_ttl: Duration, sweep_interval: Duration) -> Result<Router,
 /// banner stays 200 and says so — a probe that took every replica out of
 /// rotation because one file went missing would turn a stale policy into
 /// an outage.
-fn health(server: &DevtoolsServer) -> Response {
-    let content_type = (
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
+/// The banner `GET /` answers, and whether it is a 200: shared with the
+/// console's health page, which shows the same text behind a session.
+pub fn health_banner(server: &DevtoolsServer) -> (bool, String) {
     if server.audit_available() {
         let mut banner = format!("mcp-server-devtools v{VERSION} is running");
         // A fixed category: this route is unauthenticated, and the reason
@@ -803,15 +986,29 @@ fn health(server: &DevtoolsServer) -> Response {
         if server.rollups_degraded().is_some() {
             banner.push_str("; usage rollups are failing; usage may be dropped");
         }
-        (StatusCode::OK, [content_type], banner).into_response()
+        (true, banner)
     } else {
         (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [content_type],
-            format!("mcp-server-devtools v{VERSION} is running but its audit journal is unavailable; tool calls are refused"),
+            false,
+            format!(
+                "mcp-server-devtools v{VERSION} is running but its audit journal is unavailable; tool calls are refused"
+            ),
         )
-            .into_response()
     }
+}
+
+fn health(server: &DevtoolsServer) -> Response {
+    let content_type = (
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    let (ok, banner) = health_banner(server);
+    let status = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, [content_type], banner).into_response()
 }
 
 /// Reject requests whose `Origin` is not a loopback scheme/host pair.

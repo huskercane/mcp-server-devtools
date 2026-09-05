@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Activity</h1>
+<form class="inline" method="get" action="/console/activity" hx-get="/console/activity" hx-target="#results" hx-select="#results" hx-swap="outerHTML">
+<label>Since (RFC 3339) <input name="since" value="{{ filter.since }}" placeholder="2026-09-01T00:00:00Z"></label>
+<label>Until (RFC 3339, exclusive) <input name="until" value="{{ filter.until }}"></label>
+<label>Subject <input name="subject" value="{{ filter.subject }}"></label>
+<label>Vendor <input name="vendor" value="{{ filter.vendor }}"></label>
+<div><button type="submit">Search</button></div>
+</form>
+<section id="results">
+{% if let Some(unavailable) = unavailable %}
+<p class="banner warn">{{ unavailable }}</p>
+{% else %}
+{% if let Some(stopped) = stopped %}
+<p class="banner warn">Incomplete: the report stopped at {{ stopped }}. Narrow the window; do not read this as a complete result.</p>
+{% endif %}
+<p class="muted">{{ rows.len() }} rows shown · {{ records_read }} records read</p>
+<table>
+<thead><tr><th>Seq</th><th>Time</th><th>Kind</th><th>Subject</th><th>Tool</th><th>Vendor</th><th>Effect</th><th>Rule</th><th>Reason</th></tr></thead>
+<tbody>
+{% for row in rows %}
+<tr>
+<td>{{ row.seq }}</td>
+<td>{{ row.timestamp }}</td>
+<td>{{ row.kind }}</td>
+<td>{% if let Some(v) = row.subject %}{{ v }}{% endif %}</td>
+<td>{% if let Some(v) = row.tool %}{{ v }}{% endif %}</td>
+<td>{% if let Some(v) = row.vendor %}{{ v }}{% endif %}</td>
+<td>{% if let Some(v) = row.effect %}{{ v }}{% endif %}</td>
+<td>{% if let Some(v) = row.rule_id %}{{ v }}{% endif %}</td>
+<td>{% if let Some(v) = row.reason %}{{ v }}{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+</section>
+{% endblock %}
