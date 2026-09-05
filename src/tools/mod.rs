@@ -272,6 +272,13 @@ impl DevtoolsServer {
         self.components.rollup_store.clone()
     }
 
+    /// Admission of administrative mutations (plan §3.10.1): the adapter
+    /// `MCP_ADMIN_APPROVALS` selected, or the one the builder was handed.
+    #[must_use]
+    pub fn mutation_gate(&self) -> Arc<dyn crate::ports::MutationGate> {
+        Arc::clone(&self.components.mutation_gate)
+    }
+
     /// The Prometheus page (`MCP_METRICS=on`), or `None` when metrics are
     /// off. `rate_limited` is the limiter's refusal count, which lives on
     /// the auth stack rather than here.

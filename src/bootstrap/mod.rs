@@ -21,6 +21,7 @@
 //! `tools::mod`, which previously acted as adapter, container, composition root
 //! and config watcher all at once.
 
+pub mod approvals;
 pub mod config_handle;
 pub mod forwarding;
 pub mod rollups;
@@ -109,6 +110,10 @@ pub struct Components {
         std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<crate::ports::UsageEvent>>>,
     pub rollup_health: Arc<crate::rollups::RollupHealth>,
     pub rollup_retention: Option<std::time::Duration>,
+    /// Admission of administrative mutations (plan §3.10.1). `DirectGate`
+    /// unless `MCP_ADMIN_APPROVALS` selects another adapter; the admin
+    /// boundary consults it before every durable intent.
+    pub mutation_gate: Arc<dyn crate::ports::MutationGate>,
 }
 
 impl Components {
@@ -136,6 +141,7 @@ pub struct ServerBuilder {
     policy: Option<Arc<dyn PolicyDecisionPoint>>,
     secret_sources: Option<Vec<Arc<dyn SecretSource>>>,
     serves_control: bool,
+    mutation_gate: Option<Arc<dyn crate::ports::MutationGate>>,
 }
 
 impl Default for ServerBuilder {
@@ -152,6 +158,7 @@ impl Default for ServerBuilder {
             policy: None,
             secret_sources: None,
             serves_control: true,
+            mutation_gate: None,
         }
     }
 }
@@ -241,6 +248,15 @@ impl ServerBuilder {
     #[must_use]
     pub fn policy(mut self, policy: Arc<dyn PolicyDecisionPoint>) -> Self {
         self.policy = Some(policy);
+        self
+    }
+
+    /// Admission of administrative mutations, in place of the adapter
+    /// `MCP_ADMIN_APPROVALS` would select (tests, embedders). See
+    /// `bootstrap::approvals`.
+    #[must_use]
+    pub fn mutation_gate(mut self, gate: Arc<dyn crate::ports::MutationGate>) -> Self {
+        self.mutation_gate = Some(gate);
         self
     }
 
@@ -341,6 +357,15 @@ impl ServerBuilder {
                 ),
             };
 
+        // The admission adapter is selected before the boundary exists:
+        // a setting naming an adapter this binary lacks refuses startup.
+        let mutation_gate = match self.mutation_gate {
+            Some(gate) => gate,
+            None => approvals::gate_from_config(&config).map_err(|error| {
+                crate::error::unexpected(format!("{error}; refusing to start"), None)
+            })?,
+        };
+
         let components = Arc::new(Components {
             config: ConfigHandle::new(config),
             client,
@@ -364,6 +389,7 @@ impl ServerBuilder {
             usage_receiver: std::sync::Mutex::new(usage_receiver),
             rollup_health: Arc::default(),
             rollup_retention,
+            mutation_gate,
         });
 
         if let Some(pending) = watched {

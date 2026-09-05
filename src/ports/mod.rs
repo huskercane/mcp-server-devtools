@@ -21,12 +21,14 @@
 //! heap allocation on every request.
 
 pub mod activity_reports;
+pub mod admin_client;
 pub mod admin_inventory;
 pub mod audit_forwarder;
 pub mod audit_sink;
 pub mod checkpoint_sink;
 pub mod command_runner;
 pub mod credential_broker;
+pub mod mutation_gate;
 pub mod policy_admin;
 pub mod policy_decision_point;
 pub mod rollup_store;
@@ -34,6 +36,10 @@ pub mod secret_source;
 pub mod token_validator;
 pub mod usage_sink;
 
+pub use admin_client::{
+    AdminCallFuture, AdminClient, AdminClientError, AdminMethod, AdminRequest, AdminResponse,
+    MAX_RESPONSE_BYTES,
+};
 pub use audit_forwarder::{
     AuditForwarder, CapturedRecord, DeliverFuture, ForwardError, ForwardRecord,
     InMemoryAuditForwarder,
@@ -45,6 +51,9 @@ pub use audit_sink::{
 pub use checkpoint_sink::{CheckpointSink, DirectoryCheckpointSink, InMemoryCheckpointSink};
 pub use command_runner::{CommandOutput, CommandRunner};
 pub use credential_broker::{ConfigCredentialBroker, CredentialBroker, StaticCredentialBroker};
+pub use mutation_gate::{
+    Admission, AdmissionFuture, DirectGate, MutationGate, MutationIntent, MutationKind,
+};
 pub use policy_decision_point::{AllowAll, PolicyDecisionPoint};
 pub use rollup_store::{
     Bucket, GroupRow, InMemoryRollupStore, Report, ReportQuery, RollupError, RollupFuture,

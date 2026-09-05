@@ -2,6 +2,7 @@
 //! declares `mod support;`. Not every binary uses every item.
 #![allow(dead_code)]
 
+pub mod admin_client_conformance;
 pub mod audit_forwarder_conformance;
 pub mod fake_vault;
 pub mod rollup_store_conformance;

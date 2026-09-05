@@ -1,10 +1,14 @@
-//! Administrative client. All operations call the audited HTTP boundary.
+//! Administrative client. All operations call the audited HTTP boundary
+//! through the `AdminClient` port's HTTP adapter (plan §3.10.1).
+use crate::{
+    admin::HttpAdminClient,
+    ports::{AdminClient as _, AdminClientError, AdminMethod, AdminRequest},
+};
 use clap::{Args, Subcommand};
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
     process::ExitCode,
-    time::Duration,
 };
 
 #[derive(Debug, Args)]
@@ -89,18 +93,19 @@ async fn text_file(path: &Path) -> Result<String, &'static str> {
         .map_err(|_| "file_unavailable")
 }
 impl Command {
-    async fn request(&self) -> Result<(&str, String, Option<Value>), &'static str> {
+    async fn request(&self) -> Result<(AdminMethod, String, Option<Value>), &'static str> {
+        use AdminMethod::{Get, Post, Put};
         let (method, path, body) = match self {
             Self::Policy {
                 command: Policy::Read,
-            } => ("GET", "policy".into(), None),
+            } => (Get, "policy".into(), None),
             Self::Policy {
                 command: Policy::Reload,
-            } => ("POST", "policy/reload".into(), Some(json!({}))),
+            } => (Post, "policy/reload".into(), Some(json!({}))),
             Self::Policy {
                 command: command @ (Policy::Validate { file } | Policy::Diff { file }),
             } => (
-                "POST",
+                Post,
                 if matches!(command, Policy::Validate { .. }) {
                     "policy/validate"
                 } else {
@@ -110,41 +115,41 @@ impl Command {
                 Some(json!({"document":text_file(file).await?})),
             ),
             Self::Principals { tenant, subject } => (
-                "POST",
+                Post,
                 "principals/lookup".into(),
                 Some(json!({"tenant":tenant,"subject":subject})),
             ),
             Self::Sessions {
                 command: Inventory::List,
-            } => ("GET", "sessions".into(), None),
+            } => (Get, "sessions".into(), None),
             Self::Artifacts {
                 command: Inventory::List,
-            } => ("GET", "artifacts".into(), None),
+            } => (Get, "artifacts".into(), None),
             Self::Sessions {
                 command: Inventory::Remove { id },
-            } => ("POST", "sessions/revoke".into(), Some(json!({"id":id}))),
+            } => (Post, "sessions/revoke".into(), Some(json!({"id":id}))),
             Self::Artifacts {
                 command: Inventory::Remove { id },
-            } => ("POST", "artifacts/purge".into(), Some(json!({"id":id}))),
+            } => (Post, "artifacts/purge".into(), Some(json!({"id":id}))),
             Self::DenyList {
                 command: DenyList::Read,
-            } => ("GET", "deny-list".into(), None),
+            } => (Get, "deny-list".into(), None),
             Self::DenyList {
                 command: DenyList::Replace { file, signature },
             } => (
-                "PUT",
+                Put,
                 "deny-list".into(),
                 Some(
                     json!({"document":text_file(file).await?,"signature":text_file(signature).await?.trim()}),
                 ),
             ),
             Self::Report { report, request } => (
-                "POST",
+                Post,
                 format!("reports/{report}"),
                 Some(serde_json::from_str(&text_file(request).await?).map_err(|_| "invalid_json")?),
             ),
             Self::Usage { request } => (
-                "POST",
+                Post,
                 "usage".into(),
                 Some(serde_json::from_str(&text_file(request).await?).map_err(|_| "invalid_json")?),
             ),
@@ -153,56 +158,25 @@ impl Command {
     }
 }
 async fn execute(options: &Options) -> Result<(bool, Value), &'static str> {
-    let base = url::Url::parse(&options.url).map_err(|_| "invalid_url")?;
-    let local = match base.host() {
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        Some(url::Host::Domain("localhost")) => true,
-        _ => false,
-    };
-    if !(base.scheme() == "https" || (base.scheme() == "http" && local))
-        || !base.username().is_empty()
-        || base.password().is_some()
-        || base.query().is_some()
-        || base.fragment().is_some()
-        || base.path() != "/"
-    {
-        return Err("invalid_url");
-    }
+    let client = HttpAdminClient::new(&options.url).map_err(AdminClientError::code)?;
     let token = text_file(&options.token_file).await?;
     let token = token.trim();
     if token.is_empty() {
         return Err("empty_token");
     }
-    let (method, path, body) = options.command.request().await?;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_mins(1))
-        .build()
-        .map_err(|_| "http_unavailable")?;
-    let mut request = client
-        .request(
-            method.parse().map_err(|_| "invalid_method")?,
-            base.join(&format!("admin/{path}"))
-                .map_err(|_| "invalid_url")?,
+    let (method, operation, body) = options.command.request().await?;
+    let response = client
+        .call(
+            token,
+            AdminRequest {
+                method,
+                operation: &operation,
+                body: body.as_ref(),
+            },
         )
-        .bearer_auth(token);
-    if let Some(body) = body {
-        request = request.json(&body);
-    }
-    let mut response = request.send().await.map_err(|_| "admin_unreachable")?;
-    let success = response.status().is_success();
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| "invalid_response")? {
-        if bytes.len() + chunk.len() > 32 * 1024 * 1024 {
-            return Err("response_too_large");
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok((
-        success,
-        serde_json::from_slice(&bytes).map_err(|_| "invalid_response")?,
-    ))
+        .await
+        .map_err(AdminClientError::code)?;
+    Ok((response.is_success(), response.body))
 }
 pub async fn dispatch(options: &Options) -> ExitCode {
     let (success, value) = execute(options)

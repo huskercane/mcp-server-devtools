@@ -77,6 +77,7 @@ async fn http_uses_injected_policy_port_and_preserves_error_envelopes() {
         None,
         None,
         Some(Arc::new(RemotePolicy)),
+        Arc::new(mcp_server_devtools::ports::DirectGate),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

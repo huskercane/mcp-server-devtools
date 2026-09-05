@@ -58,6 +58,10 @@ rmcp                = { version = "=3.1.2", features = ["transport-io", "transpo
 tokio               = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "signal", "io-std", "fs", "sync", "time", "process"] }
 axum                = "=0.8.9"
 tower-http          = { version = "=0.7.0", features = ["cors", "limit"] }
+# `ServiceExt::oneshot` for the in-process admin client (plan §3.10.1,
+# WP D.0): the console drives the admin router without a loopback socket.
+# Already in the tree at this version through axum; no new crate.
+tower               = { version = "=0.5.3", default-features = false, features = ["util"] }
 tokio-util          = { version = "=0.7.19", features = ["rt", "io"] }
 futures             = "=0.3.34"
 serde               = { version = "=1.0.229", features = ["derive"] }

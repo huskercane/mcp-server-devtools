@@ -4,7 +4,7 @@ use super::auth::{InboundAuth, require_bearer};
 use crate::{
     policy::{BundleAudit, Principal},
     ports::{
-        ControlEvent, ControlEventKind,
+        Admission, ControlEvent, ControlEventKind, MutationGate, MutationIntent, MutationKind,
         admin_inventory::{ArtifactStore, SessionStore},
     },
     tools::DevtoolsServer,
@@ -29,14 +29,16 @@ struct Admin {
     artifacts: Option<Arc<dyn ArtifactStore>>,
     reports: Option<Arc<dyn crate::ports::activity_reports::ActivityReports>>,
     policy: Option<Arc<dyn crate::ports::policy_admin::PolicyAdmin>>,
+    /// Consulted before every durable intent (plan §3.10.1).
+    gate: Arc<dyn MutationGate>,
     budget: Arc<tokio::sync::Semaphore>,
     mutations: Arc<tokio::sync::Mutex<()>>,
 }
 
-/// Compose the file-backed policy backend, preserving the public router API.
-/// The HTTP adapter picks this default itself so that it never reaches into
-/// the composition root; embedders inject another backend via
-/// [`router_with_policy`].
+/// Compose the file-backed policy backend and the server's admission gate,
+/// preserving the public router API. The HTTP adapter picks these defaults
+/// itself so that it never reaches into the composition root; embedders
+/// inject another backend or gate via [`router_with_policy`].
 pub fn router(
     server: DevtoolsServer,
     auth: &InboundAuth,
@@ -45,7 +47,8 @@ pub fn router(
     reports: Option<Arc<dyn crate::ports::activity_reports::ActivityReports>>,
 ) -> Router {
     let policy = file_policy_admin(&server);
-    router_with_policy(server, auth, sessions, artifacts, reports, policy)
+    let gate = server.mutation_gate();
+    router_with_policy(server, auth, sessions, artifacts, reports, policy, gate)
 }
 
 fn file_policy_admin(
@@ -61,7 +64,8 @@ fn file_policy_admin(
     )))
 }
 
-/// Build the HTTP boundary with an explicitly supplied policy backend.
+/// Build the HTTP boundary with an explicitly supplied policy backend and
+/// admission gate.
 pub fn router_with_policy(
     server: DevtoolsServer,
     auth: &InboundAuth,
@@ -69,6 +73,7 @@ pub fn router_with_policy(
     artifacts: Option<Arc<dyn ArtifactStore>>,
     reports: Option<Arc<dyn crate::ports::activity_reports::ActivityReports>>,
     policy: Option<Arc<dyn crate::ports::policy_admin::PolicyAdmin>>,
+    gate: Arc<dyn MutationGate>,
 ) -> Router {
     let auth = Arc::new(auth.for_admin());
     let state = Admin {
@@ -78,6 +83,7 @@ pub fn router_with_policy(
         artifacts,
         reports,
         policy,
+        gate,
         budget: Arc::new(tokio::sync::Semaphore::new(4)),
         mutations: Arc::new(tokio::sync::Mutex::new(())),
     };
@@ -144,7 +150,13 @@ fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Error> {
     serde_json::from_slice(body).map_err(|_| INVALID)
 }
 
-async fn dispatch(State(state): State<Admin>, request: Request) -> Result<Json<Value>, Error> {
+/// What a mutation came back with: applied (`200`), or held as a proposal
+/// by the admission gate (`202`, plan §3.10.3).
+enum Outcome {
+    Applied(Value),
+    Deferred(Value),
+}
+async fn dispatch(State(state): State<Admin>, request: Request) -> Result<Response, Error> {
     let permit = state
         .budget
         .clone()
@@ -177,7 +189,12 @@ async fn dispatch(State(state): State<Admin>, request: Request) -> Result<Json<V
             let result = state
                 .execute(&principal, &method, &operation, &body)
                 .await?;
-            Ok(Json(json!({"data": result})))
+            Ok(match result {
+                Outcome::Applied(data) => Json(json!({"data": data})).into_response(),
+                Outcome::Deferred(data) => {
+                    (StatusCode::ACCEPTED, Json(json!({"data": data}))).into_response()
+                }
+            })
         })
         .await
         .map_err(|_| UNAVAILABLE)?
@@ -213,6 +230,20 @@ impl Admin {
         .map_err(|_| AUDIT_FAILED)
     }
 
+    /// Ask the gate. `Ok(None)` is admission; `Ok(Some(_))` the deferred
+    /// answer the caller returns instead of acting; `Err` a refusal.
+    async fn admit(&self, intent: &MutationIntent<'_>) -> Result<Option<Outcome>, Error> {
+        match self.gate.admit(intent).await {
+            Admission::Apply => Ok(None),
+            Admission::Deferred { proposal } => Ok(Some(Outcome::Deferred(json!({
+                "proposal": proposal,
+                "state": "pending",
+                "operation": intent.kind.operation(),
+            })))),
+            Admission::Refused(cause) => Err(Error(StatusCode::CONFLICT, cause)),
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
@@ -220,8 +251,8 @@ impl Admin {
         method: &Method,
         op: &str,
         body: &[u8],
-    ) -> Result<Value, Error> {
-        match (method, op) {
+    ) -> Result<Outcome, Error> {
+        let applied = match (method, op) {
             (&Method::GET, "policy") => encode(self.policy()?.read().await.map_err(policy_error)?),
             (&Method::POST, "policy/validate" | "policy/diff") => {
                 let input: Document = decode(body)?;
@@ -240,6 +271,15 @@ impl Admin {
             (&Method::POST, "policy/reload") => {
                 if !decode::<std::collections::BTreeMap<String, Value>>(body)?.is_empty() {
                     return Err(INVALID);
+                }
+                let intent = MutationIntent {
+                    kind: MutationKind::PolicyReload,
+                    principal,
+                    target: None,
+                    candidate: None,
+                };
+                if let Some(deferred) = self.admit(&intent).await? {
+                    return Ok(deferred);
                 }
                 encode(
                     self.policy()?
@@ -274,10 +314,21 @@ impl Admin {
                     return Err(INVALID);
                 }
                 let _guard = self.mutations.lock().await;
-                if op == "sessions/revoke" {
+                let kind = if op == "sessions/revoke" {
                     self.sessions.as_ref().ok_or(UNAVAILABLE)?;
+                    MutationKind::SessionRevoke
                 } else {
                     self.artifacts.as_ref().ok_or(UNAVAILABLE)?;
+                    MutationKind::ArtifactPurge
+                };
+                let intent = MutationIntent {
+                    kind,
+                    principal,
+                    target: Some(&input.id),
+                    candidate: None,
+                };
+                if let Some(deferred) = self.admit(&intent).await? {
+                    return Ok(deferred);
                 }
                 let seq = self.record(principal, op, Some(input.id.clone())).await?;
                 if op == "sessions/revoke" {
@@ -304,7 +355,9 @@ impl Admin {
                     json!({"version": list.version(), "document": String::from_utf8(list.document_bytes()).map_err(|_| UNAVAILABLE)?, "signature": list.signature()}),
                 )
             }
-            (&Method::PUT, "deny-list") => self.replace_deny_list(principal, body).await,
+            (&Method::PUT, "deny-list") => {
+                return self.replace_deny_list(principal, body).await;
+            }
             (&Method::POST, "principals/lookup") => {
                 let input: Lookup = decode(body)?;
                 let rows = self
@@ -384,10 +437,15 @@ impl Admin {
                 Err(Error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"))
             }
             _ => Err(NOT_FOUND),
-        }
+        }?;
+        Ok(Outcome::Applied(applied))
     }
 
-    async fn replace_deny_list(&self, principal: &Principal, body: &[u8]) -> Result<Value, Error> {
+    async fn replace_deny_list(
+        &self,
+        principal: &Principal,
+        body: &[u8],
+    ) -> Result<Outcome, Error> {
         let input: SignedDocument = decode(body)?;
         let list = self.auth.revocations().ok_or(UNAVAILABLE)?.clone();
         let _guard = list.mutation.lock().await;
@@ -400,12 +458,20 @@ impl Admin {
         })
         .await
         .map_err(|_| UNAVAILABLE)??;
+        // Admission is asked of the verified candidate: a proposal (D.2)
+        // binds to these exact bytes and this version.
+        let version = staged.version().to_owned();
+        let intent = MutationIntent {
+            kind: MutationKind::DenyListReplace,
+            principal,
+            target: Some(&version),
+            candidate: Some(input.document.as_bytes()),
+        };
+        if let Some(deferred) = self.admit(&intent).await? {
+            return Ok(deferred);
+        }
         let seq = self
-            .record(
-                principal,
-                "deny-list/replace",
-                Some(staged.version().into()),
-            )
+            .record(principal, "deny-list/replace", Some(version))
             .await?;
         let path = list.path().to_owned();
         // Both files are atomically replaced. A crash between them leaves an
@@ -435,7 +501,9 @@ impl Admin {
                 sessions.revoke(&row.id).await.map_err(inventory_error)?;
             }
         }
-        Ok(json!({"audit_seq": seq, "version": list.version()}))
+        Ok(Outcome::Applied(
+            json!({"audit_seq": seq, "version": list.version()}),
+        ))
     }
 }
 fn inventory_error(error: crate::ports::admin_inventory::InventoryError) -> Error {
