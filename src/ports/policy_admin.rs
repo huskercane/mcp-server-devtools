@@ -3,7 +3,7 @@
 //! Boxed futures permit an injected backend without making the HTTP router
 //! generic. These infrequent control calls are outside the MCP request path.
 use crate::{
-    policy::{Principal, RuleDescription},
+    policy::{ActionContext, Explanation, Principal, RuleDescription},
     ports::{SignatureStatus, activity_reports::AccessRow},
 };
 use serde::Serialize;
@@ -43,6 +43,14 @@ pub struct PolicyDiff {
 pub struct PolicyInstall {
     pub audit_seq: u64,
     pub version: String,
+}
+/// What [`PolicyAdmin::explain`] reports: the decision the policy in force
+/// makes for one action, and every rule's reason (WP B.2's logic, reached
+/// through the admin boundary for the console and the CLI — plan §3.10.2).
+#[derive(Serialize)]
+pub struct PolicyExplanation {
+    pub policy_version: Option<String>,
+    pub explanation: Explanation,
 }
 #[derive(Serialize)]
 pub struct PolicyReload {
@@ -84,4 +92,8 @@ pub trait PolicyAdmin: Send + Sync {
         groups: BTreeMap<String, Vec<String>>,
         tenant: String,
     ) -> AdminFuture<'_, Vec<AccessRow>>;
+    /// Evaluate `context` against the policy in force and say why: the
+    /// decision, and for every rule whether it matched or the first key it
+    /// failed on. Read-only; nothing is journaled.
+    fn explain(&self, context: ActionContext) -> AdminFuture<'_, PolicyExplanation>;
 }

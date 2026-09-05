@@ -26,6 +26,7 @@ Unknown request fields are rejected for endpoint-specific request types.
 | POST `/admin/policy/validate` | `{"document":"YAML"}` | `valid`, `version`, `rules`, `signature_verified:false` |
 | POST `/admin/policy/diff` | `{"document":"YAML"}` | `current_version`, `candidate_version`, `current_rules`, `candidate_rules` |
 | POST `/admin/policy/reload` | `{}` | `audit_seq`, `changed`, `version` |
+| POST `/admin/policy/explain` | `tool` (required), optional `arguments` (object), `subject`, `groups`, `scopes`, `environment`, `tenant`, `client_name`, `client_version` | `policy_version`, the `action` as built, `configured_environment`, `explanation` (`decision`, `unclassified`, `rules`) — the shape `mcp-devtools policy explain --json` prints |
 | POST `/admin/principals/lookup` | `{"tenant":"…","subject":"…"}` | `tenant`, `subject`, observed `principal` or null, `sessions`, `subject_denied`, `scope` |
 | GET `/admin/sessions` | No body | `scope`, `rows` (`id`, `owner`) |
 | POST `/admin/sessions/revoke` | `{"id":"…"}` | `audit_seq`, `id`, `scope` |
@@ -40,6 +41,19 @@ Unknown request fields are rejected for endpoint-specific request types.
 | POST `/admin/reports/activity` | Optional `since`, `until`, `subject`, `vendor` | `rows`, `records_read`, `stopped` |
 | POST `/admin/reports/access-review` | `{"groups":{"group":["subject"]},"tenant":"…"}` | B.5 access-review `rows` |
 | POST `/admin/usage` | C.6 named `ReportQuery`, e.g. `{"report":"totals","window":{}}` | C.6 `Report` (`shape:totals`, `groups`, or `timeline`) |
+
+Explain is `mcp-devtools policy explain` (WP B.2) asked of the policy in
+force rather than of a file: the action is built exactly as a tool call's
+would be — the same extractor, the server-declared risk for the tool, the
+upstream identity the credential broker predicts under the server's own
+configuration — so the answer is the gateway's, not a workstation's. Only
+what arrives with a request is supplied: `subject` (default
+`someone@example`), `groups`, `scopes` (default `mcp:tools`), `tenant`
+(default: the caller's), and the reporting client; `environment` overrides
+the configured `MCP_VENDOR_ENVIRONMENT` for a what-if and
+`configured_environment` says what it overrode. An unknown tool or
+environment is `400 invalid_request`. Nothing is journaled: an explanation
+is a read of the policy, not an action under it.
 
 Validation and diff compile candidate policy bytes but do not establish a
 signature or change policy. Reload reads the configured signed bundle and uses
@@ -181,7 +195,14 @@ mcp-devtools admin --url https://mcp.example.com --token-file /run/admin-token p
 mcp-devtools admin --url https://mcp.example.com --token-file /run/admin-token policy diff policy.yaml --json
 mcp-devtools admin --url https://mcp.example.com --token-file /run/admin-token policy reload --json
 mcp-devtools admin --url https://mcp.example.com --token-file /run/admin-token policy install policy.yaml --signature policy.yaml.sig --json
+mcp-devtools admin --url https://mcp.example.com --token-file /run/admin-token policy explain --tool grafana_query_logs --arguments '{"datasourceUid":"loki-qa"}' --group SRE --json
 ```
+
+`policy explain` takes the flags of `mcp-devtools policy explain` less the
+file and `--public-key` (`--tool`, `--arguments`, `--subject`, `--group`,
+`--scope`, `--environment`, `--tenant`, `--client-name`, `--client-version`)
+and sends them to `POST /admin/policy/explain`; `--arguments` must be a JSON
+object (`invalid_json` otherwise, before any request is made).
 
 Every command supports `--json`, including after the leaf command. Successful
 JSON output is the API response envelope, with no prose. API and client runtime

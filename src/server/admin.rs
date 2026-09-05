@@ -145,6 +145,35 @@ struct AccessReview {
     groups: std::collections::BTreeMap<String, Vec<String>>,
     tenant: String,
 }
+/// `POST /admin/policy/explain`: the inputs `mcp-devtools policy explain`
+/// takes, less the document (the policy in force is the one explained).
+/// Everything the gateway reads from configuration is read from
+/// configuration here too; only what arrives with a request is supplied.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Explain {
+    tool: String,
+    #[serde(default)]
+    arguments: Option<serde_json::Map<String, Value>>,
+    /// Default `someone@example`, as the CLI defaults.
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    groups: Vec<String>,
+    /// Default `mcp:tools`.
+    #[serde(default)]
+    scopes: Vec<String>,
+    /// A what-if override of the configured `MCP_VENDOR_ENVIRONMENT`.
+    #[serde(default)]
+    environment: Option<String>,
+    /// Default: the caller's tenant.
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    client_name: Option<String>,
+    #[serde(default)]
+    client_version: Option<String>,
+}
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct Activity {
@@ -283,6 +312,10 @@ impl Admin {
                 } else {
                     encode(policy.diff(input.document).await.map_err(policy_error)?)
                 }
+            }
+            (&Method::POST, "policy/explain") => {
+                let input: Explain = decode(body)?;
+                return self.explain(principal, input).await.map(Outcome::Applied);
             }
             (&Method::POST, "policy/reload") => {
                 if !decode::<std::collections::BTreeMap<String, Value>>(body)?.is_empty() {
@@ -443,6 +476,7 @@ impl Admin {
                 "policy"
                     | "policy/validate"
                     | "policy/diff"
+                    | "policy/explain"
                     | "policy/reload"
                     | "sessions"
                     | "sessions/revoke"
@@ -460,6 +494,66 @@ impl Admin {
             _ => Err(NOT_FOUND),
         }?;
         Ok(Outcome::Applied(applied))
+    }
+
+    /// `POST /admin/policy/explain` (plan §3.10.2): build the action exactly
+    /// as `call_tool` would — the same extractor through
+    /// `ActionContext::for_tool_call`, the server-declared risk, the
+    /// upstream identity the broker predicts under the configuration in
+    /// force — and ask the policy in force why. The answer has the shape
+    /// `policy explain --json` prints. Read-only: nothing is journaled.
+    async fn explain(&self, caller: &Principal, input: Explain) -> Result<Value, Error> {
+        let declared_risk = DevtoolsServer::declared_tool_risk(&input.tool).ok_or(INVALID)?;
+        let vendor = crate::tools::vendor_for_tool(&input.tool).unwrap_or("unknown");
+        let environment_override = input
+            .environment
+            .as_deref()
+            .map(|value| crate::policy::EnvironmentClass::parse(value).ok_or(INVALID))
+            .transpose()?;
+        let mut upstream = self.server.predicted_upstream_identity(vendor).await;
+        let configured_environment = upstream.environment;
+        if let Some(environment) = environment_override {
+            upstream.environment = environment;
+        }
+        let mut scopes = input.scopes;
+        if scopes.is_empty() {
+            scopes.push(super::auth::DEFAULT_REQUIRED_SCOPE.to_owned());
+        }
+        // The principal as the bearer middleware would build it for these
+        // claims: the caller's tenant and issuer unless a tenant is given,
+        // the CLI's placeholder subject when none is.
+        let principal = Principal {
+            tenant: input.tenant.unwrap_or_else(|| caller.tenant.clone()),
+            subject: input
+                .subject
+                .unwrap_or_else(|| "someone@example".to_owned()),
+            groups: input.groups,
+            scopes,
+            authority: caller.authority.clone(),
+        };
+        let context = crate::policy::ActionContext::for_tool_call(
+            principal,
+            crate::policy::ClientIdentity::reported(
+                input.client_name.as_deref(),
+                input.client_version.as_deref(),
+            ),
+            &input.tool,
+            input.arguments.as_ref(),
+            declared_risk,
+            upstream,
+        );
+        let action = encode(&context)?;
+        let explained = self
+            .policy()?
+            .explain(context)
+            .await
+            .map_err(policy_error)?;
+        Ok(json!({
+            "policy_version": explained.policy_version,
+            "action": action,
+            "configured_environment": configured_environment,
+            "explanation": explained.explanation,
+        }))
     }
 
     /// `PUT /admin/policy`: the mirror of the deny-list replacement for the

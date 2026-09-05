@@ -331,6 +331,23 @@ impl DevtoolsServer {
         self.components.config()
     }
 
+    /// The upstream identity the credential broker predicts for `vendor`
+    /// under the configuration in force: the same answer a tool call gets
+    /// before dispatch, so an explanation (`POST /admin/policy/explain`,
+    /// plan §3.10.2) is built from the environment and credential slot the
+    /// journal would carry. Awaited because answering can probe the
+    /// keychain.
+    pub async fn predicted_upstream_identity(
+        &self,
+        vendor: &str,
+    ) -> crate::policy::UpstreamIdentity {
+        let config = self.config();
+        self.components
+            .credential_broker
+            .upstream_identity(&config, vendor)
+            .await
+    }
+
     fn bitbucket_ctx<'a>(&'a self, config: &'a Config) -> HandleContext<'a> {
         HandleContext::new(
             &self.components.client,

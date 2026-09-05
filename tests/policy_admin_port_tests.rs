@@ -8,8 +8,8 @@ use mcp_server_devtools::{
     ports::{
         StaticValidator,
         policy_admin::{
-            AdminFuture, PolicyAdmin, PolicyAdminError, PolicyDiff, PolicyDocument, PolicyInstall,
-            PolicyReload, PolicyValidation,
+            AdminFuture, PolicyAdmin, PolicyAdminError, PolicyDiff, PolicyDocument,
+            PolicyExplanation, PolicyInstall, PolicyReload, PolicyValidation,
         },
     },
     server::{
@@ -56,6 +56,12 @@ impl PolicyAdmin for RemotePolicy {
         _: String,
     ) -> AdminFuture<'_, Vec<AccessRow>> {
         Box::pin(std::future::ready(Ok(vec![])))
+    }
+    fn explain(
+        &self,
+        _: mcp_server_devtools::policy::ActionContext,
+    ) -> AdminFuture<'_, PolicyExplanation> {
+        Box::pin(std::future::ready(Err(PolicyAdminError::Unavailable)))
     }
 }
 

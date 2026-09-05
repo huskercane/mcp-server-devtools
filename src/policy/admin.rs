@@ -5,8 +5,8 @@ use crate::{
     ports::{
         ControlEvent, ControlEventKind,
         policy_admin::{
-            AdminFuture, PolicyAdmin, PolicyAdminError, PolicyDiff, PolicyDocument, PolicyInstall,
-            PolicyReload, PolicyValidation,
+            AdminFuture, PolicyAdmin, PolicyAdminError, PolicyDiff, PolicyDocument,
+            PolicyExplanation, PolicyInstall, PolicyReload, PolicyValidation,
         },
     },
 };
@@ -182,5 +182,16 @@ impl PolicyAdmin for FilePolicyAdmin {
             .await
             .map_err(|_| Unavailable)
         })
+    }
+    fn explain(&self, context: crate::policy::ActionContext) -> AdminFuture<'_, PolicyExplanation> {
+        // Evaluation is a walk over compiled rules (tens of microseconds at
+        // 500 rules, stage −1b); the snapshot is one atomic load. Nothing
+        // here needs a blocking worker or the reload lock: an explanation is
+        // of whichever policy is in force at the instant it is asked.
+        let explanation = self.policy.explain(&context);
+        Box::pin(std::future::ready(Ok(PolicyExplanation {
+            policy_version: crate::ports::PolicyDecisionPoint::version(&*self.policy),
+            explanation,
+        })))
     }
 }

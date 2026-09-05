@@ -31,10 +31,12 @@ impl Drop for Fixture {
     }
 }
 async fn fixture(role: Role) -> Fixture {
+    fixture_with_policy(role, b"version: 1\nrules: []\n").await
+}
+async fn fixture_with_policy(role: Role, document: &[u8]) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let policy = dir.path().join("policy.yaml");
     let (key, _) = SigningKey::generate().unwrap();
-    let document = b"version: 1\nrules: []\n";
     std::fs::write(&policy, document).unwrap();
     write_detached(&policy, &key.sign(Domain::PolicyBundle, document)).unwrap();
     let revocation_path = dir.path().join("revocations.yaml");
@@ -812,4 +814,146 @@ async fn deny_list_reads_release_the_lock_and_admin_budget() {
         .expect("reads must leave the mutation lock available");
     assert_eq!(response.status(), 200);
     assert_eq!(f.sink.events()[0]["source"], "deny-list/replace");
+}
+
+/// `POST /admin/policy/explain` (plan §3.10.2) is `policy explain` asked
+/// of the policy in force: the same extractor, the server's own
+/// configuration for the upstream identity, the caller's tenant unless
+/// one is given, and the CLI's JSON shape — through the API and through
+/// `mcp-devtools admin policy explain`.
+#[tokio::test]
+async fn policy_explain_is_the_gateway_decision_for_both_clients() {
+    let f = fixture_with_policy(
+        Role::All,
+        b"version: 1\ndefault: deny\nrules:\n  - id: sre-read-qa-loki\n    effect: allow\n    subjects: { groups: [SRE] }\n    match:\n      vendor: grafana\n      environment: qa\n      request_risk: read\n      resource_type: datasource\n      resource_id: [loki-qa]\n",
+    )
+    .await;
+    let arguments = json!({"datasourceUid": "loki-qa", "query": "{app=\"api\"}", "limit": 10});
+    let response = post(
+        &f,
+        "policy/explain",
+        json!({"tool": "grafana_query_logs", "arguments": arguments, "groups": ["SRE"], "environment": "qa"}),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    let data = &body["data"];
+    assert_eq!(data["explanation"]["decision"]["effect"], "allow");
+    assert_eq!(
+        data["explanation"]["decision"]["rule_id"],
+        "sre-read-qa-loki"
+    );
+    assert_eq!(data["explanation"]["rules"][0]["decisive"], true);
+    assert_eq!(data["explanation"]["unclassified"], false);
+    // The what-if override is reported against what configuration says.
+    assert_eq!(data["configured_environment"], "unclassified");
+    assert_eq!(data["action"]["environment"], "qa");
+    assert_eq!(data["action"]["tool_name"], "grafana_query_logs");
+    assert_eq!(data["action"]["principal"]["tenant"], "tenant");
+    assert_eq!(data["action"]["principal"]["subject"], "someone@example");
+    assert_eq!(data["action"]["principal"]["scopes"], json!(["mcp:tools"]));
+    assert_eq!(
+        data["action"]["principal"]["authority"],
+        "https://issuer.example"
+    );
+    assert!(data["policy_version"].is_string());
+    assert_eq!(body.as_object().unwrap().len(), 1);
+
+    // Without the override the configured (unclassified) environment is
+    // what the rule fails on: the CLI's "first key" trace, from the API.
+    let response = post(
+        &f,
+        "policy/explain",
+        json!({"tool": "grafana_query_logs", "arguments": arguments, "groups": ["SRE"], "subject": "alice", "tenant": "other"}),
+    )
+    .await;
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["data"]["explanation"]["decision"]["effect"], "deny");
+    assert_eq!(
+        body["data"]["explanation"]["rules"][0]["mismatch"],
+        "environment"
+    );
+    assert_eq!(body["data"]["action"]["principal"]["tenant"], "other");
+    assert_eq!(body["data"]["action"]["principal"]["subject"], "alice");
+    // Nothing is journaled by an explanation.
+    assert!(f.sink.events().is_empty());
+
+    // Refusals: an unknown tool, an environment that does not parse, an
+    // unknown field, and the wrong method.
+    for body in [
+        json!({"tool": "no_such_tool"}),
+        json!({"tool": "grafana_query_logs", "environment": "pord"}),
+        json!({"tool": "grafana_query_logs", "file": "policy.yaml"}),
+    ] {
+        let response = post(&f, "policy/explain", body).await;
+        assert_eq!(response.status(), 400);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"],
+            "invalid_request"
+        );
+    }
+    let response = reqwest::Client::new()
+        .get(format!("{}/admin/policy/explain", f.url))
+        .bearer_auth("admin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 405);
+}
+
+/// `mcp-devtools admin policy explain`: the flags of `policy explain`,
+/// sent to the API, the same answer.
+#[tokio::test]
+async fn policy_explain_cli_sends_the_same_inputs() {
+    let f = fixture_with_policy(
+        Role::All,
+        b"version: 1\ndefault: deny\nrules:\n  - id: sre-read-qa-loki\n    effect: allow\n    subjects: { groups: [SRE] }\n    match:\n      vendor: grafana\n      environment: qa\n      request_risk: read\n      resource_type: datasource\n      resource_id: [loki-qa]\n",
+    )
+    .await;
+    let arguments = json!({"datasourceUid": "loki-qa", "query": "{app=\"api\"}", "limit": 10});
+    let token = f.dir.path().join("admin-token");
+    std::fs::write(&token, "admin\n").unwrap();
+    let run = |args: &[&str]| {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_mcp-devtools"));
+        command
+            .env("MCP_AUTH_MODE", "oidc")
+            .args(["admin", "--url", &f.url, "--token-file"])
+            .arg(&token)
+            .args(args)
+            .arg("--json");
+        async move {
+            let output = command.output().await.unwrap();
+            (
+                output.status.success(),
+                serde_json::from_slice::<Value>(&output.stdout).unwrap_or(Value::Null),
+            )
+        }
+    };
+    let (ok, body) = run(&[
+        "policy",
+        "explain",
+        "--tool",
+        "grafana_query_logs",
+        "--arguments",
+        &arguments.to_string(),
+        "--group",
+        "SRE",
+        "--environment",
+        "qa",
+    ])
+    .await;
+    assert!(ok, "{body}");
+    assert_eq!(body["data"]["explanation"]["decision"]["effect"], "allow");
+    assert_eq!(body["data"]["configured_environment"], "unclassified");
+    let (ok, body) = run(&[
+        "policy",
+        "explain",
+        "--tool",
+        "grafana_query_logs",
+        "--arguments",
+        "[]",
+    ])
+    .await;
+    assert!(!ok);
+    assert_eq!(body["error"], "invalid_json");
 }

@@ -81,6 +81,71 @@ pub enum Policy {
         #[arg(long)]
         signature: PathBuf,
     },
+    /// Ask the running server why the policy in force allows or denies a
+    /// call (`POST /admin/policy/explain`): the same inputs as
+    /// `mcp-devtools policy explain`, evaluated by the server under its own
+    /// configuration, against the policy it is enforcing right now.
+    Explain(Box<Explain>),
+}
+#[derive(Debug, Args)]
+pub struct Explain {
+    /// The tool the call names, e.g. `slack_channel_history`.
+    #[arg(long)]
+    tool: String,
+    /// The tool's arguments as a JSON object.
+    #[arg(long, default_value = "{}")]
+    arguments: String,
+    /// The caller's subject (`sub`); default `someone@example`.
+    #[arg(long)]
+    subject: Option<String>,
+    /// A group the caller belongs to (repeatable).
+    #[arg(long = "group")]
+    groups: Vec<String>,
+    /// A scope the token carries (repeatable; default `mcp:tools`).
+    #[arg(long = "scope")]
+    scopes: Vec<String>,
+    /// Override the server's configured environment for a what-if:
+    /// `prod`, `staging`, `qa`, `dev`.
+    #[arg(long)]
+    environment: Option<String>,
+    /// Tenant label of the principal; default: the token's tenant.
+    #[arg(long)]
+    tenant: Option<String>,
+    /// The client name the caller would report (telemetry only).
+    #[arg(long)]
+    client_name: Option<String>,
+    /// The client version the caller would report.
+    #[arg(long)]
+    client_version: Option<String>,
+}
+impl Explain {
+    fn body(&self) -> Result<Value, &'static str> {
+        let arguments: Value = serde_json::from_str(&self.arguments).map_err(|_| "invalid_json")?;
+        if !arguments.is_object() {
+            return Err("invalid_json");
+        }
+        let mut body = serde_json::Map::new();
+        body.insert("tool".into(), Value::String(self.tool.clone()));
+        body.insert("arguments".into(), arguments);
+        for (key, value) in [
+            ("subject", &self.subject),
+            ("environment", &self.environment),
+            ("tenant", &self.tenant),
+            ("client_name", &self.client_name),
+            ("client_version", &self.client_version),
+        ] {
+            if let Some(value) = value {
+                body.insert(key.into(), Value::String(value.clone()));
+            }
+        }
+        if !self.groups.is_empty() {
+            body.insert("groups".into(), json!(self.groups));
+        }
+        if !self.scopes.is_empty() {
+            body.insert("scopes".into(), json!(self.scopes));
+        }
+        Ok(Value::Object(body))
+    }
 }
 #[derive(Debug, Subcommand)]
 pub enum Inventory {
@@ -164,6 +229,9 @@ impl Command {
                     json!({"document":text_file(file).await?,"signature":text_file(signature).await?.trim()}),
                 ),
             ),
+            Self::Policy {
+                command: Policy::Explain(explain),
+            } => (Post, "policy/explain".into(), Some(explain.body()?)),
             Self::Principals { tenant, subject } => (
                 Post,
                 "principals/lookup".into(),
