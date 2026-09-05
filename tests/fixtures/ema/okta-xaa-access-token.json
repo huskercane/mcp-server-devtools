@@ -1,0 +1,19 @@
+{
+  "iss": "https://acme.okta.example/oauth2/mcp",
+  "sub": "00u-alice",
+  "aud": "https://mcp.acme.example",
+  "jti": "AT.fixture",
+  "iat": 1788537600,
+  "exp": 1788537900,
+  "scp": ["mcp:tools"],
+  "groups": ["Developers"],
+  "act": {
+    "sub": "agent-current",
+    "iss": "https://acme.okta.example",
+    "sub_profile": "ai_agent",
+    "groups": ["Admins"],
+    "scope": "mcp:admin",
+    "exp": 1,
+    "act": {"sub": "client-original", "sub_profile": "service"}
+  }
+}

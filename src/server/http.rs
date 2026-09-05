@@ -132,6 +132,10 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
     // trust level as the credentials they already hold.
     let config = crate::config::load();
     let auth_mode = AuthMode::parse(config.get("MCP_AUTH_MODE"))?;
+    let ema = crate::auth::ema::enabled(&config)?;
+    if ema && !auth_mode.requires_inbound_auth() {
+        return Err("MCP_EMA_ENABLED requires OIDC authentication".into());
+    }
     let addr = resolve_bind_addr(std::env::var("MCP_BIND_ADDR").ok().as_deref(), port)?;
     validate_startup_security(auth_mode, &addr)?;
     // Shared across rmcp (drops in-flight SSE on cancel) and axum (stops
@@ -154,6 +158,12 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
         AuthMode::Off => None,
         AuthMode::Oidc(keys) => Some(Arc::new(enterprise_inbound_auth(&config, &server, keys)?)),
     };
+    if ema {
+        let auth = inbound_auth.as_ref().expect("EMA requires OIDC");
+        crate::auth::ema::OidcExchange::new()?
+            .verify_resource_issuer(&auth.settings().authorization_servers[0])
+            .await?;
+    }
     // Every secret reference resolves before the port opens, or the
     // process does not start (plan §3.8): a credential it cannot read is
     // not a credential it can vouch for per call.
@@ -209,6 +219,26 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
     Ok(())
 }
 
+fn enterprise_resource_settings(
+    config: &Config,
+    keys: crate::config::OidcKeys,
+    oidc: &crate::auth::oidc::OidcSettings,
+) -> Result<InboundAuthSettings, String> {
+    let ema = crate::auth::ema::enabled(config)?;
+    // OIDC's legacy normalization stays compatible; EMA discovery uses the
+    // configured identifier exactly, including a significant trailing slash.
+    let issuer = if ema {
+        config.get(keys.issuer()).unwrap_or(&oidc.issuer).trim()
+    } else {
+        &oidc.issuer
+    };
+    let settings = InboundAuthSettings::from_config(config, keys.mode(), vec![issuer.to_owned()])?;
+    if ema && oidc.audience != settings.public_url {
+        return Err("EMA requires the OIDC audience to equal MCP_PUBLIC_URL".to_owned());
+    }
+    Ok(settings)
+}
+
 /// Assemble the enterprise inbound-auth stack from configuration, refusing
 /// anything incomplete (plan §1.2: no "temporarily permissive" mode).
 ///
@@ -223,7 +253,7 @@ fn enterprise_inbound_auth(
 ) -> Result<InboundAuth, String> {
     let mode = keys.mode();
     let oidc = crate::auth::oidc::OidcSettings::from_config(config, keys)?;
-    let settings = InboundAuthSettings::from_config(config, mode, vec![oidc.issuer.clone()])?;
+    let settings = enterprise_resource_settings(config, keys, &oidc)?;
     let rate_limit = crate::server::rate_limit::RateLimitSettings::from_config(config)
         .map_err(|error| format!("refusing to start: {error}"))?;
     if config

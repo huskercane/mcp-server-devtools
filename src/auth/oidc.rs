@@ -913,6 +913,7 @@ impl OidcJwksValidator {
         let token = TokenFacts {
             issued_at: claims.iat,
             token_id: claims.jti.filter(|jti| !jti.trim().is_empty()),
+            actors: crate::auth::ema::actors(claims.rest.get("act"))?,
         };
         let mut scopes = claims.scp;
         scopes.extend(claims.scope);
@@ -961,6 +962,9 @@ impl OidcJwksValidator {
         let header = decode_header(token).map_err(|_| TokenRejection::Malformed)?;
         if header.alg != Algorithm::RS256 {
             return Err(TokenRejection::UnsupportedAlgorithm);
+        }
+        if header.typ.as_deref() == Some("oauth-id-jag+jwt") {
+            return Err(TokenRejection::Malformed);
         }
         let kid = header.kid.ok_or(TokenRejection::UnknownKey)?;
 

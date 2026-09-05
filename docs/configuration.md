@@ -220,3 +220,14 @@ These are read directly from the process environment during startup. They do **n
 | `AUDIT_LOG_RETENTION_MAX_BYTES` | `104857600` (100 MiB) | Total size limit for prior-session audit logs. |
 
 Diagnostic and audit logs are written below `~/.mcp/data`. Diagnostic log retention is fixed at seven days and 50 MiB; audit retention is configurable as shown above.
+
+
+### Enterprise-managed authorization (C.1)
+
+`MCP_EMA_ENABLED=true` opts authenticated HTTP deployments into EMA discovery
+checks and extension advertisement. The configured OIDC audience must equal
+`MCP_PUBLIC_URL`; the issuer must advertise the ID-JAG profile and JWT-bearer
+grant. Default is false. See [EMA setup, exchange helper and required external
+client matrix](ema-runbook.md). External client interoperability is not yet
+claimed. `mcp-devtools auth exchange --help` describes the Unix file-based
+protocol helper; it is separate from vendor commands and the admin API.

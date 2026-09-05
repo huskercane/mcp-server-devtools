@@ -10,7 +10,13 @@ removed only when it is done, not when it is explained.
 
 Status legend: **open** · **blocked** (needs a decision) · **done**.
 
-Last updated: 2026-09-04, after C.7 (rev 2.21). Native Helm, real SQLite
+Last updated: 2026-09-04, after C.1 implementation (rev 2.22). Stable
+ext-auth fetched/read, two issuer grants, opt-in resource discovery and
+synthetic Okta subject/actor fixtures landed. Full 1,077 tests and all gates
+pass. CF-35 tracks real tenant and client evidence; no client interoperability
+claim. C.7 signing is still unexercised locally (CF-34). No push/PR.
+
+Previously updated:  2026-09-04, after C.7 (rev 2.21). Native Helm, real SQLite
 and signed-journal restore tests and all landing gates passed. Docker daemon
 was unavailable; no cluster rollout was run. Sigstore signing cannot be
 exercised locally: CF-34 tracks external release evidence. CF-16/33 remain.
@@ -575,6 +581,28 @@ real local journal/checkpoint/SQLite restore pass; a real cluster rollout,
 upgrade and rollback remain deployment evidence. CF-16/33 are not closed by
 packaging: the chart enforces one replica and documents split-state gaps.
 
+### CF-35 · EMA external client/tenant evidence and actor policy scope
+**Open · external runs required before interoperability claims**
+
+C.1's stable source is ext-auth `fb374c7db2b34f18ca9183882e0beecdf661892b`,
+fetched/read 2026-09-04. `docs/ema-runbook.md` names the exact E01–E16 checks
+for Claude web, Claude desktop, Claude Code, VS Code and each claimed Codex
+surface. Every row is unrun. Retain client/OS/build/org settings, real issuer
+metadata and policy, redacted exchanges and audit references. In particular,
+prove real AS grant signature/audience/resource/client binding/replay refusal,
+Okta XAA claim transformations, renewal/revocation, and session account
+isolation. Local wiremock forms, signed fixtures and HTTP routing do not prove
+those external behaviors. Generic Keycloak is not a substitute for Okta XAA.
+
+The configured external issuer remains the AS; the server never accepts a
+raw ID-JAG as a bearer. Its existing validator retains bounded actor identities
+in TokenFacts, current actor first; subject/groups/scopes remain top-level.
+Actor-aware local policy and actor fields in the frozen audit schema require
+an explicit subsequent design. The exchange adapter is portable; the optional
+file-output CLI helper is Unix-only until a private Windows ACL writer exists.
+This is a protocol helper, not an implementation of external clients' SSO,
+SAML bootstrap, private-key-JWT creation or automatic credential refresh.
+
 ### CF-10 · ADR-002: the enterprise licence
 **Blocked · counsel · hard M0 exit criterion**
 
@@ -1016,3 +1044,20 @@ Absolute cache-hit and journal p99 budgets pass; timings are observations.
 The full gate exposed a C.4 test race: the watcher can legitimately reload
 before the admin request. The corrected test proves the failed append keeps
 the old policy and that whichever reload wins has earlier durable evidence.
+
+
+Re-run after C.1 (2026-09-04, rev 2.22): every existing allocation count
+and reported KB value matches C.7. JWT validate cache hit is 9 allocations /
+1 KB / 3.78 µs; journal append is 6 allocations / 1 KB, p50 11 µs / p99 15 µs /
+max 74 µs. Known-principal observation, limiter hit and known Prometheus
+series remain zero. No material allocation regression; absolute timing
+budgets pass. Timings are observations, not a comparative speedup claim.
+
+New probe `C.1 JWT authenticate: cached actor chain`: 8 allocations / 1 KB /
+3.89 µs for a two-actor chain. This calls `authenticate` directly, whereas the
+existing 9-allocation row calls `validate` through its additional future;
+these are different entry points, not evidence that actor support saves an
+allocation. The signed chain is an Arc slice, so cache hits share it rather
+than cloning actor strings. Tokens without actors carry None. TokenFacts has
+an additional optional Arc field; KB reporting is rounded down, not exact
+byte equality. Initial verification/exchange/SSO are outside this hit probe.

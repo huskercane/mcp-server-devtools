@@ -27,6 +27,7 @@ pub mod audit;
 pub mod bb;
 pub mod conf;
 pub mod creds;
+pub mod ema;
 pub mod explain;
 pub mod health;
 pub mod jira;
@@ -58,6 +59,8 @@ pub struct Cli {
 pub enum TopCommand {
     /// Administrative operations through the audited control HTTP API.
     Admin(admin::Options),
+    /// Enterprise-managed authorization through the configured issuers.
+    Auth(ema::Options),
     /// Bitbucket Cloud REST API (`bb get|post|put|patch|delete|clone`).
     Bb {
         #[command(subcommand)]
@@ -138,6 +141,7 @@ where
     };
 
     let result = match cli.command {
+        TopCommand::Auth(options) => return ema::dispatch(&options).await,
         TopCommand::Admin(options) => return admin::dispatch(&options).await,
         TopCommand::Bb { action } => bb::dispatch(action).await,
         TopCommand::Jira { action } => jira::dispatch(action).await,
@@ -197,6 +201,7 @@ async fn dispatch_legacy(legacy: TopCommand) -> Result<(), crate::error::McpErro
         | TopCommand::Policy { .. }
         | TopCommand::Revoke { .. }
         | TopCommand::Audit { .. }
+        | TopCommand::Auth(_)
         | TopCommand::Admin(_)
         | TopCommand::Serve(_)
         | TopCommand::Health(_) => unreachable!(

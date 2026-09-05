@@ -376,6 +376,15 @@ fn enterprise_request_path_stage() {
         .await
         .expect("cached token validates");
 
+        let mut delegated = claims;
+        delegated["act"] = json!({"sub":"agent-current", "act":{"sub":"original-client"}});
+        let delegated = jsonwebtoken::encode(&header, &delegated,
+            &jsonwebtoken::EncodingKey::from_rsa_der(include_bytes!("../tests/fixtures/okta_test_rsa_pkcs1.der"))).unwrap();
+        validator.authenticate(&delegated).await.expect("delegated token validates");
+        probe_async("C.1 JWT authenticate: cached actor chain", 2000, || {
+            validator.authenticate(&delegated)
+        }).await.expect("cached delegated token validates");
+
         // -- Durable audit append --
         let dir = tempfile::tempdir().expect("tempdir");
         let journal_dir = dir.path().join("journal");

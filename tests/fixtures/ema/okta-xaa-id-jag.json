@@ -1,0 +1,16 @@
+{
+  "iss": "https://acme.okta.example",
+  "sub": "00u-alice",
+  "aud": "https://acme.okta.example/oauth2/mcp",
+  "resource": "https://mcp.acme.example",
+  "client_id": "mcp-client",
+  "jti": "IDJAG.fixture",
+  "iat": 1788537600,
+  "exp": 1788537900,
+  "scope": "mcp:tools",
+  "act": {
+    "sub": "agent-current",
+    "sub_profile": "ai_agent",
+    "act": {"sub": "client-original", "sub_profile": "service"}
+  }
+}

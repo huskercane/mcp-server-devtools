@@ -79,6 +79,7 @@ use crate::ports::{AuditEvent, AuditEventKind, TokenFacts, UsageEvent};
 #[derive(Clone)]
 pub struct DevtoolsServer {
     components: Arc<Components>,
+    ema_enabled: bool,
     // The `#[tool_handler]` macro references this field by name at expansion
     // time; the rustc reference tracker doesn't see that, so we silence the
     // dead-code lint explicitly.
@@ -106,7 +107,10 @@ impl DevtoolsServer {
     /// it directly.
     #[must_use]
     pub fn from_components(components: Arc<Components>) -> Self {
+        let ema_enabled = components.auth_required
+            && crate::auth::ema::enabled(&components.config()).unwrap_or(false);
         Self {
+            ema_enabled,
             components,
             tool_router: Self::tool_router(),
         }
@@ -1089,6 +1093,14 @@ impl ServerHandler for DevtoolsServer {
         let mut info = ServerInfo::default();
         info.protocol_version = ProtocolVersion::LATEST;
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        if self.ema_enabled {
+            let mut extensions = rmcp::model::ExtensionCapabilities::new();
+            extensions.insert(
+                crate::auth::ema::EXTENSION.to_owned(),
+                serde_json::Map::new(),
+            );
+            info.capabilities.extensions = Some(extensions);
+        }
         info.server_info = implementation;
         info
     }

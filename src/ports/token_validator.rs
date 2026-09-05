@@ -138,6 +138,16 @@ pub struct TokenFacts {
     pub issued_at: Option<u64>,
     /// `jti`, when the token carries it. What a per-token revocation names.
     pub token_id: Option<String>,
+    /// Validated delegation identities, current actor first. Nested actors are
+    /// historical only and never contribute subject, groups or scopes.
+    pub actors: Option<std::sync::Arc<[Actor]>>,
+}
+
+/// An actor identity from a signed RFC 8693 `act` claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Actor {
+    pub subject: String,
+    pub issuer: Option<String>,
 }
 
 /// A validated token: who it proves, and the facts about the token that

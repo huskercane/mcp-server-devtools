@@ -336,6 +336,7 @@ mod tests {
             token: TokenFacts {
                 issued_at: iat,
                 token_id: jti.map(str::to_owned),
+                actors: None,
             },
         }
     }
