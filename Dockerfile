@@ -47,7 +47,10 @@ RUN touch src/main.rs src/lib.rs \
 
 # ---- runtime -------------------------------------------------------------
 FROM gcr.io/distroless/static-debian12:nonroot
+LABEL org.opencontainers.image.licenses="Apache-2.0"
 COPY --from=build /mcp-devtools /mcp-devtools
+COPY LICENSE NOTICE /usr/share/licenses/mcp-devtools/
+COPY licenses /usr/share/licenses/mcp-devtools/licenses/
 COPY deploy/policies /policies
 ENV TRANSPORT_MODE=http \
     PORT=3000 \

@@ -4,7 +4,7 @@ Status: proposed execution plan for the direction in the
 [enterprise product brief](enterprise-product-brief.md); revision 2 after independent review
 Owner: Rohit Singh · Source of record: `docs/enterprise-product-plan.md` in the `mcp-devtools` repository
 Classification: internal; share with prospective collaborators under NDA
-Last reviewed: September 4, 2026
+Last reviewed: September 5, 2026
 
 This document turns the brief's thesis — *semantic, default-deny policy for AI
 agents across the engineering stack* — into a sequenced plan with decisions,
@@ -21,6 +21,7 @@ ordered by partner demand and are not scheduled until Gate B passes.
 
 | Rev | Date | Change | Driven by |
 |---|---|---|---|
+| 2.23 | 2026-09-05 | Owner selected Apache-2.0 for the current community crate and proprietary commercial licensing for separate enterprise extensions. Current community features remain in this crate; earlier ISC permissions are preserved. Release archives and the container carry license notices. ADR-001/002 amended; enterprise agreement text and contribution terms remain open. See [licensing policy](licensing.md). | Owner |
 | 1 | 2026-08-28 | Initial plan: six phases, two gates, console in Phase 5 | Brief |
 | 1.1 | 2026-08-29 | Admin CLI, policy-engine options, stay-in-Rust decision, Kubernetes topology, container in Phase 1 | Owner |
 | 2 | 2026-08-29 | Canonical `ActionContext` for resource-aware policy; durable `AuditSink` split from lossy `UsageSink`; licensing boundary moved to M0; minimal `CredentialBroker` in the first slice; commercial gates moved before Phase C; wedge vendors demoted to a hypothesis; Phase 5 split into C/D; revocation, canonicalization, client-identity, response-metadata, and availability corrections; business-plan gaps and trial metrics added | Independent review |
@@ -100,8 +101,8 @@ hypothesis to be confirmed at a gate, **D** decided.
 
 | # | Decision | Recommendation | Status | Why |
 |---|---|---|---|---|
-| ADR-001 | Repository and code boundary | Public community crate stays as is (ISC). Enterprise code lives in a **private repository** (`mcp-devtools-enterprise`) from day one, depending on the community crate as a library. The community crate therefore exposes a library target (`lib.rs`) with the ports (§3.1) and core types (§3.2) public; the community binary never links enterprise code; the enterprise binary composes the community library + enterprise crate. | D — 2026-09-01 | A private repository is the hardest licence boundary: no shared history, no accidental publication, CLA scoped per repo. Cost: the community crate must commit to a stable-enough library surface for the ports; that surface is versioned like any public API. The enterprise *licence text* itself is still ADR-002 (counsel). |
-| ADR-002 | Licence | Add `LICENSE` (ISC) for the community crate now. Decide the enterprise licence (source-available / BSL / commercial) and adopt a CLA **before any enterprise code or external contribution lands** — a hard M0 exit criterion, not a pre-trial one. | P — decide in M0 | Cannot be retrofitted after outside contributions. |
+| ADR-001 | Repository and code boundary | Community crate is Apache-2.0, including all currently implemented features (see [licensing policy](licensing.md)). Separate proprietary enterprise extensions live in a **private repository** (`mcp-devtools-enterprise`) from day one, depending on the community crate as a library. The community crate therefore exposes a library target (`lib.rs`) with the ports (§3.1) and core types (§3.2) public; the community binary never links enterprise code; the enterprise binary composes the community library + enterprise crate. | D — amended 2026-09-05 | A private repository is the hardest licence boundary: no shared history, no accidental publication, CLA scoped per repo. Cost: the community crate must commit to a stable-enough library surface for the ports; that surface is versioned like any public API. The enterprise *licence text* itself is still ADR-002 (counsel). |
+| ADR-002 | Licence | Apache-2.0 for the community crate; proprietary commercial terms for separate enterprise extensions. Preserve earlier ISC permissions and attribution. Enterprise agreement text and contribution terms remain to be finalized before accepting external enterprise contributions; see [licensing policy](licensing.md). | D — model selected 2026-09-05; legal text open | The selected model does not withdraw permissions already granted or reclassify existing community features as proprietary. |
 | ADR-003 | Policy representation | A static, versioned YAML document whose rules match a canonical `ActionContext` (§3.2), including resource type, resource id pattern, and classification — not only tool/method/path. Schema designed to compile to Cedar without loss; engine behind the `PolicyDecisionPoint` port. See §2.1. | P | v1 must express "Jira project A, not B" and "this Grafana datasource, not that one", or it is a method-and-path gateway rather than the product in the brief. |
 | ADR-004 | TLS termination | Out of process (reverse proxy / k8s ingress) for v1; the binary opens a non-loopback bind only when auth is on. | P | Every enterprise has a TLS ingress. Revisit if a partner cannot front it. |
 | ADR-005 | First workflow and vendors | **Hypothesis:** incident investigation — Grafana first (purpose-built read tools already exist), Slack second. Atlassian and CircleCI follow only if the design partner's workflow needs them. Confirmed or replaced at Gate A. | H | Sell a governed workflow, not a bundle of connectors. Grafana makes Phase A's "one vendor" nearly free. |
@@ -534,7 +535,7 @@ audit record with upstream identity is written before any tool dispatches.
 
 **Status 2026-09-01 (engineering scope):**
 
-- [x] Licensing boundary: `LICENSE` (ISC) in the community repo; private
+- [x] Licensing boundary: `LICENSE` (Apache-2.0; originally ISC) in the community repo; private
   `mcp-devtools-enterprise` builds and smoke-tests against the community
   library (github.com/huskercane/mcp-devtools-enterprise; licence text
   itself still ADR-002, with counsel).
@@ -810,7 +811,7 @@ that fails on a > 20 % regression against the checked-in baseline.
 
 ## 11. Unresolved questions
 
-1. ADR-002: which enterprise licence for the private repository? (Repository location decided 2026-09-01: private from day one — ADR-001.)
+1. ADR-002: finalize the proprietary enterprise agreement and contribution terms. The model was selected 2026-09-05: Apache-2.0 community plus a separate proprietary enterprise edition; see [licensing policy](licensing.md).
 2. Which IdP does the first partner use — Okta as assumed, or Entra?
 3. Is the incident-investigation workflow (Grafana → Slack) the partner's first workflow, or is it planning/delivery (Jira → CircleCI)?
 4. Does the partner require end-to-end upstream user identity for any operation in the first workflow?

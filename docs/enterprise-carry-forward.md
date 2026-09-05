@@ -604,10 +604,13 @@ This is a protocol helper, not an implementation of external clients' SSO,
 SAML bootstrap, private-key-JWT creation or automatic credential refresh.
 
 ### CF-10 · ADR-002: the enterprise licence
-**Blocked · counsel · hard M0 exit criterion**
+**Model decided 2026-09-05 · enterprise agreement and contribution terms remain open**
 
-Source-available / BSL / commercial, plus a CLA, must be decided **before any
-external contribution lands**. It cannot be retrofitted.
+The owner selected Apache-2.0 for the current community crate and proprietary
+commercial licensing for separate enterprise extensions. See [licensing policy](licensing.md).
+Counsel still needs to finalize the enterprise agreement and contribution terms
+before external enterprise contributions are accepted. This decision does not
+restrict earlier ISC copies or existing community functionality.
 
 Knock-on: `mcp-devtools-enterprise/deny.toml` carries
 `private = { ignore = true }` so cargo-deny does not fail on the crate's own
@@ -618,7 +621,14 @@ carries a real SPDX `license` field.
 **Open** — still unstarted from the M0 work-package list.
 
 ### CF-18 · Where the OIDC validator and the file policy engine live (ADR-001)
-**Deferred · decided 2026-09-03: option 2 in practice while the repository is private · revisit at open-sourcing, with CF-10**
+**Amended 2026-09-05 · current crate remains community; future enterprise extensions are separate**
+
+The licensing decision supersedes the proposed move below: all code currently
+in this crate, including secure remote access and existing administration and
+operations features, stays community under Apache-2.0. Future proprietary
+extensions belong in the separate enterprise repository. ADR-001 is amended;
+CF-10 retains only the enterprise legal-text and contribution-term work.
+The earlier analysis below is retained as decision history.
 
 **Decision 2026-09-03.** The community repository is private for now, so
 the boundary ADR-001 draws — "the community binary never links enterprise

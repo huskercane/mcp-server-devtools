@@ -114,7 +114,10 @@ jobs:
           staging="${{ matrix.asset }}"
           mkdir -p "$staging"
           cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$staging/"
-          cp README.md "$staging/"
+          cp README.md LICENSE NOTICE "$staging/"
+          cp -R licenses "$staging/"
+          mkdir -p "$staging/docs"
+          cp docs/licensing.md "$staging/docs/"
           tar -czf "${staging}.tar.gz" "$staging"
           shasum -a 256 "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
 
@@ -125,7 +128,10 @@ jobs:
           $staging = "${{ matrix.asset }}"
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/$env:BIN_NAME.exe" "$staging/"
-          Copy-Item README.md "$staging/"
+          Copy-Item README.md, LICENSE, NOTICE "$staging/"
+          Copy-Item -Recurse licenses "$staging/"
+          New-Item -ItemType Directory -Force -Path "$staging/docs" | Out-Null
+          Copy-Item docs/licensing.md "$staging/docs/"
           Compress-Archive -Path "$staging/*" -DestinationPath "$staging.zip"
           (Get-FileHash "$staging.zip" -Algorithm SHA256).Hash.ToLower() + "  $staging.zip" `
             | Out-File -Encoding ascii "$staging.zip.sha256"

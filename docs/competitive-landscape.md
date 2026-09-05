@@ -6,7 +6,7 @@ and the "gateway layer is where the real competition is" risk in the
 [brief](enterprise-product-brief.md#competitive-position-and-risks)
 Owner: Rohit Singh · Source of record: `docs/competitive-landscape.md` in the `mcp-devtools` repository
 Classification: internal; share with prospective collaborators under NDA
-Last reviewed: September 3, 2026
+Last reviewed: September 5, 2026
 
 This register records every product that a buyer will compare us against, what
 it actually does (from its own published material, not from our assumptions),
@@ -27,6 +27,7 @@ not the product.
 
 | Date | Change | Driven by |
 |---|---|---|
+| 2026-09-05 | Community license changed to Apache-2.0; separate enterprise extensions use proprietary commercial terms. Updated our governance comparison only; competitor assessments were not reverified. | Owner |
 | 2026-09-03 | Register created; agentgateway (Solo.io, now under the Agentic AI Foundation) is the first entry; category skeleton from the brief | Owner, after the AAIF announcement |
 | 2026-09-03 | Field survey: fourteen further products assessed from primary material where it could be reached (§4.2–§4.15), three more noted as watch items (§6); agentgateway's policy-attribute question answered from its docs (§4.1); two categories added to §1 (auth-brokering integration platforms; evidence proxies) and one split out (platform-suite gateways); §5 synthesis added — credential brokerage is no longer a differentiator on its own, the defensible position is the *combination* of axes A, C, E and F in one self-hosted binary | Owner; web survey |
 
@@ -72,7 +73,7 @@ material · **n/a** not applicable to the category.
 
 | Product | Category | A | B | C | D | E | F | G | H | I | J | Last verified |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| **This product** (plan, Phases A+B landed) | — | ● | ● | ● | ◐ YAML now, Cedar planned | ● | ● | ● | ● | ● | Private enterprise crate over ISC community crate | 2026-09-03 |
+| **This product** (plan, Phases A+B landed) | — | ● | ● | ● | ◐ YAML now, Cedar planned | ● | ● | ● | ● | ● | Proprietary enterprise extensions over Apache-2.0 community crate | 2026-09-05 |
 | agentgateway (Solo.io → AAIF) | Protocol gateway | ○ | ● | ○ tool name + JWT claims only | ◐ CEL | ○ | ◐ | ? | ◐ Rust, k8s Gateway API | ○ | Apache 2.0, LF/AAIF | 2026-09-03 |
 | Okta for AI Agents (Runtime Agent Gateway + XAA) | Identity vendor | ○ virtual MCP server | ● | ◐ task-scoped runtime decisions; resource awareness unverified | ? | ● per-request, audience-bound brokered tokens | ◐ structured System Log events | ● "revocable in seconds" | ○ SaaS (self-hosted mentioned, unverified) | ○ | Vendor | 2026-09-03 |
 | Microsoft Agent 365 + Entra Agent ID | Platform suite | ○ | ● | ◐ admin approval of MCP servers/tools | ? | ? | ◐ "audit-ready evidence" | ◐ Conditional Access for agents | ○ SaaS | ○ | Vendor; USD 15/user/month | 2026-09-03 |
@@ -159,7 +160,7 @@ across MCP servers and agents, and "seamless switching between LLM providers".
   budget controls, model aliasing, A2A federation. None of that is in the
   plan and none of it should be: it is a different buyer conversation.
 - **Governance (axis J).** Foundation-governed Apache 2.0 with a large
-  contributor base. The plan is a private enterprise crate over an ISC
+  contributor base. The plan is a private enterprise crate over an Apache-2.0
   community crate (ADR-001), which is the opposite trust story: a buyer
   trusts agentgateway because it is neutral, and would trust us because
   the binary is small enough to audit.
