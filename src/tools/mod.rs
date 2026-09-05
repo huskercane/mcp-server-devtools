@@ -279,6 +279,19 @@ impl DevtoolsServer {
         Arc::clone(&self.components.mutation_gate)
     }
 
+    /// The proposal registry behind the approval gate (WP D.2), when
+    /// `MCP_ADMIN_APPROVALS=required`; `None` under the direct gate.
+    #[must_use]
+    pub fn proposals(&self) -> Option<Arc<dyn crate::ports::ProposalRegistry>> {
+        self.components.proposals.clone()
+    }
+
+    /// The fresh-token bound for writes (`MCP_WRITE_MAX_TOKEN_AGE_SECONDS`).
+    #[must_use]
+    pub fn write_max_token_age(&self) -> std::time::Duration {
+        write_max_token_age(&self.components.config())
+    }
+
     /// The Prometheus page (`MCP_METRICS=on`), or `None` when metrics are
     /// off. `rate_limited` is the limiter's refusal count, which lives on
     /// the auth stack rather than here.
@@ -550,7 +563,10 @@ pub const DEFAULT_WRITE_MAX_TOKEN_AGE: std::time::Duration = std::time::Duration
 /// caller's client has not yet seen. A token with no `iat` cannot be shown
 /// to be fresh, so it is refused for writes (fail closed). `None` means the
 /// call may proceed.
-fn stale_for_write(facts: &TokenFacts, max_age: std::time::Duration) -> Option<String> {
+/// Why `facts` fail the fresh-token rule for writes at `max_age`, or
+/// `None` when they satisfy it (or the rule is off).
+#[must_use]
+pub fn stale_for_write(facts: &TokenFacts, max_age: std::time::Duration) -> Option<String> {
     if max_age.is_zero() {
         return None;
     }

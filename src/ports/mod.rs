@@ -31,6 +31,7 @@ pub mod credential_broker;
 pub mod mutation_gate;
 pub mod policy_admin;
 pub mod policy_decision_point;
+pub mod proposals;
 pub mod rollup_store;
 pub mod secret_source;
 pub mod token_validator;
@@ -46,7 +47,7 @@ pub use audit_forwarder::{
 };
 pub use audit_sink::{
     AuditEvent, AuditEventKind, AuditFailure, AuditSink, ControlEvent, ControlEventKind,
-    InMemoryAuditSink, SignatureStatus,
+    InMemoryAuditSink, ProposalRecord, SignatureStatus,
 };
 pub use checkpoint_sink::{CheckpointSink, DirectoryCheckpointSink, InMemoryCheckpointSink};
 pub use command_runner::{CommandOutput, CommandRunner};
@@ -55,6 +56,10 @@ pub use mutation_gate::{
     Admission, AdmissionFuture, DirectGate, MutationGate, MutationIntent, MutationKind,
 };
 pub use policy_decision_point::{AllowAll, PolicyDecisionPoint};
+pub use proposals::{
+    Approval, Candidate, Party, Proposal, ProposalError, ProposalFuture, ProposalRegistry,
+    ProposalState,
+};
 pub use rollup_store::{
     Bucket, GroupRow, InMemoryRollupStore, Report, ReportQuery, RollupError, RollupFuture,
     RollupStore, TimelineRow, Totals, UsageRow, Window,

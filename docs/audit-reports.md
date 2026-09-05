@@ -17,6 +17,8 @@ contiguous `seq` from 1 and a `kind`:
 | `policy_loaded` / `policy_changed` / `policy_rejected` | the policy document is loaded, changed, or refused | version labels (bundle hashes), signature status, reason |
 | `revocation_loaded` / `revocation_changed` / `revocation_rejected` | the revocation list is loaded, changed, or refused | counts, `not_before`, signature status |
 | `revoked_token_rejected` | a validated token is refused by the revocation list | the principal, the reason (`subject`, `token_id`, `not_before`) |
+| `admin_mutation` | an administrator's mutation is authorized, before its effect | the principal, the operation (`source`), the target or version label |
+| `admin_proposal` / `admin_approval` / `admin_rejection` | a gated mutation is held for a second administrator, approved, or rejected / found expired (`MCP_ADMIN_APPROVALS=required`) | the principal, the operation, the version label, `proposal` (`id`, `candidate_digest`, `expires`; the proposal record also carries the exact `document` and `signature`), `reason` on rejections |
 | `checkpoint` | every N records, T seconds, and at clean close | the chain value over everything before it, signed |
 
 Never a token, never tool arguments, never response content (plan §3.3).

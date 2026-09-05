@@ -1,10 +1,15 @@
 //! Audited control HTTP boundary (C.4). No backend paths are accepted from
 //! callers. Expensive work has an independent, bounded task budget.
+//!
+//! `proposals` holds the two-person approval endpoints (WP D.2), a
+//! self-contained file so that it can move under ADR-012.
+mod proposals;
 use super::auth::{InboundAuth, require_bearer};
 use crate::{
     policy::{BundleAudit, Principal},
     ports::{
         Admission, ControlEvent, ControlEventKind, MutationGate, MutationIntent, MutationKind,
+        TokenFacts,
         admin_inventory::{ArtifactStore, SessionStore},
     },
     tools::DevtoolsServer,
@@ -108,6 +113,9 @@ const INVALID: Error = Error(StatusCode::BAD_REQUEST, "invalid_request");
 const UNAVAILABLE: Error = Error(StatusCode::SERVICE_UNAVAILABLE, "admin_backend_unavailable");
 const NOT_FOUND: Error = Error(StatusCode::NOT_FOUND, "not_found");
 const AUDIT_FAILED: Error = Error(StatusCode::SERVICE_UNAVAILABLE, "audit_unavailable");
+const fn method_not_allowed() -> Error {
+    Error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -167,6 +175,7 @@ async fn dispatch(State(state): State<Admin>, request: Request) -> Result<Respon
         .get::<Principal>()
         .cloned()
         .ok_or(UNAVAILABLE)?;
+    let facts = request.extensions().get::<TokenFacts>().cloned();
     let method = request.method().clone();
     let operation = request
         .uri()
@@ -187,7 +196,7 @@ async fn dispatch(State(state): State<Admin>, request: Request) -> Result<Respon
         .spawn(async move {
             let _permit = permit;
             let result = state
-                .execute(&principal, &method, &operation, &body)
+                .execute(&principal, facts.as_ref(), &method, &operation, &body)
                 .await?;
             Ok(match result {
                 Outcome::Applied(data) => Json(json!({"data": data})).into_response(),
@@ -240,6 +249,9 @@ impl Admin {
                 "state": "pending",
                 "operation": intent.kind.operation(),
             })))),
+            // The journal being down is not a refusal; it is the same 503 as
+            // every other failed append.
+            Admission::Refused(cause) if cause == AUDIT_FAILED.1 => Err(AUDIT_FAILED),
             Admission::Refused(cause) => Err(Error(StatusCode::CONFLICT, cause)),
         }
     }
@@ -248,10 +260,14 @@ impl Admin {
     async fn execute(
         &self,
         principal: &Principal,
+        facts: Option<&TokenFacts>,
         method: &Method,
         op: &str,
         body: &[u8],
     ) -> Result<Outcome, Error> {
+        if op == "proposals" || op.starts_with("proposals/") {
+            return self.proposals(principal, facts, method, op, body).await;
+        }
         let applied = match (method, op) {
             (&Method::GET, "policy") => encode(self.policy()?.read().await.map_err(policy_error)?),
             (&Method::POST, "policy/validate" | "policy/diff") => {
@@ -277,6 +293,7 @@ impl Admin {
                     principal,
                     target: None,
                     candidate: None,
+                    signature: None,
                 };
                 if let Some(deferred) = self.admit(&intent).await? {
                     return Ok(deferred);
@@ -326,6 +343,7 @@ impl Admin {
                     principal,
                     target: Some(&input.id),
                     candidate: None,
+                    signature: None,
                 };
                 if let Some(deferred) = self.admit(&intent).await? {
                     return Ok(deferred);
@@ -437,7 +455,7 @@ impl Admin {
                     | "reports/activity"
             ) =>
             {
-                Err(Error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"))
+                Err(method_not_allowed())
             }
             _ => Err(NOT_FOUND),
         }?;
@@ -460,6 +478,7 @@ impl Admin {
             principal,
             target: Some(&verified.version),
             candidate: Some(input.document.as_bytes()),
+            signature: Some(&input.signature),
         };
         if let Some(deferred) = self.admit(&intent).await? {
             return Ok(deferred);
@@ -498,10 +517,28 @@ impl Admin {
             principal,
             target: Some(&version),
             candidate: Some(input.document.as_bytes()),
+            signature: Some(&input.signature),
         };
         if let Some(deferred) = self.admit(&intent).await? {
             return Ok(deferred);
         }
+        self.install_deny_list(principal, &list, staged, input.document, input.signature)
+            .await
+            .map(Outcome::Applied)
+    }
+
+    /// Apply an admitted (or approved) deny-list candidate. The caller
+    /// holds the list's mutation lock and has staged `staged` from exactly
+    /// `document` and `signature`.
+    async fn install_deny_list(
+        &self,
+        principal: &Principal,
+        list: &Arc<crate::auth::revocation::RevocationList>,
+        staged: crate::policy::Staged<crate::auth::revocation::RevocationDocument>,
+        document: String,
+        signature: String,
+    ) -> Result<Value, Error> {
+        let version = staged.version().to_owned();
         let seq = self
             .record(principal, "deny-list/replace", Some(version))
             .await?;
@@ -509,9 +546,9 @@ impl Admin {
         // Both files are atomically replaced under the bundle lock the
         // watcher shares; a crash between them fails closed at startup.
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            let signature = crate::policy::signing::Signature::from_base64(&input.signature)
+            let signature = crate::policy::signing::Signature::from_base64(&signature)
                 .map_err(std::io::Error::other)?;
-            files.install_signed(input.document.as_bytes(), &signature)
+            files.install_signed(document.as_bytes(), &signature)
         })
         .await
         .map_err(|_| UNAVAILABLE)?
@@ -525,9 +562,7 @@ impl Admin {
                 sessions.revoke(&row.id).await.map_err(inventory_error)?;
             }
         }
-        Ok(Outcome::Applied(
-            json!({"audit_seq": seq, "version": list.version()}),
-        ))
+        Ok(json!({"audit_seq": seq, "version": list.version()}))
     }
 }
 fn inventory_error(error: crate::ports::admin_inventory::InventoryError) -> Error {

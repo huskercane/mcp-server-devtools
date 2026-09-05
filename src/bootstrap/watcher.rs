@@ -171,6 +171,7 @@ mod tests {
             audit_append_timeout: crate::policy::egress::DEFAULT_AUDIT_APPEND_TIMEOUT,
             pending_audit: tokio_util::task::TaskTracker::new(),
             mutation_gate: Arc::new(crate::ports::DirectGate),
+            proposals: None,
         })
     }
 

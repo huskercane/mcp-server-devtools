@@ -603,6 +603,20 @@ file-output CLI helper is Unix-only until a private Windows ACL writer exists.
 This is a protocol helper, not an implementation of external clients' SSO,
 SAML bootstrap, private-key-JWT creation or automatic credential refresh.
 
+### CF-36 · Credential rotation has no approval type
+**Open · recorded at D.2 exit (2026-09-05) · design decision, not a defect**
+
+The D.2 row of the plan listed "credential rotation" among the mutations
+two-person approval might gate. It has no API target: upstream credentials
+rotate in the secret source (§3.8, `docs/secret-sources-runbook.md`) and
+the server only observes the new value on its next refresh. Gating it here
+would mean either an API that writes secrets (which ADR-009 and the
+secret-source design refuse) or a proposal that merely records an intent
+someone else carries out elsewhere. The approval adapter therefore gates
+policy install and deny-list replacement only; reload, session revoke, and
+artifact purge stay one-person by the §3.10.3 decision. Revisit only if a
+partner's rotation runs through this server rather than their vault.
+
 ### CF-10 · ADR-002: the enterprise licence
 **Model decided 2026-09-05 · enterprise agreement and contribution terms remain open**
 
@@ -658,6 +672,19 @@ in `server::http` and `bootstrap`. The list of what would move is now long
 enough that option 2 ("amend ADR-001") deserves a fresh look: everything
 here is what makes remote deployment *safe*, not what makes it
 *administrable* (Phase C/D).
+
+**Amended 2026-09-05 (Phase D, ADR-012).** D.2 is the first item the
+licensing policy names as a possible proprietary extension, and it landed
+here behind ports so that a later move is a file move: `approvals/mod.rs`
+(the `ApprovalGate` adapter, both `MutationGate` and `ProposalRegistry`),
+`server/admin/proposals.rs` (the `/admin/proposals` endpoints), the
+`Proposals` group in `cli/admin.rs`, and `bootstrap/approvals.rs` (the
+`MCP_ADMIN_APPROVALS` selection). The ports (`ports::mutation_gate`,
+`ports::proposals`), the `admin_proposal` / `admin_approval` /
+`admin_rejection` record kinds, and `PUT /admin/policy` are community.
+D.3 (console authoring) will add its files here when it lands. The move
+must happen **before** the repository is opened; until then it is a
+licence label.
 
 ADR-001 says enterprise code lives in the private repository and "the
 community binary never links enterprise code". The Phase A branch ships
@@ -1053,6 +1080,14 @@ consulted only on admin mutations and the `AdminClient` adapters are
 clients of the boundary, so neither touches the MCP request path. JWT
 cache hit 5.22 µs (9 allocations); cached actor chain 5.49 µs (8); journal
 append p50 16 µs / p99 22 µs / max 129 µs (6). Both absolute budgets hold.
+
+
+Re-run after D.2 (2026-09-05, rev 2.25): every stage's byte and allocation
+count is again identical to the compliance-review baseline. The approval
+adapter runs only on admin mutations and decisions, and its projection is
+built once at startup; the MCP request path is untouched. JWT cache hit
+3.74 µs (9 allocations); cached actor chain 3.95 µs (8); journal append
+p50 11 µs / p99 15 µs / max 89 µs (6). Both absolute budgets hold.
 
 
 Re-run after C.7 (2026-09-04, rev 2.21): all allocation counts and bytes

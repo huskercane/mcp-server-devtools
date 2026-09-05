@@ -7,7 +7,8 @@
 //! admits: that is the behaviour the boundary had before the port existed,
 //! byte for byte. The two-person approval adapter (WP D.2) defers a
 //! mutation into a proposal a second administrator must approve, and is
-//! selected by `MCP_ADMIN_APPROVALS=required` (`bootstrap::approvals`).
+//! selected by `MCP_ADMIN_APPROVALS=required` (`bootstrap::approvals`);
+//! it is [`crate::approvals::ApprovalGate`].
 //!
 //! The intent is borrowed: under [`DirectGate`] admission allocates nothing.
 use crate::policy::Principal;
@@ -56,6 +57,9 @@ pub struct MutationIntent<'a> {
     /// An approval adapter binds its proposal to a digest of these so that
     /// what is applied later is what was proposed, not what is on disk then.
     pub candidate: Option<&'a [u8]>,
+    /// The candidate's detached signature as submitted (base64), so that a
+    /// proposal can be applied later exactly as it was verified.
+    pub signature: Option<&'a str>,
 }
 
 /// The gate's answer.
@@ -69,7 +73,9 @@ pub enum Admission {
     /// proposal itself.
     Deferred { proposal: String },
     /// Never: a bounded, static cause (`approval_self`, `approval_expired`).
-    /// The boundary answers `409` with it.
+    /// The boundary answers `409` with it — except `audit_unavailable`,
+    /// which is not a refusal but the journal being down, and answers `503`
+    /// like every other append failure.
     Refused(&'static str),
 }
 

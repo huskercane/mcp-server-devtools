@@ -491,9 +491,10 @@ fn approvals_setting_selects_direct_or_refuses_startup_by_name() {
         let server = build(value).unwrap_or_else(|error| panic!("{value:?}: {error}"));
         assert_eq!(server.mutation_gate().name(), "direct", "{value:?}");
     }
+    // `required` without a durable journal has nowhere to record a proposal.
     let refused = build(Some("required")).err().expect("refused").to_string();
     assert!(refused.contains(APPROVALS_KEY), "{refused}");
-    assert!(refused.contains("D.2"), "{refused}");
+    assert!(refused.contains("MCP_AUDIT_JOURNAL_DIR"), "{refused}");
     assert!(refused.contains("refusing to start"), "{refused}");
     let unknown = build(Some("maybe")).err().expect("refused").to_string();
     assert!(unknown.contains("maybe"), "{unknown}");

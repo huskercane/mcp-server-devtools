@@ -33,6 +33,10 @@ Unknown request fields are rejected for endpoint-specific request types.
 | POST `/admin/artifacts/purge` | `{"id":"…"}` | `audit_seq`, `id`, `scope` |
 | GET `/admin/deny-list` | No body | `version`, exact loaded `document`, `signature` |
 | PUT `/admin/deny-list` | `{"document":"YAML","signature":"base64 Ed25519 signature"}` | `audit_seq`, `version` |
+| GET `/admin/proposals` | No body | `rows`: the caller's tenant's proposals, oldest first |
+| GET `/admin/proposals/{id}` | No body | `proposal` |
+| POST `/admin/proposals/{id}/approve` | `{}` | `proposal` (`state:approved`, `applied_seq`) |
+| POST `/admin/proposals/{id}/reject` | `{}` or `{"reason":"…"}` (≤ 512 bytes) | `proposal` (`state:rejected`) |
 | POST `/admin/reports/activity` | Optional `since`, `until`, `subject`, `vendor` | `rows`, `records_read`, `stopped` |
 | POST `/admin/reports/access-review` | `{"groups":{"group":["subject"]},"tenant":"…"}` | B.5 access-review `rows` |
 | POST `/admin/usage` | C.6 named `ReportQuery`, e.g. `{"report":"totals","window":{}}` | C.6 `Report` (`shape:totals`, `groups`, or `timeline`) |
@@ -61,8 +65,8 @@ update. The per-request revocation check is authoritative.
 Every mutation asks an admission gate (`ports::MutationGate`, plan §3.10.1)
 before it appends its intent; `MCP_ADMIN_APPROVALS` selects the adapter. The
 default, `off`, admits every mutation, which is the behaviour described above.
-When an adapter holds a mutation for a second administrator (plan §3.10.3,
-`required`), the endpoint answers `202 Accepted` with
+When the approval adapter holds a mutation for a second administrator
+(`required`, the section below), the endpoint answers `202 Accepted` with
 `{"data":{"proposal":"<id>","state":"pending","operation":"…"}}`, where
 `operation` is `policy/reload`, `policy/install`, `deny-list/replace`,
 `sessions/revoke`, or `artifacts/purge`, and appends **no** `admin_mutation` record: nothing has
@@ -104,6 +108,64 @@ present a truncated report as complete. `records_read` counts projection rows
 considered by the query. Access review uses the supplied group snapshot and
 active policy, as B.5 does; it is not an IdP membership fetch.
 
+## Two-person approval
+
+`MCP_ADMIN_APPROVALS=required` (plan §3.10.3) makes two mutations wait for a
+second administrator: policy install (`PUT /admin/policy`) and deny-list
+replacement (`PUT /admin/deny-list`). Policy reload, session revoke, and
+artifact purge stay one-person by decision — reload applies only what is
+already signed on disk, and the other two have a bounded blast radius and are
+journaled. `mcp-devtools revoke` remains the offline-signed emergency path.
+The setting needs the durable journal (`MCP_AUDIT_JOURNAL_DIR`): proposals
+are journal records, and the server refuses to start without one.
+
+The flow, every step a control record before it is a state:
+
+1. The proposer submits the signed candidate to the ordinary endpoint. It
+   is verified exactly as a direct install would be, then journaled as an
+   `admin_proposal` record — carrying the exact document bytes, the
+   signature, the version label it would install as, a `candidate_digest`
+   (`sha256:` over the document bytes, a NUL, and the signature text), and
+   the expiry — and the endpoint answers `202` with the proposal id. Nothing
+   is installed and no `admin_mutation` record is written.
+2. A **different** subject in the same tenant calls `approve` with a token
+   that satisfies the fresh-token rule for writes
+   (`MCP_WRITE_MAX_TOKEN_AGE_SECONDS`, §3.6; a token without an issue time
+   or older than the bound is `403 stale_token`). An `admin_approval`
+   record is made durable, the stored candidate is re-checked against its
+   digest, and the exact stored bytes are applied through the same path a
+   direct call uses, which writes its own `admin_mutation` intent before
+   the effect. The proposal then reports `applied_seq`, that record's
+   sequence. Approving an already approved proposal is idempotent: the
+   same answer, no new record, no second apply.
+3. `reject` (by anyone in the tenant, the proposer included) journals an
+   `admin_rejection` with the bounded reason. A proposal past its TTL
+   (`MCP_ADMIN_APPROVAL_TTL_SECONDS`, default one day) reads as `expired` in
+   every listing, and the first decision asked of it journals one
+   `admin_rejection` with reason `expired`; nothing is applied.
+
+The pending set is a projection of the control journal, rebuilt when a
+`control` process starts, so a restart loses no proposal and needs no other
+backend. A proposal whose journaled candidate no longer matches its digest —
+a journal altered between proposal and approval — is never applied
+(`409 proposal_digest_mismatch`). Because the proposal record carries the
+candidate, a large policy makes a large journal record (bounded by the
+4 MB document limit) that the SIEM forwarder ships like any other.
+
+A proposal is `{id, operation, target, candidate_digest, proposer:{tenant,
+subject}, created, expires, state}` with `decided_by`, `decided`, `reason`,
+and `applied_seq` once they apply; `state` is `pending`, `approved`,
+`rejected`, or `expired`; `operation` is `policy/install` or
+`deny-list/replace`; ids are `p-` and sixteen hex digits. Listings and
+lookups are scoped to the caller's tenant. The endpoint errors, all in the
+ordinary shape: `409 approval_self`, `409 approval_expired`,
+`409 proposal_decided`, `409 proposal_digest_mismatch`, `403 stale_token`,
+`404 not_found`, `503 audit_unavailable`, and `503 approvals_off` when the
+gate is `off`.
+
+Credential rotation has no proposal type: rotation happens in the secret
+source (`docs/secret-sources-runbook.md`), not through this API (CF-36).
+
 ## Command-line client
 
 `mcp-devtools admin` calls this HTTP API. Supply the service origin with
@@ -132,6 +194,7 @@ The remaining commands, following the same connection options, are:
 - `sessions list` / `sessions remove ID` (revokes the session)
 - `artifacts list` / `artifacts remove ID` (purges the artifact)
 - `deny-list read` / `deny-list replace list.yaml --signature list.yaml.sig`
+- `proposals list` / `proposals show ID` / `proposals approve ID` / `proposals reject ID [--reason TEXT]` (ID is `p-` and sixteen hex digits; anything else is refused before a request is made)
 - `report activity --request query.json`
 - `report access-review --request query.json`
 - `usage --request query.json`

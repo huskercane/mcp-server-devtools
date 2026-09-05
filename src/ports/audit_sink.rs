@@ -97,6 +97,16 @@ pub struct AuditEvent {
 pub enum ControlEventKind {
     /// An administrator authorized a mutation; durable before its effects.
     AdminMutation,
+    /// A gated mutation was recorded for a second administrator's decision
+    /// instead of applied (WP D.2). Carries the candidate itself, so the
+    /// pending set can be rebuilt from the journal alone.
+    AdminProposal,
+    /// A different administrator approved a proposal; the candidate is
+    /// applied — under its own `admin_mutation` intent — after this.
+    AdminApproval,
+    /// A proposal was rejected, or found expired when a decision was asked
+    /// for; `reason` says which.
+    AdminRejection,
     /// The policy document in force when the gateway started.
     PolicyLoaded,
     /// A changed policy document was verified and compiled; it is put in
@@ -168,6 +178,28 @@ pub struct ControlEvent {
     pub revoked_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub not_before: Option<String>,
+    /// The proposal a WP D.2 record is about.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<ProposalRecord>,
+}
+
+/// What an `admin_proposal` / `admin_approval` / `admin_rejection` record
+/// says about its proposal. The candidate travels only on the proposal
+/// record; the others name the proposal and, on approval, the digest that
+/// was re-checked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProposalRecord {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires: Option<String>,
+    /// The exact document bytes proposed (UTF-8 YAML).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document: Option<String>,
+    /// The detached signature as submitted (base64).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 impl ControlEvent {
@@ -187,6 +219,7 @@ impl ControlEvent {
             revoked_subjects: None,
             revoked_tokens: None,
             not_before: None,
+            proposal: None,
         }
     }
 

@@ -46,6 +46,11 @@ pub enum Command {
         #[command(subcommand)]
         command: DenyList,
     },
+    /// Two-person approval (WP D.2): pending proposals and decisions.
+    Proposals {
+        #[command(subcommand)]
+        command: Proposals,
+    },
     /// Run a B.5 report with a JSON request file.
     Report {
         #[arg(value_parser = ["activity", "access-review"])]
@@ -83,6 +88,21 @@ pub enum Inventory {
     Remove { id: String },
 }
 #[derive(Debug, Subcommand)]
+pub enum Proposals {
+    List,
+    Show {
+        id: String,
+    },
+    Approve {
+        id: String,
+    },
+    Reject {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+}
+#[derive(Debug, Subcommand)]
 pub enum DenyList {
     Read,
     Replace {
@@ -102,6 +122,16 @@ async fn text_file(path: &Path) -> Result<String, &'static str> {
     tokio::fs::read_to_string(path)
         .await
         .map_err(|_| "file_unavailable")
+}
+/// A proposal id as the server mints them; anything else never becomes
+/// part of a request path.
+fn proposal_id(id: &str) -> Result<&str, &'static str> {
+    let hex = id.strip_prefix("p-").ok_or("invalid_id")?;
+    if hex.len() == 16 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(id)
+    } else {
+        Err("invalid_id")
+    }
 }
 impl Command {
     async fn request(&self) -> Result<(AdminMethod, String, Option<Value>), &'static str> {
@@ -162,6 +192,29 @@ impl Command {
                 Some(
                     json!({"document":text_file(file).await?,"signature":text_file(signature).await?.trim()}),
                 ),
+            ),
+            Self::Proposals {
+                command: Proposals::List,
+            } => (Get, "proposals".into(), None),
+            Self::Proposals {
+                command: Proposals::Show { id },
+            } => (Get, format!("proposals/{}", proposal_id(id)?), None),
+            Self::Proposals {
+                command: Proposals::Approve { id },
+            } => (
+                Post,
+                format!("proposals/{}/approve", proposal_id(id)?),
+                Some(json!({})),
+            ),
+            Self::Proposals {
+                command: Proposals::Reject { id, reason },
+            } => (
+                Post,
+                format!("proposals/{}/reject", proposal_id(id)?),
+                Some(match reason {
+                    Some(reason) => json!({"reason": reason}),
+                    None => json!({}),
+                }),
             ),
             Self::Report { report, request } => (
                 Post,

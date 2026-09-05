@@ -114,6 +114,9 @@ pub struct Components {
     /// unless `MCP_ADMIN_APPROVALS` selects another adapter; the admin
     /// boundary consults it before every durable intent.
     pub mutation_gate: Arc<dyn crate::ports::MutationGate>,
+    /// The approval gate's proposal registry (WP D.2), when that is the
+    /// gate; the admin API's `/admin/proposals` reads and decides from it.
+    pub proposals: Option<Arc<dyn crate::ports::ProposalRegistry>>,
 }
 
 impl Components {
@@ -142,6 +145,7 @@ pub struct ServerBuilder {
     secret_sources: Option<Vec<Arc<dyn SecretSource>>>,
     serves_control: bool,
     mutation_gate: Option<Arc<dyn crate::ports::MutationGate>>,
+    proposals: Option<Arc<dyn crate::ports::ProposalRegistry>>,
 }
 
 impl Default for ServerBuilder {
@@ -159,6 +163,7 @@ impl Default for ServerBuilder {
             secret_sources: None,
             serves_control: true,
             mutation_gate: None,
+            proposals: None,
         }
     }
 }
@@ -257,6 +262,14 @@ impl ServerBuilder {
     #[must_use]
     pub fn mutation_gate(mut self, gate: Arc<dyn crate::ports::MutationGate>) -> Self {
         self.mutation_gate = Some(gate);
+        self
+    }
+
+    /// The proposal registry to serve `/admin/proposals` from, beside an
+    /// injected approval gate (tests, embedders).
+    #[must_use]
+    pub fn proposals(mut self, registry: Arc<dyn crate::ports::ProposalRegistry>) -> Self {
+        self.proposals = Some(registry);
         self
     }
 
@@ -359,12 +372,13 @@ impl ServerBuilder {
 
         // The admission adapter is selected before the boundary exists:
         // a setting naming an adapter this binary lacks refuses startup.
-        let mutation_gate = match self.mutation_gate {
-            Some(gate) => gate,
-            None => approvals::gate_from_config(&config).map_err(|error| {
-                crate::error::unexpected(format!("{error}; refusing to start"), None)
-            })?,
-        };
+        let (mutation_gate, proposals) = select_gate(
+            self.mutation_gate,
+            self.proposals,
+            &config,
+            audit_sink.as_ref(),
+            audit_append_timeout,
+        )?;
 
         let components = Arc::new(Components {
             config: ConfigHandle::new(config),
@@ -390,6 +404,7 @@ impl ServerBuilder {
             rollup_health: Arc::default(),
             rollup_retention,
             mutation_gate,
+            proposals,
         });
 
         if let Some(pending) = watched {
@@ -402,6 +417,34 @@ impl ServerBuilder {
 
 /// Config key enabling the durable audit journal.
 pub const AUDIT_JOURNAL_DIR_KEY: &str = "MCP_AUDIT_JOURNAL_DIR";
+
+type SelectedGate = (
+    Arc<dyn crate::ports::MutationGate>,
+    Option<Arc<dyn crate::ports::ProposalRegistry>>,
+);
+
+/// The admission gate: the one the builder was handed, else the one the
+/// configuration selects. Selected before the boundary exists, so a
+/// setting naming an adapter this binary cannot run refuses startup.
+fn select_gate(
+    injected: Option<Arc<dyn crate::ports::MutationGate>>,
+    proposals: Option<Arc<dyn crate::ports::ProposalRegistry>>,
+    config: &Config,
+    audit_sink: Option<&Arc<dyn AuditSink>>,
+    append_timeout: std::time::Duration,
+) -> Result<SelectedGate, McpError> {
+    let selected = if let Some(gate) = injected {
+        (gate, proposals)
+    } else {
+        let selected =
+            approvals::gate_from_config(config, audit_sink, append_timeout).map_err(|error| {
+                crate::error::unexpected(format!("{error}; refusing to start"), None)
+            })?;
+        (selected.gate, selected.proposals)
+    };
+    tracing::info!(gate = selected.0.name(), "admin mutation gate selected");
+    Ok(selected)
+}
 
 /// The configured journal directory, if any. Blank counts as absent.
 fn configured_journal_dir(config: &Config) -> Option<&str> {
