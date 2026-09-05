@@ -22,6 +22,7 @@ ordered by partner demand and are not scheduled until Gate B passes.
 | Rev | Date | Change | Driven by |
 |---|---|---|---|
 | 2.23 | 2026-09-05 | Owner selected Apache-2.0 for the current community crate and proprietary commercial licensing for separate enterprise extensions. Current community features remain in this crate; earlier ISC permissions are preserved. Release archives and the container carry license notices. ADR-001/002 amended; enterprise agreement text and contribution terms remain open. See [licensing policy](licensing.md). | Owner |
+| 2.24 | 2026-09-05 | D.0 landed on `feat/phase-d-administration` under ADR-012 as proposed (the owner's instruction that everything lands in this repository; the ADR row still awaits its formal status). `ports::MutationGate` (`MutationIntent` borrowed: kind, principal, target, candidate bytes; `Admission::{Apply, Deferred{proposal}, Refused(cause)}`) is consulted by every admin mutation before its durable `admin_mutation` intent — the deny-list on the *verified* candidate bytes and version — with `DirectGate` as the community adapter; a deferral is `202 {proposal, state:pending, operation}` and no journal record, a refusal `409` with the cause. `MCP_ADMIN_APPROVALS` (`bootstrap::approvals`) is the only reader: unset/`off` is direct, `required` is a typed startup refusal naming D.2 until the adapter exists. `ports::AdminClient` (`AdminMethod`, `AdminRequest`, `AdminResponse`, `AdminClientError` carrying the CLI's existing error codes) with `admin::HttpAdminClient` extracted from `cli::admin` (behaviour unchanged) and `admin::LocalAdminClient` (`tower::ServiceExt::oneshot` on the admin router; `tower` exact-pinned). `router_with_policy` takes the gate; `router` picks the server's. One conformance suite runs over both adapters; the existing admin tests run under `Direct` unchanged. Deviation from §3.10.1 as written: `AdminClient` takes an `AdminRequest` rather than an `AdminOp` enum, since the operation is the path and a closed enum would make every new endpoint a port change. Not done: the gate's name is not yet in the startup log or health banner (D.2 adds it with the adapter that makes it informative). Allocation probe: every stage unchanged. Next: D.2 API-first, starting with `PUT /admin/policy` | Implementation |
 | 1 | 2026-08-28 | Initial plan: six phases, two gates, console in Phase 5 | Brief |
 | 1.1 | 2026-08-29 | Admin CLI, policy-engine options, stay-in-Rust decision, Kubernetes topology, container in Phase 1 | Owner |
 | 2 | 2026-08-29 | Canonical `ActionContext` for resource-aware policy; durable `AuditSink` split from lossy `UsageSink`; licensing boundary moved to M0; minimal `CredentialBroker` in the first slice; commercial gates moved before Phase C; wedge vendors demoted to a hypothesis; Phase 5 split into C/D; revocation, canonicalization, client-identity, response-metadata, and availability corrections; business-plan gaps and trial metrics added | Independent review |
@@ -875,7 +876,7 @@ demand, and D.4 can run in parallel with anything since it touches only
 
 | WP | Work | Where (ADR-012) | Size |
 |---|---|---|---|
-| D.0 | Seams (§3.10.1): `ports::MutationGate` with the `Direct` adapter on every admin mutation, selected by `MCP_ADMIN_APPROVALS`; `ports::AdminClient` with the HTTP adapter extracted from `cli::admin` and the in-process adapter; conformance suite across both adapters; existing admin tests unchanged under `Direct` | This repo | S |
+| D.0 | **Landed (rev 2.24).** Seams (§3.10.1): `ports::MutationGate` with the `Direct` adapter on every admin mutation, selected by `MCP_ADMIN_APPROVALS`; `ports::AdminClient` with the HTTP adapter extracted from `cli::admin` and the in-process adapter; conformance suite across both adapters; existing admin tests unchanged under `Direct` | This repo | S |
 | D.2 | Two-person approval (§3.10.3), **API first**: `PUT /admin/policy` (signed bundle + signature; `Direct`-gated until the adapter exists), the approval `MutationGate` adapter with `admin_proposal` / `admin_approval` / `admin_rejection` control records and the startup projection, `POST /admin/proposals/{id}/approve` and `…/reject`, `GET /admin/proposals`, proposer ≠ approver, fresh-token rule, digest re-check, TTL; `admin proposals` CLI group; console page last (after D.1). Locked JSON shapes; journal record shapes locked by tests | This repo; on CF-18's would-move list | M |
 | D.1 | Console v1, read-only (§3.10.2): `console` feature, askama + `rust-embed`, vendored htmx 4.x with digest test, PKCE login and bounded in-memory sessions, strict CSP and CSRF checks, pages for policy + explain, activity, access review, usage, sessions/artifacts, health; `POST /admin/policy/explain` for both clients; probe stage −1f; IdP client-registration runbook sections | This repo (`console` feature) | L |
 | D.4 | Packaging (§3.10.4): `.deb`/`.rpm` with a hardened systemd unit and container-install CI proof; compose reference stack; air-gap: `JwksLocation::File`, `auth jwks fetch`, `cargo vendor` tarball with an `--offline` build step, mirrored-image runbook. Offline licence waits on CF-10; OVA on request | This repo | M |
@@ -906,8 +907,17 @@ caller's own upstream identity with `authority=delegated` in the record.
       "credential rotation" gap; split-topology console inventory; the
       vendors D.5 did not do).
 
-**Status 2026-09-05:** planned; nothing landed. ADR-012 and ADR-013 await
-the owner. Gate B remains unrecorded, as it was for Phase C.
+**Status 2026-09-05:** D.0 landed (rev 2.24) on
+`feat/phase-d-administration`; D.2 in progress, API first. ADR-012 is
+applied in practice (everything lands here) and ADR-013 awaits the owner
+before D.1. Gate B remains unrecorded, as it was for Phase C.
+
+- [x] D.0 seams — `MutationGate` / `Direct`, `AdminClient` / HTTP + in-process, conformance suite (rev 2.24)
+- [ ] D.2 two-person approval, API first
+- [ ] D.1 console v1, read-only (after ADR-013)
+- [ ] D.4 packaging and air-gap
+- [ ] D.3 console v2, policy authoring
+- [ ] D.5 delegated upstream identity (behind §11 item 4)
 
 ## 5. Non-engineering tracks (run in parallel)
 

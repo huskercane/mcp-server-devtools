@@ -1046,6 +1046,15 @@ p99 62 µs, max 578 µs (6 allocations). Both absolute p99/cache-hit budgets
 hold; no allocation regression was observed.
 
 
+Re-run after D.0 (2026-09-05, rev 2.24): every stage's byte and allocation
+count is identical to the 2026-09-05 compliance-review baseline
+(`benchmarks/2026-09-05-claude-compliance.txt`). The admission gate is
+consulted only on admin mutations and the `AdminClient` adapters are
+clients of the boundary, so neither touches the MCP request path. JWT
+cache hit 5.22 µs (9 allocations); cached actor chain 5.49 µs (8); journal
+append p50 16 µs / p99 22 µs / max 129 µs (6). Both absolute budgets hold.
+
+
 Re-run after C.7 (2026-09-04, rev 2.21): all allocation counts and bytes
 remain identical to C.5; no production Rust request-path changes. JWT cache
 hit: 9 allocations / 15.97 µs; journal: 6 allocations, p50 45 µs / p99 133 µs /

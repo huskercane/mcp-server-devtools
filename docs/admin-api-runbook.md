@@ -51,6 +51,30 @@ mismatched pair: startup refuses it. Restore a matching signed pair to recover.
 The validated-token cache is cleared and process sessions are closed after an
 update. The per-request revocation check is authoritative.
 
+Every mutation asks an admission gate (`ports::MutationGate`, plan §3.10.1)
+before it appends its intent; `MCP_ADMIN_APPROVALS` selects the adapter. The
+default, `off`, admits every mutation, which is the behaviour described above.
+When an adapter holds a mutation for a second administrator (plan §3.10.3,
+`required`), the endpoint answers `202 Accepted` with
+`{"data":{"proposal":"<id>","state":"pending","operation":"…"}}`, where
+`operation` is `policy/reload`, `deny-list/replace`, `sessions/revoke`, or
+`artifacts/purge`, and appends **no** `admin_mutation` record: nothing has
+changed, and the adapter journals the proposal itself. When the gate refuses,
+the endpoint answers `409 Conflict` in the ordinary error shape with the gate's
+cause as `error` (`approval_self`, `approval_expired`), again with no record.
+A deny-list replacement is admitted on the verified candidate bytes and
+version, so a held proposal is bound to the exact document submitted, not to
+whatever is on disk when it is approved.
+
+Both clients of this API depend on one port, `ports::AdminClient`: a method,
+the operation path under `/admin/`, an optional JSON body, and whatever status
+and body the boundary answered. The command-line client below uses the HTTP
+adapter (`admin::HttpAdminClient`, which owns the URL and transport rules in
+the next section). An in-process adapter (`admin::LocalAdminClient`) drives
+the same router without a socket — same bearer check, same limiter, same
+audit — for embedders and the console (plan §3.10.2). One conformance suite
+runs against both adapters, so a client cannot tell which it holds.
+
 `scope:process` is literal. Sessions and artifacts belong to the co-located
 `all` process. A separate `control` process returns `admin_backend_unavailable`
 for those inventories and principal/session lookup; there is no gateway RPC
