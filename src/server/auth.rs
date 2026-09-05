@@ -35,6 +35,8 @@
 //! Rejections are logged as their category only. Error bodies carry the
 //! category, never the token or any claim value.
 
+use crate::policy::Principal;
+
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
@@ -134,9 +136,12 @@ impl InboundAuthSettings {
     }
 }
 
-/// The middleware's state: a validator, the settings, and — in enterprise
-/// mode — the revocation list and where to journal refusals.
+type ObservedPrincipals =
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, Principal>>;
+
+/// Shared inbound token validation and control-plane observation state.
 pub struct InboundAuth {
+    observed: Arc<std::sync::RwLock<ObservedPrincipals>>,
     validator: Arc<dyn TokenValidator>,
     settings: InboundAuthSettings,
     revocations: Option<Arc<RevocationList>>,
@@ -150,11 +155,76 @@ impl InboundAuth {
     #[must_use]
     pub fn new(validator: Arc<dyn TokenValidator>, settings: InboundAuthSettings) -> Self {
         Self {
+            observed: Arc::default(),
             validator,
             settings,
             revocations: None,
             audit: None,
             rate_limit: None,
+        }
+    }
+
+    /// Independent admin boundary: same validator/revocations, a distinct scope
+    /// and limiter. Never spends the MCP request budget.
+    #[must_use]
+    pub fn for_admin(&self) -> Self {
+        let mut settings = self.settings.clone();
+        settings.required_scope = "mcp:admin".into();
+        Self {
+            observed: self.observed.clone(),
+            validator: self.validator.clone(),
+            settings,
+            revocations: self.revocations.clone(),
+            audit: self.audit.clone(),
+            rate_limit: Some(Arc::new(super::rate_limit::RateLimiter::new(
+                super::rate_limit::RateLimitSettings {
+                    per_second: 5.0,
+                    burst: 10.0,
+                },
+            ))),
+        }
+    }
+
+    /// Recently authenticated principal metadata, bounded to 10,000 entries.
+    /// This is observed token state, never a live identity-provider directory.
+    pub fn observed_principal(&self, tenant: &str, subject: &str) -> Option<Principal> {
+        self.observed
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(tenant)
+            .and_then(|subjects| subjects.get(subject))
+            .cloned()
+    }
+
+    /// Record metadata from an already authenticated principal (never an authorization input).
+    /// Exposed for the allocation probe; HTTP calls this only after validation.
+    pub fn observe(&self, principal: &Principal) {
+        // Known, unchanged principals allocate nothing. Inventory eviction
+        // cannot affect authorization.
+        if self
+            .observed
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&principal.tenant)
+            .and_then(|subjects| subjects.get(&principal.subject))
+            != Some(principal)
+        {
+            let mut observed = self
+                .observed
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if observed
+                .values()
+                .map(std::collections::BTreeMap::len)
+                .sum::<usize>()
+                >= 10_000
+            {
+                observed.pop_first();
+            }
+            observed
+                .entry(principal.tenant.clone())
+                .or_default()
+                .insert(principal.subject.clone(), principal.clone());
         }
     }
 
@@ -376,6 +446,8 @@ pub async fn require_bearer(
         );
         return auth.insufficient_scope();
     }
+
+    auth.observe(&principal);
 
     // C.6: a validated, in-scope principal past its budget is refused
     // with a retry hint. Category only in the log, as above.

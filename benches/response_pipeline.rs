@@ -498,6 +498,31 @@ fn probe_usage_path() {
     while receiver.try_recv().is_ok() {}
 }
 
+fn probe_principal_inventory() {
+    use mcp_server_devtools::policy::{Principal, PrincipalAuthority};
+    use mcp_server_devtools::ports::StaticValidator;
+    use mcp_server_devtools::server::auth::{InboundAuth, InboundAuthSettings};
+    let auth = InboundAuth::new(
+        std::sync::Arc::new(StaticValidator::new()),
+        InboundAuthSettings {
+            public_url: "https://mcp.example".into(),
+            authorization_servers: vec![],
+            required_scope: "mcp:tools".into(),
+        },
+    );
+    let principal = Principal {
+        tenant: "acme".into(),
+        subject: "sre@acme.example".into(),
+        groups: vec!["sre".into()],
+        scopes: vec!["mcp:tools".into()],
+        authority: PrincipalAuthority::oidc("https://issuer.example"),
+    };
+    auth.observe(&principal);
+    probe("observe principal, known unchanged", 2000, || {
+        auth.observe(std::hint::black_box(&principal))
+    });
+}
+
 fn main() {
     println!("=== output size: is TOON earning its CPU? ===");
     output_size_comparison();
@@ -517,6 +542,8 @@ fn main() {
     // stages below it is paid even by a request that returns two bytes.
     println!("\n=== stage -1d: usage side of the request path (mean of 2000) — C.6 ===");
     probe_usage_path();
+    println!("\n=== stage -1e: principal inventory — C.4 ===");
+    probe_principal_inventory();
     println!("\n=== stage 0: per-tool-call config snapshot (mean of 1000) ===");
     let config = realistic_config();
     let handle = ConfigHandle::new(realistic_config());

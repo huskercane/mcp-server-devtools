@@ -127,3 +127,11 @@ carry-forward register). The native Vault / OpenBao adapter (`vault://`,
 (`awssm://`, `azkv://`, C.2c–d) are deferred until a partner asks for
 them, so the CSI providers in `secrets-csi.yaml` are the supported way to
 reach those stores.
+
+C.4 administrative API configuration is described in
+[`docs/admin-api-runbook.md`](../../docs/admin-api-runbook.md). The starter
+control manifest remains loopback/auth-off; it deliberately exposes no admin
+API until an operator supplies the same OIDC, signed-policy, signed-revocation,
+and writable signed-audit configuration required by the gateway. Route
+`/admin/` to that authenticated control service. Use role `all` for local
+session/artifact administration until shared adapters are available (CF-16).

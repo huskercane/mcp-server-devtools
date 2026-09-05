@@ -317,3 +317,38 @@ impl SessionManager for ReapingSessionManager {
         Ok(stream)
     }
 }
+
+impl crate::ports::admin_inventory::SessionStore for ReapingSessionManager {
+    fn list(
+        &self,
+    ) -> crate::ports::admin_inventory::InventoryFuture<
+        '_,
+        Vec<crate::ports::admin_inventory::SessionEntry>,
+    > {
+        Box::pin(async move {
+            let mut rows: Vec<_> = self
+                .sessions
+                .read()
+                .await
+                .iter()
+                .map(|(id, state)| crate::ports::admin_inventory::SessionEntry {
+                    id: id.to_string(),
+                    owner: state.owner.clone(),
+                })
+                .collect();
+            rows.sort_by(|a, b| a.id.cmp(&b.id));
+            Ok(rows)
+        })
+    }
+    fn revoke<'a>(&'a self, id: &'a str) -> crate::ports::admin_inventory::InventoryFuture<'a, ()> {
+        Box::pin(async move {
+            let id = SessionId::from(id.to_owned());
+            if !self.sessions.read().await.contains_key(&id) {
+                return Err(crate::ports::admin_inventory::InventoryError::NotFound);
+            }
+            self.close_session(&id)
+                .await
+                .map_err(|_| crate::ports::admin_inventory::InventoryError::Unavailable)
+        })
+    }
+}

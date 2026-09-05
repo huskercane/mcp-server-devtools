@@ -362,6 +362,7 @@ pub fn build_app_with_cancel(
     // Arc<Components>, including NinjaOne console sessions and other caches.
     let shared_server = DevtoolsServer::new()?;
     Ok(build_app_inner(
+        true,
         shared_server,
         None,
         idle_ttl,
@@ -379,7 +380,7 @@ pub fn build_app_with_server(
     sweep_interval: Duration,
     cancel: CancellationToken,
 ) -> Router {
-    build_app_inner(server, None, idle_ttl, sweep_interval, cancel)
+    build_app_inner(true, server, None, idle_ttl, sweep_interval, cancel)
 }
 
 /// Like [`build_app_with_server`], with inbound bearer authentication in
@@ -394,7 +395,7 @@ pub fn build_app_with_server_and_auth(
     sweep_interval: Duration,
     cancel: CancellationToken,
 ) -> Router {
-    build_app_inner(server, Some(auth), idle_ttl, sweep_interval, cancel)
+    build_app_inner(true, server, Some(auth), idle_ttl, sweep_interval, cancel)
 }
 
 /// The router for a [`Role`]. `All` and `Gateway` are the full data plane;
@@ -408,13 +409,32 @@ pub fn build_app_for_role(
     cancel: CancellationToken,
 ) -> Router {
     if role.serves_gateway() {
-        return build_app_inner(server, auth, idle_ttl, sweep_interval, cancel);
+        return build_app_inner(
+            role.serves_control(),
+            server,
+            auth,
+            idle_ttl,
+            sweep_interval,
+            cancel,
+        );
     }
     // Control role: health only. Every other path is a 404 — there is no
     // data plane here, and nothing to hand a caller who reached the wrong
     // replica. The cross-cutting guards stay so the surface is uniform.
     let metrics_server = server.clone();
+    let admin = auth.map_or_else(Router::new, |auth| {
+        let manager = Arc::new(ReapingSessionManager::new(idle_ttl));
+        watch_revocations(&auth, &manager);
+        super::admin::router(
+            server.clone(),
+            &auth,
+            None,
+            None,
+            admin_reports(&server, cancel.clone()),
+        )
+    });
     Router::new()
+        .merge(admin)
         .route(
             "/",
             get(move || {
@@ -432,7 +452,26 @@ pub fn build_app_for_role(
         .layer(middleware::from_fn(origin_allowlist))
 }
 
+fn admin_reports(
+    server: &DevtoolsServer,
+    cancel: CancellationToken,
+) -> Option<Arc<dyn crate::ports::activity_reports::ActivityReports>> {
+    let config = server.config();
+    let directory = config.get(crate::bootstrap::AUDIT_JOURNAL_DIR_KEY)?;
+    let rollups = config
+        .get(crate::rollups::STORE_KEY)?
+        .strip_prefix("sqlite://")?;
+    let path = std::path::PathBuf::from(format!("{rollups}.activity.sqlite"));
+    let store = crate::audit::activity_sqlite::SqliteActivityReports::open(&path).ok()?;
+    store.spawn(
+        std::path::PathBuf::from(directory).join(crate::audit::journal::JOURNAL_FILE_NAME),
+        cancel,
+    );
+    Some(store)
+}
+
 fn build_app_inner(
+    serves_control: bool,
     shared_server: DevtoolsServer,
     auth: Option<Arc<InboundAuth>>,
     idle_ttl: Duration,
@@ -441,6 +480,19 @@ fn build_app_inner(
 ) -> Router {
     let manager = Arc::new(ReapingSessionManager::new(idle_ttl));
     manager.spawn_reaper(sweep_interval);
+    let admin = if serves_control {
+        auth.as_ref().map_or_else(Router::new, |auth| {
+            super::admin::router(
+                shared_server.clone(),
+                auth,
+                Some(manager.clone()),
+                Some(Arc::new(crate::transport::raw_response::LocalArtifactStore)),
+                admin_reports(&shared_server, cancel.clone()),
+            )
+        })
+    } else {
+        Router::new()
+    };
     let health_server = shared_server.clone();
     let streamable = StreamableHttpService::new(
         move || Ok(shared_server.clone()),
@@ -505,11 +557,11 @@ fn build_app_inner(
         // Inner layer first: the session binding runs after the bearer
         // check has placed the principal in the extensions.
         protected = protected
-            .layer(middleware::from_fn_with_state(
+            .route_layer(middleware::from_fn_with_state(
                 Arc::clone(&manager),
                 crate::server::session::enforce_session_owner,
             ))
-            .layer(middleware::from_fn_with_state(
+            .route_layer(middleware::from_fn_with_state(
                 Arc::clone(&auth),
                 require_bearer,
             ));
@@ -527,6 +579,7 @@ fn build_app_inner(
     // registering the `/mcp` routes, so both cover the `GET /` health endpoint
     // as well.
     public
+        .merge(admin)
         .merge(protected)
         .layer(middleware::from_fn(origin_allowlist))
         .layer(cors)

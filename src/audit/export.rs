@@ -49,7 +49,7 @@ pub struct ActivityFilter {
 }
 
 /// One journal record, flattened.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 pub struct ActivityRow {
     pub seq: u64,
     pub timestamp: String,
@@ -278,6 +278,32 @@ impl ActivityFilter {
     }
 }
 
+/// File-backed activity reports. Bounded output prevents an administrative
+/// query from accumulating an arbitrarily large journal in memory.
+pub struct JournalActivityReports {
+    path: std::path::PathBuf,
+}
+impl JournalActivityReports {
+    pub fn new(path: std::path::PathBuf) -> Self {
+        Self { path }
+    }
+}
+impl crate::ports::activity_reports::ActivityReports for JournalActivityReports {
+    fn activity<'a>(
+        &'a self,
+        filter: &'a ActivityFilter,
+    ) -> crate::ports::activity_reports::ActivityFuture<'a> {
+        let path = self.path.clone();
+        let filter = filter.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || activity_bounded(&path, &filter, 10_000))
+                .await
+                .map_err(|_| crate::ports::activity_reports::ActivityUnavailable)?
+                .map_err(|_| crate::ports::activity_reports::ActivityUnavailable)
+        })
+    }
+}
+
 /// Read the journal at `journal` and flatten every record the filter keeps.
 ///
 /// # Errors
@@ -285,6 +311,14 @@ impl ActivityFilter {
 /// When the journal cannot be opened. A read that stops early is reported
 /// in [`ActivityExport::stopped`], not as an error.
 pub fn activity(journal: &Path, filter: &ActivityFilter) -> io::Result<ActivityExport> {
+    activity_bounded(journal, filter, usize::MAX)
+}
+
+fn activity_bounded(
+    journal: &Path,
+    filter: &ActivityFilter,
+    limit: usize,
+) -> io::Result<ActivityExport> {
     let reader = JournalReader::open(journal)?;
     let mut export = ActivityExport::default();
     for item in reader {
@@ -293,6 +327,10 @@ pub fn activity(journal: &Path, filter: &ActivityFilter) -> io::Result<ActivityE
                 export.records_read += 1;
                 let row = flatten(record.seq, &record.kind, &record.value);
                 if filter.keeps(&row) {
+                    if export.rows.len() == limit {
+                        export.stopped = Some("row_limit: narrow the time window".into());
+                        break;
+                    }
                     export.rows.push(row);
                 }
             }

@@ -257,6 +257,11 @@ impl DevtoolsServer {
         Arc::clone(&self.components.rollup_health)
     }
 
+    /// The active policy bundle, for audited control operations.
+    pub fn policy_file(&self) -> Option<Arc<crate::policy::FilePolicy>> {
+        self.components.policy_file.clone()
+    }
+
     /// The rollup store, for the admin API's reports.
     #[must_use]
     pub fn rollup_store(&self) -> Option<Arc<dyn crate::ports::RollupStore>> {
@@ -298,7 +303,7 @@ impl DevtoolsServer {
     /// Snapshot the current config. Returns an `Arc` so a tool call costs one
     /// atomic increment instead of deep-cloning the credential maps; `&Arc<Config>`
     /// deref-coerces to the `&Config` every context factory takes.
-    fn config(&self) -> Arc<Config> {
+    pub(crate) fn config(&self) -> Arc<Config> {
         self.components.config()
     }
 

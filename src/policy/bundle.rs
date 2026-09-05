@@ -159,6 +159,7 @@ pub type ChangeHook<D> = Box<dyn Fn(&Arc<Loaded<D>>, &Arc<Loaded<D>>) + Send + S
 
 /// A document on disk, verified, compiled, hot-reloadable.
 pub struct SignedBundle<D> {
+    pub(crate) mutation: tokio::sync::Mutex<()>,
     path: PathBuf,
     /// The key documents must be signed with; `None` for unsigned local
     /// dry runs.
@@ -223,6 +224,7 @@ impl<D: BundleDocument> SignedBundle<D> {
             BundleError::new(format!("{} {}: {error}", D::NOUN, path.display()))
         })?;
         Ok(Arc::new(Self {
+            mutation: tokio::sync::Mutex::new(()),
             path: path.to_owned(),
             verifier,
             current: RwLock::new(Arc::new(Loaded {
@@ -250,6 +252,7 @@ impl<D: BundleDocument> SignedBundle<D> {
         }
         let document = D::compile(bytes)?;
         Ok(Arc::new(Self {
+            mutation: tokio::sync::Mutex::new(()),
             path: PathBuf::new(),
             verifier: None,
             current: RwLock::new(Arc::new(Loaded {
@@ -260,6 +263,41 @@ impl<D: BundleDocument> SignedBundle<D> {
             last_reload_error: Mutex::new(None),
             last_journaled_rejection: Mutex::new(None),
         }))
+    }
+
+    /// Exact currently loaded document bytes, for control-plane inspection.
+    pub fn document_bytes(&self) -> Vec<u8> {
+        self.loaded_bytes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Verify an uploaded candidate using the same trust anchor as file reloads.
+    pub fn stage_candidate(&self, bytes: &[u8], signature: &str) -> Result<Staged<D>, BundleError> {
+        if bytes.len() > MAX_DOCUMENT_BYTES {
+            return Err(BundleError::new("document too large"));
+        }
+        let document = D::compile(bytes)?;
+        let verifier = self
+            .verifier
+            .as_ref()
+            .ok_or_else(|| BundleError::new("signed bundle required"))?;
+        let signature = super::signing::Signature::from_base64(signature)
+            .map_err(|_| BundleError::new("invalid signature"))?;
+        verifier
+            .verify(D::DOMAIN, bytes, &signature)
+            .map_err(|_| BundleError::new("invalid signature"))?;
+        Ok(Staged {
+            loaded: Loaded {
+                document,
+                signature: Some(SignatureStatus {
+                    verified: true,
+                    key_id: Some(verifier.key_id()),
+                }),
+            },
+            bytes: bytes.to_vec(),
+        })
     }
 
     /// The document in force. One `Arc` clone; readers keep their snapshot
@@ -483,6 +521,7 @@ impl<D: BundleDocument> SignedBundle<D> {
         audit: Option<&BundleAudit>,
         on_change: Option<&ChangeHook<D>>,
     ) {
+        let _guard = self.mutation.lock().await;
         let path = self.path.clone();
         // Reading, verifying, and compiling is file I/O plus parsing: off
         // the worker threads.

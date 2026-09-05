@@ -20,6 +20,8 @@
 //! is therefore a type parameter on the one function that needs it — not a
 //! heap allocation on every request.
 
+pub mod activity_reports;
+pub mod admin_inventory;
 pub mod audit_forwarder;
 pub mod audit_sink;
 pub mod checkpoint_sink;

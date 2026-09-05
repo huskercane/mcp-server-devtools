@@ -10,7 +10,15 @@ removed only when it is done, not when it is explained.
 
 Status legend: **open** · **blocked** (needs a decision) · **done**.
 
-Last updated: 2026-09-04, after C.6 (usage rollups, Prometheus metrics,
+Last updated: 2026-09-04, after C.4 (admin API) landed locally on
+`feat/phase-c-operations` (plan rev 2.19). The API has durable mutation
+intents, independent scope/rate/task budgets, signed document operations,
+process inventories, projected activity reports, and RollupStore usage.
+CF-16's shared-state limitation remains explicit; CF-7/CF-28 are next in C.5.
+All 1,064 tests and formatting, both clippy feature sets, cargo-deny,
+benchmark, and diff gates passed. No dependencies added.
+
+Previously: 2026-09-04, after C.6 (usage rollups, Prometheus metrics,
 and per-principal rate limiting) landed on `feat/phase-c-operations`
 (plan §0 rev 2.18). CF-16 now records that the limiter is in-process and
 therefore single-replica. CF-33 now covers gateway-to-control usage
@@ -320,6 +328,16 @@ tracker holds the append and the drain completes once the journal does.
 
 ### CF-16 · Session affinity past one replica; emergency deny
 **Open · Phase C (scaling) / Phase B (revocation)**
+
+C.4 amendment (rev 2.19): the admin API's `SessionStore` and `ArtifactStore`
+inventory ports wrap the real process-local managers. Role `all` can list,
+revoke, and purge its own state. A separate control process returns an
+explicit backend-unavailable error; it cannot claim a gateway's inventory
+is empty or revoke state it cannot reach. Shared/RPC adapters remain this
+item's scaling work. Observed principals are bounded token metadata, not
+live IdP membership. Activity reports use a rebuildable SQLite projection;
+its adjacent `.activity.sqlite` file is rebuildable from the journal.
+
 
 Two things the review showed the Phase A deployment example implied but
 could not deliver:
@@ -804,6 +822,7 @@ and every extractor stage is byte-for-byte what Phase A recorded.
 | −1d rate-limit check, known subject (enterprise only) | 0 | 0 | new in C.6 |
 | −1d `PrometheusUsageSink::record`, known series (enterprise only) | 0 | 0 | new in C.6 |
 | −1d Prometheus + bounded-channel fan-out (enterprise only) | <1 KB | 9 | new in C.6 |
+| −1e observed principal, known unchanged (enterprise only) | 0 | 0 | new in C.4 |
 | 0 `ConfigHandle::snapshot()` | 0 | 0 | 0 |
 | 1 `apply_jq_filter(None)` | 0 | 0 | 0 |
 | 2 `render(Toon)` @ 500 issues | 1736 KB | 19 032 | 19 032 |
@@ -928,3 +947,15 @@ Notes recorded at the Phase A boundary:
   moved; the cost is two or three allocations per outbound request inside
   an enforcing scope.
 - The §8 CI comparison itself is CF-20.
+
+
+Re-run after C.4 (2026-09-04, rev 2.19): every existing allocation count
+and byte count is unchanged from C.6. JWT cache hit: 9 allocations, 5.46 µs;
+journal append: 6 allocations, p50 16 µs / p99 44 µs / max 88 µs. Timing
+figures are observed wall-clock results, not a claim of unchanged latency;
+both remain within their absolute budgets. Stage −1e measures the new
+principal-inventory request-path operation: a known unchanged principal is
+0 bytes / 0 allocations. Nested BTreeMaps allow borrowed tenant/subject
+lookups and deterministic bounded eviction; only new/changed metadata is
+cloned. Admin requests, projection ingestion, and initial inventory fills
+are outside that steady-state probe.

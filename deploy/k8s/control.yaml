@@ -1,6 +1,6 @@
-# The control role. Phase A: health only. Phase C adds SIEM forwarding here
-# (C.3, below) and owns the rollup database (C.6); the admin API and the
-# console follow behind this same Service.
+# The control role: SIEM forwarding (C.3), admin API (C.4), and rollups
+# (C.6). The safe starter below is auth-off/loopback, so admin is disabled.
+# See docs/admin-api-runbook.md before configuring inbound OIDC and ingress.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -31,8 +31,8 @@ spec:
               containerPort: 3000
           env:
             # The control role holds no vendor credentials and serves no
-            # tool traffic; it runs in local auth mode until Phase C gives
-            # it an admin API of its own.
+            # tool traffic. To enable admin, configure inbound OIDC, signed
+            # policy/revocations, and a writable signed audit journal.
             - { name: MCP_AUTH_MODE, value: "off" }
             - { name: MCP_BIND_ADDR, value: "127.0.0.1" }
             # --- Audit forwarding to a SIEM (WP C.3) -----------------------
