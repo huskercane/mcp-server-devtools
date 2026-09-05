@@ -246,7 +246,7 @@ fn policy_stage() {
         subject: "sre@acme.example".to_owned(),
         groups: vec!["SRE".to_owned(), "Developers".to_owned()],
         scopes: vec!["mcp:tools".to_owned()],
-        authority: PrincipalAuthority::Okta,
+        authority: PrincipalAuthority::oidc("https://acme.okta.com/oauth2/default"),
     };
     let upstream = UpstreamIdentity {
         label: CredentialLabel::slot(
@@ -257,6 +257,7 @@ fn policy_stage() {
         vendor: "grafana".to_owned(),
         environment: EnvironmentClass::Qa,
         authority: UpstreamAuthority::Shared,
+        provenance: None,
     };
     let arguments =
         json!({ "datasourceUid": "loki-qa-main", "query": "{app=\"api\"}", "limit": 100 });
@@ -319,7 +320,7 @@ fn enterprise_request_path_stage() {
     use std::sync::Arc;
 
     use mcp_server_devtools::audit::journal::{JOURNAL_FILE_NAME, JournalAuditSink};
-    use mcp_server_devtools::auth::okta::{OktaJwksValidator, OktaSettings};
+    use mcp_server_devtools::auth::oidc::{JwksLocation, OidcJwksValidator, OidcSettings, Profile};
     use mcp_server_devtools::ports::{AuditEvent, AuditEventKind, AuditSink, TokenValidator};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -341,17 +342,14 @@ fn enterprise_request_path_stage() {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [jwk] })))
             .mount(&jwks)
             .await;
-        let validator = Arc::new(OktaJwksValidator::new(
-            OktaSettings {
-                issuer: ISSUER.to_owned(),
-                audience: AUDIENCE.to_owned(),
-                jwks_url: format!("{}/keys", jwks.uri()),
-                groups_claim: "groups".to_owned(),
-                clock_skew: std::time::Duration::from_secs(60),
-                tenant: "acme".to_owned(),
-                jwks_refresh: std::time::Duration::from_secs(600),
-                jwks_min_refetch_interval: std::time::Duration::from_secs(30),
-            },
+        let validator = Arc::new(OidcJwksValidator::new(
+            OidcSettings::new(
+                    Profile::Okta,
+                    ISSUER,
+                    AUDIENCE,
+                    JwksLocation::Direct(format!("{}/keys", jwks.uri())),
+                )
+                .with_tenant("acme"),
             reqwest::Client::new(),
         ));
         let now = jsonwebtoken::get_current_timestamp();
@@ -378,6 +376,15 @@ fn enterprise_request_path_stage() {
         .await
         .expect("cached token validates");
 
+        let mut delegated = claims;
+        delegated["act"] = json!({"sub":"agent-current", "act":{"sub":"original-client"}});
+        let delegated = jsonwebtoken::encode(&header, &delegated,
+            &jsonwebtoken::EncodingKey::from_rsa_der(include_bytes!("../tests/fixtures/okta_test_rsa_pkcs1.der"))).unwrap();
+        validator.authenticate(&delegated).await.expect("delegated token validates");
+        probe_async("C.1 JWT authenticate: cached actor chain", 2000, || {
+            validator.authenticate(&delegated)
+        }).await.expect("cached delegated token validates");
+
         // -- Durable audit append --
         let dir = tempfile::tempdir().expect("tempdir");
         let journal_dir = dir.path().join("journal");
@@ -397,7 +404,7 @@ fn enterprise_request_path_stage() {
                 subject: "sre@acme.example".to_owned(),
                 groups: vec!["SRE".to_owned()],
                 scopes: vec!["mcp:tools".to_owned()],
-                authority: PrincipalAuthority::Okta,
+                authority: PrincipalAuthority::oidc("https://acme.okta.com/oauth2/default"),
             },
             client: ClientIdentity::default(),
             decision: mcp_server_devtools::policy::PolicyDecision::by_rule(
@@ -414,6 +421,7 @@ fn enterprise_request_path_stage() {
                 vendor: "grafana".to_owned(),
                 environment: EnvironmentClass::Qa,
                 authority: UpstreamAuthority::Shared,
+                provenance: None,
             },
             action: None,
             outcome: None,
@@ -445,6 +453,85 @@ fn enterprise_request_path_stage() {
     });
 }
 
+/// C.6: the two things the usage side adds to the request path — the
+/// per-principal rate-limit check in the bearer middleware (a hit on a
+/// known subject) and the usage sink's `record` on the tail of a call:
+/// the Prometheus adapter alone, and the fan-out to it plus the rollup
+/// channel. Each is expected allocation-free on the hot path; the event
+/// itself is built by the caller and is not counted.
+fn probe_usage_path() {
+    use mcp_server_devtools::metrics::{FanOutUsageSink, PrometheusUsageSink};
+    use mcp_server_devtools::ports::{BoundedUsageChannel, UsageEvent, UsageSink};
+    use mcp_server_devtools::server::rate_limit::{RateLimitSettings, RateLimiter, Verdict};
+    const ITERS: u32 = 2000;
+
+    let limiter = RateLimiter::new(RateLimitSettings {
+        per_second: 1_000_000.0,
+        burst: 1_000_000.0,
+    });
+    assert_eq!(limiter.check("sre@acme.example"), Verdict::Allow);
+    probe("rate limit check, known subject", ITERS, || {
+        std::hint::black_box(limiter.check("sre@acme.example"))
+    });
+
+    let event = || UsageEvent {
+        timestamp: "2026-09-04T12:00:00Z".to_owned(),
+        tenant: "acme".to_owned(),
+        subject: "sre@acme.example".to_owned(),
+        tool_name: "grafana_query_logs".to_owned(),
+        vendor: "grafana".to_owned(),
+        environment: "qa".to_owned(),
+        decision: "allow".to_owned(),
+        risk: "read".to_owned(),
+        outcome: "success".to_owned(),
+        duration_ms: 12,
+    };
+    // Events are built ahead of the loop so their allocation is not
+    // attributed to `record`; the caller builds the event either way.
+    let prometheus = std::sync::Arc::new(PrometheusUsageSink::new());
+    prometheus.record(event());
+    let mut events: Vec<UsageEvent> = (0..ITERS).map(|_| event()).collect();
+    probe("PrometheusUsageSink::record, known series", ITERS, || {
+        prometheus.record(events.pop().expect("one per iteration"));
+    });
+
+    let (channel, mut receiver) = BoundedUsageChannel::new(ITERS as usize + 8);
+    let fan_out = FanOutUsageSink::new(vec![
+        std::sync::Arc::clone(&prometheus) as std::sync::Arc<dyn UsageSink>,
+        std::sync::Arc::new(channel),
+    ]);
+    let mut events: Vec<UsageEvent> = (0..ITERS).map(|_| event()).collect();
+    probe("FanOut(prometheus + channel)::record", ITERS, || {
+        fan_out.record(events.pop().expect("one per iteration"));
+    });
+    while receiver.try_recv().is_ok() {}
+}
+
+fn probe_principal_inventory() {
+    use mcp_server_devtools::policy::{Principal, PrincipalAuthority};
+    use mcp_server_devtools::ports::StaticValidator;
+    use mcp_server_devtools::server::auth::{InboundAuth, InboundAuthSettings};
+    let auth = InboundAuth::new(
+        std::sync::Arc::new(StaticValidator::new()),
+        InboundAuthSettings {
+            public_url: "https://mcp.example".into(),
+            authorization_servers: vec![],
+            required_scope: "mcp:tools".into(),
+        },
+    );
+    let principal = Principal {
+        tenant: "acme".into(),
+        subject: "sre@acme.example".into(),
+        groups: vec!["sre".into()],
+        scopes: vec!["mcp:tools".into()],
+        authority: PrincipalAuthority::oidc("https://issuer.example"),
+    };
+    auth.observe(&principal);
+    probe("observe principal, known unchanged", 2000, || {
+        auth.observe(std::hint::black_box(&principal))
+    });
+}
+
 fn main() {
     println!("=== output size: is TOON earning its CPU? ===");
     output_size_comparison();
@@ -462,6 +549,10 @@ fn main() {
 
     // Stage 0 runs once per *tool call*, before any payload work — so unlike the
     // stages below it is paid even by a request that returns two bytes.
+    println!("\n=== stage -1d: usage side of the request path (mean of 2000) — C.6 ===");
+    probe_usage_path();
+    println!("\n=== stage -1e: principal inventory — C.4 ===");
+    probe_principal_inventory();
     println!("\n=== stage 0: per-tool-call config snapshot (mean of 1000) ===");
     let config = realistic_config();
     let handle = ConfigHandle::new(realistic_config());

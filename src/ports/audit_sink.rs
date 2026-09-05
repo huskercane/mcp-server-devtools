@@ -95,6 +95,8 @@ pub struct AuditEvent {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ControlEventKind {
+    /// An administrator authorized a mutation; durable before its effects.
+    AdminMutation,
     /// The policy document in force when the gateway started.
     PolicyLoaded,
     /// A changed policy document was verified and compiled; it is put in
@@ -438,6 +440,7 @@ mod tests {
                 vendor: "jira".to_owned(),
                 environment: EnvironmentClass::Unclassified,
                 authority: UpstreamAuthority::Shared,
+                provenance: None,
             },
             action: None,
             outcome: None,

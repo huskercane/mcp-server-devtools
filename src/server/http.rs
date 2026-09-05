@@ -94,6 +94,13 @@ impl Role {
     pub const fn serves_gateway(self) -> bool {
         matches!(self, Self::All | Self::Gateway)
     }
+
+    /// Whether this role runs the control plane's background work: audit
+    /// forwarding (C.3), and the rollups and admin API to come.
+    #[must_use]
+    pub const fn serves_control(self) -> bool {
+        matches!(self, Self::All | Self::Control)
+    }
 }
 
 /// Boot the streamable-HTTP server on `127.0.0.1:${PORT:-3000}`.
@@ -125,6 +132,10 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
     // trust level as the credentials they already hold.
     let config = crate::config::load();
     let auth_mode = AuthMode::parse(config.get("MCP_AUTH_MODE"))?;
+    let ema = crate::auth::ema::enabled(&config)?;
+    if ema && !auth_mode.requires_inbound_auth() {
+        return Err("MCP_EMA_ENABLED requires OIDC authentication".into());
+    }
     let addr = resolve_bind_addr(std::env::var("MCP_BIND_ADDR").ok().as_deref(), port)?;
     validate_startup_security(auth_mode, &addr)?;
     // Shared across rmcp (drops in-flight SSE on cancel) and axum (stops
@@ -140,12 +151,23 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
     // the server's audit sink.
     let server = crate::bootstrap::ServerBuilder::new()
         .watch_config(true)
-        .require_inbound_auth(matches!(auth_mode, AuthMode::Okta))
+        .require_inbound_auth(auth_mode.requires_inbound_auth())
+        .serves_control(role.serves_control())
         .build()?;
     let inbound_auth = match auth_mode {
         AuthMode::Off => None,
-        AuthMode::Okta => Some(Arc::new(enterprise_inbound_auth(&config, &server)?)),
+        AuthMode::Oidc(keys) => Some(Arc::new(enterprise_inbound_auth(&config, &server, keys)?)),
     };
+    if ema {
+        let auth = inbound_auth.as_ref().expect("EMA requires OIDC");
+        crate::auth::ema::OidcExchange::new()?
+            .verify_resource_issuer(&auth.settings().authorization_servers[0])
+            .await?;
+    }
+    // Every secret reference resolves before the port opens, or the
+    // process does not start (plan §3.8): a credential it cannot read is
+    // not a credential it can vouch for per call.
+    server.resolve_secrets().await?;
     // The startup evidence — which policy and which revocation list this
     // process runs under — is durable before the port opens. A journal
     // that cannot take these records is a journal that cannot take the
@@ -158,6 +180,14 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
                 crate::ports::AuditFailure::classify(&error)
             )
         })?;
+    }
+    // Forwarding the journal to a SIEM is the control plane's job (§3.4):
+    // it starts here, after the startup records are durable, and only on
+    // a role that serves the control plane. A misconfiguration refuses to
+    // start; an unreachable receiver does not (ADR-011: asynchronous).
+    if role.serves_control() {
+        server.start_audit_forwarding(cancel.clone())?;
+        server.start_rollups(cancel.clone())?;
     }
     let pending_audit = server.pending_audit();
     let app = build_app_for_role(
@@ -189,25 +219,52 @@ pub async fn run_http_as(role: Role) -> Result<(), Box<dyn std::error::Error + S
     Ok(())
 }
 
+fn enterprise_resource_settings(
+    config: &Config,
+    keys: crate::config::OidcKeys,
+    oidc: &crate::auth::oidc::OidcSettings,
+) -> Result<InboundAuthSettings, String> {
+    let ema = crate::auth::ema::enabled(config)?;
+    // OIDC's legacy normalization stays compatible; EMA discovery uses the
+    // configured identifier exactly, including a significant trailing slash.
+    let issuer = if ema {
+        config.get(keys.issuer()).unwrap_or(&oidc.issuer).trim()
+    } else {
+        &oidc.issuer
+    };
+    let settings = InboundAuthSettings::from_config(config, keys.mode(), vec![issuer.to_owned()])?;
+    if ema && oidc.audience != settings.public_url {
+        return Err("EMA requires the OIDC audience to equal MCP_PUBLIC_URL".to_owned());
+    }
+    Ok(settings)
+}
+
 /// Assemble the enterprise inbound-auth stack from configuration, refusing
 /// anything incomplete (plan §1.2: no "temporarily permissive" mode).
 ///
-/// Required together: the Okta issuer and audience, the public URL clients
-/// are told to obtain a token for, and the durable audit journal — evidence
-/// is the product, so enterprise mode without a journal is not a mode.
+/// Required together: the issuer and audience (under whichever key family
+/// `MCP_AUTH_MODE` selected), the public URL clients are told to obtain a
+/// token for, and the durable audit journal — evidence is the product, so
+/// enterprise mode without a journal is not a mode.
 fn enterprise_inbound_auth(
     config: &Config,
     server: &DevtoolsServer,
+    keys: crate::config::OidcKeys,
 ) -> Result<InboundAuth, String> {
-    let okta = crate::auth::okta::OktaSettings::from_config(config)?;
-    let settings = InboundAuthSettings::from_config(config, vec![okta.issuer.clone()])?;
+    let mode = keys.mode();
+    let oidc = crate::auth::oidc::OidcSettings::from_config(config, keys)?;
+    let settings = enterprise_resource_settings(config, keys, &oidc)?;
+    let rate_limit = crate::server::rate_limit::RateLimitSettings::from_config(config)
+        .map_err(|error| format!("refusing to start: {error}"))?;
     if config
         .get(crate::bootstrap::AUDIT_JOURNAL_DIR_KEY)
         .map(str::trim)
         .is_none_or(str::is_empty)
     {
         return Err(format!(
-            "refusing to start: MCP_AUTH_MODE=okta requires {} — enterprise mode without a              durable audit journal would authorize calls it cannot evidence (fail-closed;              see docs/enterprise-product-plan.md §1.2)",
+            "refusing to start: MCP_AUTH_MODE={mode} requires {} — enterprise mode without a \
+             durable audit journal would authorize calls it cannot evidence (fail-closed; \
+             see docs/enterprise-product-plan.md §1.2)",
             crate::bootstrap::AUDIT_JOURNAL_DIR_KEY
         ));
     }
@@ -217,7 +274,7 @@ fn enterprise_inbound_auth(
         .is_none_or(str::is_empty)
     {
         return Err(format!(
-            "refusing to start: MCP_AUTH_MODE=okta requires {} — enterprise mode with no \
+            "refusing to start: MCP_AUTH_MODE={mode} requires {} — enterprise mode with no \
              policy loaded would authenticate every caller and then allow everything \
              (fail-closed; see docs/enterprise-product-plan.md §1.2)",
             crate::policy::engine::POLICY_FILE_KEY
@@ -229,7 +286,7 @@ fn enterprise_inbound_auth(
         .is_none_or(str::is_empty)
     {
         return Err(format!(
-            "refusing to start: MCP_AUTH_MODE=okta requires {} — enterprise mode applies only \
+            "refusing to start: MCP_AUTH_MODE={mode} requires {} — enterprise mode applies only \
              signed policy bundles, so a gateway with no verifying key could not tell an \
              authored policy from a planted one (fail-closed; plan §4 B.3). Generate a key \
              pair with `mcp-devtools policy keygen` and sign the policy with \
@@ -243,7 +300,7 @@ fn enterprise_inbound_auth(
         .is_none_or(str::is_empty)
     {
         return Err(format!(
-            "refusing to start: MCP_AUTH_MODE=okta requires {} — the audit journal's \
+            "refusing to start: MCP_AUTH_MODE={mode} requires {} — the audit journal's \
              checkpoints are signed so tampering is detectable offline, and an unsigned \
              journal is evidence only for whoever holds the disk (plan §3.3, B.6). Generate \
              a key with `mcp-devtools audit keygen`",
@@ -256,7 +313,7 @@ fn enterprise_inbound_auth(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             format!(
-                "refusing to start: MCP_AUTH_MODE=okta requires {} — the revocation list is \
+                "refusing to start: MCP_AUTH_MODE={mode} requires {} — the revocation list is \
                  the emergency stop (deny by subject, by token id, or `revoke all`), and a \
                  gateway without one has no way to cut a compromised token off before it \
                  expires (plan §3.6, B.4). Create an empty, signed list with \
@@ -279,7 +336,7 @@ fn enterprise_inbound_auth(
         )
     })?;
     let client = crate::transport::build_client().map_err(|error| error.message)?;
-    let validator = Arc::new(crate::auth::okta::OktaJwksValidator::new(okta, client));
+    let validator = Arc::new(crate::auth::oidc::OidcJwksValidator::new(oidc, client));
     let mut auth = InboundAuth::new(Arc::new(validator), settings).with_revocations(revocations);
     if let Some(sink) = server.audit_sink() {
         auth = auth.with_audit(BundleAudit {
@@ -287,7 +344,33 @@ fn enterprise_inbound_auth(
             append_timeout: server.audit_append_timeout(),
         });
     }
+    if let Some(settings) = rate_limit {
+        auth = auth.with_rate_limit(Arc::new(crate::server::rate_limit::RateLimiter::new(
+            settings,
+        )));
+    }
     Ok(auth)
+}
+
+/// `GET /metrics` (`MCP_METRICS=on`): the Prometheus page, or 404 when
+/// metrics are off. Unauthenticated, like the health banner: it carries
+/// counts by vendor and tool, never a subject or a token.
+fn metrics(server: &DevtoolsServer, auth: Option<&Arc<InboundAuth>>) -> Response {
+    let rate_limited = auth
+        .and_then(|auth| auth.rate_limiter())
+        .map_or(0, |limiter| limiter.refused());
+    match server.metrics_page(rate_limited) {
+        Some(page) => (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+            )],
+            page,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Build the full Axum app with a caller-owned cancellation token. Tests use
@@ -309,6 +392,7 @@ pub fn build_app_with_cancel(
     // Arc<Components>, including NinjaOne console sessions and other caches.
     let shared_server = DevtoolsServer::new()?;
     Ok(build_app_inner(
+        true,
         shared_server,
         None,
         idle_ttl,
@@ -326,7 +410,7 @@ pub fn build_app_with_server(
     sweep_interval: Duration,
     cancel: CancellationToken,
 ) -> Router {
-    build_app_inner(server, None, idle_ttl, sweep_interval, cancel)
+    build_app_inner(true, server, None, idle_ttl, sweep_interval, cancel)
 }
 
 /// Like [`build_app_with_server`], with inbound bearer authentication in
@@ -341,7 +425,7 @@ pub fn build_app_with_server_and_auth(
     sweep_interval: Duration,
     cancel: CancellationToken,
 ) -> Router {
-    build_app_inner(server, Some(auth), idle_ttl, sweep_interval, cancel)
+    build_app_inner(true, server, Some(auth), idle_ttl, sweep_interval, cancel)
 }
 
 /// The router for a [`Role`]. `All` and `Gateway` are the full data plane;
@@ -355,12 +439,32 @@ pub fn build_app_for_role(
     cancel: CancellationToken,
 ) -> Router {
     if role.serves_gateway() {
-        return build_app_inner(server, auth, idle_ttl, sweep_interval, cancel);
+        return build_app_inner(
+            role.serves_control(),
+            server,
+            auth,
+            idle_ttl,
+            sweep_interval,
+            cancel,
+        );
     }
     // Control role: health only. Every other path is a 404 — there is no
     // data plane here, and nothing to hand a caller who reached the wrong
     // replica. The cross-cutting guards stay so the surface is uniform.
+    let metrics_server = server.clone();
+    let admin = auth.map_or_else(Router::new, |auth| {
+        let manager = Arc::new(ReapingSessionManager::new(idle_ttl));
+        watch_revocations(&auth, &manager);
+        super::admin::router(
+            server.clone(),
+            &auth,
+            None,
+            None,
+            admin_reports(&server, cancel.clone()),
+        )
+    });
     Router::new()
+        .merge(admin)
         .route(
             "/",
             get(move || {
@@ -368,10 +472,36 @@ pub fn build_app_for_role(
                 async move { health(&server) }
             }),
         )
+        .route(
+            "/metrics",
+            get(move || {
+                let server = metrics_server.clone();
+                async move { metrics(&server, None) }
+            }),
+        )
         .layer(middleware::from_fn(origin_allowlist))
 }
 
+fn admin_reports(
+    server: &DevtoolsServer,
+    cancel: CancellationToken,
+) -> Option<Arc<dyn crate::ports::activity_reports::ActivityReports>> {
+    let config = server.config();
+    let directory = config.get(crate::bootstrap::AUDIT_JOURNAL_DIR_KEY)?;
+    let rollups = config
+        .get(crate::rollups::STORE_KEY)?
+        .strip_prefix("sqlite://")?;
+    let path = std::path::PathBuf::from(format!("{rollups}.activity.sqlite"));
+    let store = crate::audit::activity_sqlite::SqliteActivityReports::open(&path).ok()?;
+    store.spawn(
+        std::path::PathBuf::from(directory).join(crate::audit::journal::JOURNAL_FILE_NAME),
+        cancel,
+    );
+    Some(store)
+}
+
 fn build_app_inner(
+    serves_control: bool,
     shared_server: DevtoolsServer,
     auth: Option<Arc<InboundAuth>>,
     idle_ttl: Duration,
@@ -380,6 +510,19 @@ fn build_app_inner(
 ) -> Router {
     let manager = Arc::new(ReapingSessionManager::new(idle_ttl));
     manager.spawn_reaper(sweep_interval);
+    let admin = if serves_control {
+        auth.as_ref().map_or_else(Router::new, |auth| {
+            super::admin::router(
+                shared_server.clone(),
+                auth,
+                Some(manager.clone()),
+                Some(Arc::new(crate::transport::raw_response::LocalArtifactStore)),
+                admin_reports(&shared_server, cancel.clone()),
+            )
+        })
+    } else {
+        Router::new()
+    };
     let health_server = shared_server.clone();
     let streamable = StreamableHttpService::new(
         move || Ok(shared_server.clone()),
@@ -421,23 +564,34 @@ fn build_app_inner(
     let mut protected = Router::new()
         .route("/artifacts/{id}", get(download_artifact))
         .merge(mcp_routes);
-    let mut public = Router::new().route(
-        "/",
-        get(move || {
-            let server = health_server.clone();
-            async move { health(&server) }
-        }),
-    );
+    let metrics_server = health_server.clone();
+    let metrics_auth = auth.clone();
+    let mut public = Router::new()
+        .route(
+            "/",
+            get(move || {
+                let server = health_server.clone();
+                async move { health(&server) }
+            }),
+        )
+        .route(
+            "/metrics",
+            get(move || {
+                let server = metrics_server.clone();
+                let auth = metrics_auth.clone();
+                async move { metrics(&server, auth.as_ref()) }
+            }),
+        );
     if let Some(auth) = auth {
         watch_revocations(&auth, &manager);
         // Inner layer first: the session binding runs after the bearer
         // check has placed the principal in the extensions.
         protected = protected
-            .layer(middleware::from_fn_with_state(
+            .route_layer(middleware::from_fn_with_state(
                 Arc::clone(&manager),
                 crate::server::session::enforce_session_owner,
             ))
-            .layer(middleware::from_fn_with_state(
+            .route_layer(middleware::from_fn_with_state(
                 Arc::clone(&auth),
                 require_bearer,
             ));
@@ -455,6 +609,7 @@ fn build_app_inner(
     // registering the `/mcp` routes, so both cover the `GET /` health endpoint
     // as well.
     public
+        .merge(admin)
         .merge(protected)
         .layer(middleware::from_fn(origin_allowlist))
         .layer(cors)
@@ -633,6 +788,20 @@ fn health(server: &DevtoolsServer) -> Response {
         // log (the watcher warns on every failed reload), not to the world.
         if server.policy_degraded().is_some() {
             banner.push_str("; policy reload is failing; last good policy in force");
+        }
+        // Same posture, same reason: the category is all this route says.
+        if server.secrets_degraded().is_some() {
+            banner.push_str("; secret refresh is failing; last good values in force");
+        }
+        // Forwarding is a copy of durable evidence; failing to make the
+        // copy degrades, it does not stop serving (ADR-011).
+        if server.forwarding_degraded().is_some() {
+            banner.push_str("; audit forwarding is failing; journal retained");
+        }
+        // Rollups are the lossy pipeline: a failing store drops usage,
+        // counted, and never touches a call.
+        if server.rollups_degraded().is_some() {
+            banner.push_str("; usage rollups are failing; usage may be dropped");
         }
         (StatusCode::OK, [content_type], banner).into_response()
     } else {
@@ -839,7 +1008,7 @@ fn validate_startup_security(auth_mode: AuthMode, addr: &SocketAddr) -> Result<(
              docs/enterprise-product-plan.md §1.2)",
             addr.ip()
         )),
-        AuthMode::Okta => Ok(()),
+        AuthMode::Oidc(_) => Ok(()),
     }
 }
 
@@ -862,6 +1031,9 @@ mod startup_security_tests {
         assert!(Role::All.serves_gateway());
         assert!(Role::Gateway.serves_gateway());
         assert!(!Role::Control.serves_gateway());
+        assert!(Role::All.serves_control());
+        assert!(Role::Control.serves_control());
+        assert!(!Role::Gateway.serves_control());
     }
 
     #[test]
@@ -923,7 +1095,10 @@ mod startup_security_tests {
     fn okta_mode_accepts_any_bind_at_this_gate() {
         for addr in ["127.0.0.1:3000", "0.0.0.0:8443", "[::]:3000"] {
             let addr: SocketAddr = addr.parse().unwrap();
-            assert_eq!(validate_startup_security(AuthMode::Okta, &addr), Ok(()));
+            assert_eq!(
+                validate_startup_security(AuthMode::Oidc(crate::config::OidcKeys::Okta), &addr),
+                Ok(())
+            );
         }
     }
 }

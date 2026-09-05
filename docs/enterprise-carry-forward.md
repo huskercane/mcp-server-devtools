@@ -10,7 +10,80 @@ removed only when it is done, not when it is explained.
 
 Status legend: **open** · **blocked** (needs a decision) · **done**.
 
-Last updated: 2026-09-03, after the independent review of the Phase B
+Last updated: 2026-09-04, after C.1 implementation (rev 2.22). Stable
+ext-auth fetched/read, two issuer grants, opt-in resource discovery and
+synthetic Okta subject/actor fixtures landed. Full 1,077 tests and all gates
+pass. CF-35 tracks real tenant and client evidence; no client interoperability
+claim. C.7 signing is still unexercised locally (CF-34). No push/PR.
+
+Previously updated:  2026-09-04, after C.7 (rev 2.21). Native Helm, real SQLite
+and signed-journal restore tests and all landing gates passed. Docker daemon
+was unavailable; no cluster rollout was run. Sigstore signing cannot be
+exercised locally: CF-34 tracks external release evidence. CF-16/33 remain.
+
+Previously updated:  2026-09-04, after C.5 (admin CLI) landed locally on
+`feat/phase-c-operations` (plan rev 2.20). CF-7 is closed for the admin
+commands; direct vendor CLI operations remain open. CF-28 remains scoped
+to those vendor commands. All 1,066 tests and every landing gate passed;
+no dependencies or request-path allocation changes.
+
+Previously: 2026-09-04, after C.4 (admin API) landed locally on
+`feat/phase-c-operations` (plan rev 2.19). The API has durable mutation
+intents, independent scope/rate/task budgets, signed document operations,
+process inventories, projected activity reports, and RollupStore usage.
+CF-16's shared-state limitation remains explicit; CF-7/CF-28 are next in C.5.
+All 1,064 tests and formatting, both clippy feature sets, cargo-deny,
+benchmark, and diff gates passed. No dependencies added.
+
+Previously: 2026-09-04, after C.6 (usage rollups, Prometheus metrics,
+and per-principal rate limiting) landed on `feat/phase-c-operations`
+(plan §0 rev 2.18). CF-16 now records that the limiter is in-process and
+therefore single-replica. CF-33 now covers gateway-to-control usage
+delivery as well as the existing journal reach/pruning gap. The allocation
+baseline gained stage −1d: limiter and known Prometheus series are
+allocation-free; Prometheus-plus-channel fan-out is 9 allocations.
+
+Previously: 2026-09-04, after C.3 (SIEM forwarding behind the
+`AuditForwarder` port) landed on `feat/phase-c-operations` (plan §0 rev
+2.17). Opened CF-32 (TCP syslog carries no acknowledgement; the adapter
+detects a closed peer within a grace window and RELP would close the
+residual) and CF-33 (in the split topology the control replica reads the
+gateway's journal volume rather than receiving the push §3.4 sketches;
+one shipper per journal; no prune-after-acknowledgement). The allocation
+baseline below gained the C.3 note.
+
+Previously: 2026-09-04, at the start of `feat/phase-c-operations` (plan
+§0 rev 2.16): C.2c and C.2d are deferred until a partner asks for a native
+cloud adapter, so CF-30 and plan §11 item 8 are now **deferred with
+C.2c–d** rather than open; the CSI Secrets Store provider plus `file://`
+is the supported path on both clouds meanwhile. Nothing else changed.
+
+Before that: 2026-09-04, after C.2b (the `vault://` secret source)
+landed on `feat/phase-c-secret-sources` (plan §0 rev 2.15). CF-30 narrowed
+to the two cloud adapters and their placement (§11 item 8), with the
+`aws-config` spike named as the input that decision needs. Nothing new
+opened: Kubernetes auth and the namespace header are contract-tested
+rather than live-tested, which the plan's §3.8 test table now records
+rather than a register item, because no CI environment can supply a
+cluster or an Enterprise server. The allocation baseline below gained the
+C.2b note.
+
+Earlier: 2026-09-04, after C.1b (OIDC provider profiles) landed on
+`feat/phase-c-secret-sources` (plan §0 rev 2.14). Opened CF-31 (the
+manually triggered Entra and Auth0 live jobs against developer tenants are
+not built; those profiles are fixture-locked only). CF-18's reading now
+covers `auth/oidc.rs` as it did `auth/okta.rs`. The allocation baseline
+gained the C.1b note.
+
+Before that still: 2026-09-04, after C.2a (secret references) landed on
+`feat/phase-c-secret-sources` (plan §0 rev 2.13). Opened CF-28 (the
+one-shot CLI refuses references rather than resolving them), CF-29
+(`NINJAONE_SERVERS` nested credentials take no references), and CF-30 (the
+reserved cloud schemes refuse by name until C.2b–d; the placement question
+in plan §11 item 8 is still open). The allocation baseline below gained
+the C.2a note.
+
+Earlier: 2026-09-03, after the independent review of the Phase B
 branch (plan §0 rev 2.8). The review opened CF-23 (checkpoint threat model
 and an external retention boundary), CF-24 (policy and revocation are two
 signed documents, not one bundle), CF-25 (the §7 metrics are proxies),
@@ -200,7 +273,16 @@ journal cannot accept records, so a gateway that will refuse every call is
 not reported healthy. Local mode without a journal is byte-identical.
 
 ### CF-7 · Route CLI subcommands through the audited boundary
-**Open · Phase A/B**
+**Open for direct vendor operations · Admin commands done in C.5 (rev 2.20)**
+
+`mcp-devtools admin` now calls C.4 over HTTP, including mutations and
+reports, and supports `--json` on every command. A real CLI-to-server test
+proves its mutation has the server’s durable control record, and journal
+failure reaches the CLI as JSON plus a nonzero exit status. It does not
+instantiate server handlers or vendor runtimes. This closes CF-7 for admin
+commands. The direct vendor operations below remain refused in enterprise
+mode until they use an audited boundary.
+
 
 `mcp-devtools jira post …` reaches the same vendor APIs as the MCP tools with
 no journal record. M0 closes the hole by **refusing** operational CLI
@@ -273,6 +355,16 @@ tracker holds the append and the drain completes once the journal does.
 ### CF-16 · Session affinity past one replica; emergency deny
 **Open · Phase C (scaling) / Phase B (revocation)**
 
+C.4 amendment (rev 2.19): the admin API's `SessionStore` and `ArtifactStore`
+inventory ports wrap the real process-local managers. Role `all` can list,
+revoke, and purge its own state. A separate control process returns an
+explicit backend-unavailable error; it cannot claim a gateway's inventory
+is empty or revoke state it cannot reach. Shared/RPC adapters remain this
+item's scaling work. Observed principals are bounded token metadata, not
+live IdP membership. Activity reports use a rebuildable SQLite projection;
+its adjacent `.activity.sqlite` file is rebuildable from the journal.
+
+
 Two things the review showed the Phase A deployment example implied but
 could not deliver:
 
@@ -308,6 +400,11 @@ could not deliver:
   the stale binding. A revocation generation on bindings would close the
   cosmetic gap; do it when session affinity (above) is designed, since
   both touch the binding step.
+- **Rate limiting (C.6).** The per-principal token bucket is deliberately
+  in-process and keyed by validated subject. With several gateway replicas,
+  each replica grants its own budget, so the configured rate is multiplied
+  by replica count. Move it behind the shared session/scaling design (or a
+  dedicated limiter port) before raising the gateway replica count.
 
 ### CF-17 · Credential-provider bootstrap traffic is outside the egress policy
 **Open · Phase B (with the vendor read profiles)**
@@ -345,13 +442,175 @@ malformed-body behaviour, and adversarial tests, reviewed on its own.
 
 ---
 
+### CF-28 · The one-shot CLI does not resolve secret references
+**Open · Phase C (C.2a)**
+
+C.5 amendment (rev 2.20): admin commands read their explicit bearer-token
+file on each invocation and call the authenticated server; they never load
+vendor configuration. Tests run them with enterprise mode and an unresolved
+vendor reference present. They need no duplicate SecretSource resolver.
+The direct vendor commands described below remain open.
+
+`DevtoolsServer::resolve_secrets` is the async step that turns `file://…`
+references into values before the server binds; `CliRuntime::load` is
+synchronous and one-shot, so `mcp-devtools jira|bb|conf …` do not run it.
+Rather than send a reference upstream as if it were the token, or fail the
+first call as "credential missing", `bootstrap::refuse_unresolved_references`
+refuses the subcommand up front and names the reference. Closed by giving
+the CLI paths the same startup step (they already share `refuse_unaudited_cli`,
+so the seam exists) — most naturally when CF-7 routes them through the
+audited boundary, since that is the same "the CLI is a client of the
+server's composition" change.
+
+### CF-29 · Credentials nested in `NINJAONE_SERVERS` accept no references
+**Open · Phase C (C.2a)**
+
+The reference syntax applies to every top-level configuration value
+(`Config::secret_references` walks `shared` and every vendor section). A
+per-server `password` or `totpSecret` inside the `NINJAONE_SERVERS` JSON
+value is resolved later through `auth::resolve_configured_secret_async`
+with the raw field value, which the snapshot never saw; a `file://` there is
+refused by name at use, not expanded. Closing it means either teaching the
+reference walk to descend into that one JSON document (the registry
+deliberately does not describe those rows — `auth/secrets.rs` explains why)
+or moving NinjaOne's per-server credentials to top-level keys. Decide when
+NinjaOne gets a read profile, with CF-1/CF-13.
+
+### CF-30 · The cloud secret schemes refuse by name until C.2c–d, and their placement is undecided
+**Deferred with C.2c–d · 2026-09-04 (plan rev 2.16); reopens when a partner asks for a native adapter**
+
+C.2c and C.2d are deferred until a design partner asks for `awssm://` or
+`azkv://` natively. Until then the supported path on both clouds is the
+CSI Secrets Store provider plus `file://` (`deploy/k8s/secrets-csi.yaml`),
+which rotates without a restart. The placement decision below (plan §11
+item 8) is deferred with them; the `aws-config` spike stays the input it
+needs. The rest of this entry is kept as the state it reopens into.
+
+`awssm://` and `azkv://` parse today and fail startup with
+`no adapter for `awssm://` is compiled into this binary`, which is the
+typed error §3.8 asks for. C.2b (rev 2.15) closed the Vault third of this
+item: the `secrets-vault` feature exists, is on by default, and
+`SecretResolver::from_config` registers the adapter from `MCP_VAULT_*`.
+The `secrets-aws` / `secrets-azure` features and the adapters behind them
+are C.2c–d, and §11 item 8 — features in the community crate, or the
+enterprise crate — is still to decide before C.2c starts. Vault did not
+force the question because it added no dependency; the AWS and Azure SDK
+trees are the case where it matters, and the `aws-config` spike C.2c
+opens with (dependency count, binary size) is the input the decision
+needs.
+
+### CF-31 · Entra and Auth0 profiles are proven against fixtures, not tenants
+**Open · Phase C (C.1b); needs a developer tenant of each**
+
+§3.9 asks for the Keycloak container *and* "a manually triggered live job
+against a developer tenant of each" for Entra and Auth0. The container
+job exists (`tests/keycloak_live_tests.rs`, the `keycloak` job in
+`rust.yml`) and paid for itself on its first run — the Keycloak fixture
+had assumed `aud: "account"` and the real realm emits no `aud` at all.
+The Entra and Auth0 profiles are locked against wiremock fixtures written
+from the documented claim shapes (`tests/token_validator_tests.rs`), which
+is exactly the position the Keycloak fixture was in. Closing this needs a
+developer tenant of each with a client credential in a repository secret,
+a `workflow_dispatch` job that obtains a real token (client credentials
+for Entra with an app role; an M2M application for Auth0 with the API
+audience) and validates it through the profile, and a run against each
+before Gate A if the partner is on either provider (plan §11 item 2). Until
+then a claim-shape drift at Entra or Auth0 is found by the partner, not by
+CI.
+
+### CF-32 · TCP syslog has no acknowledgement; RELP would
+**Open · Phase C (C.3); a second syslog adapter when a partner's relay speaks RELP**
+
+The `syslog+tls://` adapter can only know that the peer is still there:
+it checks before writing to a reused connection (a zero-wait read) and
+listens for a close or a TLS alert for 50 ms after every flushed batch
+(`audit::forward::syslog::POST_WRITE_GRACE`), then acknowledges. A
+receiver that takes the bytes and dies inside that window without
+writing them loses that batch, and nothing re-sends it — the shipper's
+cursor has moved. The runbook therefore steers the receiver to a
+**local relay with a disk queue** (rsyslog, syslog-ng), where the window
+holds only what a `close` can carry, and the relay's own retries cover
+the WAN. RELP (rsyslog's Reliable Event Logging Protocol; syslog-ng has
+no client, rsyslog has `omrelp`/`imrelp`) acknowledges per message and is
+the adapter that closes the gap properly: same port, a `relp+tls://`
+scheme, a per-batch ack. HEC and the JSON endpoint already acknowledge
+(`2xx` after the whole body), so this item is syslog-only.
+
+### CF-33 · Split topology: journal and usage delivery to control; one shipper per journal; no pruning
+**Open · Phase C (C.7 or when a partner runs the split topology)**
+
+§3.4 sketches the gateway *pushing* audit to `control` and retaining its
+journal until acknowledged. C.3 built the acknowledgement (the control
+side's cursor) and the forwarding, but not the push: in
+`--role control` the shipper reads the gateway's journal *file*
+(`MCP_AUDIT_FORWARD_JOURNAL_DIR`, a read-only mount of the gateway's
+volume; `deploy/k8s/control.yaml` shows it) and keeps its cursor on its
+own volume (`MCP_AUDIT_FORWARD_STATE_DIR`). That needs storage readable
+from another pod — `ReadWriteMany`, or a single node — and it is one
+shipper per journal, so several gateway replicas need several control
+shippers or a fan-in that does not exist. The journal is also one
+append-only file with no rotation, so "retain until acknowledged" is
+"retain": pruning up to the acknowledged sequence — a rotation the
+verifier understands (the chain and checkpoints span files) — is not
+built. Decide with the affinity half of CF-16 when horizontal scaling is
+scoped; until then `--role all` and the single-replica split are the
+tested shapes.
+
+C.6 has the analogous usage gap: only a process that serves the control
+plane attaches the bounded channel to its `RollupStore`, while a pure
+`gateway` process is where tool calls produce usage. There is no push or
+shared queue between them, so a split deployment's control database stays
+empty. `MCP_ROLE=all` is the supported complete-rollup shape until the
+gateway pushes usage to control (bounded and lossy by the `UsageSink`
+contract), or a shared store/queue adapter is selected with the scaling
+work above.
+
 ## Decisions we owe someone
 
-### CF-10 · ADR-002: the enterprise licence
-**Blocked · counsel · hard M0 exit criterion**
+### CF-34 · External release signing and deployment evidence
+**Open · next authorized release / deployment**
 
-Source-available / BSL / commercial, plus a CLA, must be decided **before any
-external contribution lands**. It cannot be retrofitted.
+C.7 implements CycloneDX source inventory and Sigstore signing plus immediate
+verification of the container digest and release files in `release.yml`.
+Signing cannot be exercised locally; no signature, publication, or external
+verification is claimed. On the next authorized release, retain the workflow
+run, SBOM and bundles, then independently run `cosign verify` with the exact
+workflow certificate identity and GitHub OIDC issuer, plus `verify-blob` for
+archives/SBOM. See `docs/release-operations-runbook.md`. Helm lint/render and
+real local journal/checkpoint/SQLite restore pass; a real cluster rollout,
+upgrade and rollback remain deployment evidence. CF-16/33 are not closed by
+packaging: the chart enforces one replica and documents split-state gaps.
+
+### CF-35 · EMA external client/tenant evidence and actor policy scope
+**Open · external runs required before interoperability claims**
+
+C.1's stable source is ext-auth `fb374c7db2b34f18ca9183882e0beecdf661892b`,
+fetched/read 2026-09-04. `docs/ema-runbook.md` names the exact E01–E16 checks
+for Claude web, Claude desktop, Claude Code, VS Code and each claimed Codex
+surface. Every row is unrun. Retain client/OS/build/org settings, real issuer
+metadata and policy, redacted exchanges and audit references. In particular,
+prove real AS grant signature/audience/resource/client binding/replay refusal,
+Okta XAA claim transformations, renewal/revocation, and session account
+isolation. Local wiremock forms, signed fixtures and HTTP routing do not prove
+those external behaviors. Generic Keycloak is not a substitute for Okta XAA.
+
+The configured external issuer remains the AS; the server never accepts a
+raw ID-JAG as a bearer. Its existing validator retains bounded actor identities
+in TokenFacts, current actor first; subject/groups/scopes remain top-level.
+Actor-aware local policy and actor fields in the frozen audit schema require
+an explicit subsequent design. The exchange adapter is portable; the optional
+file-output CLI helper is Unix-only until a private Windows ACL writer exists.
+This is a protocol helper, not an implementation of external clients' SSO,
+SAML bootstrap, private-key-JWT creation or automatic credential refresh.
+
+### CF-10 · ADR-002: the enterprise licence
+**Model decided 2026-09-05 · enterprise agreement and contribution terms remain open**
+
+The owner selected Apache-2.0 for the current community crate and proprietary
+commercial licensing for separate enterprise extensions. See [licensing policy](licensing.md).
+Counsel still needs to finalize the enterprise agreement and contribution terms
+before external enterprise contributions are accepted. This decision does not
+restrict earlier ISC copies or existing community functionality.
 
 Knock-on: `mcp-devtools-enterprise/deny.toml` carries
 `private = { ignore = true }` so cargo-deny does not fail on the crate's own
@@ -361,8 +620,15 @@ carries a real SPDX `license` field.
 ### CF-11 · WP 0.2 and WP 0.3
 **Open** — still unstarted from the M0 work-package list.
 
-### CF-18 · Where the Okta validator and the file policy engine live (ADR-001)
-**Deferred · decided 2026-09-03: option 2 in practice while the repository is private · revisit at open-sourcing, with CF-10**
+### CF-18 · Where the OIDC validator and the file policy engine live (ADR-001)
+**Amended 2026-09-05 · current crate remains community; future enterprise extensions are separate**
+
+The licensing decision supersedes the proposed move below: all code currently
+in this crate, including secure remote access and existing administration and
+operations features, stays community under Apache-2.0. Future proprietary
+extensions belong in the separate enterprise repository. ADR-001 is amended;
+CF-10 retains only the enterprise legal-text and contribution-term work.
+The earlier analysis below is retained as decision history.
 
 **Decision 2026-09-03.** The community repository is private for now, so
 the boundary ADR-001 draws — "the community binary never links enterprise
@@ -631,11 +897,75 @@ and every extractor stage is byte-for-byte what Phase A recorded.
 | −1b `FilePolicy::evaluate` @ 500 rules (enterprise only) | 0 | 5 | 5 |
 | −1c JWT validate, cache hit (enterprise only; §8 budget 50 µs) | 1 KB | **9** | 8 — 3.7 µs (was 3.5) |
 | −1c journal append, sequential (enterprise only; §8 budget p99 200 µs) | 1 KB | 6 | 6 — p50 11 µs, p99 18–31 µs, max ≈ 100 µs (chain hash per line) |
+| −1d rate-limit check, known subject (enterprise only) | 0 | 0 | new in C.6 |
+| −1d `PrometheusUsageSink::record`, known series (enterprise only) | 0 | 0 | new in C.6 |
+| −1d Prometheus + bounded-channel fan-out (enterprise only) | <1 KB | 9 | new in C.6 |
+| −1e observed principal, known unchanged (enterprise only) | 0 | 0 | new in C.4 |
 | 0 `ConfigHandle::snapshot()` | 0 | 0 | 0 |
 | 1 `apply_jq_filter(None)` | 0 | 0 | 0 |
 | 2 `render(Toon)` @ 500 issues | 1736 KB | 19 032 | 19 032 |
 | 3 `truncate_for_ai` | 39 KB | 4 | 4 |
 | 2 `render(Toon)` @ 5000 issues | 16 547 KB | 190 035 | 190 035 |
+
+Re-run after C.2a (2026-09-04, rev 2.13): every stage's byte and
+allocation count is identical to the table below (JWT cache hit 9, journal
+append 6, `ConfigHandle::snapshot()` 0, every extractor and render stage
+unchanged; journal append p50 11 µs, p99 16 µs). C.2a's only request-path
+change is in `Config::get_for`: one byte dispatch to decide "not a
+reference" (`secrets::is_reference`) before returning the borrowed value,
+and a hash lookup into the attached snapshot only for an actual reference —
+no allocation on either branch, which is why stage 0 and the extractor
+rows (all of which read configuration) did not move. Secret fetches run
+on the refresher task and at startup, never per call (§8, "Secret
+resolution (C.2)"). A probe row for "get_for through a resolved
+reference" is worth adding when the probe next gains stages (CF-20).
+
+Re-run after C.1b (2026-09-04, rev 2.14): every stage's byte and
+allocation count is identical to the table above (JWT cache hit 9 at
+3.7 µs, journal append 6 at p50 11 µs / p99 19 µs / max 86 µs; every
+extractor and render stage unchanged). C.1b's request-path changes are
+in the validator's cached-principal clone and nowhere else: the principal's
+`authority` is now an `Arc<str>` issuer shared by every principal the
+validator produces (a refcount increment, not an allocation — which is why
+the cache hit did not move to 10), and claim-shape work (scope string
+splitting, group-path normalisation, discovery) runs on the uncached
+validation path and the key fetch only. The `Profile` comparison for the
+Keycloak audience hint sits on the rejection path.
+
+Re-run after C.2b (2026-09-04, rev 2.15): every stage's byte and
+allocation count is identical to the table above (JWT cache hit 9 at
+3.8 µs, journal append 6 at p50 11 µs / p99 15 µs / max 91 µs; every
+extractor and render stage unchanged). C.2b adds nothing to the request
+path at all: the Vault adapter is called from the refresher and at
+startup only, and a `vault://` value is read from the same snapshot a
+`file://` value is (`Config::get_for`, the one-byte scheme dispatch C.2a
+recorded). `SecretResolver::from_config` runs once in
+`ServerBuilder::build`.
+
+Re-run after C.3 (2026-09-04, rev 2.17): every stage's byte and
+allocation count is identical to the table above (JWT cache hit 9 at
+3.7 µs, journal append 6 at p50 11 µs / p99 16 µs / max 101 µs; every
+extractor and render stage unchanged). C.3 adds nothing to the request
+path: the shipper is a background task on the control plane that
+*reads* the journal file, the adapters are called from it only, and the
+append path gained no branch — the one new thing the writer's callers
+see is `Role::serves_control`, evaluated once at startup. The health
+banner reads one more `Mutex<Option<&'static str>>`. The syslog and HTTP
+adapters allocate per batch (one frame buffer, one body), never per
+request. No new probe row: nothing here runs on the request path.
+
+Re-run after C.6 (2026-09-04, rev 2.18): every pre-existing stage's byte
+and allocation count is identical to the table above (JWT cache hit 9 at
+3.79 µs; journal append 6 at p50 12 µs / p99 37 µs / max 149 µs; every
+extractor and render stage unchanged). Stage −1d adds the three C.6
+request-path operations: a token-bucket check for an existing subject is
+0 bytes / 0 allocations; recording into an existing Prometheus series is
+0 / 0; fan-out to Prometheus plus the bounded rollup channel is <1 KB / 9
+allocations. The fan-out cost is the owned usage event sent across the
+task boundary (tenant, subject, tool, vendor, environment, decision, risk,
+and outcome); it is new functionality rather than growth in an existing
+stage, and remains non-blocking. No pre-existing row moved, so the 20 %
+regression gate passes.
 
 Notes for the Phase C comparison:
 
@@ -695,3 +1025,69 @@ Notes recorded at the Phase A boundary:
   moved; the cost is two or three allocations per outbound request inside
   an enforcing scope.
 - The §8 CI comparison itself is CF-20.
+
+
+Re-run after C.4 (2026-09-04, rev 2.19): every existing allocation count
+and byte count is unchanged from C.6. JWT cache hit: 9 allocations, 5.46 µs;
+journal append: 6 allocations, p50 16 µs / p99 44 µs / max 88 µs. Timing
+figures are observed wall-clock results, not a claim of unchanged latency;
+both remain within their absolute budgets. Stage −1e measures the new
+principal-inventory request-path operation: a known unchanged principal is
+0 bytes / 0 allocations. Nested BTreeMaps allow borrowed tenant/subject
+lookups and deterministic bounded eviction; only new/changed metadata is
+cloned. Admin requests, projection ingestion, and initial inventory fills
+are outside that steady-state probe.
+
+
+Re-run after C.5 (2026-09-04, rev 2.20): all allocation counts and bytes
+remain identical to C.4, including stage −1e at zero. The new CLI is a
+one-shot HTTP client and adds no work to the MCP request path. JWT cache hit was 5.48 µs (9 allocations); journal append was p50 17 µs,
+p99 62 µs, max 578 µs (6 allocations). Both absolute p99/cache-hit budgets
+hold; no allocation regression was observed.
+
+
+Re-run after C.7 (2026-09-04, rev 2.21): all allocation counts and bytes
+remain identical to C.5; no production Rust request-path changes. JWT cache
+hit: 9 allocations / 15.97 µs; journal: 6 allocations, p50 45 µs / p99 133 µs /
+max 251 µs. Known principal, limiter and Prometheus series remain zero.
+Absolute cache-hit and journal p99 budgets pass; timings are observations.
+The full gate exposed a C.4 test race: the watcher can legitimately reload
+before the admin request. The corrected test proves the failed append keeps
+the old policy and that whichever reload wins has earlier durable evidence.
+
+
+Re-run after C.1 (2026-09-04, rev 2.22): every existing allocation count
+and reported KB value matches C.7. JWT validate cache hit is 9 allocations /
+1 KB / 3.78 µs; journal append is 6 allocations / 1 KB, p50 11 µs / p99 15 µs /
+max 74 µs. Known-principal observation, limiter hit and known Prometheus
+series remain zero. No material allocation regression; absolute timing
+budgets pass. Timings are observations, not a comparative speedup claim.
+
+New probe `C.1 JWT authenticate: cached actor chain`: 8 allocations / 1 KB /
+3.89 µs for a two-actor chain. This calls `authenticate` directly, whereas the
+existing 9-allocation row calls `validate` through its additional future;
+these are different entry points, not evidence that actor support saves an
+allocation. The signed chain is an Arc slice, so cache hits share it rather
+than cloning actor strings. Tokens without actors carry None. TokenFacts has
+an additional optional Arc field; KB reporting is rounded down, not exact
+byte equality. Initial verification/exchange/SSO are outside this hit probe.
+
+
+Re-run after the CLAUDE.md compliance follow-up (2026-09-05): every existing
+stage allocation count and reported KB value matches C.1 and the table above.
+JWT validation cache hit: 9 allocations / 1 KB / 3.69 µs; cached actor-chain
+authentication: 8 / 1 KB / 3.99 µs. Journal append: 6 / 1 KB, p50 11 µs,
+p99 15 µs, max 71 µs. Both absolute budgets hold. Known rate-limit subjects,
+metric series, unchanged principals, config snapshots, and no-filter jq
+remain 0 bytes / 0 allocations; fan-out stays at 9 allocations. TOON rendering
+remains 19,032 allocations / 1,736 KB for 500 issues and 190,035 / 16,547 KB
+for 5,000 issues; truncation remains 4 / 39 KB. No measured allocation
+regression crosses the 20% phase-exit threshold.
+
+The follow-up adds no MCP-facing schema/description changes. It moves trusted
+integer quota maps to FxHashMap and small metric outcome collections to
+SmallVec; both crates were already in the lockfile at the exact versions now
+pinned directly. Admin projection batching is bounded and reuses its vector;
+its contention/peak memory are outside the response-pipeline probe.
+See the [full fresh output](benchmarks/2026-09-05-claude-compliance.txt) and
+[compliance review](claude-compliance-review.md) for scope and validation.

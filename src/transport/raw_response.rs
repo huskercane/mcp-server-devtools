@@ -37,6 +37,42 @@ static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static PIN_RELEASED: OnceLock<tokio::sync::Notify> = OnceLock::new();
 static RECLAMATION_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static RETENTION_SWEEPER: OnceLock<std::sync::Mutex<Option<RetentionSweeper>>> = OnceLock::new();
+/// Adapter over the existing artifact registry and its pin-aware reclamation.
+pub struct LocalArtifactStore;
+impl crate::ports::admin_inventory::ArtifactStore for LocalArtifactStore {
+    fn list(
+        &self,
+    ) -> crate::ports::admin_inventory::InventoryFuture<
+        '_,
+        Vec<crate::ports::admin_inventory::ArtifactEntry>,
+    > {
+        use crate::ports::admin_inventory::ArtifactEntry;
+        let mut rows: Vec<_> = artifacts()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|item| item.lifecycle == ArtifactLifecycle::Readable)
+            .map(|item| ArtifactEntry {
+                id: item.metadata.id.clone(),
+                owner: item.metadata.owner.clone(),
+                size: item.metadata.size,
+                content_type: item.metadata.content_type.clone(),
+            })
+            .collect();
+        rows.sort_by(|a, b| a.id.cmp(&b.id));
+        Box::pin(std::future::ready(Ok(rows)))
+    }
+    fn purge<'a>(&'a self, id: &'a str) -> crate::ports::admin_inventory::InventoryFuture<'a, ()> {
+        Box::pin(async move {
+            let item =
+                artifact(id).ok_or(crate::ports::admin_inventory::InventoryError::NotFound)?;
+            remove_artifact(&item.path)
+                .await
+                .map_err(|_| crate::ports::admin_inventory::InventoryError::Unavailable)
+        })
+    }
+}
+
 #[cfg(test)]
 static DELETE_FAILURES: OnceLock<std::sync::Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
 #[cfg(test)]

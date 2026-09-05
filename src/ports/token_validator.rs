@@ -9,7 +9,7 @@
 //!
 //! ## Two implementations from day one
 //!
-//! - `crate::auth::okta::OktaJwksValidator` — RS256 JWTs against the identity provider's
+//! - `crate::auth::oidc::OidcJwksValidator` — RS256 JWTs against the identity provider's
 //!   JWKS, with key caching, rotation, and clock-skew tolerance.
 //! - [`StaticValidator`] — a fixed token → principal table for tests and
 //!   local development. It is deliberately **not** reachable from
@@ -73,6 +73,12 @@ pub enum TokenRejection {
     /// The token validated, but the revocation list names its subject,
     /// its id, or its issue time (WP B.4).
     Revoked,
+    /// The groups claim is configured, absent from the token, and the
+    /// token says why: the identity provider left the groups out because
+    /// there were too many (Entra's `_claim_names` / `_claim_sources`
+    /// overage). Reading that as "no groups" would consult policy with a
+    /// false membership list, so the token is refused instead (C.1b).
+    GroupsOverage,
 }
 
 impl TokenRejection {
@@ -93,6 +99,7 @@ impl TokenRejection {
             Self::KeysUnavailable => "keys_unavailable",
             Self::Unknown => "unknown_token",
             Self::Revoked => "revoked",
+            Self::GroupsOverage => "groups_overage",
         }
     }
 
@@ -131,6 +138,16 @@ pub struct TokenFacts {
     pub issued_at: Option<u64>,
     /// `jti`, when the token carries it. What a per-token revocation names.
     pub token_id: Option<String>,
+    /// Validated delegation identities, current actor first. Nested actors are
+    /// historical only and never contribute subject, groups or scopes.
+    pub actors: Option<std::sync::Arc<[Actor]>>,
+}
+
+/// An actor identity from a signed RFC 8693 `act` claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Actor {
+    pub subject: String,
+    pub issuer: Option<String>,
 }
 
 /// A validated token: who it proves, and the facts about the token that
@@ -245,7 +262,7 @@ mod tests {
             subject: subject.to_owned(),
             groups: vec!["SRE".to_owned()],
             scopes: vec!["mcp:tools".to_owned()],
-            authority: PrincipalAuthority::Okta,
+            authority: PrincipalAuthority::oidc("https://acme.okta.com/oauth2/default"),
         }
     }
 

@@ -22,7 +22,8 @@
 # the journal survives the pod).
 #
 # Features: the OS keychain is meaningless in a container (`keychain` off);
-# WRDS stays on so the image is the same catalog as the binary release.
+# WRDS stays on so the image is the same catalog as the binary release, and
+# `secrets-vault` so `vault://` references work from the image (C.2b).
 
 # ---- build ---------------------------------------------------------------
 # Alpine ships musl; aws-lc-sys (the TLS/JWT crypto, via rustls and
@@ -34,19 +35,22 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY benches ./benches
 RUN mkdir -p src/bin && echo 'fn main() {}' > src/main.rs && echo '' > src/lib.rs \
- && cargo build --release --locked --no-default-features --features wrds \
+ && cargo build --release --locked --no-default-features --features wrds,secrets-vault \
       --target x86_64-unknown-linux-musl 2>/dev/null || true
 COPY src ./src
 COPY README.md ./
 RUN touch src/main.rs src/lib.rs \
- && cargo build --release --locked --no-default-features --features wrds \
+ && cargo build --release --locked --no-default-features --features wrds,secrets-vault \
       --target x86_64-unknown-linux-musl \
  && cp target/x86_64-unknown-linux-musl/release/mcp-devtools /mcp-devtools \
  && /mcp-devtools --version
 
 # ---- runtime -------------------------------------------------------------
 FROM gcr.io/distroless/static-debian12:nonroot
+LABEL org.opencontainers.image.licenses="Apache-2.0"
 COPY --from=build /mcp-devtools /mcp-devtools
+COPY LICENSE NOTICE /usr/share/licenses/mcp-devtools/
+COPY licenses /usr/share/licenses/mcp-devtools/licenses/
 COPY deploy/policies /policies
 ENV TRANSPORT_MODE=http \
     PORT=3000 \

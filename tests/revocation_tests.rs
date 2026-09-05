@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use assert_cmd::cargo::cargo_bin;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode, get_current_timestamp};
-use mcp_server_devtools::auth::okta::{OktaJwksValidator, OktaSettings};
+use mcp_server_devtools::auth::oidc::{JwksLocation, OidcJwksValidator, OidcSettings, Profile};
 use mcp_server_devtools::auth::revocation::{
     NotBefore, RevocationFile, RevocationList, RevokedSubject,
 };
@@ -60,7 +60,7 @@ fn principal(subject: &str, groups: &[&str]) -> Principal {
         subject: subject.to_owned(),
         groups: groups.iter().map(|group| (*group).to_owned()).collect(),
         scopes: vec!["mcp:tools".to_owned()],
-        authority: PrincipalAuthority::Okta,
+        authority: PrincipalAuthority::oidc("https://acme.okta.com/oauth2/default"),
     }
 }
 
@@ -68,6 +68,7 @@ fn facts(issued_at: u64, jti: &str) -> TokenFacts {
     TokenFacts {
         issued_at: Some(issued_at),
         token_id: Some(jti.to_owned()),
+        actors: None,
     }
 }
 
@@ -138,6 +139,7 @@ fn settings() -> InboundAuthSettings {
             "MCP_PUBLIC_URL".to_owned(),
             "https://mcp.acme.example".to_owned(),
         )])),
+        "okta",
         vec!["https://acme.okta.com/oauth2/default".to_owned()],
     )
     .unwrap()
@@ -638,17 +640,14 @@ async fn group_removal_waits_for_the_token_but_revocation_does_not() {
         .require_inbound_auth(true)
         .build()
         .unwrap();
-    let validator = Arc::new(OktaJwksValidator::new(
-        OktaSettings {
-            issuer: ISSUER.to_owned(),
-            audience: AUDIENCE.to_owned(),
-            jwks_url: format!("{}/keys", jwks.uri()),
-            groups_claim: "groups".to_owned(),
-            clock_skew: Duration::from_mins(1),
-            tenant: "acme".to_owned(),
-            jwks_refresh: Duration::from_mins(10),
-            jwks_min_refetch_interval: Duration::from_secs(30),
-        },
+    let validator = Arc::new(OidcJwksValidator::new(
+        OidcSettings::new(
+            Profile::Okta,
+            ISSUER,
+            AUDIENCE,
+            JwksLocation::Direct(format!("{}/keys", jwks.uri())),
+        )
+        .with_tenant("acme"),
         reqwest::Client::new(),
     ));
     let signed = Signed::empty();
@@ -734,17 +733,14 @@ async fn a_token_issued_in_the_future_is_refused_before_revocation_or_freshness_
             ..Vendors::default()
         },
     );
-    let validator = Arc::new(OktaJwksValidator::new(
-        OktaSettings {
-            issuer: ISSUER.to_owned(),
-            audience: AUDIENCE.to_owned(),
-            jwks_url: format!("{}/keys", jwks.uri()),
-            groups_claim: "groups".to_owned(),
-            clock_skew: Duration::from_mins(1),
-            tenant: "acme".to_owned(),
-            jwks_refresh: Duration::from_mins(10),
-            jwks_min_refetch_interval: Duration::from_secs(30),
-        },
+    let validator = Arc::new(OidcJwksValidator::new(
+        OidcSettings::new(
+            Profile::Okta,
+            ISSUER,
+            AUDIENCE,
+            JwksLocation::Direct(format!("{}/keys", jwks.uri())),
+        )
+        .with_tenant("acme"),
         reqwest::Client::new(),
     ));
     let signed = Signed::empty();

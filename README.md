@@ -275,4 +275,8 @@ CI builds and tests the default and headless feature sets across Linux, macOS, a
 
 ## License
 
-[ISC](Cargo.toml)
+The community edition is licensed under [Apache-2.0](LICENSE). Commercial use,
+including internal business use, modification, and redistribution are permitted
+under that license. See [NOTICE](NOTICE) for attribution and the
+[licensing policy](docs/licensing.md) for the community/enterprise boundary and
+the treatment of earlier ISC-licensed versions.

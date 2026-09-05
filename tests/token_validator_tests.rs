@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode, get_current_timestamp};
-use mcp_server_devtools::auth::okta::{OktaJwksValidator, OktaSettings};
+use mcp_server_devtools::auth::oidc::{JwksLocation, OidcJwksValidator, OidcSettings, Profile};
 use mcp_server_devtools::policy::PrincipalAuthority;
 use mcp_server_devtools::ports::{TokenRejection, TokenValidator};
 use serde_json::{Value, json};
@@ -43,21 +43,18 @@ async fn mount_jwks(server: &MockServer, kids: &[&str], expect: Option<u64>) {
     mock.mount(server).await;
 }
 
-fn settings(server: &MockServer) -> OktaSettings {
-    OktaSettings {
-        issuer: ISSUER.to_owned(),
-        audience: AUDIENCE.to_owned(),
-        jwks_url: format!("{}/keys", server.uri()),
-        groups_claim: "groups".to_owned(),
-        clock_skew: Duration::from_mins(1),
-        tenant: "acme".to_owned(),
-        jwks_refresh: Duration::from_mins(10),
-        jwks_min_refetch_interval: Duration::from_secs(30),
-    }
+fn settings(server: &MockServer) -> OidcSettings {
+    OidcSettings::new(
+        Profile::Okta,
+        ISSUER,
+        AUDIENCE,
+        JwksLocation::Direct(format!("{}/keys", server.uri())),
+    )
+    .with_tenant("acme")
 }
 
-fn validator(settings: OktaSettings) -> Arc<OktaJwksValidator> {
-    Arc::new(OktaJwksValidator::new(settings, reqwest::Client::new()))
+fn validator(settings: OidcSettings) -> Arc<OidcJwksValidator> {
+    Arc::new(OidcJwksValidator::new(settings, reqwest::Client::new()))
 }
 
 fn base_claims() -> Value {
@@ -94,7 +91,10 @@ async fn a_valid_token_yields_a_principal_with_claims_mapped() {
     assert_eq!(principal.subject, "alice@acme.example");
     assert_eq!(principal.groups, vec!["Developers", "SRE"]);
     assert_eq!(principal.scopes, vec!["mcp:tools", "openid"]);
-    assert_eq!(principal.authority, PrincipalAuthority::Okta);
+    assert_eq!(
+        principal.authority,
+        PrincipalAuthority::oidc("https://acme.okta.com/oauth2/default")
+    );
 
     // Second validation of the same token: served from the validated-token
     // cache, so the JWKS is still fetched exactly once (`expect(1)`).
@@ -107,7 +107,7 @@ async fn space_separated_scope_claim_and_custom_groups_claim_are_read() {
     let server = MockServer::start().await;
     mount_jwks(&server, &["test-key-1"], None).await;
     let mut settings = settings(&server);
-    settings.groups_claim = "roles".to_owned();
+    settings.groups_claim = Some("roles".to_owned());
     let validator = validator(settings);
 
     let mut claims = base_claims();
@@ -650,7 +650,7 @@ async fn oversized_jwks_is_refused_whether_or_not_its_length_is_declared() {
         }
     });
     let mut chunked = settings(&server);
-    chunked.jwks_url = format!("http://{addr}/keys");
+    chunked.jwks = JwksLocation::Direct(format!("http://{addr}/keys"));
     let undeclared = validator(chunked);
     assert_eq!(
         undeclared
@@ -671,4 +671,360 @@ async fn oversized_jwks_is_refused_whether_or_not_its_length_is_declared() {
 fn base64_url(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Provider profiles (WP C.1b, plan §3.9): the same validator, a different
+// profile, and one fixture per claim-shape gotcha the §3.9 table records.
+// Every token below is signed by the same test key; what differs is the
+// claim shape each provider actually emits.
+// ---------------------------------------------------------------------------
+
+/// Settings for a profile whose issuer lives on the wiremock server, keys
+/// wherever the profile's default says (relative to that issuer).
+fn profile_settings(profile: Profile, issuer: &str) -> OidcSettings {
+    let jwks = profile.default_jwks(issuer.trim_end_matches('/'));
+    OidcSettings::new(profile, issuer, AUDIENCE, jwks).with_tenant("acme")
+}
+
+async fn mount_jwks_at(server: &MockServer, at: &str, kids: &[&str]) {
+    Mock::given(method("GET"))
+        .and(path(at))
+        .respond_with(ResponseTemplate::new(200).set_body_json(jwks(kids)))
+        .mount(server)
+        .await;
+}
+
+/// Entra: keys are found through the discovery document, `scp` is one
+/// space-separated string, and the subject is `oid` — `sub` is pairwise
+/// per application and must not be what policy and revocation bind to.
+#[tokio::test]
+async fn entra_profile_reads_keys_through_discovery_scp_as_a_string_and_oid_as_the_subject() {
+    let server = MockServer::start().await;
+    let tenant = "1f2e3d4c-0000-4000-8000-000000000000";
+    let issuer = format!("{}/{tenant}/v2.0", server.uri());
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/{tenant}/v2.0/.well-known/openid-configuration"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": issuer,
+            "jwks_uri": format!("{}/{tenant}/discovery/v2.0/keys", server.uri()),
+            "token_endpoint": format!("{}/{tenant}/oauth2/v2.0/token", server.uri()),
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_jwks_at(
+        &server,
+        &format!("/{tenant}/discovery/v2.0/keys"),
+        &["test-key-1"],
+    )
+    .await;
+    let validator = validator(profile_settings(Profile::Entra, &issuer));
+
+    let now = get_current_timestamp();
+    let claims = json!({
+        "iss": issuer,
+        "aud": AUDIENCE,
+        "iat": now, "nbf": now, "exp": now + 300,
+        "sub": "AAAAAAAAAAAAAAAAAAAAAPairwisePerApplication",
+        "oid": "5d6a4a3b-1111-4222-8333-444444444444",
+        "preferred_username": "alice@acme.example",
+        "scp": "mcp:tools openid profile",
+        "groups": ["8b4f1c00-aaaa-4bbb-8ccc-dddddddddddd", "SRE"],
+        "tid": tenant,
+        "ver": "2.0",
+    });
+    let principal = validator.validate(&sign(&claims)).await.unwrap();
+    assert_eq!(
+        principal.subject, "5d6a4a3b-1111-4222-8333-444444444444",
+        "the subject is `oid`, never the pairwise `sub`"
+    );
+    assert_eq!(principal.scopes, vec!["mcp:tools", "openid", "profile"]);
+    assert_eq!(
+        principal.groups,
+        vec!["8b4f1c00-aaaa-4bbb-8ccc-dddddddddddd", "SRE"]
+    );
+    assert_eq!(principal.authority, PrincipalAuthority::oidc(&issuer));
+
+    // Discovery is exact: a document answering for another issuer (a
+    // multi-tenant endpoint, or the wrong tenant) yields no keys at all.
+    let other = MockServer::start().await;
+    let configured = format!("{}/{tenant}/v2.0", other.uri());
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/{tenant}/v2.0/.well-known/openid-configuration"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": format!("{}/{{tenantid}}/v2.0", other.uri()),
+            "jwks_uri": format!("{}/common/discovery/v2.0/keys", other.uri()),
+        })))
+        .mount(&other)
+        .await;
+    mount_jwks_at(&other, "/common/discovery/v2.0/keys", &["test-key-1"]).await;
+    let wrong_tenant = self::validator(profile_settings(Profile::Entra, &configured));
+    let mut for_other = claims.clone();
+    for_other["iss"] = json!(configured);
+    assert_eq!(
+        wrong_tenant.validate(&sign(&for_other)).await.unwrap_err(),
+        TokenRejection::KeysUnavailable,
+        "a discovery document for a different issuer must not supply keys"
+    );
+    assert!(
+        other
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.url.path().ends_with("openid-configuration")),
+        "the jwks_uri of a mismatched discovery document is never fetched"
+    );
+}
+
+/// Entra groups overage: past ~200 groups the token carries no `groups`
+/// claim and says so with `_claim_names` / `_claim_sources` (or the older
+/// `hasgroups`). Reading that as "no groups" would consult policy with a
+/// false membership list; the token is refused instead. A token that
+/// simply has no groups is still fine, and app roles are readable as the
+/// groups claim.
+#[tokio::test]
+async fn entra_groups_overage_fails_closed_and_app_roles_can_be_the_groups_claim() {
+    let server = MockServer::start().await;
+    let issuer = format!("{}/tenant/v2.0", server.uri());
+    Mock::given(method("GET"))
+        .and(path("/tenant/v2.0/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": issuer,
+            "jwks_uri": format!("{}/tenant/discovery/v2.0/keys", server.uri()),
+        })))
+        .mount(&server)
+        .await;
+    mount_jwks_at(&server, "/tenant/discovery/v2.0/keys", &["test-key-1"]).await;
+    let validator = validator(profile_settings(Profile::Entra, &issuer));
+
+    let now = get_current_timestamp();
+    let base = json!({
+        "iss": issuer, "aud": AUDIENCE, "iat": now, "exp": now + 300,
+        "sub": "pairwise", "oid": "oid-1", "scp": "mcp:tools",
+    });
+    let mut overage = base.clone();
+    overage["_claim_names"] = json!({ "groups": "src1" });
+    overage["_claim_sources"] = json!({
+        "src1": { "endpoint": "https://graph.microsoft.com/v1.0/users/oid-1/getMemberObjects" }
+    });
+    let rejection = validator.validate(&sign(&overage)).await.unwrap_err();
+    assert_eq!(rejection, TokenRejection::GroupsOverage);
+    assert!(
+        !rejection.is_server_side(),
+        "the fix is at the identity provider, not here"
+    );
+    assert_eq!(rejection.category(), "groups_overage");
+
+    let mut v1_overage = base.clone();
+    v1_overage["hasgroups"] = json!(true);
+    assert_eq!(
+        validator.validate(&sign(&v1_overage)).await.unwrap_err(),
+        TokenRejection::GroupsOverage
+    );
+
+    // No groups and no overage marker: a user in no groups, which is a
+    // principal policy may still allow by subject or scope.
+    let principal = validator.validate(&sign(&base)).await.unwrap();
+    assert!(principal.groups.is_empty());
+
+    // `_claim_names` naming some *other* claim is not a groups overage.
+    let mut other_claim = base.clone();
+    other_claim["_claim_names"] = json!({ "manager": "src1" });
+    other_claim["groups"] = json!(["SRE"]);
+    assert_eq!(
+        validator
+            .validate(&sign(&other_claim))
+            .await
+            .unwrap()
+            .groups,
+        vec!["SRE"]
+    );
+
+    // App roles as the groups claim, and no overage check bites on them.
+    let mut settings = profile_settings(Profile::Entra, &issuer);
+    settings.groups_claim = Some("roles".to_owned());
+    let by_roles = self::validator(settings);
+    let mut with_roles = base;
+    with_roles["roles"] = json!(["Reader", "Auditor"]);
+    assert_eq!(
+        by_roles.validate(&sign(&with_roles)).await.unwrap().groups,
+        vec!["Auditor", "Reader"]
+    );
+}
+
+/// Keycloak: keys at `protocol/openid-connect/certs`, `scope` as a
+/// string, an `aud` that is only `account` until the client has an
+/// audience mapper (refused, not relaxed), group paths from the Group
+/// Membership mapper normalised, and nested realm roles reachable as a
+/// dotted claim path.
+#[tokio::test]
+async fn keycloak_profile_requires_a_mapped_audience_and_normalises_group_paths() {
+    let server = MockServer::start().await;
+    let issuer = format!("{}/realms/acme", server.uri());
+    mount_jwks_at(
+        &server,
+        "/realms/acme/protocol/openid-connect/certs",
+        &["test-key-1"],
+    )
+    .await;
+    let validator = validator(profile_settings(Profile::Keycloak, &issuer));
+
+    let now = get_current_timestamp();
+    // The shape Keycloak 26 emits without an audience mapper (locked
+    // against the real realm in `tests/keycloak_live_tests.rs`): no `aud`
+    // at all, `azp` naming the client the token was issued *to*.
+    let mut default_token = json!({
+        "iss": issuer, "azp": "mcp-devtools",
+        "iat": now, "exp": now + 300, "typ": "Bearer",
+        "sub": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "preferred_username": "alice",
+        "scope": "openid profile email",
+        "groups": ["/engineering", "/engineering/platform"],
+        "realm_access": { "roles": ["default-roles-acme", "offline_access", "sre"] },
+    });
+    assert_eq!(
+        validator.validate(&sign(&default_token)).await.unwrap_err(),
+        TokenRejection::MissingClaim("aud"),
+        "without an audience mapper the token names no audience at all; \
+         `azp` is who asked for the token, not who it is for"
+    );
+    // Older realms add the `account` client as the audience instead.
+    default_token["aud"] = json!("account");
+    assert_eq!(
+        validator.validate(&sign(&default_token)).await.unwrap_err(),
+        TokenRejection::WrongAudience
+    );
+
+    // With the mapper: `aud` gains our audience (Keycloak keeps `account`).
+    default_token["aud"] = json!([AUDIENCE, "account"]);
+    let principal = validator.validate(&sign(&default_token)).await.unwrap();
+    assert_eq!(principal.subject, "f47ac10b-58cc-4372-a567-0e02b2c3d479");
+    assert_eq!(principal.scopes, vec!["email", "openid", "profile"]);
+    assert_eq!(
+        principal.groups,
+        vec!["engineering", "engineering/platform"],
+        "the mapper's leading slash is not part of the group name"
+    );
+
+    // Realm roles are nested; the claim setting is a path.
+    let mut settings = profile_settings(Profile::Keycloak, &issuer);
+    settings.groups_claim = Some("realm_access.roles".to_owned());
+    let by_realm_roles = self::validator(settings);
+    assert_eq!(
+        by_realm_roles
+            .validate(&sign(&default_token))
+            .await
+            .unwrap()
+            .groups,
+        vec!["default-roles-acme", "offline_access", "sre"]
+    );
+}
+
+/// Auth0: the `iss` claim ends in a slash (the configured issuer may or
+/// may not), `aud` is an array of the API identifier and the userinfo
+/// URL, `scope` is a string, keys live at `.well-known/jwks.json`, and
+/// groups exist only as a namespaced custom claim an Action adds — so
+/// nothing is read until one is configured.
+#[tokio::test]
+async fn auth0_profile_accepts_the_trailing_slash_issuer_and_a_namespaced_groups_claim() {
+    let server = MockServer::start().await;
+    let issuer_with_slash = format!("{}/", server.uri());
+    mount_jwks_at(&server, "/.well-known/jwks.json", &["test-key-1"]).await;
+
+    let now = get_current_timestamp();
+    let claims = json!({
+        "iss": issuer_with_slash,
+        "aud": [AUDIENCE, format!("{issuer_with_slash}userinfo")],
+        "iat": now, "exp": now + 300,
+        "sub": "google-oauth2|103547991597142817347",
+        "azp": "client-id",
+        "scope": "openid profile mcp:tools",
+        "https://acme.example/groups": ["SRE", "Developers"],
+    });
+    let token = sign(&claims);
+
+    for configured in [server.uri(), issuer_with_slash.clone()] {
+        let validator = validator(profile_settings(Profile::Auth0, &configured));
+        let principal = validator.validate(&token).await.unwrap();
+        assert_eq!(principal.subject, "google-oauth2|103547991597142817347");
+        assert_eq!(principal.scopes, vec!["mcp:tools", "openid", "profile"]);
+        assert!(
+            principal.groups.is_empty(),
+            "no groups claim is configured, so none are read — not even one that looks right"
+        );
+        assert_eq!(
+            principal.authority,
+            PrincipalAuthority::oidc(&server.uri()),
+            "the authority is the trimmed issuer whichever spelling was configured"
+        );
+    }
+
+    let mut settings = profile_settings(Profile::Auth0, &server.uri());
+    settings.groups_claim = Some("https://acme.example/groups".to_owned());
+    let with_groups = self::validator(settings);
+    assert_eq!(
+        with_groups.validate(&token).await.unwrap().groups,
+        vec!["Developers", "SRE"],
+        "a claim name with dots and slashes is looked up literally"
+    );
+
+    // Trailing-slash tolerance is one origin, two spellings — not a prefix
+    // match. A different path under the same host is a different issuer.
+    let mut other_path = claims;
+    other_path["iss"] = json!(format!("{}/tenant2/", server.uri()));
+    assert_eq!(
+        with_groups.validate(&sign(&other_path)).await.unwrap_err(),
+        TokenRejection::WrongIssuer
+    );
+}
+
+/// The generic profile is the spec shape: discovery, `sub`, `groups`,
+/// values as they come. And the Okta profile still spells `scp` as an
+/// array — the string form is accepted everywhere, not traded for it.
+#[tokio::test]
+async fn generic_profile_uses_discovery_and_every_profile_accepts_both_scope_shapes() {
+    let server = MockServer::start().await;
+    let issuer = format!("{}/oidc", server.uri());
+    Mock::given(method("GET"))
+        .and(path("/oidc/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": format!("{issuer}/"),
+            "jwks_uri": format!("{}/oidc/jwks", server.uri()),
+        })))
+        .mount(&server)
+        .await;
+    mount_jwks_at(&server, "/oidc/jwks", &["test-key-1"]).await;
+    let validator = validator(profile_settings(Profile::Generic, &issuer));
+
+    let now = get_current_timestamp();
+    let mut claims = json!({
+        "iss": issuer, "aud": AUDIENCE, "iat": now, "exp": now + 300,
+        "sub": "alice", "scp": "mcp:tools", "scope": ["openid", "mcp:admin"],
+        "groups": ["/not-normalised", "SRE"],
+    });
+    let principal = validator.validate(&sign(&claims)).await.unwrap();
+    assert_eq!(principal.subject, "alice");
+    assert_eq!(principal.scopes, vec!["mcp:admin", "mcp:tools", "openid"]);
+    assert_eq!(principal.groups, vec!["/not-normalised", "SRE"]);
+
+    // A subject claim that is missing is named by the category, never by
+    // value; the well-known names survive as themselves.
+    let mut settings = profile_settings(Profile::Generic, &issuer);
+    settings.subject_claim = "email".to_owned();
+    let by_email = self::validator(settings);
+    assert_eq!(
+        by_email.validate(&sign(&claims)).await.unwrap_err(),
+        TokenRejection::MissingClaim("email")
+    );
+    claims["email"] = json!("alice@acme.example");
+    assert_eq!(
+        by_email.validate(&sign(&claims)).await.unwrap().subject,
+        "alice@acme.example"
+    );
 }

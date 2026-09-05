@@ -20,8 +20,10 @@ use reqwest::header::{AUTHORIZATION, HeaderName};
 use crate::config::Config;
 use crate::error::{McpError, auth_invalid, auth_missing};
 
+pub mod credential_broker;
+pub mod ema;
 pub mod keychain;
-pub mod okta;
+pub mod oidc;
 pub mod revocation;
 pub mod secrets;
 
@@ -296,8 +298,11 @@ pub async fn vendor_secret(
     // sentinel or an absent key — the two cases that actually reach the OS
     // keychain — go to the blocking pool.
     if let Some(value) = non_blank(config, vendor, secret_key)
-        && value != "keychain"
+        && !crate::secrets::is_keychain_sentinel(value)
     {
+        if crate::secrets::is_reference(value) {
+            return Err(unresolved_reference(vendor, secret_key, value));
+        }
         return Ok(Some(value.to_owned()));
     }
 
@@ -312,6 +317,19 @@ pub async fn vendor_secret(
             None,
         )
     })?
+}
+
+/// A configured value is a secret reference (`file:///…`) that no snapshot
+/// expanded. The MCP server resolves every reference before it binds
+/// (`DevtoolsServer::resolve_secrets`), so this is reached only by a path
+/// that skipped that step — the one-shot CLI, or a server assembled without
+/// it. The message names the reference (a path and a key, never a value).
+fn unresolved_reference(vendor: &str, label: &str, reference: &str) -> McpError {
+    auth_missing(format!(
+        "vendor `{vendor}`: {label} references {reference}, but the reference is not \
+         resolved in this process. The MCP server resolves secret references before it \
+         starts (docs/configuration.md, \"Secret references\"); this path did not."
+    ))
 }
 
 fn non_blank<'a>(config: &'a Config, vendor: &str, key: &str) -> Option<&'a str> {
@@ -369,12 +387,22 @@ fn try_resolve_kind(
     secret_key: &str,
 ) -> Result<Option<(String, String)>, McpError> {
     let principal = match config.get_for(vendor, principal_key) {
+        // A principal may be a reference too (the email half of a
+        // multi-part secret); one that did not resolve is refused by
+        // name, never sent upstream as an account.
+        Some(p) if crate::secrets::is_reference(p.trim()) => {
+            return Err(unresolved_reference(vendor, principal_key, p.trim()));
+        }
         Some(p) if !p.is_empty() => p,
         _ => {
             // Principal absent. If the secret is an explicit sentinel,
             // that's a misconfiguration — error out so the user sees it.
             // Otherwise just fall through to the next kind.
-            if config.get_for(vendor, secret_key).map(str::trim) == Some("keychain") {
+            if config
+                .get_for(vendor, secret_key)
+                .map(str::trim)
+                .is_some_and(crate::secrets::is_keychain_sentinel)
+            {
                 return Err(auth_missing(format!(
                     "vendor `{vendor}` sets {secret_key}=\"keychain\" but \
                      {principal_key} is missing"
@@ -433,48 +461,56 @@ pub fn resolve_configured_secret(
     // intentional — it is a copy-paste artefact — and a whitespace-only value
     // must read as "not set" rather than as a credential made of spaces.
     match raw.map(str::trim) {
-        // Explicit sentinel — user opted in, miss is a hard error.
-        Some("keychain") => match backend.get(kind, vendor, principal) {
-            Ok(Some(s)) if !s.is_empty() => {
-                if backend.note_breadcrumb(kind, vendor, principal) {
-                    tracing::info!(
-                        source = "keychain",
+        // Explicit sentinel (`keychain` or `keychain://`) — user opted in,
+        // miss is a hard error.
+        Some(value) if crate::secrets::is_keychain_sentinel(value) => {
+            match backend.get(kind, vendor, principal) {
+                Ok(Some(s)) if !s.is_empty() => {
+                    if backend.note_breadcrumb(kind, vendor, principal) {
+                        tracing::info!(
+                            source = "keychain",
+                            kind = %kind,
+                            vendor = vendor,
+                            principal = principal,
+                            "resolved credential (sentinel)"
+                        );
+                    }
+                    Ok(Some(s))
+                }
+                Ok(_) => {
+                    tracing::error!(
                         kind = %kind,
                         vendor = vendor,
                         principal = principal,
-                        "resolved credential (sentinel)"
+                        "vendor `{vendor}` sets {secret_label}=\"keychain\" but no entry exists"
                     );
-                }
-                Ok(Some(s))
-            }
-            Ok(_) => {
-                tracing::error!(
-                    kind = %kind,
-                    vendor = vendor,
-                    principal = principal,
-                    "vendor `{vendor}` sets {secret_label}=\"keychain\" but no entry exists"
-                );
-                Err(auth_missing(format!(
-                    "vendor `{vendor}` sets {secret_label}=\"keychain\" but no keychain \
+                    Err(auth_missing(format!(
+                        "vendor `{vendor}` sets {secret_label}=\"keychain\" but no keychain \
                      entry exists for kind={kind}, vendor={vendor}, principal={principal}. \
                      Run `mcp-devtools creds set --kind {kind} --vendor {vendor} \
                      --principal {principal}` or remove the sentinel."
-                )))
-            }
-            Err(e) => {
-                tracing::error!(
-                    kind = %kind,
-                    vendor = vendor,
-                    principal = principal,
-                    error = %e,
-                    "keychain lookup failed for sentinel"
-                );
-                Err(auth_missing(format!(
-                    "keychain lookup failed for kind={kind}, vendor={vendor}, \
+                    )))
+                }
+                Err(e) => {
+                    tracing::error!(
+                        kind = %kind,
+                        vendor = vendor,
+                        principal = principal,
+                        error = %e,
+                        "keychain lookup failed for sentinel"
+                    );
+                    Err(auth_missing(format!(
+                        "keychain lookup failed for kind={kind}, vendor={vendor}, \
                      principal={principal}: {e}"
-                )))
+                    )))
+                }
             }
-        },
+        }
+        // A reference the snapshot did not expand: refuse by name rather
+        // than send `file:///…` upstream as if it were the token.
+        Some(s) if crate::secrets::is_reference(s) => {
+            Err(unresolved_reference(vendor, secret_label, s))
+        }
         // Plaintext secret — use as-is.
         Some(s) if !s.is_empty() => Ok(Some(s.to_owned())),
         // Empty plaintext is treated as missing for fall-through.
@@ -542,8 +578,12 @@ pub async fn resolve_configured_secret_async(
     match raw.as_deref().map(str::trim) {
         // Only a sentinel or an absent value needs the keychain; everything
         // else is decided here, off the blocking pool.
-        Some("keychain") | None => {}
+        None => {}
+        Some(value) if crate::secrets::is_keychain_sentinel(value) => {}
         Some("") => return Ok(None),
+        Some(value) if crate::secrets::is_reference(value) => {
+            return Err(unresolved_reference(vendor, &secret_label, value));
+        }
         Some(secret) => return Ok(Some(secret.to_owned())),
     }
 

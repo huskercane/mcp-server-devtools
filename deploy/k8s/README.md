@@ -15,6 +15,8 @@ Files:
 | `gateway.yaml` | Deployment (non-root, read-only root filesystem, `/tmp` on `emptyDir`, journal on a PVC), Service, PodDisruptionBudget. |
 | `control.yaml` | Deployment + Service for the control role. |
 | `ingress-nginx.yaml` | ingress-nginx Ingress with TLS via cert-manager and the body limit. No session affinity: see "Sessions" below. |
+| `secrets-csi.yaml` | **Optional** (Phase C, C.2a). Vendor credentials as `file://` references over a mounted Secret or a Secrets Store CSI volume, so a rotation reaches the gateway without a restart and the audit trail names the version. Shows the `gateway.yaml` changes as a commented patch. |
+| `secrets-vault.yaml` | **Optional** (Phase C, C.2b). Vendor credentials as `vault://` references the gateway resolves itself, authenticating to Vault / OpenBao with its projected service-account token (Kubernetes auth). No plaintext on a volume; every read is in Vault's audit log under the gateway's identity. Vault-side setup in `docs/secret-sources-runbook.md`. |
 
 Before applying, produce the keys and signatures on an operator machine
 (never on a gateway) — Phase B, WPs B.3/B.4/B.6:
@@ -45,7 +47,7 @@ kubectl apply -f deploy/k8s/control.yaml
 kubectl apply -f deploy/k8s/ingress-nginx.yaml
 ```
 
-Then, from a client with an Okta-issued token:
+Then, from a client with a token from the configured identity provider:
 
 ```bash
 curl -sS https://mcp.example.com/.well-known/oauth-protected-resource
@@ -90,6 +92,15 @@ curl -sS -H "Authorization: Bearer $TOKEN" \
   of the same guarantee.
 - **Read-only root filesystem.** The only writable paths are `/tmp`
   (response artifacts, diagnostic logs — `HOME=/tmp`) and the journal.
+- **Credentials rotate without a restart** when `secrets-csi.yaml` is
+  applied: a config value such as `file:///secrets/grafana.json#token` is
+  resolved before the port opens (a missing file or key refuses startup)
+  and re-read every `MCP_SECRET_REFRESH_INTERVAL_SECONDS`; the values from
+  one document swap together, every audit record carries the `source` and
+  `version` that acted, and a file that vanishes keeps the last good value
+  in force with the health banner reporting the degraded refresh. As
+  shipped, `gateway.yaml` still injects credentials with `envFrom`, which
+  is fixed for the life of the pod.
 - **Sessions.** Legacy MCP sessions live in the pod that created them,
   and the example runs **one** gateway replica, so nothing more is needed.
   Scaling past one replica needs an affinity mechanism that binds a
@@ -106,4 +117,21 @@ curl -sS -H "Authorization: Bearer $TOKEN" \
 
 Horizontal gateway scaling (session affinity, a shared artifact volume),
 the control plane's admin API, Prometheus metrics, and Helm packaging are
-Phase C (plan §4).
+Phase C (plan §4). SIEM forwarding landed in C.3: the commented block in
+`control.yaml` shows the control replica shipping the gateway's journal
+(mounted read-only) to a syslog relay or a Splunk collector; the split
+topology needs the journal volume readable from the control pod, which
+means `ReadWriteMany` storage or a single node (CF-33 in the
+carry-forward register). The native Vault / OpenBao adapter (`vault://`,
+`secrets-vault.yaml`) landed in C.2b; the native AWS and Azure adapters
+(`awssm://`, `azkv://`, C.2c–d) are deferred until a partner asks for
+them, so the CSI providers in `secrets-csi.yaml` are the supported way to
+reach those stores.
+
+C.4 administrative API configuration is described in
+[`docs/admin-api-runbook.md`](../../docs/admin-api-runbook.md). The starter
+control manifest remains loopback/auth-off; it deliberately exposes no admin
+API until an operator supplies the same OIDC, signed-policy, signed-revocation,
+and writable signed-audit configuration required by the gateway. Route
+`/admin/` to that authenticated control service. Use role `all` for local
+session/artifact administration until shared adapters are available (CF-16).

@@ -35,6 +35,8 @@
 //! Rejections are logged as their category only. Error bodies carry the
 //! category, never the token or any claim value.
 
+use crate::policy::Principal;
+
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
@@ -88,6 +90,7 @@ impl InboundAuthSettings {
     /// plaintext metadata URL is worse than no challenge.
     pub fn from_config(
         config: &crate::config::Config,
+        auth_mode: &str,
         authorization_servers: Vec<String>,
     ) -> Result<Self, String> {
         let public_url = config
@@ -96,8 +99,8 @@ impl InboundAuthSettings {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
                 format!(
-                    "{PUBLIC_URL_KEY} is required when MCP_AUTH_MODE=okta: it is the RFC 9728 \
-                     resource identifier clients are told to obtain a token for"
+                    "{PUBLIC_URL_KEY} is required when MCP_AUTH_MODE={auth_mode}: it is the \
+                     RFC 9728 resource identifier clients are told to obtain a token for"
                 )
             })?
             .trim_end_matches('/')
@@ -133,24 +136,109 @@ impl InboundAuthSettings {
     }
 }
 
-/// The middleware's state: a validator, the settings, and — in enterprise
-/// mode — the revocation list and where to journal refusals.
+type ObservedPrincipals =
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, Principal>>;
+
+/// Shared inbound token validation and control-plane observation state.
 pub struct InboundAuth {
+    observed: Arc<std::sync::RwLock<ObservedPrincipals>>,
     validator: Arc<dyn TokenValidator>,
     settings: InboundAuthSettings,
     revocations: Option<Arc<RevocationList>>,
     audit: Option<BundleAudit>,
+    /// Per-principal rate limit (C.6), applied after validation and the
+    /// scope check.
+    rate_limit: Option<Arc<super::rate_limit::RateLimiter>>,
 }
 
 impl InboundAuth {
     #[must_use]
     pub fn new(validator: Arc<dyn TokenValidator>, settings: InboundAuthSettings) -> Self {
         Self {
+            observed: Arc::default(),
             validator,
             settings,
             revocations: None,
             audit: None,
+            rate_limit: None,
         }
+    }
+
+    /// Independent admin boundary: same validator/revocations, a distinct scope
+    /// and limiter. Never spends the MCP request budget.
+    #[must_use]
+    pub fn for_admin(&self) -> Self {
+        let mut settings = self.settings.clone();
+        settings.required_scope = "mcp:admin".into();
+        Self {
+            observed: self.observed.clone(),
+            validator: self.validator.clone(),
+            settings,
+            revocations: self.revocations.clone(),
+            audit: self.audit.clone(),
+            rate_limit: Some(Arc::new(super::rate_limit::RateLimiter::new(
+                super::rate_limit::RateLimitSettings {
+                    per_second: 5.0,
+                    burst: 10.0,
+                },
+            ))),
+        }
+    }
+
+    /// Recently authenticated principal metadata, bounded to 10,000 entries.
+    /// This is observed token state, never a live identity-provider directory.
+    pub fn observed_principal(&self, tenant: &str, subject: &str) -> Option<Principal> {
+        self.observed
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(tenant)
+            .and_then(|subjects| subjects.get(subject))
+            .cloned()
+    }
+
+    /// Record metadata from an already authenticated principal (never an authorization input).
+    /// Exposed for the allocation probe; HTTP calls this only after validation.
+    pub fn observe(&self, principal: &Principal) {
+        // Known, unchanged principals allocate nothing. Inventory eviction
+        // cannot affect authorization.
+        if self
+            .observed
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&principal.tenant)
+            .and_then(|subjects| subjects.get(&principal.subject))
+            != Some(principal)
+        {
+            let mut observed = self
+                .observed
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if observed
+                .values()
+                .map(std::collections::BTreeMap::len)
+                .sum::<usize>()
+                >= 10_000
+            {
+                observed.pop_first();
+            }
+            observed
+                .entry(principal.tenant.clone())
+                .or_default()
+                .insert(principal.subject.clone(), principal.clone());
+        }
+    }
+
+    /// Enforce a per-principal rate limit (C.6).
+    #[must_use]
+    pub fn with_rate_limit(mut self, limiter: Arc<super::rate_limit::RateLimiter>) -> Self {
+        self.rate_limit = Some(limiter);
+        self
+    }
+
+    /// The limiter, if one is enforced.
+    #[must_use]
+    pub fn rate_limiter(&self) -> Option<&Arc<super::rate_limit::RateLimiter>> {
+        self.rate_limit.as_ref()
     }
 
     /// Enforce `list` after validation (WP B.4).
@@ -359,6 +447,21 @@ pub async fn require_bearer(
         return auth.insufficient_scope();
     }
 
+    auth.observe(&principal);
+
+    // C.6: a validated, in-scope principal past its budget is refused
+    // with a retry hint. Category only in the log, as above.
+    if let Some(limiter) = &auth.rate_limit
+        && let super::rate_limit::Verdict::Refuse { retry_after_secs } =
+            limiter.check(&principal.subject)
+    {
+        warn!(
+            rejection = "rate_limited",
+            "principal over its rate limit (429)"
+        );
+        return rate_limited(retry_after_secs);
+    }
+
     request.extensions_mut().insert(principal);
     request.extensions_mut().insert(facts);
     next.run(request).await
@@ -404,6 +507,32 @@ impl InboundAuth {
             "the token does not carry the scope required for this resource",
         )
     }
+}
+
+/// `429 Too Many Requests` with `Retry-After`, in the JSON envelope the
+/// other refusals use.
+fn rate_limited(retry_after_secs: u64) -> Response {
+    let body = serde_json::json!({
+        "error": "rate_limited",
+        "error_description": "the principal has exceeded its request rate; retry after the indicated delay",
+    })
+    .to_string();
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+            (
+                header::RETRY_AFTER,
+                HeaderValue::from_str(&retry_after_secs.to_string())
+                    .unwrap_or_else(|_| HeaderValue::from_static("1")),
+            ),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 fn error_response(status: StatusCode, challenge: &str, error: &str, description: &str) -> Response {
@@ -482,6 +611,7 @@ mod tests {
         };
         let settings = InboundAuthSettings::from_config(
             &config(&[("MCP_PUBLIC_URL", "https://mcp.acme.example/")]),
+            "okta",
             vec!["https://acme.okta.com/oauth2/default".to_owned()],
         )
         .unwrap();
@@ -492,10 +622,13 @@ mod tests {
             "https://mcp.acme.example/.well-known/oauth-protected-resource"
         );
 
-        assert!(InboundAuthSettings::from_config(&config(&[]), Vec::new()).is_err());
+        let missing =
+            InboundAuthSettings::from_config(&config(&[]), "oidc", Vec::new()).unwrap_err();
+        assert!(missing.contains("MCP_AUTH_MODE=oidc"), "{missing}");
         assert!(
             InboundAuthSettings::from_config(
                 &config(&[("MCP_PUBLIC_URL", "http://mcp.acme.example")]),
+                "okta",
                 Vec::new()
             )
             .is_err()
@@ -505,6 +638,7 @@ mod tests {
                 ("MCP_PUBLIC_URL", "http://127.0.0.1:3000"),
                 ("MCP_REQUIRED_SCOPE", "mcp:read"),
             ]),
+            "okta",
             Vec::new(),
         )
         .unwrap();

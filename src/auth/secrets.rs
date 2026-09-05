@@ -290,7 +290,7 @@ pub fn kind_supported_by(kind: SecretKind, vendor: &str) -> bool {
 /// Canonical vendors that hold at least one registered secret, in declaration
 /// order and without duplicates. Used for CLI help and validation.
 pub fn vendors_with_secrets() -> Vec<&'static str> {
-    let mut vendors: Vec<&'static str> = Vec::new();
+    let mut vendors: Vec<&'static str> = Vec::with_capacity(VENDOR_SECRETS.len());
     for secret in VENDOR_SECRETS {
         if !vendors.contains(&secret.vendor) {
             vendors.push(secret.vendor);

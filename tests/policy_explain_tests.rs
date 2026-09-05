@@ -38,7 +38,7 @@ fn context(
             subject: subject.to_owned(),
             groups: groups.iter().map(|group| (*group).to_owned()).collect(),
             scopes: vec!["mcp:tools".to_owned()],
-            authority: PrincipalAuthority::Okta,
+            authority: PrincipalAuthority::oidc("https://acme.okta.com/oauth2/default"),
         },
         ClientIdentity::default(),
         None,
@@ -50,6 +50,7 @@ fn context(
             vendor: vendor.to_owned(),
             environment,
             authority: UpstreamAuthority::Shared,
+            provenance: None,
         },
     )
 }
@@ -310,7 +311,7 @@ async fn spawn_gateway(
             subject: "sre@acme.example".to_owned(),
             groups: vec!["SRE".to_owned()],
             scopes: vec!["mcp:tools".to_owned()],
-            authority: PrincipalAuthority::Okta,
+            authority: PrincipalAuthority::oidc("https://acme.okta.com/oauth2/default"),
         },
     );
     let auth = InboundAuth::new(
@@ -320,6 +321,7 @@ async fn spawn_gateway(
                 "MCP_PUBLIC_URL".to_owned(),
                 "https://mcp.acme.example".to_owned(),
             )])),
+            "okta",
             vec!["https://acme.okta.com/oauth2/default".to_owned()],
         )
         .unwrap(),
@@ -422,7 +424,14 @@ async fn explain_builds_the_context_a_real_call_is_journaled_with() {
             "--client-version",
             "1.2.3",
         ],
-        &[("GRAFANA_TOKEN", "glsa"), ("MCP_VENDOR_ENVIRONMENT", "qa")],
+        &[
+            ("GRAFANA_TOKEN", "glsa"),
+            ("MCP_VENDOR_ENVIRONMENT", "qa"),
+            // The principal's authority is the issuer (C.1b), read from the
+            // same configuration the gateway validated the token under.
+            ("MCP_OKTA_ISSUER", "https://acme.okta.com/oauth2/default"),
+            ("MCP_OKTA_AUDIENCE", "api://mcp-devtools"),
+        ],
     );
     assert!(ok, "{stderr}");
     let explained: Value = serde_json::from_str(stdout.trim()).unwrap();

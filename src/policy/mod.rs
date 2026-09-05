@@ -25,6 +25,7 @@
 //! legacy `AUDIT_LOG` JSONL keeps its camelCase shape untouched — that
 //! surface is parity-locked; this one is new.)
 
+pub mod admin;
 pub mod bundle;
 pub mod canonical;
 pub mod egress;
@@ -86,17 +87,65 @@ impl Principal {
 
 /// How the inbound identity was established.
 ///
-/// `#[non_exhaustive]`: Entra and EMA variants arrive in later phases;
-/// downstream matches must carry a deny arm, which is the default-deny
-/// posture anyway.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+/// The domain records *who vouched* for the principal, not which vendor's
+/// product did the vouching (plan §3.9, constraint 8): an OIDC principal
+/// carries the issuer URL its token named, so an access review or a policy
+/// explanation can say "validated by `https://login.example/realms/acme`"
+/// without the audit format knowing that Okta, Entra, or Keycloak exists.
+///
+/// Serialised as a single string — `"local"`, or the issuer URL — so every
+/// consumer of the §3.2 canonical object keeps reading one field. An
+/// issuer is always a URL, so the two cannot collide.
+///
+/// `#[non_exhaustive]`: an EMA variant arrives in C.1; downstream matches
+/// must carry a deny arm, which is the default-deny posture anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PrincipalAuthority {
     /// Community trust boundary: stdio or loopback bind, no inbound token.
     Local,
-    /// Okta-validated bearer token (Phase A).
-    Okta,
+    /// A bearer token validated against this OIDC issuer's
+    /// published keys (Phase A; provider profiles in C.1b). Shared, not
+    /// owned: every principal from one validator points at one allocation,
+    /// so cloning a cached principal does not copy the URL.
+    Oidc {
+        /// The configured issuer, without a trailing slash.
+        issuer: std::sync::Arc<str>,
+    },
+}
+
+impl PrincipalAuthority {
+    /// An OIDC authority for `issuer`.
+    #[must_use]
+    pub fn oidc(issuer: &str) -> Self {
+        Self::Oidc {
+            issuer: std::sync::Arc::from(issuer),
+        }
+    }
+
+    /// The issuer that vouched for the principal, when one did.
+    #[must_use]
+    pub fn issuer(&self) -> Option<&str> {
+        match self {
+            Self::Local => None,
+            Self::Oidc { issuer } => Some(issuer),
+        }
+    }
+
+    /// The single-string form the audit record carries.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Local => "local",
+            Self::Oidc { issuer } => issuer,
+        }
+    }
+}
+
+impl Serialize for PrincipalAuthority {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.label())
+    }
 }
 
 /// MCP client self-identification (`clientInfo`).
@@ -187,6 +236,18 @@ pub enum EnvironmentClass {
 }
 
 impl EnvironmentClass {
+    /// The serialised name (`prod`, `staging`, `qa`, `dev`, `unclassified`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prod => "prod",
+            Self::Staging => "staging",
+            Self::Qa => "qa",
+            Self::Dev => "dev",
+            Self::Unclassified => "unclassified",
+        }
+    }
+
     /// Parse a configured classification. Unknown strings are `None` so the
     /// caller can fail loudly instead of silently mapping a typo (`"pord"`)
     /// to something permissive.
@@ -410,6 +471,12 @@ pub struct UpstreamIdentity {
     pub environment: EnvironmentClass,
     /// Shared or delegated authority.
     pub authority: UpstreamAuthority,
+    /// For a credential that came from a secret *reference* (plan §3.8):
+    /// its scheme and the provider's version, flattened into the record as
+    /// `source` and `version`. Absent for a literal or keychain value, so a
+    /// record for those is byte-for-byte what it was.
+    #[serde(flatten)]
+    pub provenance: Option<crate::secrets::SecretProvenance>,
 }
 
 /// Classification of the resource a call addresses.
@@ -467,6 +534,16 @@ pub enum RequestRisk {
 }
 
 impl RequestRisk {
+    /// The serialised name (`read`, `write`, `destructive`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Destructive => "destructive",
+        }
+    }
+
     /// Conservative derivation from the HTTP method, for passthrough calls
     /// with no finer-grained mapping. `POST` is `Write` even when the
     /// endpoint is semantically a search — a per-endpoint extractor must
@@ -1172,7 +1249,7 @@ mod tests {
                 subject: "user@acme.example".to_owned(),
                 groups: vec!["SRE".to_owned()],
                 scopes: vec!["mcp:tools".to_owned()],
-                authority: PrincipalAuthority::Okta,
+                authority: PrincipalAuthority::oidc("https://acme.okta.com/oauth2/default"),
             },
             ClientIdentity {
                 name: Some("claude".to_owned()),
@@ -1200,6 +1277,7 @@ mod tests {
                 vendor: crate::config::VENDOR_GRAFANA.to_owned(),
                 environment: EnvironmentClass::Prod,
                 authority: UpstreamAuthority::Shared,
+                provenance: None,
             },
         )
     }
@@ -1207,7 +1285,9 @@ mod tests {
     /// Locks the serialized shape of the canonical object. Every audit
     /// record and golden decision table depends on these exact names; a
     /// rename here is a breaking API change and must fail a test, not slip
-    /// through a refactor.
+    /// through a refactor. (`principal.authority` changed value once, in
+    /// C.1b: from the vendor name `"okta"` to the issuer URL — plan §0 rev
+    /// 2.14 — while staying a single string.)
     #[test]
     fn action_context_serialized_shape_is_the_section_3_2_field_list() {
         let value = serde_json::to_value(sample_context()).unwrap();
@@ -1219,7 +1299,7 @@ mod tests {
                     "subject": "user@acme.example",
                     "groups": ["SRE"],
                     "scopes": ["mcp:tools"],
-                    "authority": "okta",
+                    "authority": "https://acme.okta.com/oauth2/default",
                 },
                 "client": { "name": "claude", "version": "1.0" },
                 "vendor": "grafana",
@@ -1413,6 +1493,7 @@ mod tests {
             vendor: "jira".to_owned(),
             environment: EnvironmentClass::Unclassified,
             authority: UpstreamAuthority::Shared,
+            provenance: None,
         };
         assert!(!format!("{identity:?}").contains("a@b.example"));
     }

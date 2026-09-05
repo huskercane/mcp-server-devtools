@@ -6,7 +6,7 @@
 # environment, and datasource, including any call whose resource the
 # extractors could not classify.
 #
-# Edit the group name, environment, and datasource UIDs to match your Okta
+# Edit the group name, environment, and datasource UIDs to match your identity-provider
 # groups and Grafana. Validate with:
 #
 #     mcp-devtools policy check deploy/policies/grafana-read-only.yaml

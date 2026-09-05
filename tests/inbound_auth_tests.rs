@@ -75,7 +75,7 @@ fn principal(subject: &str, scopes: &[&str]) -> Principal {
         subject: subject.to_owned(),
         groups: vec!["SRE".to_owned()],
         scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
-        authority: PrincipalAuthority::Okta,
+        authority: PrincipalAuthority::oidc("https://acme.okta.com/oauth2/default"),
     }
 }
 
@@ -88,6 +88,7 @@ fn inbound_auth() -> Arc<InboundAuth> {
             "MCP_PUBLIC_URL".to_owned(),
             PUBLIC_URL.to_owned(),
         )])),
+        "okta",
         vec![ISSUER.to_owned()],
     )
     .unwrap();
@@ -322,7 +323,8 @@ async fn valid_token_reaches_the_tool_and_its_principal_reaches_the_journal() {
     for event in &events {
         assert_eq!(event["principal"]["subject"], "alice@acme.example");
         assert_eq!(event["principal"]["tenant"], "acme");
-        assert_eq!(event["principal"]["authority"], "okta");
+        // C.1b: the authority records the issuer, not the vendor.
+        assert_eq!(event["principal"]["authority"], ISSUER);
         assert_eq!(event["principal"]["groups"], json!(["SRE"]));
         assert_eq!(event["principal"]["scopes"], json!(["mcp:tools"]));
     }

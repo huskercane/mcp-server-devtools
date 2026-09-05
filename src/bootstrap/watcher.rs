@@ -9,7 +9,7 @@
 //! Holds only a [`Weak`] reference to [`Components`], so the task stops on its
 //! own when the server is dropped and never keeps the graph alive.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -85,34 +85,53 @@ pub fn spawn(components: &Arc<Components>, pending: PendingWatch) {
             if contents == last_contents {
                 continue;
             }
-            last_contents = contents;
+            // Parse the exact bytes observed above. The remaining cascade
+            // reads .env and process configuration on a blocking worker.
+            let loaded = tokio::task::spawn_blocking(move || {
+                let result = crate::config::load_from_global_bytes(contents.as_deref());
+                (contents, result)
+            })
+            .await;
+            let reloaded = match loaded {
+                Ok((contents, result)) => {
+                    last_contents = contents;
+                    match result {
+                        Ok(config) => config,
+                        Err(error) => {
+                            tracing::warn!(path = %path.display(), %error, "invalid global config; keeping previous config");
+                            continue;
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "config loader failed; retrying next tick");
+                    continue;
+                }
+            };
 
-            if !reloadable(&path) {
-                continue;
-            }
-
-            components
-                .config
-                .replace(crate::config::load_from_global_path(Some(&path)));
+            // A reloaded configuration may reference secrets the current
+            // snapshot has never seen; resolve them before the swap, and
+            // keep the last good configuration if one does not resolve
+            // (plan §3.8 — the policy-reload contract).
+            let reloaded =
+                match super::secrets::resolve_reloaded(&components.secrets, reloaded).await {
+                    Ok(config) => config,
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            reference = %error.reference,
+                            failure = error.cause.category(),
+                            "global config changed but a secret reference does not resolve; keeping previous config: {}",
+                            error.cause
+                        );
+                        continue;
+                    }
+                };
+            components.config.replace(reloaded);
             components.workspace_cache.clear();
             tracing::info!(path = %path.display(), "reloaded global config");
         }
     });
-}
-
-/// An editor may briefly expose a partially-written file. Keep the last
-/// known-good snapshot and retry when the bytes change again.
-fn reloadable(path: &Path) -> bool {
-    if !path.exists() {
-        return true;
-    }
-    match crate::config::global::read_all_vendors(path, crate::constants::PACKAGE_NAME) {
-        Ok(_) => true,
-        Err(err) => {
-            tracing::warn!(path = %path.display(), error = %err, "global config changed but is not valid JSON; keeping previous config");
-            false
-        }
-    }
 }
 
 #[cfg(test)]
@@ -140,6 +159,14 @@ mod tests {
             usage_sink: Arc::new(crate::ports::NoopUsageSink),
             auth_required: false,
             policy: Arc::new(crate::ports::AllowAll),
+            secrets: Arc::new(crate::secrets::SecretResolver::with_defaults()),
+            secret_health: crate::bootstrap::secrets::SecretHealth::default(),
+            forward_health: Arc::default(),
+            usage_metrics: None,
+            rollup_store: None,
+            usage_receiver: std::sync::Mutex::new(None),
+            rollup_health: Arc::default(),
+            rollup_retention: None,
             policy_file: None,
             audit_append_timeout: crate::policy::egress::DEFAULT_AUDIT_APPEND_TIMEOUT,
             pending_audit: tokio_util::task::TaskTracker::new(),

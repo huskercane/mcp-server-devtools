@@ -79,6 +79,7 @@ use crate::ports::{AuditEvent, AuditEventKind, TokenFacts, UsageEvent};
 #[derive(Clone)]
 pub struct DevtoolsServer {
     components: Arc<Components>,
+    ema_enabled: bool,
     // The `#[tool_handler]` macro references this field by name at expansion
     // time; the rustc reference tracker doesn't see that, so we silence the
     // dead-code lint explicitly.
@@ -106,7 +107,10 @@ impl DevtoolsServer {
     /// it directly.
     #[must_use]
     pub fn from_components(components: Arc<Components>) -> Self {
+        let ema_enabled = components.auth_required
+            && crate::auth::ema::enabled(&components.config()).unwrap_or(false);
         Self {
+            ema_enabled,
             components,
             tool_router: Self::tool_router(),
         }
@@ -175,10 +179,135 @@ impl DevtoolsServer {
             })
     }
 
+    /// Resolve every secret reference (`file://…`) in the configuration
+    /// and start the background refresher (plan §3.8). A transport calls
+    /// this **before** it binds, next to [`Self::journal_startup`]: a
+    /// gateway that cannot resolve a credential it was configured with does
+    /// not start. A configuration with no references does nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`McpError`] naming the first reference that did not resolve and why
+    /// — the reference and a category, never a value.
+    pub async fn resolve_secrets(&self) -> Result<(), crate::error::McpError> {
+        crate::bootstrap::secrets::resolve_startup(&self.components).await
+    }
+
+    /// The failure category when the secret refresher is failing and the
+    /// last good values are in force; `None` when it is healthy or there
+    /// is nothing to refresh.
+    #[must_use]
+    pub fn secrets_degraded(&self) -> Option<&'static str> {
+        self.components.secret_health.degraded()
+    }
+
+    /// Start forwarding the journal to the configured SIEM receiver
+    /// (`MCP_AUDIT_FORWARD_URL`, WP C.3). Called by the HTTP transport on
+    /// the roles that serve the control plane, after `journal_startup`.
+    /// Returns the adapter's name, or `None` when nothing is configured.
+    ///
+    /// # Errors
+    ///
+    /// [`McpError`] when the configuration cannot become a running
+    /// shipper (unknown scheme, unreadable certificate, unwritable state
+    /// directory); the transport refuses to start. An unreachable
+    /// receiver is not an error here: the journal is retained and the
+    /// health banner reports the failure.
+    pub fn start_audit_forwarding(
+        &self,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<&'static str>, crate::error::McpError> {
+        crate::bootstrap::forwarding::spawn_configured(&self.components, cancel)
+    }
+
+    /// The failure category while audit forwarding is failing (the
+    /// journal is retained and delivery retried); `None` when it is
+    /// healthy or not configured.
+    #[must_use]
+    pub fn forwarding_degraded(&self) -> Option<&'static str> {
+        self.components.forward_health.degraded()
+    }
+
+    /// The forwarding health handle, for tests that wait on rounds.
+    #[must_use]
+    pub fn forward_health(&self) -> Arc<crate::audit::forward::ForwardHealth> {
+        Arc::clone(&self.components.forward_health)
+    }
+
+    /// Start the usage-rollup consumer (`MCP_ROLLUP_STORE`, C.6) on the
+    /// roles that serve the control plane. Returns the store's name, or
+    /// `None` when nothing is configured.
+    ///
+    /// # Errors
+    ///
+    /// [`McpError`] when there is no runtime to spawn on.
+    pub fn start_rollups(
+        &self,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<&'static str>, crate::error::McpError> {
+        crate::bootstrap::rollups::spawn_consumer(&self.components, cancel)
+    }
+
+    /// The failure category while rollup appends are failing; `None` when
+    /// healthy or not configured.
+    #[must_use]
+    pub fn rollups_degraded(&self) -> Option<&'static str> {
+        self.components.rollup_health.degraded()
+    }
+
+    /// The rollup health handle, for tests.
+    #[must_use]
+    pub fn rollup_health(&self) -> Arc<crate::rollups::RollupHealth> {
+        Arc::clone(&self.components.rollup_health)
+    }
+
+    /// The active policy bundle, for audited control operations.
+    pub fn policy_file(&self) -> Option<Arc<crate::policy::FilePolicy>> {
+        self.components.policy_file.clone()
+    }
+
+    /// The rollup store, for the admin API's reports.
+    #[must_use]
+    pub fn rollup_store(&self) -> Option<Arc<dyn crate::ports::RollupStore>> {
+        self.components.rollup_store.clone()
+    }
+
+    /// The Prometheus page (`MCP_METRICS=on`), or `None` when metrics are
+    /// off. `rate_limited` is the limiter's refusal count, which lives on
+    /// the auth stack rather than here.
+    #[must_use]
+    pub fn metrics_page(&self, rate_limited: u64) -> Option<String> {
+        let sink = self.components.usage_metrics.as_ref()?;
+        let gauges = crate::metrics::Gauges {
+            audit_journal_available: self
+                .components
+                .audit_sink
+                .as_ref()
+                .map(|sink| sink.is_available()),
+            audit_forward_acknowledged_seq: Some(self.components.forward_health.acknowledged()),
+            audit_forward_degraded: Some(self.components.forward_health.degraded().is_some()),
+            rollups_degraded: self
+                .components
+                .rollup_store
+                .as_ref()
+                .map(|_| self.components.rollup_health.degraded().is_some()),
+            rollups_appended: self
+                .components
+                .rollup_store
+                .as_ref()
+                .map(|_| self.components.rollup_health.appended()),
+            usage_events_dropped: self.components.usage_sink.dropped(),
+            rate_limited_total: rate_limited,
+            secrets_degraded: Some(self.components.secret_health.degraded().is_some()),
+            policy_degraded: Some(self.components.policy.degraded().is_some()),
+        };
+        Some(crate::metrics::render(sink, &gauges))
+    }
+
     /// Snapshot the current config. Returns an `Arc` so a tool call costs one
     /// atomic increment instead of deep-cloning the credential maps; `&Arc<Config>`
     /// deref-coerces to the `&Config` every context factory takes.
-    fn config(&self) -> Arc<Config> {
+    pub(crate) fn config(&self) -> Arc<Config> {
         self.components.config()
     }
 
@@ -526,6 +655,8 @@ struct EnterpriseCall {
     upstream: crate::policy::UpstreamIdentity,
     /// The tool-level decision (WP A.7), repeated on the outcome record.
     decision: PolicyDecision,
+    /// The call's risk class, for the usage row (C.6).
+    risk: crate::policy::RequestRisk,
     /// The call scope the dispatch runs inside (WP A.4/A.5): it carries the
     /// principal, the digested client identity and request id, and the
     /// egress enforcement (WP A.7).
@@ -636,6 +767,7 @@ impl DevtoolsServer {
             };
         }
         let append_timeout = self.components.audit_append_timeout;
+        let risk = action.request_risk();
 
         let intent = AuditEvent {
             timestamp: crate::logger::iso_timestamp(),
@@ -680,6 +812,7 @@ impl DevtoolsServer {
                 rule = decision.rule_id.as_deref().unwrap_or("-"),
                 "tool call denied by policy"
             );
+            self.record_denied_usage(intent.timestamp, principal, tool, vendor, &upstream, risk);
             return Err(Refusal::PolicyDenied(decision));
         }
 
@@ -697,9 +830,34 @@ impl DevtoolsServer {
             vendor,
             upstream,
             decision,
+            risk,
             scope: Arc::new(scope),
             append_timeout,
         }))
+    }
+
+    /// A denial is usage too: reports count it without dispatching.
+    fn record_denied_usage(
+        &self,
+        timestamp: String,
+        principal: &Principal,
+        tool: &str,
+        vendor: &str,
+        upstream: &crate::policy::UpstreamIdentity,
+        risk: crate::policy::RequestRisk,
+    ) {
+        self.components.usage_sink.record(UsageEvent {
+            timestamp,
+            tenant: principal.tenant.clone(),
+            subject: principal.subject.clone(),
+            tool_name: tool.to_owned(),
+            vendor: vendor.to_owned(),
+            environment: upstream.environment.as_str().to_owned(),
+            decision: "deny".to_owned(),
+            risk: risk.as_str().to_owned(),
+            outcome: "policy_denied".to_owned(),
+            duration_ms: 0,
+        });
     }
 
     /// The risk class the server itself declares for a tool through its
@@ -739,6 +897,7 @@ impl DevtoolsServer {
     /// on a path that is about to wait for a disk sync anyway.
     async fn record_outcome(&self, call: EnterpriseCall, outcome: &str, duration_ms: u128) {
         let tool_name = call.scope.tool_name().to_owned();
+        let environment = call.upstream.environment.as_str();
         // One timestamp for the outcome event and the usage event
         // (CLAUDE.md perf guidelines: no repeated formatting work).
         let completed_at = crate::logger::iso_timestamp();
@@ -806,8 +965,13 @@ impl DevtoolsServer {
         }
         self.components.usage_sink.record(UsageEvent {
             timestamp: completed_at,
+            tenant: call.scope.principal().tenant.clone(),
+            subject: call.scope.principal().subject.clone(),
             tool_name,
             vendor: call.vendor.to_owned(),
+            environment: environment.to_owned(),
+            decision: "allow".to_owned(),
+            risk: call.risk.as_str().to_owned(),
             outcome: outcome.to_owned(),
             duration_ms,
         });
@@ -872,7 +1036,7 @@ impl ServerHandler for DevtoolsServer {
         // being handed it. Local mode sets no scope and pays nothing.
         let tool_context =
             rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let result = match &enterprise {
+        let mut result = match &enterprise {
             Some(call) => {
                 crate::policy::CallScope::enter(
                     Arc::clone(&call.scope),
@@ -882,6 +1046,12 @@ impl ServerHandler for DevtoolsServer {
             }
             None => self.tool_router.call(tool_context).await,
         };
+        // Plan §3.7: the upstream identity goes in structured result
+        // metadata, never appended to text content. Enterprise mode only;
+        // a local-mode result is byte-for-byte what it was.
+        if let (Some(call), Ok(CallToolResponse::Complete(value))) = (&enterprise, &mut result) {
+            value.meta = upstream_meta(&call.upstream);
+        }
         let outcome = match &result {
             Ok(CallToolResponse::Complete(value)) if value.is_error == Some(true) => "error",
             Ok(CallToolResponse::Complete(_)) => "success",
@@ -923,6 +1093,14 @@ impl ServerHandler for DevtoolsServer {
         let mut info = ServerInfo::default();
         info.protocol_version = ProtocolVersion::LATEST;
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        if self.ema_enabled {
+            let mut extensions = rmcp::model::ExtensionCapabilities::new();
+            extensions.insert(
+                crate::auth::ema::EXTENSION.to_owned(),
+                serde_json::Map::new(),
+            );
+            info.capabilities.extensions = Some(extensions);
+        }
         info.server_info = implementation;
         info
     }
@@ -1004,12 +1182,32 @@ pub fn vendor_for_tool(tool: &str) -> Option<&'static str> {
     }
 }
 
+/// The `_meta` key under which enterprise responses carry the upstream
+/// identity: which credential slot acted, with what authority, and (for a
+/// referenced secret) from which source and version.
+pub const UPSTREAM_META_KEY: &str = "mcp-devtools/upstream";
+
+/// `_meta` for an enterprise-mode result. Non-secret by construction: the
+/// identity is a label, a vendor, a classification, an authority, and the
+/// secret's provenance — the same fields every journal record carries.
+fn upstream_meta(upstream: &crate::policy::UpstreamIdentity) -> Option<rmcp::model::MetaObject> {
+    let value = serde_json::to_value(upstream).ok()?;
+    let mut meta = rmcp::model::JsonObject::new();
+    meta.insert(UPSTREAM_META_KEY.to_owned(), value);
+    Some(rmcp::model::MetaObject(meta))
+}
+
 pub(crate) fn success_response(resp: &crate::controllers::ControllerResponse) -> CallToolResult {
     let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
     CallToolResult::success(vec![Content::text(text)])
 }
 
 pub(crate) fn error_to_result(err: &crate::error::McpError) -> CallToolResult {
+    // An upstream `401` may mean the credential rotated under us (plan
+    // §3.8): ask for one early, rate-limited refresh of any references.
+    if err.status_code == Some(401) {
+        crate::bootstrap::secrets::note_upstream_unauthorized();
+    }
     let formatted = format_error_for_mcp_tool(err);
     let text = formatted
         .content

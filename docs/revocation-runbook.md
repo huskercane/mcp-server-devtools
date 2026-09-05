@@ -84,7 +84,7 @@ A token with no `jti` cannot be named; revoke its subject instead.
 3. Publish the pair. Every gateway clears its validated-token cache and
    closes every principal session; every token with `iat` before the
    cut-off — or with no `iat` — is refused. A token whose `iat` is in the
-   future (beyond `MCP_OKTA_CLOCK_SKEW_SECONDS`) is refused at
+   future (beyond `MCP_OIDC_CLOCK_SKEW_SECONDS` / `MCP_OKTA_CLOCK_SKEW_SECONDS`) is refused at
    authentication as `not_yet_valid` and never reaches the cut-off test,
    so the cut-off cannot be outrun by a mis-dated token. Clients
    re-authenticate and re-initialise.

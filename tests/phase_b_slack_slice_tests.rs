@@ -42,7 +42,7 @@ fn principal(subject: &str, groups: &[&str]) -> Principal {
         subject: subject.to_owned(),
         groups: groups.iter().map(|group| (*group).to_owned()).collect(),
         scopes: vec!["mcp:tools".to_owned()],
-        authority: PrincipalAuthority::Okta,
+        authority: PrincipalAuthority::oidc("https://acme.okta.com/oauth2/default"),
     }
 }
 
@@ -126,6 +126,7 @@ async fn spawn_slice() -> Slice {
                 "MCP_PUBLIC_URL".to_owned(),
                 "https://mcp.acme.example".to_owned(),
             )])),
+            "okta",
             vec!["https://acme.okta.com/oauth2/default".to_owned()],
         )
         .unwrap(),

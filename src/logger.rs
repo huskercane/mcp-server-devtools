@@ -336,11 +336,14 @@ fn sweep_retention(
 
 // --- Time helpers -----------------------------------------------------------
 
-#[allow(clippy::many_single_char_names)]
 pub(crate) fn iso_timestamp() -> String {
-    let now = SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+    iso_timestamp_at(SystemTime::now())
+}
+
+/// `at` as `YYYY-MM-DDTHH:MM:SSZ`, the journal's timestamp form.
+#[allow(clippy::many_single_char_names)]
+pub(crate) fn iso_timestamp_at(at: SystemTime) -> String {
+    let now = at.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     let secs = i64::try_from(now.as_secs()).unwrap_or(i64::MAX);
     let days = secs.div_euclid(86_400);
     let sod = secs.rem_euclid(86_400);

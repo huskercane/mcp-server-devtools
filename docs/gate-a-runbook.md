@@ -37,7 +37,9 @@ is decided and executed; until then the community image is the artifact.
    `release.yml` publishes the image to GHCR and prints its **digest**.
    Deploy by digest (`image@sha256:…`), never by tag.
 2. **Hand over the manifests.** `deploy/k8s/` with the partner's values
-   filled in: `MCP_OKTA_ISSUER`, `MCP_OKTA_AUDIENCE`, `MCP_PUBLIC_URL`,
+   filled in: `MCP_OIDC_PROFILE`, `MCP_OIDC_ISSUER`, `MCP_OIDC_AUDIENCE`
+   (per [`identity-provider-runbook.md`](identity-provider-runbook.md);
+   `MCP_AUTH_MODE=okta` with `MCP_OKTA_*` still works), `MCP_PUBLIC_URL`,
    `MCP_POLICY_FILE` (start from `deploy/policies/grafana-read-only.yaml`
    with their group names), `MCP_AUDIT_JOURNAL_DIR` on a persistent volume.
    **Phase B added three requirements** the image refuses to start without:
@@ -74,7 +76,7 @@ is decided and executed; until then the community image is the artifact.
    - the intent line exists on disk before Grafana logs the request
      (compare timestamps, or watch the journal while the call runs).
 5. **Rotation and outage, against their IdP.** Rotate the signing key at
-   Okta and confirm the next token validates after the refetch and a token
+   the provider and confirm the next token validates after the refetch and a token
    under the withdrawn key is refused. Block the JWKS URL and confirm cached
    keys keep serving while the log warns.
 6. **Measure what the in-process test could not.**
