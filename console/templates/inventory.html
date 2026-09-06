@@ -6,13 +6,13 @@
 {% else %}
 <p class="banner">Scope: <code>{{ scope }}</code> — this process only. A separate <code>control</code> process cannot see a gateway's inventory (CF-16).</p>
 <p class="muted">{{ rows.len() }} rows</p>
-<table>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Report table"><table>
 <thead><tr><th>Id</th><th>Owner</th>{% if artifacts %}<th>Size</th><th>Content type</th>{% endif %}</tr></thead>
 <tbody>
 {% for row in rows %}
 <tr><td><code>{{ row.id }}</code></td><td>{{ row.owner }}</td>{% if artifacts %}<td>{{ row.size }}</td><td>{{ row.content_type }}</td>{% endif %}</tr>
 {% endfor %}
 </tbody>
-</table>
+</table></div>
 {% endif %}
 {% endblock %}

@@ -586,7 +586,7 @@ implementation boundaries. CF-39 is closed by authenticated decision forms.
   'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action
   'self'; frame-ancestors 'none'; base-uri 'none'` with `htmx.config.allowEval
   = false` set from the embedded configuration, no inline script or style;
-  `Referrer-Policy: no-referrer`; `X-Content-Type-Options: nosniff`;
+  `Referrer-Policy: same-origin`; `X-Content-Type-Options: nosniff`;
   `Cache-Control: no-store` on every rendered page. HSTS stays at the
   ingress (ADR-004). A test asserts every header on every route.
 - **Sessions and CSRF (ADR-013).** Login is the authorization-code + PKCE

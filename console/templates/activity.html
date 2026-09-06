@@ -16,7 +16,7 @@
 <p class="banner warn">Incomplete: the report stopped at {{ stopped }}. Narrow the window; do not read this as a complete result.</p>
 {% endif %}
 <p class="muted">{{ rows.len() }} rows shown · {{ records_read }} records read</p>
-<table>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Report table"><table>
 <thead><tr><th>Seq</th><th>Time</th><th>Kind</th><th>Subject</th><th>Tool</th><th>Vendor</th><th>Effect</th><th>Rule</th><th>Reason</th></tr></thead>
 <tbody>
 {% for row in rows %}
@@ -33,7 +33,7 @@
 </tr>
 {% endfor %}
 </tbody>
-</table>
+</table></div>
 {% endif %}
 </section>
 {% endblock %}

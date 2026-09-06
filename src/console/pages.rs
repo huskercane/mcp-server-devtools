@@ -752,16 +752,51 @@ pub(super) async fn artifacts(
 // ------------------------------------------------------------- proposals
 
 pub(super) struct ProposalView {
-    id: String,
-    operation: String,
-    target: String,
-    proposer: String,
-    created: String,
-    expires: String,
-    state: String,
-    decided_by: String,
-    reason: String,
-    applied_seq: String,
+    pub(super) id: String,
+    pub(super) operation: String,
+    pub(super) target: String,
+    pub(super) proposer: String,
+    pub(super) created: String,
+    pub(super) expires: String,
+    pub(super) state_label: &'static str,
+    pub(super) state_class: &'static str,
+    pub(super) pending: bool,
+    pub(super) incomplete: bool,
+    pub(super) decided_by: String,
+    pub(super) reason: String,
+    pub(super) applied_seq: String,
+    pub(super) digest: String,
+}
+
+impl ProposalView {
+    pub(super) fn from_data(row: &Value) -> Self {
+        let state = row["state"].as_str().unwrap_or_default();
+        let applied = row["applied_seq"].as_u64().is_some();
+        let (state_label, state_class) = match (state, applied) {
+            ("approved", true) => ("Applied", "ok"),
+            ("approved", false) => ("Approved · incomplete", "warn"),
+            ("pending", _) => ("Pending review", "warn"),
+            ("rejected", _) => ("Rejected", "deny"),
+            ("expired", _) => ("Expired", "neutral"),
+            _ => ("Unknown", "neutral"),
+        };
+        Self {
+            id: text(&row["id"]),
+            operation: text(&row["operation"]),
+            target: text(&row["target"]),
+            proposer: party(&row["proposer"]),
+            created: text(&row["created"]),
+            expires: text(&row["expires"]),
+            state_label,
+            state_class,
+            pending: state == "pending",
+            incomplete: state == "approved" && !applied,
+            decided_by: party(&row["decided_by"]),
+            reason: text(&row["reason"]),
+            applied_seq: text(&row["applied_seq"]),
+            digest: text(&row["candidate_digest"]),
+        }
+    }
 }
 
 #[derive(Template)]
@@ -803,22 +838,7 @@ pub(super) async fn proposals(
         Answer::Data(data) => {
             page.rows = data["rows"]
                 .as_array()
-                .map(|rows| {
-                    rows.iter()
-                        .map(|row| ProposalView {
-                            id: text(&row["id"]),
-                            operation: text(&row["operation"]),
-                            target: text(&row["target"]),
-                            proposer: party(&row["proposer"]),
-                            created: text(&row["created"]),
-                            expires: text(&row["expires"]),
-                            state: text(&row["state"]),
-                            decided_by: party(&row["decided_by"]),
-                            reason: text(&row["reason"]),
-                            applied_seq: text(&row["applied_seq"]),
-                        })
-                        .collect()
-                })
+                .map(|rows| rows.iter().map(ProposalView::from_data).collect())
                 .unwrap_or_default();
         }
         Answer::Refused { status, code } => page.unavailable = Some(refusal(status, &code)),
@@ -847,4 +867,29 @@ pub(super) async fn health(
         ok: banner.ok,
         banner: banner.text,
     }))
+}
+
+#[cfg(test)]
+mod proposal_view_tests {
+    use super::ProposalView;
+    use serde_json::json;
+
+    #[test]
+    fn approval_without_application_evidence_is_never_presented_as_applied() {
+        for evidence in [serde_json::Value::Null, json!("42")] {
+            let view = ProposalView::from_data(&json!({
+                "state": "approved", "applied_seq": evidence,
+            }));
+            assert_eq!(view.state_label, "Approved · incomplete");
+            assert!(view.incomplete);
+            assert!(!view.pending);
+        }
+        let applied = ProposalView::from_data(&json!({"state": "approved", "applied_seq": 42}));
+        assert_eq!(applied.state_label, "Applied");
+        assert!(!applied.incomplete);
+        assert!(!applied.pending);
+        let unknown = ProposalView::from_data(&json!({"state": "unexpected"}));
+        assert!(!unknown.pending);
+        assert_eq!(unknown.state_label, "Unknown");
+    }
 }

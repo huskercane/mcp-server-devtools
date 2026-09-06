@@ -218,7 +218,7 @@ header. No shell is used to open a URL anywhere in this codebase.
 **Content Security Policy.** The console serves
 `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self';
 connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`
-with no inline script or style, plus `Referrer-Policy: no-referrer`,
+with no inline script or style, plus `Referrer-Policy: same-origin`,
 `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `no-store` on
 everything but static assets (`CSP` and `security_headers`, `src/console/mod.rs`).
 This is stricter than the spec's `script-src 'self'` suggestion and covers the

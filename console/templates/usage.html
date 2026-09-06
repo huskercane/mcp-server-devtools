@@ -33,24 +33,24 @@
 </dl>
 {% endif %}
 {% if let Some(rows) = groups %}
-<table>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Report table"><table>
 <thead><tr><th>Key</th><th>Rows</th><th>Allowed</th><th>Denied</th><th>Failed</th><th>First</th><th>Last</th></tr></thead>
 <tbody>
 {% for row in rows %}
 <tr><td>{{ row.key }}</td><td>{{ row.rows }}</td><td>{{ row.allowed }}</td><td>{{ row.denied }}</td><td>{{ row.failed }}</td><td>{% if let Some(v) = row.first_timestamp %}{{ v }}{% endif %}</td><td>{% if let Some(v) = row.last_timestamp %}{{ v }}{% endif %}</td></tr>
 {% endfor %}
 </tbody>
-</table>
+</table></div>
 {% endif %}
 {% if let Some(rows) = timeline %}
-<table>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Report table"><table>
 <thead><tr><th>Bucket</th><th>Rows</th><th>Allowed</th><th>Denied</th></tr></thead>
 <tbody>
 {% for row in rows %}
 <tr><td>{{ row.bucket }}</td><td>{{ row.rows }}</td><td>{{ row.allowed }}</td><td>{{ row.denied }}</td></tr>
 {% endfor %}
 </tbody>
-</table>
+</table></div>
 {% endif %}
 </section>
 {% endblock %}

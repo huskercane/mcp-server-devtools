@@ -836,6 +836,7 @@ async fn non_get_requests_need_the_public_origin() {
         (Some("https://evil.example"), None),
         (Some("https://evil.example"), Some("same-origin")),
         (Some("null"), None),
+        (Some("null"), Some("same-origin")),
         (Some("https://mcp.example.evil"), None),
         (Some("http://mcp.example"), None),
     ] {
@@ -926,7 +927,8 @@ async fn pages_render_the_api_answers_and_never_the_token() {
     let html = policy.text().await.unwrap();
     assert!(html.contains("sre-read-qa-loki"));
     assert!(html.contains("Policy in force"));
-    assert!(html.contains(r#"aria-current="page">Policy"#));
+    assert!(html.contains(r#"href="/console/policy" aria-current="page""#));
+    assert!(html.contains("</svg>Policy</a>"));
     assert!(html.contains("Sign out"));
     assert!(!html.contains(ADMIN_TOKEN));
 
@@ -1642,12 +1644,59 @@ async fn console_proposals_enforce_separation_freshness_rejection_and_durable_id
     assert_eq!(verified.unsealed_records, 0);
 }
 
+#[tokio::test]
+async fn proposal_redesign_shows_real_state_and_removes_completed_decision_forms() {
+    let f = approval_fixture(&[]).await;
+    let alice = sign_in(&f).await;
+    let bob = sign_in_as(&f, "bob").await;
+    let empty = page(&f, &bob, "/console/proposals")
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(empty.contains("No proposals yet"));
+    let candidate = "version: 2\nrules: []\n";
+    let signature = f
+        .key
+        .sign(Domain::PolicyBundle, candidate.as_bytes())
+        .to_base64();
+    assert_eq!(
+        upload_policy(&f, &alice, candidate, &signature)
+            .await
+            .status(),
+        202
+    );
+    let id = pending_id(&f).await;
+    let route = format!("/console/proposals/{id}");
+    let pending = page(&f, &bob, &route).await.text().await.unwrap();
+    assert!(pending.contains("Pending review"));
+    assert!(pending.contains("Approve stored candidate"));
+    assert_eq!(
+        console_post(&f, &bob, &format!("{route}/approve"), &[])
+            .await
+            .status(),
+        200
+    );
+    let applied = page(&f, &bob, &route).await.text().await.unwrap();
+    assert!(applied.contains("Applied sequence"));
+    assert!(applied.contains("Decision recorded"));
+    assert!(!applied.contains("Approve stored candidate"));
+    assert!(!applied.contains("Reject proposal"));
+    let register = page(&f, &bob, "/console/proposals")
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(register.contains("Applied</span>"));
+    assert!(!register.contains("No proposals yet"));
+}
+
 fn assert_headers(route: &str, response: &reqwest::Response, cache: &str) {
     let csp = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 
     let headers = response.headers();
     assert_eq!(headers["content-security-policy"], csp, "{route}");
-    assert_eq!(headers["referrer-policy"], "no-referrer", "{route}");
+    assert_eq!(headers["referrer-policy"], "same-origin", "{route}");
     assert_eq!(headers["x-content-type-options"], "nosniff", "{route}");
     assert_eq!(headers["x-frame-options"], "DENY", "{route}");
     assert_eq!(headers["cache-control"], cache, "{route}");

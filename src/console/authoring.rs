@@ -205,6 +205,7 @@ struct ProposalPage {
     page: Page,
     id: String,
     body: String,
+    proposal: super::pages::ProposalView,
 }
 
 // Prevent a decoded path segment from becoming another AdminClient operation.
@@ -236,6 +237,7 @@ pub(super) async fn proposal(
         page: Page::signed_in("Review proposal", "proposals"),
         id,
         body: pretty(&response.body),
+        proposal: super::pages::ProposalView::from_data(&response.body["data"]["proposal"]),
     }))
 }
 

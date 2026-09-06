@@ -16,7 +16,7 @@
 //! - `Content-Security-Policy: default-src 'none'; script-src 'self';
 //!   style-src 'self'; img-src 'self'; connect-src 'self'; form-action
 //!   'self'; frame-ancestors 'none'; base-uri 'none'`, no inline script or
-//!   style; `Referrer-Policy: no-referrer`; `X-Content-Type-Options:
+//!   style; `Referrer-Policy: same-origin`; `X-Content-Type-Options:
 //!   nosniff`; `Cache-Control: no-store` on every page.
 //! - Every non-GET request must carry an `Origin` equal to `MCP_PUBLIC_URL`'s
 //!   origin (or, with no `Origin`, `Sec-Fetch-Site: same-origin`). The
@@ -476,9 +476,12 @@ async fn security_headers(request: Request, next: Next) -> Response {
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(CSP),
     );
+    // Suppress cross-origin referrers while preserving Origin on native form
+    // POSTs. no-referrer makes browsers send Origin: null, which our CSRF guard
+    // correctly refuses.
     headers.insert(
         header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+        HeaderValue::from_static("same-origin"),
     );
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,

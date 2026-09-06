@@ -1,20 +1,26 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>Proposals</h1>
-<p class="muted">Two-person approval (plan §3.10.3). Open a proposal to review its digest and approve or reject it. Approval requires another administrator with a fresh token.</p>
-<section id="proposals" hx-get="/console/proposals" hx-trigger="every 30s" hx-select="#proposals" hx-swap="outerHTML">
+<div class="page-heading"><div><p class="eyebrow">Change governance</p><h1>Proposals</h1><p class="muted">Review administrative changes before they take effect.</p></div><a class="button" href="/console/policy/edit">Author a policy change <span aria-hidden="true">↗</span></a></div>
+<p class="banner">Two-person approval requires a different administrator in the same tenant with a fresh sign-in. An approval is complete only when its application is recorded.</p>
+<section id="proposals" class="card" hx-get="/console/proposals" hx-trigger="every 30s" hx-select="#proposals" hx-swap="outerHTML">
+<div class="card-heading"><div><h2>Proposal register</h2><p>Your tenant's administrative change history</p></div><span class="badge neutral">Refreshes every 30s</span></div>
 {% if let Some(unavailable) = unavailable %}
-<p class="banner warn">{{ unavailable }}</p>
+<div class="card-body"><p class="banner warn">{{ unavailable }}</p></div>
 {% else %}
-<p class="muted">{{ rows.len() }} proposals in your tenant</p>
+{% if rows.is_empty() %}
+<div class="empty-state"><span class="empty-symbol" aria-hidden="true">≡</span><h3>No proposals yet</h3><p>Submit a signed policy with required approvals enabled to start a review.</p><a class="button quiet" href="/console/policy/edit">Prepare a candidate</a></div>
+{% else %}
+<div class="table-scroll" tabindex="0" role="region" aria-label="Proposal register">
 <table>
-<thead><tr><th>Id</th><th>Operation</th><th>Target</th><th>Proposer</th><th>Created</th><th>Expires</th><th>State</th><th>Decided by</th><th>Reason</th><th>Applied seq</th></tr></thead>
+<thead><tr><th>Proposal / operation</th><th>Target</th><th>Proposer</th><th>Created / expires</th><th>State</th><th>Decision</th></tr></thead>
 <tbody>
 {% for row in rows %}
-<tr><td><a href="/console/proposals/{{ row.id }}"><code>{{ row.id }}</code></a></td><td>{{ row.operation }}</td><td>{{ row.target }}</td><td>{{ row.proposer }}</td><td>{{ row.created }}</td><td>{{ row.expires }}</td><td>{{ row.state }}</td><td>{{ row.decided_by }}</td><td>{{ row.reason }}</td><td>{{ row.applied_seq }}</td></tr>
+<tr><td><a href="/console/proposals/{{ row.id }}"><code>{{ row.id }}</code></a><span class="secondary-line">{{ row.operation }}</span></td><td><code>{{ row.target }}</code></td><td>{{ row.proposer }}</td><td><time>{{ row.created }}</time><span class="secondary-line">Expires {{ row.expires }}</span></td><td><span class="badge {{ row.state_class }}">{{ row.state_label }}</span>{% if !row.applied_seq.is_empty() %}<span class="secondary-line">Applied seq {{ row.applied_seq }}</span>{% endif %}</td><td>{{ row.decided_by }}{% if !row.reason.is_empty() %}<span class="secondary-line">{{ row.reason }}</span>{% endif %}</td></tr>
 {% endfor %}
 </tbody>
-</table>
+</table></div>
+{% endif %}
+<div class="card-footer muted">{{ rows.len() }} proposals in your tenant · Open a proposal to review the candidate digest and decision.</div>
 {% endif %}
 </section>
 {% endblock %}

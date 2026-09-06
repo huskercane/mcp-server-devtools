@@ -3,6 +3,6 @@
 <h1>Admin API result ({{ status }})</h1>
 {% if deferred %}<p class="banner warn">Proposal created. The policy has not been applied. A different administrator must approve it with a fresh token.</p>{% endif %}
 <pre>{{ body }}</pre>
-<p>A stale_token refusal requires signing out and obtaining a newly issued token from your identity provider. Approval is applied only when the result contains applied_seq; retry an approved proposal without it to finish a previously interrupted application.</p>
+<p>A stale_token refusal requires signing out and obtaining a newly issued token from your identity provider. Approval is applied only when the result contains applied_seq; an approved proposal without it is incomplete. Refresh its status and reconcile the signed state and journal if it remains incomplete.</p>
 <p><a href="/console/proposals">Review proposals</a> · <a href="/console/policy">Policy in force</a> · <a href="/console/policy/edit">Author policy</a></p>
 {% endblock %}

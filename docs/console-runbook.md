@@ -53,11 +53,15 @@ Every console route carries:
 
 ```text
 Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'
-Referrer-Policy: no-referrer
+Referrer-Policy: same-origin
 X-Content-Type-Options: nosniff
 X-Frame-Options: DENY
 Cache-Control: no-store
 ```
+
+`same-origin` suppresses referrers to other origins while preserving the
+`Origin` header on native form submissions. Using `no-referrer` causes browsers
+to submit these forms with `Origin: null`, which the origin check rejects.
 
 Successfully served embedded static assets instead use
 `Cache-Control: private, max-age=86400`. No CDN, inline script,

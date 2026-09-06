@@ -1,13 +1,20 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>Review proposal {{ id }}</h1>
-<p>Check the operation, target, proposer, expiry and candidate digest against the signing handoff. The API reports metadata here; obtain the candidate and signature from the proposer through your review process.</p>
-<pre>{{ body }}</pre>
-<p>Approval applies the stored candidate. It requires a different administrator in the same tenant and a fresh token. The API rechecks the digest, signature, expiry and prior decision.</p>
+<div class="page-heading"><div><p class="eyebrow"><a href="/console/proposals">Proposals</a> / Review</p><h1>Review proposal</h1><code>{{ id }}</code></div><span class="badge {{ proposal.state_class }}">{{ proposal.state_label }}</span></div>
+{% if proposal.incomplete %}<p class="banner warn">Approval is recorded, but application is incomplete. Refresh this page to check progress. If it remains incomplete, reconcile the signed state and journal before submitting another proposal.</p>{% endif %}
+<div class="proposal-layout">
+<section class="card"><div class="card-heading"><h2>Change details</h2><span class="badge neutral">Signed candidate</span></div><div class="card-body">
+<dl><dt>Operation</dt><dd><code>{{ proposal.operation }}</code></dd><dt>Target version</dt><dd><code>{{ proposal.target }}</code></dd><dt>Proposed by</dt><dd>{{ proposal.proposer }}</dd><dt>Created</dt><dd>{{ proposal.created }}</dd><dt>Expires</dt><dd>{{ proposal.expires }}</dd><dt>Decided by</dt><dd>{{ proposal.decided_by }}</dd>{% if !proposal.reason.is_empty() %}<dt>Decision reason</dt><dd>{{ proposal.reason }}</dd>{% endif %}{% if !proposal.applied_seq.is_empty() %}<dt>Applied sequence</dt><dd>{{ proposal.applied_seq }}</dd>{% endif %}</dl>
+<h2>Candidate digest</h2><code class="digest">{{ proposal.digest }}</code>
+<p class="muted">Compare this digest with the signed candidate from the proposer. Obtain the candidate and signature through your offline review process.</p>
+<details class="advanced"><summary>Full proposal metadata</summary><pre>{{ body }}</pre></details>
+</div></section>
+<section class="card"><div class="card-heading"><h2>Review &amp; decision</h2></div><div class="card-body">
+{% if proposal.pending %}
+<p>Verify the operation, target, expiry and candidate digest before deciding.</p><p class="banner">Approval requires a different administrator in the same tenant and a fresh token. The server rechecks the digest and signature before application.</p>
 <form method="post" action="/console/proposals/{{ id }}/approve"><button type="submit">Approve stored candidate</button></form>
-<form method="post" action="/console/proposals/{{ id }}/reject">
-<label>Rejection reason (maximum 512 UTF-8 bytes) <textarea name="reason" maxlength="512"></textarea></label>
-<button type="submit">Reject proposal</button>
-</form>
-<p><a href="/console/proposals">All proposals</a></p>
+<form method="post" action="/console/proposals/{{ id }}/reject"><label>Rejection reason (maximum 512 UTF-8 bytes)<textarea name="reason" maxlength="512" rows="4"></textarea></label><button class="destructive" type="submit">Reject proposal</button></form>
+{% else %}<div class="empty-state"><h3>Decision recorded</h3><p>This proposal is no longer pending review. Its current status and application details are shown alongside.</p><a class="button quiet" href="/console/proposals/{{ id }}">Refresh status</a></div>{% endif %}
+</div></section>
+</div>
 {% endblock %}

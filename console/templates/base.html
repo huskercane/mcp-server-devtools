@@ -8,25 +8,37 @@
 <link rel="stylesheet" href="/console/static/console.css">
 <script src="/console/static/htmx.min.js" defer></script>
 </head>
-<body>
-<header>
-<span class="brand">mcp-devtools console</span>
+<body class="{% if page.signed_in %}authenticated{% else %}anonymous{% endif %}">
+<a class="skip-link" href="#main">Skip to content</a>
 {% if page.signed_in %}
-<nav>
-<a href="/console/policy"{% if page.active == "policy" %} aria-current="page"{% endif %}>Policy</a>
-<a href="/console/activity"{% if page.active == "activity" %} aria-current="page"{% endif %}>Activity</a>
-<a href="/console/access-review"{% if page.active == "access-review" %} aria-current="page"{% endif %}>Access review</a>
-<a href="/console/usage"{% if page.active == "usage" %} aria-current="page"{% endif %}>Usage</a>
-<a href="/console/sessions"{% if page.active == "sessions" %} aria-current="page"{% endif %}>Sessions</a>
-<a href="/console/artifacts"{% if page.active == "artifacts" %} aria-current="page"{% endif %}>Artifacts</a>
-<a href="/console/proposals"{% if page.active == "proposals" %} aria-current="page"{% endif %}>Proposals</a>
-<a href="/console/health"{% if page.active == "health" %} aria-current="page"{% endif %}>Health</a>
+<aside class="sidebar" aria-label="Console navigation">
+<a class="brand" href="/console/policy"><svg class="brand-mark" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <rect width="32" height="32" rx="6" fill="#0f172a"/>
+  <path d="M16 6L24 10.5V17.5C24 22 20.5 25.5 16 26.5C11.5 25.5 8 22 8 17.5V10.5L16 6Z" stroke="#38bdf8" stroke-width="2" stroke-linejoin="round"/>
+  <path d="M13 16L15.5 18.5L19.5 13.5" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg><span>mcp-devtools<small>Governance console</small></span></a>
+<p class="nav-label">Administration</p>
+<nav aria-label="Primary"><a href="/console/policy"{% if page.active == "policy" %} aria-current="page"{% endif %}><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 6v6c0 5 8 9 8 9s8-4 8-9V6Z M9 12l2 2 4-5"/></svg>Policy</a>
+<a href="/console/activity"{% if page.active == "activity" %} aria-current="page"{% endif %}><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 4h18v16H3Z M5 13h3l2-5 4 8 2-4h3"/></svg>Activity</a>
+<a href="/console/access-review"{% if page.active == "access-review" %} aria-current="page"{% endif %}><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 6v6c0 5 8 9 8 9s8-4 8-9V6Z M12 3v18"/></svg>Access review</a>
+<a href="/console/usage"{% if page.active == "usage" %} aria-current="page"{% endif %}><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4v16h17 M8 15v-4 M13 15V7 M18 15v-6"/></svg>Usage</a>
+<a href="/console/sessions"{% if page.active == "sessions" %} aria-current="page"{% endif %}><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 4h18v16H3Z M7 9l3 3-3 3 M13 15h4"/></svg>Sessions</a>
+<a href="/console/artifacts"{% if page.active == "artifacts" %} aria-current="page"{% endif %}><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 4h18v4H3Z M5 8v12h14V8 M10 12h4"/></svg>Artifacts</a>
+<a href="/console/proposals"{% if page.active == "proposals" %} aria-current="page"{% endif %}><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h11 M4 12h8 M4 19h8 M16 11l2 2 3-4 M16 17l5 5 M21 17l-5 5"/></svg>Proposals</a>
+<a href="/console/health"{% if page.active == "health" %} aria-current="page"{% endif %}><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12h5l3-8 4 16 3-8h5"/></svg>Health</a>
 </nav>
-<form method="post" action="/console/logout"><button class="quiet" type="submit">Sign out</button></form>
+<div class="sidebar-footer"><span class="session-label">Organization sign-in</span><p class="muted">Your authenticated workspace</p><form method="post" action="/console/logout"><button class="quiet" type="submit">Sign out</button></form></div>
+</aside>
 {% endif %}
-</header>
-<main>
+<div class="workspace">
+<header class="context-bar">{% if page.signed_in %}<span>Governance <span class="crumb-divider">/</span> <strong>{{ page.title }}</strong></span><span class="context-label">mcp-devtools console</span>{% else %}<a class="brand" href="/console"><svg class="brand-mark" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <rect width="32" height="32" rx="6" fill="#0f172a"/>
+  <path d="M16 6L24 10.5V17.5C24 22 20.5 25.5 16 26.5C11.5 25.5 8 22 8 17.5V10.5L16 6Z" stroke="#38bdf8" stroke-width="2" stroke-linejoin="round"/>
+  <path d="M13 16L15.5 18.5L19.5 13.5" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg><span>mcp-devtools<small>Governance console</small></span></a>{% endif %}</header>
+<main id="main" tabindex="-1">
 {% block content %}{% endblock %}
 </main>
+</div>
 </body>
 </html>
