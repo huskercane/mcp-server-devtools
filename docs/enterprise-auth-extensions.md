@@ -1,6 +1,8 @@
 # Enterprise plan extension: optional MCP authorization extensions
 
-Status: proposed implementation scope; documentation only  
+Status: proposed implementation scope. The AE-1 identity-policy decision
+below is taken and enforced locally (2026-09-06, plan revision 2.30); the
+client-credentials flag and every external evidence item remain proposed  
 Date: September 6, 2026  
 Parent: [Enterprise technical execution plan](enterprise-product-plan.md), C.1 and C.1b  
 Recorded as plan revision 2.28. No ADR is opened: AE-2 reuses the ADR-013
@@ -136,6 +138,41 @@ AE-2 enables the flag anywhere an administrator can reach.
    view, which requires a validated claim to distinguish them by — the same
    constraint as above, and the reason this is an AE-1 decision rather than a
    rendering detail.
+
+   **Decision (AE-1, 2026-09-06; implemented on `feat/phase-d-administration`).**
+   The kind of a principal is a fact about the credential, read from the
+   claims each provider documents for the purpose and carried on
+   `TokenFacts` (`ports::SubjectKind`: human, machine, unknown), not on the
+   `Principal`, so the §3.2 audit shape is unchanged. Per profile: Okta `uid`
+   present is a person and `cid` without `uid` a machine; Entra `idtyp`
+   `app`/`user`; Auth0 `gty=client-credentials`; Keycloak's service-account
+   session-note mappers (`clientId`/`client_id`, `clientHost`,
+   `clientAddress`) — which a real Keycloak 26.5.7 does **not** add on its
+   own, so the runbook makes the `client_id` mapper a required step
+   (`tests/keycloak_live_tests.rs` acquires a real client-credentials token
+   with and without it); generic reads nothing. `MCP_OIDC_MACHINE_CLAIM` /
+   `MCP_OIDC_HUMAN_CLAIM` add a marker (`name` or `name=value`); every machine
+   source, the profile's reading included, is consulted before either human
+   source, so a human marker can never admit a service account. Subject naming is never consulted. `MCP_ADMIN_PRINCIPALS`
+   decides what the kind does at `/admin/*`, enforced in `require_bearer` on
+   the admin instance after the scope check and before the principal is
+   observed: `human-or-unknown` (default) refuses a positive machine and
+   changes nothing for unmarked tokens; `human` refuses unknown too; `any`
+   admits machines and is refused at startup with `MCP_ADMIN_APPROVALS=required`,
+   because the D.2 predicate compares subjects. A profile that can see no
+   machine warns at startup. The MCP boundary is untouched. Refusals are
+   `403 machine_principal` / `403 unverified_principal_kind`, logged by
+   category, not journaled (a control record would be a schema change; open
+   under CF-42). Locked by `tests/admin_principal_kind_tests.rs` (real RS256
+   tokens over the real HTTP path: refusal at `/admin/*`, admission at `/mcp`
+   with the same token, the inventory never seeing a refused machine) and the
+   per-profile matrix in `tests/token_validator_tests.rs`. Access review
+   rendering of the kind is decided in principle — distinguishable, from the
+   validated kind — and deferred until the observation record carries it
+   (CF-42, with CF-22). Fixtures prove the gateway's reading of each claim
+   shape, not that a tenant emits it — Keycloak 26.5.7 is the one provider
+   where the emission itself is proven, by the live test, and it proved the
+   assumption wrong before it reached an operator.
 3. **Rate limits and revocation were sized for people.** A CI fleet's request
    profile is not an employee's, so reusing the existing limiter is a decision
    to test, not a given. Offboarding-driven revocation has no analogue for a
@@ -143,6 +180,15 @@ AE-2 enables the flag anywhere an administrator can reach.
    resource server can revoke a session or a subject, but rotation and
    withdrawal of the credential itself are AS-side, and AE-4's rotation guidance
    is where that boundary gets stated.
+
+   **Decision (AE-1, 2026-09-06).** The admin limiter is unchanged: machines are
+   refused before it under the default. The MCP limiter stays per subject,
+   which for a CI fleet sharing one client means one shared budget — sized by
+   the operator with `MCP_RATE_LIMIT_PER_PRINCIPAL`, and to be measured against
+   a real fleet's profile under CF-42 before any machine-specific limit is
+   designed. Revocation is as stated: the list revokes a subject or a token
+   id; the credential itself is rotated or withdrawn at the authorization
+   server.
 
 ## Protocol compatibility audit
 
@@ -237,7 +283,8 @@ is not. Items 1–3 are roughly two hours in total, are documentation only, need
 no gates and no design-partner tenant, and between them turn this addendum from
 proposed scope into one shippable support claim plus one stated risk.
 
-**1. Write down that client credentials already works.** No code, no flag. A CI
+**1. Write down that client credentials already works.** *Done (2026-09-06,
+`docs/configuration.md`, "Service accounts already authenticate").* No code, no flag. A CI
 pipeline can authenticate to this server today with a client-credentials token
 from the configured OIDC issuer: the validator checks issuer, audience, expiry,
 subject claim and the required scope, and nothing requires a human-shaped claim.
@@ -254,7 +301,10 @@ is reading the two draft `.mdx` files, confirming the stable EMA file's
 advertisement wording, and writing the table. AE-1 is the stated first package
 and blocks AE-2 and AE-3; leaving it unfinished is what stalls everything else.
 
-**3. Warn operators about `mcp:admin` and four-eyes.** One paragraph in the
+**3. Warn operators about `mcp:admin` and four-eyes.** *Done (2026-09-06),
+and superseded in part: the boundary now refuses positively marked machines by
+default, so the runbook paragraph states the residual — unmarked profiles — and
+the `any` refusal.* One paragraph in the
 approvals runbook, per the reasoning above: granting `mcp:admin` to two service
 accounts satisfies the D.2 self-approval rule with no human in the loop. The
 enforcement decision belongs to AE-1; the warning does not have to wait for it.
@@ -267,11 +317,11 @@ second entry to the extensions map (`src/tools/mod.rs:1139`), and mirror
 only: advertisement is optional by specification, and what it advertises is a
 draft extension. It is not the place to start.
 
-Deliberately **not** in this list, despite appearing cheap: distinguishing
-machine principals by a validated claim (claim shapes differ per provider, which
-is why C.1b needed profiles — an AE-1 decision plus per-provider fixtures, not
-an afternoon); the access-review rendering, which depends on that decision and
-overlaps CF-22's existing scope assumption; external authorization-server
+Deliberately **not** in this list, despite appearing cheap: ~~distinguishing
+machine principals by a validated claim~~ (done with the AE-1 decision above:
+claim shapes differ per provider, and each is now a fixture-locked profile
+reading plus an operator marker); the access-review rendering, which depends on
+that decision and overlaps CF-22's existing scope assumption; external authorization-server
 evidence (CF-42, needs a real tenant); and moving advertisement off `initialize`,
 which is a breaking change for clients built against the stable file and carries
 its own ADR.

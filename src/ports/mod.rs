@@ -69,6 +69,6 @@ pub use secret_source::{
     SecretSourceError,
 };
 pub use token_validator::{
-    Authenticated, StaticValidator, TokenFacts, TokenRejection, TokenValidator,
+    Authenticated, StaticValidator, SubjectKind, TokenFacts, TokenRejection, TokenValidator,
 };
 pub use usage_sink::{BoundedUsageChannel, NoopUsageSink, UsageEvent, UsageSink};

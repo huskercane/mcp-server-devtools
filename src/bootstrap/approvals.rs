@@ -22,6 +22,18 @@ pub const DEFAULT_APPROVAL_TTL: Duration = Duration::from_hours(24);
 /// The longest TTL accepted: thirty days.
 pub const MAX_APPROVAL_TTL: Duration = Duration::from_hours(30 * 24);
 
+/// Whether `MCP_ADMIN_APPROVALS` asks for two-person approval, read the
+/// way [`gate_from_config`] reads it. For settings that must not be
+/// combined with it (`MCP_ADMIN_PRINCIPALS=any`), so the refusal happens at
+/// startup and not on the first proposal.
+#[must_use]
+pub fn required(config: &Config) -> bool {
+    config
+        .get(APPROVALS_KEY)
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("required"))
+}
+
 /// What the configuration selected.
 pub struct Selected {
     pub gate: Arc<dyn MutationGate>,

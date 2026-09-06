@@ -835,6 +835,8 @@ impl OidcKeys {
                 "MCP_OIDC_CLOCK_SKEW_SECONDS",
                 "MCP_OIDC_PROFILE",
                 "MCP_OIDC_SUBJECT_CLAIM",
+                "MCP_OIDC_MACHINE_CLAIM",
+                "MCP_OIDC_HUMAN_CLAIM",
             ],
             Self::Okta => &[
                 "MCP_OKTA_ISSUER",

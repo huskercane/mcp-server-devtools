@@ -161,6 +161,23 @@ The flow, every step a control record before it is a state:
    every listing, and the first decision asked of it journals one
    `admin_rejection` with reason `expired`; nothing is applied.
 
+**Service accounts and the two-person rule.** Step 2 checks that the
+approver's *subject* differs from the proposer's. Two service accounts in one
+tenant satisfy that, so granting `mcp:admin` to two pipeline identities would
+let one propose a signed policy and the other approve it, with a
+correct-looking journal and nobody in the loop. The control that closes this
+is at the boundary, not in the rule: `/admin/*` refuses a principal the
+provider positively marks as a machine's (`403 machine_principal`) under the
+default `MCP_ADMIN_PRINCIPALS=human-or-unknown`, decided on a validated claim
+per provider profile ([identity provider runbook](identity-provider-runbook.md#service-accounts-and-the-administrative-api)).
+`MCP_ADMIN_PRINCIPALS=any` opens administration to machines and is refused at
+startup together with `MCP_ADMIN_APPROVALS=required`; machine administration
+under two-person approval needs an approval predicate that can tell a person
+from a pipeline, which does not exist yet (CF-42). Where the profile carries no
+marker (a generic provider without `MCP_OIDC_MACHINE_CLAIM`), the gateway
+cannot tell and says so at startup; do not grant `mcp:admin` to service
+accounts there.
+
 The pending set is a projection of the control journal, rebuilt when a
 `control` process starts, so a restart loses no proposal and needs no other
 backend. A proposal whose journaled candidate no longer matches its digest —

@@ -49,7 +49,7 @@ use crate::auth::revocation::{RevocationList, RevocationReason};
 use crate::policy::BundleAudit;
 use crate::policy::bundle::BundleDocument as _;
 use crate::ports::audit_sink::{AuditFailure, ControlEvent, ControlEventKind};
-use crate::ports::{Authenticated, TokenRejection, TokenValidator};
+use crate::ports::{Authenticated, SubjectKind, TokenRejection, TokenValidator};
 
 /// RFC 9728 well-known path.
 pub const PROTECTED_RESOURCE_METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
@@ -68,6 +68,89 @@ pub const DEFAULT_REQUIRED_SCOPE: &str = "mcp:tools";
 
 /// The realm named in every challenge.
 const REALM: &str = "mcp-devtools";
+
+/// Config key: which kinds of principal `/admin/*` admits (CF-42, AE-1).
+pub const ADMIN_PRINCIPALS_KEY: &str = "MCP_ADMIN_PRINCIPALS";
+
+/// Who may reach the administrative boundary, over and above `mcp:admin`.
+///
+/// The four-eyes rule (D.2) refuses self-approval on subject equality, which
+/// two service accounts in one tenant satisfy: with `mcp:admin` granted to
+/// both, a pipeline could propose a signed policy and a second pipeline
+/// approve it, with a correct-looking journal and nobody in the loop. Scope
+/// alone cannot tell; this can, on a validated claim
+/// ([`SubjectKind`], per provider profile).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AdminPrincipals {
+    /// Only tokens the provider positively marks as a person's. Refuses
+    /// unknown too — right for a profile that marks both directions
+    /// (Okta, Entra with `idtyp` on user tokens), and locks every
+    /// administrator out under one that cannot.
+    Human,
+    /// Refuse what is positively a machine, admit the rest. The default:
+    /// it closes the four-eyes gap wherever the profile can see a machine,
+    /// and changes nothing for a deployment whose tokens carry no marker.
+    #[default]
+    HumanOrUnknown,
+    /// Admit machines at `/admin/*`. Explicit opt-in for automated
+    /// administration; refused at startup together with
+    /// `MCP_ADMIN_APPROVALS=required`, because that pairing is exactly the
+    /// bypass, until the approval rule can tell a person from a pipeline.
+    Any,
+}
+
+impl AdminPrincipals {
+    /// Read `MCP_ADMIN_PRINCIPALS`, and refuse the pairing that hollows out
+    /// two-person approval.
+    ///
+    /// # Errors
+    ///
+    /// An unrecognised value, or `any` with `MCP_ADMIN_APPROVALS=required`.
+    pub fn from_config(config: &crate::config::Config) -> Result<Self, String> {
+        let value = config
+            .get(ADMIN_PRINCIPALS_KEY)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase);
+        let policy = match value.as_deref() {
+            None | Some("human-or-unknown") => Self::HumanOrUnknown,
+            Some("human") => Self::Human,
+            Some("any") => Self::Any,
+            Some(other) => {
+                return Err(format!(
+                    "{ADMIN_PRINCIPALS_KEY} is {other:?}; expected human, human-or-unknown, or any"
+                ));
+            }
+        };
+        if policy == Self::Any && crate::bootstrap::approvals::required(config) {
+            return Err(format!(
+                "{ADMIN_PRINCIPALS_KEY}=any with {}=required would let two service accounts                  propose and approve a policy with nobody in the loop: the self-approval rule                  compares subjects, not kinds (plan §3.10.3). Keep machines out of /admin/*,                  or turn approvals off and accept single-person machine administration",
+                crate::bootstrap::approvals::APPROVALS_KEY
+            ));
+        }
+        Ok(policy)
+    }
+
+    /// The configured spelling.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::HumanOrUnknown => "human-or-unknown",
+            Self::Any => "any",
+        }
+    }
+
+    /// Whether a principal of `kind` may pass the administrative boundary.
+    #[must_use]
+    pub const fn admits(self, kind: SubjectKind) -> bool {
+        match self {
+            Self::Any => true,
+            Self::HumanOrUnknown => !matches!(kind, SubjectKind::Machine),
+            Self::Human => matches!(kind, SubjectKind::Human),
+        }
+    }
+}
 
 /// Everything the middleware and the metadata document need.
 #[derive(Debug, Clone)]
@@ -149,6 +232,11 @@ pub struct InboundAuth {
     /// Per-principal rate limit (C.6), applied after validation and the
     /// scope check.
     rate_limit: Option<Arc<super::rate_limit::RateLimiter>>,
+    /// Which principal kinds `/admin/*` admits; carried on the MCP boundary
+    /// too so [`Self::for_admin`] inherits it, enforced only there.
+    admin_principals: AdminPrincipals,
+    /// True on the instance [`Self::for_admin`] built.
+    admin_boundary: bool,
 }
 
 impl InboundAuth {
@@ -161,6 +249,8 @@ impl InboundAuth {
             revocations: None,
             audit: None,
             rate_limit: None,
+            admin_principals: AdminPrincipals::default(),
+            admin_boundary: false,
         }
     }
 
@@ -182,7 +272,24 @@ impl InboundAuth {
                     burst: 10.0,
                 },
             ))),
+            admin_principals: self.admin_principals,
+            admin_boundary: true,
         }
+    }
+
+    /// Which principal kinds the administrative boundary admits (CF-42).
+    /// Set on the MCP-boundary instance; [`Self::for_admin`] carries it
+    /// over and is where it is enforced.
+    #[must_use]
+    pub fn with_admin_principals(mut self, policy: AdminPrincipals) -> Self {
+        self.admin_principals = policy;
+        self
+    }
+
+    /// The administrative admission policy in force.
+    #[must_use]
+    pub fn admin_principals(&self) -> AdminPrincipals {
+        self.admin_principals
     }
 
     /// Recently authenticated principal metadata, bounded to 10,000 entries.
@@ -447,6 +554,20 @@ pub async fn require_bearer(
         return auth.insufficient_scope();
     }
 
+    // CF-42 / AE-1: the administrative boundary admits kinds of principal,
+    // not just scopes. Decided on a validated claim, before the principal
+    // is observed, so a refused pipeline never appears in the inventory as
+    // an administrator. Category only in the log, as above.
+    if auth.admin_boundary && !auth.admin_principals.admits(facts.subject_kind) {
+        warn!(
+            rejection = "principal_kind",
+            kind = facts.subject_kind.label(),
+            policy = auth.admin_principals.name(),
+            "principal kind not admitted at the administrative boundary (403)"
+        );
+        return auth.principal_kind_refused(facts.subject_kind);
+    }
+
     auth.observe(&principal);
 
     // C.6: a validated, in-scope principal past its budget is refused
@@ -492,6 +613,29 @@ impl InboundAuth {
             );
         }
         error_response(status, &challenge, body_error, body_description)
+    }
+
+    /// `403` for a principal whose kind the administrative policy refuses.
+    /// The body names the kind and the setting, never a claim value.
+    fn principal_kind_refused(&self, kind: SubjectKind) -> Response {
+        let (error, description) = match kind {
+            SubjectKind::Machine => (
+                "machine_principal",
+                "service-account and other non-human principals are not admitted to the \
+                 administrative API (MCP_ADMIN_PRINCIPALS)",
+            ),
+            SubjectKind::Human | SubjectKind::Unknown => (
+                "unverified_principal_kind",
+                "the token does not positively identify a person, and MCP_ADMIN_PRINCIPALS=human \
+                 admits only those",
+            ),
+        };
+        error_response(
+            StatusCode::FORBIDDEN,
+            &self.base_challenge(),
+            error,
+            description,
+        )
     }
 
     fn insufficient_scope(&self) -> Response {
@@ -597,6 +741,53 @@ mod tests {
         assert_eq!(bearer_token("Bearer"), None);
         assert_eq!(bearer_token("Bearer "), None);
         assert_eq!(bearer_token(""), None);
+    }
+
+    #[test]
+    fn admin_principals_parse_default_and_refuse_any_with_required_approvals() {
+        let config = |pairs: &[(&str, &str)]| {
+            crate::config::Config::from_map(
+                pairs
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .collect(),
+            )
+        };
+        assert_eq!(
+            AdminPrincipals::from_config(&config(&[])).unwrap(),
+            AdminPrincipals::HumanOrUnknown
+        );
+        assert_eq!(
+            AdminPrincipals::from_config(&config(&[(ADMIN_PRINCIPALS_KEY, " Human ")])).unwrap(),
+            AdminPrincipals::Human
+        );
+        assert_eq!(
+            AdminPrincipals::from_config(&config(&[
+                (ADMIN_PRINCIPALS_KEY, "any"),
+                ("MCP_ADMIN_APPROVALS", "off"),
+            ]))
+            .unwrap(),
+            AdminPrincipals::Any
+        );
+        let error = AdminPrincipals::from_config(&config(&[(ADMIN_PRINCIPALS_KEY, "machines")]))
+            .unwrap_err();
+        assert!(error.contains("human, human-or-unknown, or any"), "{error}");
+        let error = AdminPrincipals::from_config(&config(&[
+            (ADMIN_PRINCIPALS_KEY, "any"),
+            ("MCP_ADMIN_APPROVALS", "required"),
+        ]))
+        .unwrap_err();
+        assert!(error.contains("nobody in the loop"), "{error}");
+
+        for (policy, human, machine, unknown) in [
+            (AdminPrincipals::Human, true, false, false),
+            (AdminPrincipals::HumanOrUnknown, true, false, true),
+            (AdminPrincipals::Any, true, true, true),
+        ] {
+            assert_eq!(policy.admits(SubjectKind::Human), human, "{policy:?}");
+            assert_eq!(policy.admits(SubjectKind::Machine), machine, "{policy:?}");
+            assert_eq!(policy.admits(SubjectKind::Unknown), unknown, "{policy:?}");
+        }
     }
 
     #[test]

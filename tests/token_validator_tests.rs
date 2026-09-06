@@ -13,7 +13,7 @@ use std::time::Duration;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode, get_current_timestamp};
 use mcp_server_devtools::auth::oidc::{JwksLocation, OidcJwksValidator, OidcSettings, Profile};
 use mcp_server_devtools::policy::PrincipalAuthority;
-use mcp_server_devtools::ports::{TokenRejection, TokenValidator};
+use mcp_server_devtools::ports::{SubjectKind, TokenRejection, TokenValidator};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1236,5 +1236,211 @@ async fn file_keys_reject_oversize_directories_and_replaced_key_material() {
     assert_eq!(
         validator.validate(&token).await.unwrap_err(),
         TokenRejection::KeysUnavailable
+    );
+}
+
+/// CF-42 / AE-1: the subject kind is read from the claims each provider
+/// documents for the purpose, over the real validation path, and never from
+/// a subject-name convention.
+#[tokio::test]
+async fn subject_kind_is_read_per_profile_from_validated_claims() {
+    let server = MockServer::start().await;
+    mount_jwks(&server, &["test-key-1"], None).await;
+    let jwks = || JwksLocation::Direct(format!("{}/keys", server.uri()));
+    let kind_of = |profile: Profile, mutate: fn(&mut Value)| {
+        let jwks = jwks();
+        async move {
+            let validator = validator(OidcSettings::new(profile, ISSUER, AUDIENCE, jwks));
+            let mut claims = base_claims();
+            mutate(&mut claims);
+            validator
+                .authenticate(&sign(&claims))
+                .await
+                .unwrap()
+                .token
+                .subject_kind
+        }
+    };
+
+    // Okta: `uid` is only present when a user is bound to the token.
+    assert_eq!(
+        kind_of(Profile::Okta, |c| c["uid"] = json!("00u1")).await,
+        SubjectKind::Human
+    );
+    assert_eq!(
+        kind_of(Profile::Okta, |c| {
+            c["sub"] = json!("0oa-client");
+            c["cid"] = json!("0oa-client");
+        })
+        .await,
+        SubjectKind::Machine
+    );
+    // A machine-looking subject name with a user bound is still a person.
+    assert_eq!(
+        kind_of(Profile::Okta, |c| {
+            c["sub"] = json!("service-account-ci");
+            c["uid"] = json!("00u2");
+            c["cid"] = json!("0oa-client");
+        })
+        .await,
+        SubjectKind::Human
+    );
+    assert_eq!(
+        kind_of(Profile::Okta, |c| {
+            c.as_object_mut().unwrap().remove("uid");
+        })
+        .await,
+        SubjectKind::Unknown
+    );
+
+    // Entra: the `idtyp` optional claim, and nothing without it.
+    let entra = |c: &mut Value| c["oid"] = json!("11111111-2222-3333-4444-555555555555");
+    assert_eq!(
+        kind_of(Profile::Entra, |c| {
+            c["oid"] = json!("11111111-2222-3333-4444-555555555555");
+            c["idtyp"] = json!("app");
+        })
+        .await,
+        SubjectKind::Machine
+    );
+    assert_eq!(
+        kind_of(Profile::Entra, |c| {
+            c["oid"] = json!("11111111-2222-3333-4444-555555555555");
+            c["idtyp"] = json!("user");
+        })
+        .await,
+        SubjectKind::Human
+    );
+    assert_eq!(kind_of(Profile::Entra, entra).await, SubjectKind::Unknown);
+}
+
+/// The second half of the per-profile matrix: Auth0, Keycloak, generic, and
+/// the operator marker that teaches a profile a claim it does not read.
+#[tokio::test]
+async fn subject_kind_auth0_keycloak_generic_and_operator_markers() {
+    let server = MockServer::start().await;
+    mount_jwks(&server, &["test-key-1"], None).await;
+    let jwks = || JwksLocation::Direct(format!("{}/keys", server.uri()));
+    let kind_of = |profile: Profile, mutate: fn(&mut Value)| {
+        let jwks = jwks();
+        async move {
+            let validator = validator(OidcSettings::new(profile, ISSUER, AUDIENCE, jwks));
+            let mut claims = base_claims();
+            mutate(&mut claims);
+            validator
+                .authenticate(&sign(&claims))
+                .await
+                .unwrap()
+                .token
+                .subject_kind
+        }
+    };
+
+    // Auth0: `gty` on the default profile; an `@clients` subject alone says nothing.
+    assert_eq!(
+        kind_of(Profile::Auth0, |c| c["gty"] = json!("client-credentials")).await,
+        SubjectKind::Machine
+    );
+    assert_eq!(
+        kind_of(Profile::Auth0, |c| c["sub"] = json!("abc123@clients")).await,
+        SubjectKind::Unknown
+    );
+    assert_eq!(
+        kind_of(Profile::Auth0, |c| c["gty"] = json!("password")).await,
+        SubjectKind::Unknown
+    );
+
+    // Keycloak: the service-account session-note mappers, old and new spelling.
+    for claim in ["clientId", "client_id", "clientHost", "clientAddress"] {
+        let validator = validator(OidcSettings::new(
+            Profile::Keycloak,
+            ISSUER,
+            AUDIENCE,
+            jwks(),
+        ));
+        let mut claims = base_claims();
+        claims[claim] = json!("ci-pipeline");
+        assert_eq!(
+            validator
+                .authenticate(&sign(&claims))
+                .await
+                .unwrap()
+                .token
+                .subject_kind,
+            SubjectKind::Machine,
+            "{claim}"
+        );
+    }
+    assert_eq!(
+        kind_of(Profile::Keycloak, |c| c["preferred_username"] =
+            json!("service-account-ci"))
+        .await,
+        SubjectKind::Unknown
+    );
+
+    // Generic: no marker exists in the specification.
+    assert_eq!(
+        kind_of(Profile::Generic, |c| {
+            c["gty"] = json!("client-credentials");
+            c["idtyp"] = json!("app");
+        })
+        .await,
+        SubjectKind::Unknown
+    );
+}
+
+/// A human marker never outranks a machine reading, the profile's or the
+/// operator's, and an operator marker teaches a profile a claim it does not
+/// read.
+#[tokio::test]
+async fn subject_kind_operator_markers_never_outrank_a_machine_reading() {
+    let server = MockServer::start().await;
+    mount_jwks(&server, &["test-key-1"], None).await;
+    let jwks = || JwksLocation::Direct(format!("{}/keys", server.uri()));
+
+    // A Keycloak service-account token that also carries the configured
+    // human claim is still a machine.
+    let mut settings = OidcSettings::new(Profile::Keycloak, ISSUER, AUDIENCE, jwks());
+    settings.human_claim = Some(
+        mcp_server_devtools::auth::oidc::ClaimMatch::parse(
+            "MCP_OIDC_HUMAN_CLAIM",
+            "email_verified=true",
+        )
+        .unwrap(),
+    );
+    let keycloak = validator(settings);
+    let mut claims = base_claims();
+    claims["client_id"] = json!("ci-pipeline");
+    claims["email_verified"] = json!(true);
+    assert_eq!(
+        keycloak
+            .authenticate(&sign(&claims))
+            .await
+            .unwrap()
+            .token
+            .subject_kind,
+        SubjectKind::Machine
+    );
+
+    // An operator marker teaches the generic profile the provider's claim.
+    let mut settings = OidcSettings::new(Profile::Generic, ISSUER, AUDIENCE, jwks());
+    settings.machine_claim = Some(
+        mcp_server_devtools::auth::oidc::ClaimMatch::parse(
+            "MCP_OIDC_MACHINE_CLAIM",
+            "gty=client-credentials",
+        )
+        .unwrap(),
+    );
+    let validator = validator(settings);
+    let mut claims = base_claims();
+    claims["gty"] = json!("client-credentials");
+    assert_eq!(
+        validator
+            .authenticate(&sign(&claims))
+            .await
+            .unwrap()
+            .token
+            .subject_kind,
+        SubjectKind::Machine
     );
 }

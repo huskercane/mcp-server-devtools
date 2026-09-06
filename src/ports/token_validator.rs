@@ -127,6 +127,43 @@ pub type ValidateFuture<'a> =
 pub type AuthenticateFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Authenticated, TokenRejection>> + Send + 'a>>;
 
+/// Whether the validated token stands for a person or for a machine
+/// (a service account, a CI pipeline, a background job) — or whether the
+/// provider's claims did not say.
+///
+/// Derived from **validated** claims only, per provider profile
+/// (`Profile::subject_kind` in `crate::auth::oidc`), never from the shape of
+/// a subject name or from unsigned client metadata. `Unknown` is an honest
+/// answer, not a default that admits: what an `Unknown` principal may do is
+/// a policy question (`MCP_ADMIN_PRINCIPALS`), decided where it is enforced.
+///
+/// Lives on [`TokenFacts`] rather than on [`Principal`] on purpose: the
+/// principal is the §3.2 audit shape, and widening it is a schema decision;
+/// this is a fact about how one credential was obtained.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SubjectKind {
+    /// The provider marked the token as issued to a person.
+    Human,
+    /// The provider marked the token as issued to a client with no user
+    /// behind it (client credentials, app-only).
+    Machine,
+    /// The provider's claims carry no marker this profile reads.
+    #[default]
+    Unknown,
+}
+
+impl SubjectKind {
+    /// Stable, secret-free label for logs and the error envelope.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Machine => "machine",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Facts about the token itself that revocation needs (plan §3.6, WP B.4)
 /// and that are **not** part of the principal: they describe one credential,
 /// not the person. Never the token, never a signature.
@@ -141,6 +178,8 @@ pub struct TokenFacts {
     /// Validated delegation identities, current actor first. Nested actors are
     /// historical only and never contribute subject, groups or scopes.
     pub actors: Option<std::sync::Arc<[Actor]>>,
+    /// Person, machine, or not said — from validated claims (CF-42, AE-1).
+    pub subject_kind: SubjectKind,
 }
 
 /// An actor identity from a signed RFC 8693 `act` claim.

@@ -318,7 +318,22 @@ fn enterprise_inbound_auth(
         oidc.clone(),
         client,
     ));
-    let mut auth = InboundAuth::new(Arc::new(validator), settings).with_revocations(revocations);
+    let admin_principals = crate::server::auth::AdminPrincipals::from_config(config)
+        .map_err(|error| format!("refusing to start: {error}"))?;
+    if admin_principals != crate::server::auth::AdminPrincipals::Any
+        && !oidc.distinguishes_machines()
+    {
+        tracing::warn!(
+            profile = oidc.profile.name(),
+            policy = admin_principals.name(),
+            "this profile carries no machine-principal marker, so /admin/* admits every \
+             mcp:admin token, a service account's included; name one with \
+             MCP_OIDC_MACHINE_CLAIM (docs/identity-provider-runbook.md)"
+        );
+    }
+    let mut auth = InboundAuth::new(Arc::new(validator), settings)
+        .with_revocations(revocations)
+        .with_admin_principals(admin_principals);
     if let Some(sink) = server.audit_sink() {
         auth = auth.with_audit(BundleAudit {
             sink,

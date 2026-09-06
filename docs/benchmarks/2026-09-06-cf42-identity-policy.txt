@@ -1,0 +1,96 @@
+CF-42 item 1, AE-1 identity policy — 2026-09-06, decision-log revision 2.30
+Branch: feat/phase-d-administration (uncommitted at the owner's instruction)
+Starting HEAD: 48a4b4c (Phase D closeout review). The worktree also held the
+owner's unrelated README/deploy/dev/scripts/dev changes; they are not part of
+this work and were not touched.
+
+What changed on the request path: `TokenFacts` gained a `Copy` enum field
+(`subject_kind`), computed in `principal_from` by two or three map lookups on
+the already-deserialised claims; the admin `InboundAuth` instance checks it
+after the scope check. No new allocation is expected on a cache hit (the enum
+is copied with the cached `Authenticated`) or on a miss.
+
+Landing gates (all zero warnings): cargo build; cargo build
+--no-default-features; cargo clippy --all-targets -- -D warnings; cargo fmt
+--all -- --check; cargo deny --locked check --deny warnings; cargo test
+(default features, every binary ok); console_tests under --features console
+(19 ok). New: tests/admin_principal_kind_tests.rs (3), the per-profile
+subject-kind matrix in tests/token_validator_tests.rs (3), three unit tests
+(ClaimMatch, marker config, MCP_ADMIN_PRINCIPALS), and one Keycloak live test
+run against a real Keycloak 26.5.7 (the dev compose realm) — it records that
+the service-account token carries no marker until the `client_id` User
+Session Note mapper is added. Its sibling rotation test cannot run on the dev
+realm (no `mcp-devtools` client there); it runs in CI's keycloak job.
+
+Allocation probe versus ../2026-09-06-phase-d-closeout.txt (default features):
+every KB / allocation-count row is identical — JWT validate cache hit 1 KB /
+9 allocs, C.1 authenticate 1 KB / 8, journal append 1 KB / 6, rate limit and
+observe 0 / 0, render and truncate rows unchanged. Timings are higher (JWT
+cache hit 6.39 µs vs 4.38 µs) because the probe ran while the test suite was
+still building and running on the same machine; the gate is allocation
+growth, and there is none. Stage -1f (console render) was not built in this
+run; the change does not touch the console.
+
+Raw allocation probe output
+=== output size: is TOON earning its CPU? ===
+                                            compact     pretty       TOON
+  uniform flat rows (TOON's best case)       12392B     20800B      5016B   TOON is 40% of compact, 24% of pretty
+  nested objects (Jira search shape)         89903B    133723B     99300B   TOON is 110% of compact, 74% of pretty
+
+=== stage -1: policy extractors, per tool call (mean of 2000) ===
+  canonical: short path                            0 KB          4 allocs     0.00 ms
+  canonical: dot-segments + escapes                0 KB          1 allocs     0.00 ms
+  canonical: search URL (long JQL)                 0 KB         10 allocs     0.00 ms
+  jira::extract GET /issue/{key}                   0 KB          6 allocs     0.00 ms
+  jira::extract GET /search/jql (long JQL)         1 KB         17 allocs     0.01 ms
+  jira::project_keys_from_jql (long JQL)           0 KB          9 allocs     0.00 ms
+  jira::extract unmapped (default arm)             0 KB          1 allocs     0.00 ms
+  grafana::query_logs                              0 KB         10 allocs     0.00 ms
+
+=== stage -1b: policy decision, per tool call (mean of 2000) ===
+  ActionContext via for_tool (grafana)             0 KB         21 allocs     0.00 ms
+  FilePolicy::evaluate @ 500 rules                 0 KB          5 allocs     0.02 ms
+
+=== stage -1c: enterprise request path, production components (mean of 2000 / 1000) ===
+  JWT validate: cache hit (budget 50 µs)           1 KB          9 allocs     6.39 µs
+  C.1 JWT authenticate: cached actor chain         1 KB          8 allocs     5.87 µs
+  journal append, sequential (budget p99 200 µs)         1 KB          6 allocs  p50      17 µs  p99      48 µs  max     116 µs
+
+=== stage -1d: usage side of the request path (mean of 2000) — C.6 ===
+  rate limit check, known subject                  0 KB          0 allocs     0.00 ms
+  PrometheusUsageSink::record, known series         0 KB          0 allocs     0.00 ms
+  FanOut(prometheus + channel)::record             0 KB          9 allocs     0.00 ms
+
+=== stage -1e: principal inventory — C.4 ===
+  observe principal, known unchanged               0 KB          0 allocs     0.00 ms
+
+=== stage -1f: console activity render, 1000 rows (mean of 100) — D.1 ===
+  skipped: build with --features console to render 1000 activity rows
+
+=== stage 0: per-tool-call config snapshot (mean of 1000) ===
+  BEFORE: deep clone of Config                     4 KB         73 allocs     0.01 ms
+  NOW:    ConfigHandle::snapshot()                 0 KB          0 allocs     0.00 ms
+
+=== 500 issues / 220 KB compact JSON  (mean of 20) ===
+ -- stage 1: jq filter, no filter supplied (the default path)
+  BEFORE: deep clone of the payload             1469 KB      17507 allocs     2.98 ms
+  NOW:    apply_jq_filter(None) borrows            0 KB          0 allocs     0.00 ms
+ -- stage 2: render
+  BEFORE: eager pretty-JSON, then discard       2249 KB      19053 allocs     7.38 ms
+  NOW:    render(Toon), lazy fallback           1736 KB      19032 allocs     8.61 ms
+  ref:    render(Json) on same data              512 KB         13 allocs     1.06 ms
+ -- stage 3: truncate
+  truncate_for_ai (over budget)                   39 KB          4 allocs     0.00 ms
+   rendered output: 243 KB
+
+=== 5000 issues / 2226 KB compact JSON  (mean of 4) ===
+ -- stage 1: jq filter, no filter supplied (the default path)
+  BEFORE: deep clone of the payload            14703 KB     175007 allocs    55.44 ms
+  NOW:    apply_jq_filter(None) borrows            0 KB          0 allocs     0.00 ms
+ -- stage 2: render
+  BEFORE: eager pretty-JSON, then discard      20643 KB     190051 allocs    84.76 ms
+  NOW:    render(Toon), lazy fallback          16547 KB     190035 allocs    60.26 ms
+  ref:    render(Json) on same data             4096 KB         16 allocs     8.81 ms
+ -- stage 3: truncate
+  truncate_for_ai (over budget)                   39 KB          4 allocs     0.01 ms
+   rendered output: 2455 KB

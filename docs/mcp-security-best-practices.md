@@ -293,6 +293,13 @@ and no trust policy to apply.
   the control plane, which is a separate boundary with its own rate limiter
   (`InboundAuth::for_admin`). No `*`, `all`, or `full-access` scope exists —
   the spec's first "common mistake".
+- **Scope is not the only gate on the control plane.** `mcp:admin` admits a
+  kind of principal as well as a scope: a token the provider positively marks
+  as a machine's (per profile, on validated claims — never on subject naming)
+  is refused at `/admin/*` under the default `MCP_ADMIN_PRINCIPALS`, because
+  the two-person approval rule compares subjects and two service accounts
+  would satisfy it. Locked by `tests/admin_principal_kind_tests.rs`; CF-42
+  carries the per-tenant evidence that a real provider emits the marker.
 - **The catalog is not published.** `scopes_supported` in the RFC 9728
   document carries only the required scope, not every scope the server knows
   (`src/server/auth.rs:338`) — the spec's second "common mistake". Locked by

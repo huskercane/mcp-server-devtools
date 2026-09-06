@@ -96,8 +96,8 @@ use serde::Deserialize;
 use crate::config::{Config, OidcKeys};
 use crate::policy::{Principal, PrincipalAuthority};
 use crate::ports::token_validator::{
-    AuthenticateFuture, Authenticated, TokenFacts, TokenRejection, TokenValidator, ValidateFuture,
-    digest,
+    AuthenticateFuture, Authenticated, SubjectKind, TokenFacts, TokenRejection, TokenValidator,
+    ValidateFuture, digest,
 };
 
 /// Config key: the provider profile, `MCP_AUTH_MODE=oidc` only. One of
@@ -111,6 +111,13 @@ pub const SUBJECT_CLAIM_KEY: &str = "MCP_OIDC_SUBJECT_CLAIM";
 /// Config key: tenant label stamped on every principal. Defaults to the
 /// issuer's host.
 pub const TENANT_KEY: &str = "MCP_TENANT";
+/// Config key, `MCP_AUTH_MODE=oidc` only: a claim whose presence (`name`)
+/// or value (`name=value`) marks a token as issued to a machine, in
+/// addition to what the profile already reads. See [`ClaimMatch`].
+pub const MACHINE_CLAIM_KEY: &str = "MCP_OIDC_MACHINE_CLAIM";
+/// Config key, `MCP_AUTH_MODE=oidc` only: a claim whose presence or value
+/// marks a token as issued to a person. See [`ClaimMatch`].
+pub const HUMAN_CLAIM_KEY: &str = "MCP_OIDC_HUMAN_CLAIM";
 
 const DEFAULT_CLOCK_SKEW: Duration = Duration::from_mins(1);
 const MAX_CLOCK_SKEW: Duration = Duration::from_mins(5);
@@ -240,6 +247,148 @@ impl Profile {
             Self::Okta | Self::Entra | Self::Auth0 | Self::Generic => value,
         }
     }
+
+    /// Whether this profile can ever classify a token as [`SubjectKind::Machine`]
+    /// without help from `MCP_OIDC_MACHINE_CLAIM`. Generic cannot: the
+    /// specification has no such claim.
+    #[must_use]
+    pub const fn distinguishes_machines(self) -> bool {
+        !matches!(self, Self::Generic)
+    }
+
+    /// Person or machine, from the claims the provider documents for the
+    /// purpose (CF-42, AE-1). Positive markers only, in both directions;
+    /// anything else is [`SubjectKind::Unknown`]. Never a subject-name
+    /// convention (`service-account-…`, `…@clients`): those are display
+    /// strings an administrator can change.
+    ///
+    /// - **Okta**: `uid` "isn't included in the access token if there is
+    ///   no user bound to it" (Okta's reserved-claims reference), so `uid`
+    ///   present is a person and `cid` without `uid` is the client itself.
+    /// - **Entra**: the `idtyp` optional claim, `app` for app-only tokens
+    ///   and `user` when `include_user_token` is set. Must be enabled on
+    ///   the resource app registration; without it, every token is unknown.
+    /// - **Auth0**: `gty` is `client-credentials` on the default token
+    ///   profile. The RFC 9068 profile omits `gty`, so it is unknown there.
+    /// - **Keycloak**: the Client ID / Client Host / Client IP Address
+    ///   *User Session Note* mappers, whose notes exist only on a
+    ///   service-account login — `clientId` (`client_id` from Keycloak 25),
+    ///   `clientHost`, `clientAddress`. Keycloak 26.5.7 does **not** add
+    ///   them when service accounts are enabled through the admin API
+    ///   (`tests/keycloak_live_tests.rs` records the bare token: `sub`,
+    ///   `azp`, `typ`, `scope`, nothing else), so the runbook step is to add
+    ///   the `clientId` → `client_id` mapper. No positive human marker.
+    /// - **Generic**: unknown.
+    #[must_use]
+    pub fn subject_kind(self, rest: &serde_json::Map<String, serde_json::Value>) -> SubjectKind {
+        let present = |name: &str| rest.get(name).is_some_and(|value| !value.is_null());
+        let equals = |name: &str, expected: &str| {
+            rest.get(name)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value == expected)
+        };
+        match self {
+            Self::Okta => {
+                if present("uid") {
+                    SubjectKind::Human
+                } else if present("cid") {
+                    SubjectKind::Machine
+                } else {
+                    SubjectKind::Unknown
+                }
+            }
+            Self::Entra => {
+                if equals("idtyp", "app") {
+                    SubjectKind::Machine
+                } else if equals("idtyp", "user") {
+                    SubjectKind::Human
+                } else {
+                    SubjectKind::Unknown
+                }
+            }
+            Self::Auth0 => {
+                if equals("gty", "client-credentials") {
+                    SubjectKind::Machine
+                } else {
+                    SubjectKind::Unknown
+                }
+            }
+            Self::Keycloak => {
+                if ["clientId", "client_id", "clientHost", "clientAddress"]
+                    .into_iter()
+                    .any(present)
+                {
+                    SubjectKind::Machine
+                } else {
+                    SubjectKind::Unknown
+                }
+            }
+            Self::Generic => SubjectKind::Unknown,
+        }
+    }
+}
+
+/// An operator-configured claim marker: `name` (the claim is present and
+/// not `null`) or `name=value` (the claim is that exact string, or that
+/// boolean spelled `true`/`false`). `name` may be a dotted path into nested
+/// objects, resolved as the groups claim is. Adds to the profile's own
+/// markers; it does not replace them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimMatch {
+    name: String,
+    value: Option<String>,
+}
+
+impl ClaimMatch {
+    /// Parse a `MCP_OIDC_MACHINE_CLAIM` / `MCP_OIDC_HUMAN_CLAIM` value.
+    ///
+    /// # Errors
+    ///
+    /// When the claim name is empty (`=x`), or a value is given but empty
+    /// (`gty=`): a marker that matches nothing, or everything, is a
+    /// misconfiguration to refuse at startup, not a policy to run under.
+    pub fn parse(key: &str, raw: &str) -> Result<Self, String> {
+        let raw = raw.trim();
+        let (name, value) = match raw.split_once('=') {
+            Some((name, value)) => (name.trim(), Some(value.trim())),
+            None => (raw, None),
+        };
+        if name.is_empty() {
+            return Err(format!(
+                "{key} must name a claim (`name`, or `name=value`), got {raw:?}"
+            ));
+        }
+        if value == Some("") {
+            return Err(format!(
+                "{key} is {raw:?}: a value after `=` must not be empty (drop the `=` to                  match on presence alone)"
+            ));
+        }
+        Ok(Self {
+            name: name.to_owned(),
+            value: value.map(str::to_owned),
+        })
+    }
+
+    /// The claim this marker reads.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn matches(&self, rest: &serde_json::Map<String, serde_json::Value>) -> bool {
+        let Some(found) = lookup_claim(rest, &self.name) else {
+            return false;
+        };
+        match (&self.value, found) {
+            (_, serde_json::Value::Null) => false,
+            (None, _) => true,
+            (Some(expected), serde_json::Value::String(actual)) => actual == expected,
+            (Some(expected), serde_json::Value::Bool(actual)) => {
+                expected == if *actual { "true" } else { "false" }
+            }
+            (Some(_), _) => false,
+        }
+    }
 }
 
 /// Where signing keys are fetched from.
@@ -283,6 +432,12 @@ pub struct OidcSettings {
     pub jwks_refresh: Duration,
     /// Minimum spacing between JWKS fetches triggered by unknown `kid`s.
     pub jwks_min_refetch_interval: Duration,
+    /// Operator marker for machine tokens, in addition to the profile's
+    /// (`MCP_OIDC_MACHINE_CLAIM`).
+    pub machine_claim: Option<ClaimMatch>,
+    /// Operator marker for human tokens, in addition to the profile's
+    /// (`MCP_OIDC_HUMAN_CLAIM`).
+    pub human_claim: Option<ClaimMatch>,
 }
 
 impl OidcSettings {
@@ -373,6 +528,16 @@ impl OidcSettings {
             }
         };
         let tenant = optional(config, TENANT_KEY).map_or(host, str::to_owned);
+        let marker = |key: &str| -> Result<Option<ClaimMatch>, String> {
+            match keys {
+                OidcKeys::Okta => Ok(None),
+                OidcKeys::Oidc => optional(config, key)
+                    .map(|raw| ClaimMatch::parse(key, raw))
+                    .transpose(),
+            }
+        };
+        let machine_claim = marker(MACHINE_CLAIM_KEY)?;
+        let human_claim = marker(HUMAN_CLAIM_KEY)?;
         Ok(Self {
             profile,
             issuer,
@@ -384,7 +549,37 @@ impl OidcSettings {
             tenant,
             jwks_refresh: Duration::from_mins(10),
             jwks_min_refetch_interval: Duration::from_secs(30),
+            machine_claim,
+            human_claim,
         })
+    }
+
+    /// Person, machine, or unknown. Every machine source — the operator's
+    /// marker and the profile's own reading — is consulted before either
+    /// human source, because refusal is the safe failure: a human marker
+    /// that happens to match a service-account token (`email_verified`,
+    /// say) must not admit it. See [`Profile::subject_kind`].
+    #[must_use]
+    pub fn subject_kind(&self, rest: &serde_json::Map<String, serde_json::Value>) -> SubjectKind {
+        let profile = self.profile.subject_kind(rest);
+        if profile == SubjectKind::Machine
+            || self.machine_claim.as_ref().is_some_and(|m| m.matches(rest))
+        {
+            return SubjectKind::Machine;
+        }
+        if self.human_claim.as_ref().is_some_and(|m| m.matches(rest)) {
+            return SubjectKind::Human;
+        }
+        profile
+    }
+
+    /// Whether any token can come out of this configuration classified as
+    /// a machine — the profile reads a marker, or the operator named one.
+    /// When false, `MCP_ADMIN_PRINCIPALS`' default refuses nothing, and
+    /// startup says so.
+    #[must_use]
+    pub fn distinguishes_machines(&self) -> bool {
+        self.profile.distinguishes_machines() || self.machine_claim.is_some()
     }
 
     /// Replace the tenant label.
@@ -414,6 +609,8 @@ impl OidcSettings {
             tenant,
             jwks_refresh: Duration::from_mins(10),
             jwks_min_refetch_interval: Duration::from_secs(30),
+            machine_claim: None,
+            human_claim: None,
         }
     }
 }
@@ -1088,6 +1285,7 @@ impl OidcJwksValidator {
             issued_at: claims.iat,
             token_id: claims.jti.filter(|jti| !jti.trim().is_empty()),
             actors: crate::auth::ema::actors(claims.rest.get("act"))?,
+            subject_kind: self.settings.subject_kind(&claims.rest),
         };
         let mut scopes = claims.scp;
         scopes.extend(claims.scope);
@@ -1329,6 +1527,142 @@ mod tests {
                 .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
                 .collect::<HashMap<_, _>>(),
         )
+    }
+
+    #[test]
+    fn claim_markers_parse_presence_and_value_forms_and_refuse_empty_ones() {
+        let rest = |json: &str| -> serde_json::Map<String, serde_json::Value> {
+            serde_json::from_str(json).unwrap()
+        };
+        let presence = ClaimMatch::parse(MACHINE_CLAIM_KEY, " gty ").unwrap();
+        assert_eq!(presence.name(), "gty");
+        assert!(presence.matches(&rest(r#"{"gty":"password"}"#)));
+        assert!(!presence.matches(&rest(r#"{"gty":null}"#)));
+        assert!(!presence.matches(&rest("{}")));
+
+        let value = ClaimMatch::parse(MACHINE_CLAIM_KEY, "gty=client-credentials").unwrap();
+        assert!(value.matches(&rest(r#"{"gty":"client-credentials"}"#)));
+        assert!(!value.matches(&rest(r#"{"gty":"password"}"#)));
+        assert!(!value.matches(&rest(r#"{"gty":["client-credentials"]}"#)));
+
+        let nested = ClaimMatch::parse(HUMAN_CLAIM_KEY, "acme.person=true").unwrap();
+        assert!(nested.matches(&rest(r#"{"acme":{"person":true}}"#)));
+        assert!(!nested.matches(&rest(r#"{"acme":{"person":false}}"#)));
+
+        for bad in ["=app", "gty=", "   "] {
+            assert!(
+                ClaimMatch::parse(MACHINE_CLAIM_KEY, bad).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn oidc_family_reads_claim_markers_and_the_okta_family_ignores_them() {
+        let settings = OidcSettings::from_config(
+            &config(&[
+                ("MCP_OIDC_PROFILE", "generic"),
+                ("MCP_OIDC_ISSUER", "https://id.acme.example"),
+                ("MCP_OIDC_AUDIENCE", "api://mcp-devtools"),
+                ("MCP_OIDC_MACHINE_CLAIM", "gty=client-credentials"),
+                ("MCP_OIDC_HUMAN_CLAIM", "email_verified"),
+            ]),
+            OidcKeys::Oidc,
+        )
+        .unwrap();
+        assert!(settings.distinguishes_machines());
+        let rest = |json: &str| -> serde_json::Map<String, serde_json::Value> {
+            serde_json::from_str(json).unwrap()
+        };
+        assert_eq!(
+            settings.subject_kind(&rest(r#"{"gty":"client-credentials"}"#)),
+            SubjectKind::Machine
+        );
+        assert_eq!(
+            settings.subject_kind(&rest(r#"{"email_verified":true}"#)),
+            SubjectKind::Human
+        );
+        // A token matching both markers is a machine: refusal is the safe failure.
+        assert_eq!(
+            settings.subject_kind(&rest(
+                r#"{"gty":"client-credentials","email_verified":true}"#
+            )),
+            SubjectKind::Machine
+        );
+        assert_eq!(settings.subject_kind(&rest("{}")), SubjectKind::Unknown);
+
+        // The profile's own machine reading also beats a matching human marker:
+        // a Keycloak service account whose token happens to carry the
+        // operator's human claim is still a machine.
+        let keycloak = OidcSettings::from_config(
+            &config(&[
+                ("MCP_OIDC_PROFILE", "keycloak"),
+                ("MCP_OIDC_ISSUER", "https://id.acme.example/realms/acme"),
+                ("MCP_OIDC_AUDIENCE", "api://mcp-devtools"),
+                ("MCP_OIDC_HUMAN_CLAIM", "email_verified=true"),
+            ]),
+            OidcKeys::Oidc,
+        )
+        .unwrap();
+        assert_eq!(
+            keycloak.subject_kind(&rest(r#"{"client_id":"ci","email_verified":true}"#)),
+            SubjectKind::Machine
+        );
+        assert_eq!(
+            keycloak.subject_kind(&rest(r#"{"email_verified":true}"#)),
+            SubjectKind::Human
+        );
+        // And the operator's machine marker beats the profile's human reading.
+        let okta = OidcSettings::from_config(
+            &config(&[
+                ("MCP_OIDC_PROFILE", "okta"),
+                ("MCP_OIDC_ISSUER", "https://acme.okta.com/oauth2/default"),
+                ("MCP_OIDC_AUDIENCE", "api://mcp-devtools"),
+                ("MCP_OIDC_MACHINE_CLAIM", "acme_bot=true"),
+            ]),
+            OidcKeys::Oidc,
+        )
+        .unwrap();
+        assert_eq!(
+            okta.subject_kind(&rest(r#"{"uid":"00u1","acme_bot":true}"#)),
+            SubjectKind::Machine
+        );
+
+        let error = OidcSettings::from_config(
+            &config(&[
+                ("MCP_OIDC_PROFILE", "generic"),
+                ("MCP_OIDC_ISSUER", "https://id.acme.example"),
+                ("MCP_OIDC_AUDIENCE", "api://mcp-devtools"),
+                ("MCP_OIDC_MACHINE_CLAIM", "=app"),
+            ]),
+            OidcKeys::Oidc,
+        )
+        .unwrap_err();
+        assert!(error.contains("MCP_OIDC_MACHINE_CLAIM"), "{error}");
+
+        let generic = OidcSettings::from_config(
+            &config(&[
+                ("MCP_OIDC_PROFILE", "generic"),
+                ("MCP_OIDC_ISSUER", "https://id.acme.example"),
+                ("MCP_OIDC_AUDIENCE", "api://mcp-devtools"),
+            ]),
+            OidcKeys::Oidc,
+        )
+        .unwrap();
+        assert!(!generic.distinguishes_machines());
+
+        // The okta family reads no marker key: setting one is a mixed-family
+        // configuration, refused like any other MCP_OIDC_* key there.
+        let error = OidcSettings::from_config(
+            &config(&[
+                ("MCP_OKTA_ISSUER", "https://acme.okta.com/oauth2/default"),
+                ("MCP_OKTA_AUDIENCE", "api://mcp-devtools"),
+                ("MCP_OIDC_MACHINE_CLAIM", "cid"),
+            ]),
+            OidcKeys::Okta,
+        )
+        .unwrap_err();
+        assert!(error.contains("MCP_OIDC_MACHINE_CLAIM is set"), "{error}");
     }
 
     #[test]

@@ -337,6 +337,7 @@ mod tests {
                 issued_at: iat,
                 token_id: jti.map(str::to_owned),
                 actors: None,
+                subject_kind: crate::ports::SubjectKind::Unknown,
             },
         }
     }

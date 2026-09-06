@@ -48,6 +48,38 @@ tracks a successful browser login and admin call per provider, including
 Entra's scope and code-redemption compatibility. Do not infer production
 interoperability from ADR-013's acceptance.
 
+## Service accounts and the administrative API
+
+A client-credentials token from the configured issuer authenticates like any
+other (see [`configuration.md`](configuration.md), "Service accounts already
+authenticate"). What differs is the administrative boundary: `/admin/*`
+requires `mcp:admin` **and** a principal kind `MCP_ADMIN_PRINCIPALS` admits.
+By default a token the provider positively marks as a machine's is refused
+there with `403 machine_principal`, because the two-person approval rule
+compares subjects, and two service accounts with `mcp:admin` would satisfy it
+with nobody in the loop ([admin API runbook](admin-api-runbook.md#two-person-approval)).
+
+The kind is read from the claims each provider documents for the purpose,
+never from a subject-name convention (`service-account-…`, `…@clients` are
+display strings an administrator can change). `MCP_OIDC_MACHINE_CLAIM` and
+`MCP_OIDC_HUMAN_CLAIM` add a marker where the profile's is missing or the
+provider is configured unusually.
+
+| Profile | Machine when | Person when | Provider-side setup |
+|---|---|---|---|
+| `okta` | `cid` present and no `uid` | `uid` present | None: Okta omits `uid` "if there is no user bound to" the token. Both directions marked, so `MCP_ADMIN_PRINCIPALS=human` is safe here. |
+| `entra` | `idtyp` = `app` | `idtyp` = `user` | Add the `idtyp` optional claim to the **resource** app registration's access tokens; add the `include_user_token` property for user tokens to carry `user`. Without it every token is unknown, and the default admits it. |
+| `auth0` | `gty` = `client-credentials` | — | None on the default token profile. The RFC 9068 profile omits `gty`; set `MCP_OIDC_MACHINE_CLAIM` to a claim an Action adds for machine clients. |
+| `keycloak` | any of `clientId` (`client_id` from Keycloak 25), `clientHost`, `clientAddress` present | — | **Required.** Observed on Keycloak 26.5.7 (`tests/keycloak_live_tests.rs`): a client with service accounts enabled through the admin API emits a client-credentials token with `sub`, `azp`, `typ`, `scope` and no marker at all, so the profile reads it as unknown and the default policy admits it. Add a *User Session Note* mapper to the service-account client (or a scope every such client has): session note `clientId`, token claim `client_id`, *Add to access token* on. The note exists only on a service-account login, so a person through the same client carries no `client_id` (also observed). |
+| `generic` | `MCP_OIDC_MACHINE_CLAIM` only | `MCP_OIDC_HUMAN_CLAIM` only | The specification has no such claim. Without a marker the gateway logs at startup that `/admin/*` admits every `mcp:admin` token, a service account's included. |
+
+The kind is a fact about the token and is not part of the principal, so the
+audit record shape is unchanged; a refused machine principal is logged by
+category and is never entered in the observed-principal inventory. Access
+review pages do not yet render the kind (CF-42). Local fixtures prove the
+gateway's reading of each claim shape; they do not prove that a given tenant
+emits it — record that per provider before relying on it.
+
 ## Okta
 
 | Setting | Value |
@@ -175,6 +207,16 @@ On the Keycloak side, on the client the tokens are issued to:
    `MCP_OIDC_GROUPS_CLAIM=realm_access.roles` (or
    `resource_access.<client>.roles`); the setting is a path into the
    nested claim.
+4. **Service accounts need a marker mapper.** On Keycloak 26.5.7 a
+   client-credentials token carries nothing that says it is a service
+   account's (see [service accounts](#service-accounts-and-the-administrative-api)):
+   add a *User Session Note* mapper with session note `clientId` and token
+   claim `client_id` to every client that has *Service accounts roles* on,
+   or `/admin/*` cannot tell it from a person. Related, observed on the same
+   version: a user access token carries `sub` only through the `basic`
+   client scope (or a *Subject (sub)* mapper); a realm imported without the
+   built-in scopes issues user tokens with no `sub`, refused as
+   `missing_claim`.
 
 The realm used by CI is `tests/fixtures/keycloak/mcp-realm.json` — two
 clients, one with the audience mapper and one without, which is what the
@@ -286,6 +328,8 @@ never a claim value.
 | `wrong_issuer` | `iss` differs beyond a trailing slash: wrong tenant, realm, or authorization server; Entra v1 token against a v2 issuer. |
 | `wrong_audience`, `missing_claim` (`aud`) | No audience mapper (Keycloak), no API audience requested (Auth0), Graph's audience instead of yours (Entra). |
 | `missing_claim` (`oid`, `sub`, …) | The subject claim the profile names is absent — usually a client-credentials token with no user, or an ID token sent as an access token. |
+| `machine_principal` (403, `/admin/*` only) | The token validated and carries `mcp:admin`, but the provider marks it as a machine's and `MCP_ADMIN_PRINCIPALS` refuses those. Administer as a person, or see the setting before opening administration to automation. |
+| `unverified_principal_kind` (403, `/admin/*` only) | `MCP_ADMIN_PRINCIPALS=human` and the token carries no positive person marker — the profile has none (Keycloak, Auth0, generic), or Entra's `idtyp` is not emitted for user tokens. Configure the marker, or use the default. |
 | `groups_overage` | Entra left the groups out; see the Entra section. |
 | `unsupported_algorithm`, `malformed` | Not an RS256 JWT: an opaque token, an HMAC token, `alg: none`. |
 | `not_yet_valid`, `expired` | Clock skew beyond `MCP_OIDC_CLOCK_SKEW_SECONDS`; fix the clock, do not widen the skew. |

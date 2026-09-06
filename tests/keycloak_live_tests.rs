@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use mcp_server_devtools::auth::oidc::{OidcJwksValidator, OidcSettings};
 use mcp_server_devtools::config::{Config, OidcKeys};
 use mcp_server_devtools::policy::PrincipalAuthority;
-use mcp_server_devtools::ports::{TokenRejection, TokenValidator};
+use mcp_server_devtools::ports::{SubjectKind, TokenRejection, TokenValidator};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -145,6 +145,7 @@ async fn keycloak_realm_tokens_validate_through_the_keycloak_profile_including_r
         eprintln!("MCP_KEYCLOAK_URL is not set; skipping the Keycloak live test");
         return;
     };
+    let _realm = REALM_IN_USE.lock().await;
     let http = reqwest::Client::new();
     wait_for_realm(&http, &base).await;
     let issuer = format!("{base}/realms/{REALM}");
@@ -387,4 +388,249 @@ fn unverified_claims(token: &str) -> Value {
         .decode(payload)
         .expect("base64url payload");
     serde_json::from_slice(&bytes).expect("JSON claims")
+}
+
+const SA_CLIENT_ID: &str = "mcp-ci-live-test";
+const SA_CLIENT_SECRET: &str = "mcp-ci-live-test-secret";
+/// The claims the Keycloak profile reads as a service-account marker.
+const SA_MARKERS: [&str; 4] = ["clientId", "client_id", "clientHost", "clientAddress"];
+
+/// Both live tests change the realm (signing keys; a client) and read
+/// tokens the other's change could invalidate, so they take turns.
+static REALM_IN_USE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Create the service-account client (removing any earlier run's), with the
+/// audience mapper and an explicit `sub` mapper — on Keycloak 26 `sub` comes
+/// from the `basic` client scope, and a realm imported without the built-in
+/// scopes (the dev compose realm) emits no `sub` for users at all. Returns
+/// the client's admin URL.
+async fn create_service_account_client(http: &reqwest::Client, base: &str, admin: &str) -> String {
+    let existing: Value = admin_get(
+        http,
+        admin,
+        format!("{base}/admin/realms/{REALM}/clients?clientId={SA_CLIENT_ID}"),
+    )
+    .await;
+    for client in existing.as_array().into_iter().flatten() {
+        let id = client["id"].as_str().unwrap();
+        http.delete(format!("{base}/admin/realms/{REALM}/clients/{id}"))
+            .bearer_auth(admin)
+            .send()
+            .await
+            .unwrap();
+    }
+    let created = http
+        .post(format!("{base}/admin/realms/{REALM}/clients"))
+        .bearer_auth(admin)
+        .json(&json!({
+            "clientId": SA_CLIENT_ID,
+            "publicClient": false,
+            "secret": SA_CLIENT_SECRET,
+            "standardFlowEnabled": false,
+            "directAccessGrantsEnabled": true,
+            "serviceAccountsEnabled": true,
+            "protocolMappers": [{
+                "name": "sub",
+                "protocol": "openid-connect",
+                "protocolMapper": "oidc-sub-mapper",
+                "consentRequired": false,
+                "config": {
+                    "access.token.claim": "true",
+                    "id.token.claim": "true"
+                }
+            }, {
+                "name": "mcp-audience",
+                "protocol": "openid-connect",
+                "protocolMapper": "oidc-audience-mapper",
+                "consentRequired": false,
+                "config": {
+                    "included.custom.audience": AUDIENCE,
+                    "id.token.claim": "false",
+                    "access.token.claim": "true"
+                }
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        created.status().is_success(),
+        "creating the service-account client failed: {} {}",
+        created.status(),
+        created.text().await.unwrap_or_default()
+    );
+    created
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("Location of the created client")
+        .to_owned()
+}
+
+/// The runbook step: a *User Session Note* mapper for `clientId`, the note
+/// Keycloak sets on a service-account login and on nothing else.
+async fn add_client_id_mapper(http: &reqwest::Client, admin: &str, client_url: &str) {
+    let mapper = http
+        .post(format!("{client_url}/protocol-mappers/models"))
+        .bearer_auth(admin)
+        .json(&json!({
+            "name": "service-account-client-id",
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-usersessionmodel-note-mapper",
+            "consentRequired": false,
+            "config": {
+                "user.session.note": "clientId",
+                "claim.name": "client_id",
+                "jsonType.label": "String",
+                "id.token.claim": "false",
+                "access.token.claim": "true"
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        mapper.status().is_success(),
+        "adding the mapper failed: {} {}",
+        mapper.status(),
+        mapper.text().await.unwrap_or_default()
+    );
+}
+
+async fn client_credentials_grant(http: &reqwest::Client, base: &str) -> String {
+    let response = http
+        .post(format!(
+            "{base}/realms/{REALM}/protocol/openid-connect/token"
+        ))
+        .form(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", SA_CLIENT_ID),
+            ("client_secret", SA_CLIENT_SECRET),
+        ])
+        .send()
+        .await
+        .expect("token endpoint reachable");
+    let status = response.status();
+    let body: Value = response.json().await.expect("token response is JSON");
+    assert!(
+        status.is_success(),
+        "client credentials grant failed: {body}"
+    );
+    body["access_token"].as_str().unwrap().to_owned()
+}
+
+fn markers_in(claims: &Value) -> Vec<&'static str> {
+    SA_MARKERS
+        .into_iter()
+        .filter(|claim| claims.get(claim).is_some())
+        .collect()
+}
+
+/// CF-42 / AE-1: a **real** Keycloak service account, not a fixture claim
+/// shape. The client is created through the admin API so the test carries
+/// its own precondition on any realm.
+///
+/// What a real Keycloak 26.5.7 does, recorded here because it contradicts
+/// the older documentation: a client-credentials token carries `sub`,
+/// `azp`, `typ`, `scope` and nothing that marks it as a service account's —
+/// the Client ID / Client Host / Client IP Address mappers are **not** added
+/// when service accounts are enabled through the admin API. So out of the
+/// box the profile reads it as unknown, and the documented fix is the
+/// *User Session Note* mapper (`clientId` → `client_id`) on the service
+/// account's client, which this test adds and proves. A person through the
+/// same client, mapper and all, carries no such claim.
+#[tokio::test]
+async fn keycloak_service_account_tokens_are_machines_once_the_client_id_mapper_exists() {
+    let Some(base) = keycloak_url() else {
+        eprintln!("MCP_KEYCLOAK_URL is not set; skipping the Keycloak live test");
+        return;
+    };
+    let _realm = REALM_IN_USE.lock().await;
+    let http = reqwest::Client::new();
+    wait_for_realm(&http, &base).await;
+    let admin = admin_token(&http, &base).await;
+    let client_url = create_service_account_client(&http, &base, &admin).await;
+    let validator = Arc::new(OidcJwksValidator::new(
+        settings(&base),
+        reqwest::Client::new(),
+    ));
+
+    // 1. Out of the box: whatever this Keycloak emits, the profile's answer
+    //    agrees with it — machine if a marker is there, unknown if not. On
+    //    26.5.7 none is, and that is the gap the runbook step closes.
+    let plain = client_credentials_grant(&http, &base).await;
+    let plain_claims = unverified_claims(&plain);
+    let plain_markers = markers_in(&plain_claims);
+    eprintln!(
+        "keycloak client-credentials token, no mapper: markers {plain_markers:?}, claims {:?}",
+        plain_claims.as_object().unwrap().keys().collect::<Vec<_>>()
+    );
+    let plain_kind = validator
+        .authenticate(&plain)
+        .await
+        .unwrap()
+        .token
+        .subject_kind;
+    assert_eq!(
+        plain_kind,
+        if plain_markers.is_empty() {
+            SubjectKind::Unknown
+        } else {
+            SubjectKind::Machine
+        }
+    );
+
+    // 2. With the mapper, the token says what it is.
+    add_client_id_mapper(&http, &admin, &client_url).await;
+    let machine = client_credentials_grant(&http, &base).await;
+    let claims = unverified_claims(&machine);
+    assert_eq!(
+        claims["client_id"], SA_CLIENT_ID,
+        "the session-note mapper emits the client id: {claims}"
+    );
+    let authenticated = validator
+        .authenticate(&machine)
+        .await
+        .expect("the service account's token validates like any other");
+    assert_eq!(authenticated.token.subject_kind, SubjectKind::Machine);
+    assert_eq!(
+        authenticated.principal.subject,
+        claims["sub"].as_str().unwrap(),
+        "the subject is the service-account user's id, not the client id"
+    );
+    assert!(authenticated.principal.groups.is_empty());
+
+    // 3. A person through the same client, mapper included: the note is not
+    //    set on a user login, so no marker and nothing positive to say —
+    //    unknown, not machine, and never refused by the default policy.
+    let alice = password_grant(
+        &http,
+        &base,
+        SA_CLIENT_ID,
+        SA_CLIENT_SECRET,
+        "alice",
+        "alice-password",
+    )
+    .await;
+    let alice_claims = unverified_claims(&alice);
+    assert!(
+        markers_in(&alice_claims).is_empty(),
+        "a user login must not carry a service-account marker: {alice_claims}"
+    );
+    let alice_kind = validator
+        .authenticate(&alice)
+        .await
+        .unwrap_or_else(|rejection| panic!("alice's token: {rejection:?} in {alice_claims}"))
+        .token
+        .subject_kind;
+    assert_eq!(alice_kind, SubjectKind::Unknown);
+
+    // Leave the realm as it was found.
+    let deleted = http
+        .delete(&client_url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert!(deleted.status().is_success(), "{}", deleted.status());
 }

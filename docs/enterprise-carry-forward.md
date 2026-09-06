@@ -839,39 +839,85 @@ licensing, an editor widget, build-speed work (CF-40), or new shipping profiles.
 
 ### CF-42 · Client-credentials external evidence and machine-principal scope
 
-**Open · AE-2 follow-up (2026-09-06); owner: engineering + operations.**
-The [authorization extensions addendum](enterprise-auth-extensions.md) proposes
-`MCP_CLIENT_CREDENTIALS_ENABLED` as an opt-in advertisement setting. Local
-configuration and wire tests can be completed here; the acceptance evidence
-that cannot is the external half — a real authorization server issuing a
-client-credentials or RFC 7523 private-key-JWT token, followed by an allowed
-tool call and a policy-denied call through the real HTTP path, plus credential
-rotation and reacquisition at the client/AS boundary. This is the client
-credentials sibling of CF-35 and carries the same rule: a fixture issuer
-establishes local behaviour, never that a particular tenant or MCP client
-implements the extension. No support claim for any provider/client pair until
-the pair is run.
+**Open · AE-2 follow-up (2026-09-06; identity policy landed 2026-09-06);
+owner: engineering + operations.** Two pieces of work, one done locally and
+one that cannot be.
 
-The extension is specified in `specification/draft/oauth-client-credentials.mdx`
-only — there is no stable file, unlike EMA. Operator documentation must say so;
-a draft extension is a weaker support commitment and may change under us.
+**1. Decide and enforce what machines may do — landed on
+`feat/phase-d-administration`.** A CI pipeline could already present a valid
+access token from the configured issuer; the proposed
+`MCP_CLIENT_CREDENTIALS_ENABLED` flag only advertises support and never
+controlled whether such tokens authenticate. The concern was administration:
+pipeline account A submits a signed policy change, pipeline account B approves
+it, both hold `mcp:admin`, their subjects differ, and D.2's approval rule
+(`src/approvals/mod.rs`, subject inequality within a tenant) accepts the
+sequence — two identities, no human review. Decided under AE-1 and enforced:
 
-Scope still undecided, and blocking before the flag is enabled anywhere an
-administrator can reach: whether a machine principal is admitted at `/admin/*`
-at all. D.2's four-eyes rule refuses self-approval on subject equality within a
-tenant (`src/approvals/mod.rs:291`, `:312`), which two service accounts in one
-tenant satisfy, so `MCP_ADMIN_APPROVALS=required` would admit a fully machine
-approval chain with a correct-looking journal. The control that stands today is
-scope, not the approval rule: `/admin/*` requires `mcp:admin`
-(`src/server/auth.rs:172`), so this needs an operator to have granted that scope
-to two service accounts — plausible for automated policy deployment, and
-unwarned against. Note the exposure does not wait on the proposed flag: the flag
-is advertisement only, and a client-credentials token from the configured issuer
-already validates today. The proposed default is refusal at the
-administrative router on a validated claim; a stronger approval predicate would
-be a D.2 change with its own tests. Related: machine principals are currently
-indistinguishable from employees in the D.1 access review, and the existing
-rate limiter was sized for human request profiles.
+- The kind of a principal (`ports::SubjectKind`: human, machine, unknown) is
+  read from validated claims per provider profile — Okta `uid`/`cid`, Entra
+  `idtyp`, Auth0 `gty`, Keycloak's service-account mappers, generic none —
+  with `MCP_OIDC_MACHINE_CLAIM` / `MCP_OIDC_HUMAN_CLAIM` as operator markers.
+  Subject naming is never consulted. The kind rides on `TokenFacts`, so the
+  principal and audit shapes are unchanged.
+- `MCP_ADMIN_PRINCIPALS` (default `human-or-unknown`) refuses a positively
+  marked machine at `/admin/*` with `403 machine_principal`; `human` refuses
+  unknown too; `any` is refused at startup with `MCP_ADMIN_APPROVALS=required`.
+  Explicitly authorized tool calls at `/mcp` are untouched. A profile that can
+  see no machine warns at startup.
+- Locked by `tests/admin_principal_kind_tests.rs` (real RS256 tokens through
+  the real HTTP path) and the per-profile matrix in
+  `tests/token_validator_tests.rs`; configuration refusals are unit-locked.
+- **Real-provider evidence, Keycloak only:** `tests/keycloak_live_tests.rs`
+  creates a service-account client on a real Keycloak 26.5.7 through the admin
+  API and acquires a client-credentials token. Out of the box it carries
+  `sub`, `azp`, `typ`, `scope` and **no** service-account marker — the
+  documented auto-added Client ID/Host/Address mappers are not there — so the
+  profile reads it as unknown; with a *User Session Note* mapper
+  (`clientId` → `client_id`) it is a machine, and a person through the same
+  client carries no marker. The runbook now makes the mapper a required step.
+  Run locally against the dev compose realm on 2026-09-06; CI runs it in the
+  `keycloak` job. This is acquisition plus classification only, not a tool
+  call, rotation or revocation timing, and not an MCP client.
+- Documented in `configuration.md`, the identity-provider runbook (per-profile
+  markers and provider-side setup) and the admin API runbook (the four-eyes
+  paragraph). Gates and the allocation probe (no row changed against the
+  closeout baseline): `benchmarks/2026-09-06-cf42-identity-policy.txt`.
+
+Still open under this item: rendering the kind in the D.1 access review
+(decided in principle, waits on the observation record carrying it; overlaps
+CF-22); a control record for a refused machine (a journal-schema change, so a
+separate decision); a machine-aware approval predicate if a deployment ever
+needs machine administration under two-person approval (a D.2 change with its
+own tests — until then `any` and `required` are mutually exclusive); and
+whether the per-subject MCP limiter suits a fleet sharing one client, which is
+a measurement against a real fleet, not a local design.
+
+**2. Collect real interoperability evidence — cannot be done here.** The
+[authorization extensions addendum](enterprise-auth-extensions.md) proposes
+`MCP_CLIENT_CREDENTIALS_ENABLED` as an opt-in advertisement setting; local
+configuration and wire tests can be completed when it is built. For each
+provider/client combination we intend to support, exercise and record with
+exact versions and redacted results:
+
+- actual token acquisition by a service account (client secret or RFC 7523
+  private-key JWT) from the real authorization server;
+- an allowed tool call and a policy-denied call through the real HTTP path;
+- administrative refusal under the identity policy above — which also proves
+  the tenant emits the marker the profile reads, something fixtures cannot
+  (done for Keycloak 26.5.7 at the validator, not yet through `/admin/*`;
+  open for Okta, Entra and Auth0, where the markers are documented but
+  unobserved);
+- credential rotation and token reacquisition at the client/AS boundary;
+- revocation behaviour, with observed timing.
+
+This is the client-credentials sibling of CF-35 and carries the same rule: a
+fixture issuer establishes local behaviour, never that a particular tenant or
+MCP client implements the extension. No support claim for any provider/client
+pair until the pair is run. The extension is specified in
+`specification/draft/oauth-client-credentials.mdx` only — there is no stable
+file, unlike EMA — and operator documentation says so; a draft extension is a
+weaker support commitment and may change under us. CF-42 stays open until the
+external evidence is recorded.
 
 ### CF-43 · The outbound network posture is not written down
 

@@ -68,7 +68,7 @@ fn facts(issued_at: u64, jti: &str) -> TokenFacts {
     TokenFacts {
         issued_at: Some(issued_at),
         token_id: Some(jti.to_owned()),
-        actors: None,
+        ..TokenFacts::default()
     }
 }
 
