@@ -45,3 +45,10 @@ Thumbs.db
 /fuzz/artifacts
 /fuzz/coverage
 /fuzz/Cargo.lock
+
+# Public, test-only TLS fixtures; see tests/fixtures/tls/README.md.
+!tests/fixtures/tls/ca.pem
+!tests/fixtures/tls/client.pem
+!tests/fixtures/tls/client-key.pem
+!tests/fixtures/tls/server.pem
+!tests/fixtures/tls/server-key.pem

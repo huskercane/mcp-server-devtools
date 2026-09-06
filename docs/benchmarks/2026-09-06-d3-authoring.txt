@@ -1,0 +1,235 @@
+D.3 console v2, policy authoring — 2026-09-06
+Branch: feat/phase-d-administration
+Parent: c09537f (independent documentation/login commits retained).
+D.4 comparison baseline: 0182b3b, docs/benchmarks/2026-09-06-d4-packaging.txt.
+Validated code includes the independently committed security-map documentation
+(75a18ad) and login fix (06308e4); their changes are not attributed to D.3.
+
+Implementation and operating boundaries
+
+Textarea editing uses the existing policy/validate and policy/diff operations
+through AdminClient. htmx input is debounced by 500 ms; replacement previews
+swap only the result section. The API's structural rule descriptions and
+validation envelope are rendered with askama escaping. Download validates the
+submitted candidate again and returns its exact bytes as a no-store attachment.
+
+A small first-party file helper JSON-escapes signed UTF-8 before ordinary form
+submission, preserving CRLF/non-ASCII/signature bytes without a multipart parser,
+editor widget or new dependency. The no-script path accepts the ordinary signed
+API JSON envelope. Native textarea download bytes are the authoritative signing
+input because form submission can normalize newlines. Upload never edits or
+repairs signed bytes; the API rejects unsupported content and bad signatures.
+Helper limits: 256 KiB policy / 1 KiB signature; console encoded form cap 2 MiB.
+
+PUT /admin/policy remains the only install surface, through the configured
+MutationGate. Required mode records a pending proposal without applying it;
+direct mode still verifies, journals its intent and installs. Proposal review
+and approve/reject forms call the existing tenant-scoped API. No gate, signature,
+fresh-token, digest, expiry, idempotency, or durable-intent implementation changed.
+The read API exposes proposal metadata/digest, so candidate review still needs
+the offline signing handoff. CF-39 closes interactive decisions; CF-45 carries
+structural-diff, review/concurrency, input-size and browser-evidence boundaries.
+CF-42–44 are reserved by concurrent authorization/security documentation.
+
+Landing-gate deviation: the clean worktree exposed five existing public TLS
+fixture PEMs missing from Git because of the broad *.pem ignore. D.3 includes
+the exact local test CA/server/client certificates and two leaf keys with narrow
+ignore exceptions; the fixture README explicitly identifies them as throwaway
+public test material. No production key or CA private key is included. Tests
+now have their required inputs in a clean checkout. This does not prove hosted CI.
+
+Local proof
+
+Real HTTP console tests exercise validation/diff and exact downloaded-byte
+sign/upload round trip, invalid signed input, audit-outage refusal without an
+effect, escaping, Origin/session/security headers and encoded-body bounds.
+Required-mode tests use explicit synthetic principal/token facts and the real
+configured gate/on-disk signed journal: proposal without effect, self/stale/
+other-tenant refusal, approval -> ordinary durable intent -> effect, repeat
+approval without another record, rejection and repeated-decision refusal,
+observed expiry journaled once. The offline verifier accepts the signed records.
+The real RS256/wiremock JWKS login test also exercises signed policy upload.
+Existing API/CLI/conformance, restart/tampered-digest and negative-matrix tests
+remain active; admin_api_tests adds rejection of a signature over a document
+whose only difference is newline bytes.
+
+The optional node tests/console_upload_script_test.cjs harness executed byte
+preservation (BOM/CRLF/non-ASCII/trailing newlines), malformed UTF-8, missing and
+oversized files, and JSON fallback with a minimal DOM. No npm packages, Node
+build requirement, real browser or real IdP tenant was introduced/exercised.
+CF-38 retains provider proof; hosted CI/release evidence is not claimed.
+
+CF-40 remains backlog only. Cargo.toml, Cargo.lock, release/benchmark profiles,
+shipping feature selections, vendored htmx and the activity base template are
+unchanged. Offline licensing remains blocked on CF-10; D.5 remains gated.
+No PR was opened.
+
+Landing gates
+
+Gate scripts ran through bash with pinned Rust/Cargo 1.96.0 on Linux x86_64.
+An initial attempt sharing the main checkout's Cargo target encountered a
+concurrent-build metadata collision; that attempt is not landing evidence.
+The complete final run uses /tmp/d3-landing with separate target/d3-landing
+Cargo output and the committed 06308e4 login baseline. Source/template hashes
+were frozen and checked during validation. Final outcomes follow.
+
+PASS cargo build
+PASS cargo build --no-default-features
+PASS cargo clippy --all-targets -- -D warnings
+PASS cargo clippy --all-targets --no-default-features -- -D warnings
+PASS cargo clippy --all-targets --features console -- -D warnings
+PASS cargo test (1,108 passed; 2 existing ignored helpers/doctest)
+PASS cargo test --features console (1,127 passed; 2 existing ignored helpers/doctest)
+PASS cargo fmt --all -- --check
+PASS cargo deny --locked check --deny warnings
+PASS cargo bench --bench response_pipeline
+PASS cargo bench --bench response_pipeline --features console
+PASS node tests/console_upload_script_test.cjs (optional local helper check)
+PASS git diff --check
+
+Allocation comparison against 2026-09-06-d4-packaging.txt
+
+All 31 earlier rows match reported KB and allocation counts in BOTH modes,
+including the reference/BEFORE rows and both payload sizes. Console adds its
+unchanged 32nd row: stage -1f is 432 KB / 9 allocations, 0.21 ms mean and
+231,639 HTML bytes for 1,000 activity rows. No allocation regression to
+investigate. Reported KB is integer-rounded; elapsed timings vary and these
+observations do not imply exact latency equality with D.4.
+Default/console JWT cache hit: 3.84 / 4.18 us (budget <50 us).
+Default/console journal p99: 49 / 18 us (budget <200 us).
+No request-path or activity-render implementation changed in D.3.
+
+$ cargo bench --bench response_pipeline
+   Compiling mcp-server-devtools v0.15.0 (/tmp/d3-landing)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 8m 21s
+     Running benches/response_pipeline.rs (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs/target/d3-landing/release/deps/response_pipeline-b20dc5b32d4b7a86)
+=== output size: is TOON earning its CPU? ===
+                                            compact     pretty       TOON
+  uniform flat rows (TOON's best case)       12392B     20800B      5016B   TOON is 40% of compact, 24% of pretty
+  nested objects (Jira search shape)         89903B    133723B     99300B   TOON is 110% of compact, 74% of pretty
+
+=== stage -1: policy extractors, per tool call (mean of 2000) ===
+  canonical: short path                            0 KB          4 allocs     0.00 ms
+  canonical: dot-segments + escapes                0 KB          1 allocs     0.00 ms
+  canonical: search URL (long JQL)                 0 KB         10 allocs     0.00 ms
+  jira::extract GET /issue/{key}                   0 KB          6 allocs     0.00 ms
+  jira::extract GET /search/jql (long JQL)         1 KB         17 allocs     0.01 ms
+  jira::project_keys_from_jql (long JQL)           0 KB          9 allocs     0.00 ms
+  jira::extract unmapped (default arm)             0 KB          1 allocs     0.00 ms
+  grafana::query_logs                              0 KB         10 allocs     0.00 ms
+
+=== stage -1b: policy decision, per tool call (mean of 2000) ===
+  ActionContext via for_tool (grafana)             0 KB         21 allocs     0.00 ms
+  FilePolicy::evaluate @ 500 rules                 0 KB          5 allocs     0.01 ms
+
+=== stage -1c: enterprise request path, production components (mean of 2000 / 1000) ===
+  JWT validate: cache hit (budget 50 µs)           1 KB          9 allocs     3.84 µs
+  C.1 JWT authenticate: cached actor chain         1 KB          8 allocs     4.43 µs
+  journal append, sequential (budget p99 200 µs)         1 KB          6 allocs  p50      13 µs  p99      49 µs  max     146 µs
+
+=== stage -1d: usage side of the request path (mean of 2000) — C.6 ===
+  rate limit check, known subject                  0 KB          0 allocs     0.00 ms
+  PrometheusUsageSink::record, known series         0 KB          0 allocs     0.00 ms
+  FanOut(prometheus + channel)::record             0 KB          9 allocs     0.00 ms
+
+=== stage -1e: principal inventory — C.4 ===
+  observe principal, known unchanged               0 KB          0 allocs     0.00 ms
+
+=== stage -1f: console activity render, 1000 rows (mean of 100) — D.1 ===
+  skipped: build with --features console to render 1000 activity rows
+
+=== stage 0: per-tool-call config snapshot (mean of 1000) ===
+  BEFORE: deep clone of Config                     4 KB         73 allocs     0.00 ms
+  NOW:    ConfigHandle::snapshot()                 0 KB          0 allocs     0.00 ms
+
+=== 500 issues / 220 KB compact JSON  (mean of 20) ===
+ -- stage 1: jq filter, no filter supplied (the default path)
+  BEFORE: deep clone of the payload             1469 KB      17507 allocs     1.72 ms
+  NOW:    apply_jq_filter(None) borrows            0 KB          0 allocs     0.00 ms
+ -- stage 2: render
+  BEFORE: eager pretty-JSON, then discard       2249 KB      19053 allocs     3.96 ms
+  NOW:    render(Toon), lazy fallback           1736 KB      19032 allocs     4.01 ms
+  ref:    render(Json) on same data              512 KB         13 allocs     0.68 ms
+ -- stage 3: truncate
+  truncate_for_ai (over budget)                   39 KB          4 allocs     0.00 ms
+   rendered output: 243 KB
+
+=== 5000 issues / 2226 KB compact JSON  (mean of 4) ===
+ -- stage 1: jq filter, no filter supplied (the default path)
+  BEFORE: deep clone of the payload            14703 KB     175007 allocs    22.12 ms
+  NOW:    apply_jq_filter(None) borrows            0 KB          0 allocs     0.00 ms
+ -- stage 2: render
+  BEFORE: eager pretty-JSON, then discard      20643 KB     190051 allocs    48.98 ms
+  NOW:    render(Toon), lazy fallback          16547 KB     190035 allocs    39.73 ms
+  ref:    render(Json) on same data             4096 KB         16 allocs     5.75 ms
+ -- stage 3: truncate
+  truncate_for_ai (over budget)                   39 KB          4 allocs     0.00 ms
+   rendered output: 2455 KB
+
+$ cargo bench --bench response_pipeline --features console
+   Compiling mcp-server-devtools v0.15.0 (/tmp/d3-landing)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 4m 11s
+     Running benches/response_pipeline.rs (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs/target/d3-landing/release/deps/response_pipeline-4ed279ee41231fb2)
+=== output size: is TOON earning its CPU? ===
+                                            compact     pretty       TOON
+  uniform flat rows (TOON's best case)       12392B     20800B      5016B   TOON is 40% of compact, 24% of pretty
+  nested objects (Jira search shape)         89903B    133723B     99300B   TOON is 110% of compact, 74% of pretty
+
+=== stage -1: policy extractors, per tool call (mean of 2000) ===
+  canonical: short path                            0 KB          4 allocs     0.00 ms
+  canonical: dot-segments + escapes                0 KB          1 allocs     0.00 ms
+  canonical: search URL (long JQL)                 0 KB         10 allocs     0.00 ms
+  jira::extract GET /issue/{key}                   0 KB          6 allocs     0.00 ms
+  jira::extract GET /search/jql (long JQL)         1 KB         17 allocs     0.01 ms
+  jira::project_keys_from_jql (long JQL)           0 KB          9 allocs     0.00 ms
+  jira::extract unmapped (default arm)             0 KB          1 allocs     0.00 ms
+  grafana::query_logs                              0 KB         10 allocs     0.00 ms
+
+=== stage -1b: policy decision, per tool call (mean of 2000) ===
+  ActionContext via for_tool (grafana)             0 KB         21 allocs     0.00 ms
+  FilePolicy::evaluate @ 500 rules                 0 KB          5 allocs     0.01 ms
+
+=== stage -1c: enterprise request path, production components (mean of 2000 / 1000) ===
+  JWT validate: cache hit (budget 50 µs)           1 KB          9 allocs     4.18 µs
+  C.1 JWT authenticate: cached actor chain         1 KB          8 allocs     4.09 µs
+  journal append, sequential (budget p99 200 µs)         1 KB          6 allocs  p50      11 µs  p99      18 µs  max     111 µs
+
+=== stage -1d: usage side of the request path (mean of 2000) — C.6 ===
+  rate limit check, known subject                  0 KB          0 allocs     0.00 ms
+  PrometheusUsageSink::record, known series         0 KB          0 allocs     0.00 ms
+  FanOut(prometheus + channel)::record             0 KB          9 allocs     0.00 ms
+
+=== stage -1e: principal inventory — C.4 ===
+  observe principal, known unchanged               0 KB          0 allocs     0.00 ms
+
+=== stage -1f: console activity render, 1000 rows (mean of 100) — D.1 ===
+  ActivityPage::complete render, 1000 rows       432 KB          9 allocs     0.21 ms
+   rendered HTML: 231639 bytes
+
+=== stage 0: per-tool-call config snapshot (mean of 1000) ===
+  BEFORE: deep clone of Config                     4 KB         73 allocs     0.00 ms
+  NOW:    ConfigHandle::snapshot()                 0 KB          0 allocs     0.00 ms
+
+=== 500 issues / 220 KB compact JSON  (mean of 20) ===
+ -- stage 1: jq filter, no filter supplied (the default path)
+  BEFORE: deep clone of the payload             1469 KB      17507 allocs     1.68 ms
+  NOW:    apply_jq_filter(None) borrows            0 KB          0 allocs     0.00 ms
+ -- stage 2: render
+  BEFORE: eager pretty-JSON, then discard       2249 KB      19053 allocs     4.11 ms
+  NOW:    render(Toon), lazy fallback           1736 KB      19032 allocs     3.40 ms
+  ref:    render(Json) on same data              512 KB         13 allocs     0.45 ms
+ -- stage 3: truncate
+  truncate_for_ai (over budget)                   39 KB          4 allocs     0.00 ms
+   rendered output: 243 KB
+
+=== 5000 issues / 2226 KB compact JSON  (mean of 4) ===
+ -- stage 1: jq filter, no filter supplied (the default path)
+  BEFORE: deep clone of the payload            14703 KB     175007 allocs    20.32 ms
+  NOW:    apply_jq_filter(None) borrows            0 KB          0 allocs     0.00 ms
+ -- stage 2: render
+  BEFORE: eager pretty-JSON, then discard      20643 KB     190051 allocs    43.26 ms
+  NOW:    render(Toon), lazy fallback          16547 KB     190035 allocs    35.86 ms
+  ref:    render(Json) on same data             4096 KB         16 allocs     6.68 ms
+ -- stage 3: truncate
+  truncate_for_ai (over budget)                   39 KB          4 allocs     0.00 ms
+   rendered output: 2455 KB

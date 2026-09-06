@@ -229,3 +229,15 @@ their existing enterprise-mode refusal; CF-7 is closed for these admin commands,
 not for unaudited direct vendor operations. CF-28's vendor-reference resolution
 work remains open; the admin client only needs its explicitly supplied token
 file and the server's authenticated boundary.
+
+## Console client (D.3)
+
+The optional console now authors and signs through the workflow in the
+[console runbook](console-runbook.md#author-sign-and-submit-a-policy-d3).
+The browser never supplies a bearer or signing key in page content: its
+server-side session calls `AdminClient` for validate/diff, signed policy PUT,
+and proposal reads/approve/reject. Existing JSON API shapes, configured gate,
+freshness/tenant/separation checks, signature verification, durable intent
+ordering and fail-closed refusals are unchanged. Proposal review currently
+shows metadata and digest only; candidate/signature review uses the offline
+handoff. No HTML endpoints were added under `/admin`.

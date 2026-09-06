@@ -10,7 +10,15 @@ removed only when it is done, not when it is explained.
 
 Status legend: **open** · **blocked** (needs a decision) · **done**.
 
-Last updated: 2026-09-06, after D.4 (rev 2.27). Packaging, TLS Compose,
+Last updated: 2026-09-06, after D.3 (rev 2.28). Textarea policy authoring,
+validated download/offline signing, signed uploads through the configured
+MutationGate, and interactive proposal decisions landed; CF-39 is closed.
+CF-45 records authoring/review boundaries and unexercised browser evidence.
+CF-18's inventory is updated. Fresh gates/allocation evidence is in
+`benchmarks/2026-09-06-d3-authoring.txt`. Real-provider proof remains CF-38;
+CF-40 is backlog only, offline licensing remains CF-10 and D.5 stays gated.
+
+Previously updated: 2026-09-06, after D.4 (rev 2.27). Packaging, TLS Compose,
 file-backed JWKS and vendored-source offline builds landed; actual local
 proof and unchanged allocation evidence are in the D.4 summary. CF-41
 records hosted CI/release, portability and operating boundaries. CF-40
@@ -672,16 +680,19 @@ callback, correct audience/admin scope, and an authenticated admin call;
 for Entra also settle and test the code-redemption compatibility gap.
 No token values should appear in the evidence.
 
-### CF-39 · D.2 console proposals are read-only
+### CF-39 · D.2 console proposal decisions
 
-**Open · D.1 (rev 2.26); follow-up owner: D.3 console authoring.**
-D.1 lands `/console/proposals` as the D.2 inventory/state page. Approve and
-reject remain `mcp-devtools admin proposals approve|reject`; no browser
-mutation controls were added. The two-person/fresh-token/digest checks remain
-at the API. Close when browser decisions are explicitly scoped and tested
-through the same `AdminClient` and mutation gate, including CSRF and durable
-intent ordering. D.2's API/CLI landing does not claim the interactive console
-approval acceptance scenario is complete.
+**Done · D.3 (rev 2.28, 2026-09-06).** The proposal inventory links to an
+escaped metadata/digest review page with approve/reject forms. Both decisions
+call the existing authenticated API through `AdminClient`, preserving the
+Origin/session checks and configured gate. Local real-HTTP tests exercise
+required signed uploads without effects, self/stale/other-tenant refusal,
+durable proposal → approval → mutation ordering, repeat approval without a
+second effect, rejection and repeat-decision refusal, and observed expiry.
+The offline verifier accepts the signed console journal. Existing D.2
+restart and tampered-digest coverage remains active; no API or gate semantics
+were replaced. Browser/real-provider evidence and candidate-review limits are
+CF-38/42, not claims made by closing the interactive-controls work item.
 
 ### CF-40 · Faster builds for development and validation
 
@@ -751,8 +762,51 @@ Dockerfile base images still use tags; release images and the new runtime/test
 pins are immutable, but a rebuild needs reviewed/mirrored build inputs.
 Offline licence support remains blocked on CF-10; OVA remains on request.
 CF-40 is backlog only and was committed separately; no build-speed work lands
-with D.4. D.3 authoring, D.5 delegation, CF-36 credential rotation, CF-38
-provider evidence, and CF-39 interactive approvals remain outstanding.
+with D.4. D.3 authoring and CF-39 interactive approvals subsequently landed
+in rev 2.28. D.5 delegation, CF-36 credential rotation and CF-38 provider
+evidence remain outstanding.
+
+### CF-45 · D.3 authoring review and browser evidence boundaries
+
+**Open · D.3 (rev 2.28, 2026-09-06); owner: console/partner evidence.**
+The initial authoring scope uses existing API operations and adds no editor
+widget or dependency. Deliberate boundaries:
+
+- Diff displays current/candidate rule descriptions and versions from the
+  existing API, not a line-by-line patch or parser diagnostics. Validation
+  only establishes syntax/rules; it does not establish signature validity.
+  The active policy can change between preview and upload/approval; there is
+  no optimistic-concurrency base-version precondition. Review the target and
+  candidate digest before deciding.
+- Existing proposal reads expose metadata/digest, not stored candidate and
+  signature bytes. Reviewers obtain those through the offline signing handoff
+  and compare the adapter's digest (document + NUL + trimmed signature).
+  A future tenant-scoped candidate-read/diff API requires separate scope;
+  this phase does not bypass `AdminClient` to read the journal.
+- Native file selection needs a small first-party script to JSON-escape exact
+  signed UTF-8 bytes across HTML form newline normalization, avoiding a new
+  multipart parser/dependency. No-script JSON paste uses the same endpoint.
+  File-helper bounds are 256 KiB policy / 1 KiB signature; the console also
+  applies the existing 2 MiB encoded form bound, which heavily escaped input
+  can hit sooner. Drafts are not persisted, and larger inputs use the CLI.
+- HTTP/markup and actual server-side signed-byte round-trip tests passed;
+  an optional local Node/minimal-DOM harness exercised the helper's exact
+  CRLF/BOM/non-ASCII and malformed-file paths. No browser was run, so native
+  file-picker behavior, htmx debounce/swap and download UX are not end-to-end
+  browser proof. The existing htmx asset/digest remains unchanged. A real IdP
+  tenant and fresh-token re-login UX remain unexercised (CF-38), and no hosted
+  CI run is claimed. Obtain partner/browser evidence before claiming it.
+
+**Landing-gate deviation:** a clean isolated checkout exposed that the existing
+TLS forwarding tests' five PEM inputs were ignored by the global `*.pem` rule.
+The public test CA/server/client certificates and two leaf keys, explicitly
+identified as throwaway public fixtures by `tests/fixtures/tls/README.md`, are
+now included through five narrow `.gitignore` exceptions. No production key or
+CA private key was added. Local gates therefore use reproducible repository
+inputs; this is not hosted-CI evidence.
+
+These are review/evidence follow-ups, not a request to implement D.5, offline
+licensing, an editor widget, build-speed work (CF-40), or new shipping profiles.
 
 ### CF-10 · ADR-002: the enterprise licence
 **Model decided 2026-09-05 · enterprise agreement and contribution terms remain open**
@@ -821,8 +875,15 @@ here behind ports so that a later move is a file move: `approvals/mod.rs`
 `admin_rejection` record kinds, and `PUT /admin/policy` are community.
 D.1 adds `src/console` (login, sessions, pages and router), together with
 `console/` templates/static assets and the `server::http` composition wiring,
-to the would-move inventory. D.3 (console authoring) will add its files here
-when it lands. The move
+to the would-move inventory. **D.3 (rev 2.28)** adds
+`src/console/authoring.rs`, the routes in `src/console/mod.rs`,
+`console/templates/{authoring,proposal,mutation_result}.html`, the links in
+`console/templates/{policy,proposals}.html`, and
+`console/static/policy-upload.js`. Coverage moves with it: D.3 portions of
+`tests/console_tests.rs` and `tests/console_upload_script_test.cjs`.
+Existing `AdminClient` and mutation/proposal ports remain the community seams;
+`tests/admin_api_tests.rs` retains shared signed-install/fail-closed coverage.
+The move
 must happen **before** the repository is opened; until then it is a
 licence label.
 
@@ -1317,3 +1378,24 @@ within the existing absolute budgets. No release or benchmark profile changes.
 The opt-in file-JWKS I/O path is not measured by the remote cache probe (CF-41).
 Full outputs, all landing gates and actual package/Compose/offline proof are
 in [the D.4 summary](benchmarks/2026-09-06-d4-packaging.txt).
+
+
+### Phase D baseline · D.3 policy authoring (2026-09-06, rev 2.28)
+
+Every landing gate passed using bash scripts and isolated Cargo output:
+both builds; default/no-default/console clippy with warnings denied; full
+tests (1,108 default / 1,127 console, two existing ignored in each); formatting,
+cargo-deny and diff checks. Both allocation probes match all 31 prior D.4
+rows at reported KB/allocation precision, including reference rows and both
+payload sizes. Stage −1f remains **432 KB / 9 allocations**, 0.21 ms mean,
+231,639 HTML bytes for 1,000 activity rows. JWT cache-hit means are 3.84 /
+4.18 µs; journal p99 is 49 / 18 µs (default / console), within the stated
+budgets. Timings are observations, not an exact-latency-equality claim.
+No allocation regression was found. Profiles and dependency graph are unchanged.
+
+Raw outputs, final gate results, the clean-checkout TLS-fixture correction,
+and exact local proof limits are in
+[`benchmarks/2026-09-06-d3-authoring.txt`](benchmarks/2026-09-06-d3-authoring.txt).
+CF-45 retains authoring/review/browser boundaries, CF-38 real-provider evidence;
+no hosted CI or real-tenant proof is claimed. CF-40 stays backlog only, offline
+licensing remains CF-10 and D.5 remains gated.

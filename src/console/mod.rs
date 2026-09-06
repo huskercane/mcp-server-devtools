@@ -38,6 +38,7 @@
 //! | `POST /console/policy/explain`, `POST /console/access-review` | Forms that call a read-only endpoint |
 //! | `GET /console/static/{file}` | The embedded assets |
 
+mod authoring;
 mod login;
 mod pages;
 mod session;
@@ -395,6 +396,15 @@ pub fn router(console: Arc<Console>) -> Router {
         .route(&callback, get(callback_handler))
         .route("/console/logout", post(logout))
         .route("/console/policy", get(pages::policy))
+        .route(
+            "/console/policy/edit",
+            get(authoring::edit).post(authoring::preview),
+        )
+        .route("/console/policy/download", post(authoring::download))
+        .route("/console/policy/upload", post(authoring::upload))
+        .route("/console/proposals/{id}", get(authoring::proposal))
+        .route("/console/proposals/{id}/approve", post(authoring::approve))
+        .route("/console/proposals/{id}/reject", post(authoring::reject))
         .route("/console/policy/explain", post(pages::explain))
         .route("/console/activity", get(pages::activity))
         .route(

@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Review proposal {{ id }}</h1>
+<p>Check the operation, target, proposer, expiry and candidate digest against the signing handoff. The API reports metadata here; obtain the candidate and signature from the proposer through your review process.</p>
+<pre>{{ body }}</pre>
+<p>Approval applies the stored candidate. It requires a different administrator in the same tenant and a fresh token. The API rechecks the digest, signature, expiry and prior decision.</p>
+<form method="post" action="/console/proposals/{{ id }}/approve"><button type="submit">Approve stored candidate</button></form>
+<form method="post" action="/console/proposals/{{ id }}/reject">
+<label>Rejection reason (maximum 512 UTF-8 bytes) <textarea name="reason" maxlength="512"></textarea></label>
+<button type="submit">Reject proposal</button>
+</form>
+<p><a href="/console/proposals">All proposals</a></p>
+{% endblock %}

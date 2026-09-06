@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Author a policy change</h1>
+<p>Validation checks syntax and rules; it does not verify a signature. The diff shows current and candidate rule descriptions from the API, not a textual diff. The active policy can change after this preview.</p>
+<form method="post" action="/console/policy/edit">
+<label>Candidate policy
+<textarea name="document" rows="24" spellcheck="false" hx-post="/console/policy/edit" hx-trigger="input changed delay:500ms" hx-sync="this:replace" hx-target="#policy-check" hx-select="#policy-check" hx-swap="outerHTML">{{ document }}</textarea>
+</label>
+<button type="submit">Validate and diff</button>
+<button type="submit" formaction="/console/policy/download">Download candidate for signing</button>
+</form>
+<section id="policy-check" aria-live="polite">
+<h2>Validation</h2><pre>{{ validation }}</pre>
+<h2>Diff</h2><pre>{{ diff }}</pre>
+</section>
+<h2>Upload signed policy</h2>
+<p>Sign the downloaded file offline. Upload that exact file and its detached base64 signature. Required approvals create a pending proposal; direct mode installs immediately. Signing keys never belong in this form.</p>
+<script src="/console/static/policy-upload.js" defer></script>
+<form id="signed-policy" method="post" action="/console/policy/upload">
+<label>Signed policy file <input id="policy-file" type="file"></label>
+<label>Detached signature file <input id="signature-file" type="file"></label>
+<p id="upload-error" role="alert"></p>
+<details><summary>JSON upload / no-script fallback</summary>
+<p>Paste the admin API JSON object with document and signature strings. Newlines inside document must be JSON escapes. File selection fills this field without changing signed bytes.</p>
+<textarea name="bundle" id="signed-bundle" spellcheck="false"></textarea>
+</details>
+<button type="submit">Submit signed policy</button>
+</form>
+<p><a href="/console/proposals">Review proposals</a> · <a href="/console/policy">Policy in force</a></p>
+{% endblock %}

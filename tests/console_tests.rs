@@ -39,9 +39,11 @@ const PUBLIC_URL: &str = "https://mcp.example";
 const POLICY: &[u8] = b"version: 1\ndefault: deny\nrules:\n  - id: sre-read-qa-loki\n    effect: allow\n    subjects: { groups: [SRE] }\n    match:\n      vendor: grafana\n      environment: qa\n      request_risk: read\n      resource_type: datasource\n      resource_id: [loki-qa]\n";
 
 struct Fixture {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     url: String,
     key: SigningKey,
+    sink: Option<Arc<InMemoryAuditSink>>,
+    audit_public: Option<mcp_server_devtools::policy::signing::VerifyingKey>,
     idp: MockServer,
     client: reqwest::Client,
     cancel: CancellationToken,
@@ -130,6 +132,17 @@ async fn fixture_with(
     journal: bool,
     provider: Option<MockServer>,
 ) -> Fixture {
+    fixture_with_options(role, validator, token_response, journal, provider, &[]).await
+}
+
+async fn fixture_with_options(
+    role: Role,
+    validator: Arc<dyn TokenValidator>,
+    token_response: Value,
+    journal: bool,
+    provider: Option<MockServer>,
+    options: &[(&str, &str)],
+) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let (key, policy, revocations) = sign_files(dir.path());
     let idp = match provider {
@@ -144,7 +157,9 @@ async fn fixture_with(
             key.verifying_key().to_base64(),
         ),
     ]);
+    let mut audit_public = None;
     if journal {
+        audit_public = Some(configure_signed_checkpoints(dir.path(), &mut map));
         map.insert(
             "MCP_AUDIT_JOURNAL_DIR".to_owned(),
             dir.path().display().to_string(),
@@ -156,11 +171,17 @@ async fn fixture_with(
     } else {
         map.insert("MCP_ROLLUP_STORE".to_owned(), "memory://".to_owned());
     }
+    map.extend(
+        options
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
+    );
     let mut builder = ServerBuilder::new()
         .config(Config::from_map(map))
         .serves_control(true);
-    if !journal {
-        builder = builder.audit_sink(Arc::new(InMemoryAuditSink::new()));
+    let sink = (!journal).then(|| Arc::new(InMemoryAuditSink::new()));
+    if let Some(sink) = &sink {
+        builder = builder.audit_sink(sink.clone());
     }
     let server = builder.build().unwrap();
     if journal {
@@ -177,15 +198,7 @@ async fn fixture_with(
         )
         .with_revocations(revocations),
     );
-    let settings = ConsoleSettings {
-        client_id: "console-client".into(),
-        redirect_path: "/console/callback".into(),
-        scopes: "openid mcp:admin".into(),
-        issuer: idp.uri(),
-        audience: PUBLIC_URL.into(),
-        profile: Profile::Generic,
-        public_url: PUBLIC_URL.into(),
-    };
+    let settings = console_settings(&idp);
     let cancel = CancellationToken::new();
     let app = build_app_for_role_with_console(
         role,
@@ -209,9 +222,11 @@ async fn fixture_with(
             .unwrap();
     });
     Fixture {
-        _dir: dir,
+        dir,
         url,
         key,
+        audit_public,
+        sink,
         idp,
         client: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -715,19 +730,7 @@ async fn a_token_the_admin_api_refuses_gets_no_session() {
 async fn every_route_carries_the_security_headers() {
     let f = fixture(Role::All).await;
     let session = sign_in(&f).await;
-    let csp = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
-    let assert_headers = |route: &str, response: &reqwest::Response, cache: &str| {
-        let headers = response.headers();
-        assert_eq!(headers["content-security-policy"], csp, "{route}");
-        assert_eq!(headers["referrer-policy"], "no-referrer", "{route}");
-        assert_eq!(headers["x-content-type-options"], "nosniff", "{route}");
-        assert_eq!(headers["x-frame-options"], "DENY", "{route}");
-        assert_eq!(headers["cache-control"], cache, "{route}");
-        assert!(
-            headers.get("access-control-allow-origin").is_none(),
-            "{route}: the console never reflects an origin"
-        );
-    };
+
     for route in [
         "/console",
         "/console?reason=expired",
@@ -1278,6 +1281,15 @@ async fn signs_in_with_a_real_bearer_from_a_wiremock_jwks() {
     let html = policy.text().await.unwrap();
     assert!(html.contains("sre-read-qa-loki"));
     assert!(!html.contains(&token));
+    let candidate = "version: 2\nrules: []\n";
+    let signature = f
+        .key
+        .sign(Domain::PolicyBundle, candidate.as_bytes())
+        .to_base64();
+    let response = upload_policy(&f, &session, candidate, &signature).await;
+    assert_eq!(response.status(), 200);
+    let html = response.text().await.unwrap();
+    assert!(html.contains("audit_seq") && !html.contains(&token));
     let health = page(&f, &session, "/console/health")
         .await
         .text()
@@ -1293,4 +1305,528 @@ async fn signs_in_with_a_real_bearer_from_a_wiremock_jwks() {
             .any(|r| r.url.path() == "/keys"),
         "the production validator fetched the JWKS"
     );
+}
+
+async fn console_post(
+    f: &Fixture,
+    session: &str,
+    route: &str,
+    form: &[(&str, &str)],
+) -> reqwest::Response {
+    f.client
+        .post(format!("{}{route}", f.url))
+        .header("cookie", session)
+        .header("origin", PUBLIC_URL)
+        .form(form)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn upload_policy(
+    f: &Fixture,
+    session: &str,
+    document: &str,
+    signature: &str,
+) -> reqwest::Response {
+    let bundle = json!({"document": document, "signature": signature}).to_string();
+    console_post(f, session, "/console/policy/upload", &[("bundle", &bundle)]).await
+}
+
+#[tokio::test]
+async fn authoring_validates_diffs_downloads_exact_bytes_and_uploads_through_the_api() {
+    let f = fixture(Role::All).await;
+    let session = sign_in(&f).await;
+    let html = page(&f, &session, "/console/policy/edit")
+        .await
+        .text()
+        .await
+        .unwrap();
+    for expected in [
+        "<textarea name=\"document\"",
+        "input changed delay:500ms",
+        "hx-sync=\"this:replace\"",
+        "hx-target=\"#policy-check\"",
+        "/console/policy/download",
+        "/console/policy/upload",
+        "/console/static/policy-upload.js",
+    ] {
+        assert!(html.contains(expected), "missing {expected}");
+    }
+    // CRLF, non-ASCII, HTML and a trailing blank line survive the
+    // server download -> offline signing -> JSON/form upload exactly.
+    let candidate = "version: 2\r\nrules: []\r\n# </textarea><script>é & +</script>\r\n\r\n";
+    let preview = console_post(
+        &f,
+        &session,
+        "/console/policy/edit",
+        &[("document", candidate)],
+    )
+    .await;
+    assert_eq!(preview.status(), 200);
+    let html = preview.text().await.unwrap();
+    assert!(html.contains("signature_verified"));
+    assert!(html.contains("current_rules") && html.contains("candidate_rules"));
+    assert!(!html.contains("<script>é"));
+    assert!(!html.contains(ADMIN_TOKEN));
+    assert_eq!(
+        std::fs::read(f.dir.path().join("policy.yaml")).unwrap(),
+        POLICY
+    );
+    let download = console_post(
+        &f,
+        &session,
+        "/console/policy/download",
+        &[("document", candidate)],
+    )
+    .await;
+    assert_eq!(download.status(), 200);
+    assert_headers("download", &download, "no-store");
+    assert_eq!(
+        download.headers()["content-disposition"],
+        "attachment; filename=policy-candidate.yaml"
+    );
+    let bytes = download.bytes().await.unwrap();
+    assert_eq!(bytes, candidate.as_bytes());
+    let bad = upload_policy(&f, &session, candidate, "bad").await;
+    assert_eq!(bad.status(), 400);
+    assert_eq!(
+        std::fs::read(f.dir.path().join("policy.yaml")).unwrap(),
+        POLICY
+    );
+    let signature = f.key.sign(Domain::PolicyBundle, &bytes).to_base64();
+    f.sink.as_ref().unwrap().set_failing(true);
+    let refused = upload_policy(&f, &session, candidate, &signature).await;
+    assert_eq!(refused.status(), 503);
+    assert!(refused.text().await.unwrap().contains("audit_unavailable"));
+    assert_eq!(
+        std::fs::read(f.dir.path().join("policy.yaml")).unwrap(),
+        POLICY
+    );
+    f.sink.as_ref().unwrap().set_failing(false);
+    let applied = upload_policy(&f, &session, candidate, &signature).await;
+    assert_eq!(applied.status(), 200, "{}", applied.text().await.unwrap());
+    assert_eq!(
+        std::fs::read(f.dir.path().join("policy.yaml")).unwrap(),
+        bytes
+    );
+    mcp_server_devtools::policy::FilePolicy::load_verified(
+        &f.dir.path().join("policy.yaml"),
+        f.key.verifying_key(),
+    )
+    .unwrap();
+    invalid_authoring_forms(&f, &session).await;
+}
+
+#[tokio::test]
+async fn every_authoring_route_preserves_headers_sessions_and_origin_checks() {
+    let f = fixture(Role::All).await;
+    let session = sign_in(&f).await;
+    for route in [
+        "/console/policy/edit",
+        "/console/proposals/p-0000000000000001",
+        "/console/static/policy-upload.js",
+    ] {
+        let response = page(&f, &session, route).await;
+        assert_headers(
+            route,
+            &response,
+            if route.contains("/static/") {
+                "private, max-age=86400"
+            } else {
+                "no-store"
+            },
+        );
+    }
+    for route in [
+        "/console/policy/edit",
+        "/console/policy/download",
+        "/console/policy/upload",
+        "/console/proposals/p-0000000000000001/approve",
+        "/console/proposals/p-0000000000000001/reject",
+    ] {
+        for origin in [None, Some("https://evil.example")] {
+            let mut request = f
+                .client
+                .post(format!("{}{route}", f.url))
+                .header("cookie", &session)
+                .form(&[
+                    ("document", "version: 2\nrules: []"),
+                    ("bundle", "{}"),
+                    ("reason", "no"),
+                ]);
+            if let Some(origin) = origin {
+                request = request.header("origin", origin);
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), 403, "{route}");
+            assert_headers(route, &response, "no-store");
+        }
+        let anonymous = console_post(
+            &f,
+            "",
+            route,
+            &[("document", "x"), ("bundle", "{}"), ("reason", "no")],
+        )
+        .await;
+        assert_eq!(anonymous.status(), 303, "{route}");
+        assert_eq!(anonymous.headers()["location"], "/console");
+    }
+    assert_eq!(
+        page(&f, &session, "/console/proposals/not-an-id")
+            .await
+            .status(),
+        404
+    );
+    let oversized = "x".repeat(2 * 1024 * 1024 + 1);
+    assert_eq!(
+        console_post(
+            &f,
+            &session,
+            "/console/policy/upload",
+            &[("bundle", &oversized)]
+        )
+        .await
+        .status(),
+        413
+    );
+    assert_eq!(
+        std::fs::read(f.dir.path().join("policy.yaml")).unwrap(),
+        POLICY
+    );
+}
+
+async fn sign_in_as(f: &Fixture, token: &str) -> String {
+    f.idp.reset().await;
+    mount_provider(
+        &f.idp,
+        json!({"access_token": token, "token_type": "Bearer", "expires_in": 300}),
+    )
+    .await;
+    sign_in(f).await
+}
+
+fn control_records(f: &Fixture) -> Vec<Value> {
+    let path = f
+        .dir
+        .path()
+        .join(mcp_server_devtools::audit::journal::JOURNAL_FILE_NAME);
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|record| {
+            record["kind"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("admin_"))
+        })
+        .collect()
+}
+
+async fn pending_id(f: &Fixture) -> String {
+    let data: Value = f
+        .client
+        .get(format!("{}/admin/proposals", f.url))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    data["data"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["state"] == "pending")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn console_proposals_enforce_separation_freshness_rejection_and_durable_idempotent_apply() {
+    let f = approval_fixture(&[]).await;
+    let alice = sign_in(&f).await;
+    let bob = sign_in_as(&f, "bob").await;
+    let stale = sign_in_as(&f, "stale").await;
+    let eve = sign_in_as(&f, "eve").await;
+    let candidate = "version: 2\nrules: []\n";
+    let signature = f
+        .key
+        .sign(Domain::PolicyBundle, candidate.as_bytes())
+        .to_base64();
+    assert_eq!(
+        upload_policy(&f, &alice, candidate, "bad").await.status(),
+        400
+    );
+    assert!(control_records(&f).is_empty());
+    let response = upload_policy(&f, &alice, candidate, &signature).await;
+    assert_eq!(response.status(), 202);
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("policy has not been applied")
+    );
+    let id = pending_id(&f).await;
+    let route = format!("/console/proposals/{id}/approve");
+    let review = page(&f, &bob, &format!("/console/proposals/{id}"))
+        .await
+        .text()
+        .await
+        .unwrap();
+    for expected in [
+        "candidate_digest",
+        "sha256:",
+        "alice",
+        "expires",
+        "Approve stored candidate",
+        "Reject proposal",
+    ] {
+        assert!(review.contains(expected), "{expected}: {review}");
+    }
+    for (session, status, code) in [
+        (&alice, 409, "approval_self"),
+        (&stale, 403, "stale_token"),
+        (&eve, 404, "not_found"),
+    ] {
+        let response = console_post(&f, session, &route, &[]).await;
+        assert_eq!(response.status(), status);
+        assert!(response.text().await.unwrap().contains(code));
+    }
+    assert_eq!(control_records(&f).len(), 1);
+    assert_eq!(
+        std::fs::read(f.dir.path().join("policy.yaml")).unwrap(),
+        POLICY
+    );
+    let response = console_post(&f, &bob, &route, &[]).await;
+    assert_eq!(response.status(), 200);
+    let first = response.text().await.unwrap();
+    assert!(first.contains("applied_seq"));
+    let records = control_records(&f);
+    assert_eq!(
+        records
+            .iter()
+            .map(|r| r["kind"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["admin_proposal", "admin_approval", "admin_mutation"]
+    );
+    assert_eq!(records[0]["proposal"]["document"], candidate);
+    assert_eq!(records[0]["proposal"]["signature"], signature);
+    assert_eq!(records[1]["principal"]["subject"], "bob");
+    assert_eq!(
+        std::fs::read_to_string(f.dir.path().join("policy.yaml")).unwrap(),
+        candidate
+    );
+    let again = console_post(&f, &bob, &route, &[]).await;
+    assert_eq!(again.status(), 200);
+    assert_eq!(again.text().await.unwrap(), first);
+    assert_eq!(control_records(&f).len(), 3);
+    reject_another_proposal(&f, &alice, &bob, candidate, &signature).await;
+    let verified = mcp_server_devtools::audit::verify::verify(
+        f.dir.path(),
+        std::slice::from_ref(f.audit_public.as_ref().unwrap()),
+        None,
+    )
+    .unwrap();
+    assert!(verified.ok(), "{:?}", verified.problems);
+    assert!(verified.signed_checkpoints > 0);
+    assert_eq!(verified.unsealed_records, 0);
+}
+
+fn assert_headers(route: &str, response: &reqwest::Response, cache: &str) {
+    let csp = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+
+    let headers = response.headers();
+    assert_eq!(headers["content-security-policy"], csp, "{route}");
+    assert_eq!(headers["referrer-policy"], "no-referrer", "{route}");
+    assert_eq!(headers["x-content-type-options"], "nosniff", "{route}");
+    assert_eq!(headers["x-frame-options"], "DENY", "{route}");
+    assert_eq!(headers["cache-control"], cache, "{route}");
+    assert!(
+        headers.get("access-control-allow-origin").is_none(),
+        "{route}: the console never reflects an origin"
+    );
+}
+
+async fn approval_fixture(extra: &[(&str, &str)]) -> Fixture {
+    use mcp_server_devtools::ports::TokenFacts;
+    let fresh = TokenFacts {
+        issued_at: Some(get_current_timestamp()),
+        ..TokenFacts::default()
+    };
+    let mut other_tenant = principal("eve", &["mcp:admin"]);
+    other_tenant.tenant = "other".into();
+    let validator = Arc::new(
+        StaticValidator::new()
+            .with_facts(
+                ADMIN_TOKEN,
+                principal("alice", &["mcp:admin"]),
+                fresh.clone(),
+            )
+            .with_facts("bob", principal("bob", &["mcp:admin"]), fresh.clone())
+            .with_facts("eve", other_tenant, fresh)
+            .with_facts(
+                "stale",
+                principal("bob", &["mcp:admin"]),
+                TokenFacts {
+                    issued_at: Some(get_current_timestamp() - 3600),
+                    ..TokenFacts::default()
+                },
+            ),
+    );
+    let mut options = vec![("MCP_ADMIN_APPROVALS", "required")];
+    options.extend_from_slice(extra);
+    fixture_with_options(
+        Role::All,
+        validator,
+        json!({"access_token": ADMIN_TOKEN, "token_type": "Bearer", "expires_in": 300}),
+        true,
+        None,
+        &options,
+    )
+    .await
+}
+
+async fn invalid_authoring_forms(f: &Fixture, session: &str) {
+    let bad_preview = console_post(
+        f,
+        session,
+        "/console/policy/edit",
+        &[("document", "rules: [")],
+    )
+    .await
+    .text()
+    .await
+    .unwrap();
+    assert!(bad_preview.contains("invalid_request") && bad_preview.contains("Diff unavailable"));
+    let bad_download = console_post(
+        f,
+        session,
+        "/console/policy/download",
+        &[("document", "rules: [")],
+    )
+    .await;
+    assert_eq!(bad_download.status(), 400);
+    assert!(bad_download.headers().get("content-disposition").is_none());
+    for malformed in [
+        "not JSON",
+        "{}",
+        r#"{"document":"x","signature":"x","extra":true}"#,
+    ] {
+        assert_eq!(
+            console_post(
+                f,
+                session,
+                "/console/policy/upload",
+                &[("bundle", malformed)]
+            )
+            .await
+            .status(),
+            400
+        );
+    }
+}
+
+#[tokio::test]
+async fn console_expiry_is_journaled_once_and_never_applies() {
+    let f = approval_fixture(&[("MCP_ADMIN_APPROVAL_TTL_SECONDS", "1")]).await;
+    let alice = sign_in(&f).await;
+    let bob = sign_in_as(&f, "bob").await;
+    let candidate = "version: 2\nrules: []\n";
+    let signature = f
+        .key
+        .sign(Domain::PolicyBundle, candidate.as_bytes())
+        .to_base64();
+    assert_eq!(
+        upload_policy(&f, &alice, candidate, &signature)
+            .await
+            .status(),
+        202
+    );
+    let id = pending_id(&f).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    for decision in ["approve", "approve", "reject"] {
+        let response = console_post(
+            &f,
+            &bob,
+            &format!("/console/proposals/{id}/{decision}"),
+            &[("reason", "too late")],
+        )
+        .await;
+        assert_eq!(response.status(), 409);
+        assert!(response.text().await.unwrap().contains("approval_expired"));
+    }
+    let records = control_records(&f);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1]["kind"], "admin_rejection");
+    assert_eq!(records[1]["reason"], "expired");
+    assert_eq!(
+        std::fs::read(f.dir.path().join("policy.yaml")).unwrap(),
+        POLICY
+    );
+}
+
+fn configure_signed_checkpoints(
+    dir: &std::path::Path,
+    map: &mut HashMap<String, String>,
+) -> mcp_server_devtools::policy::signing::VerifyingKey {
+    let (audit_key, pkcs8) = SigningKey::generate().unwrap();
+    let audit_path = dir.join("audit-key.pk8");
+    mcp_server_devtools::policy::signing::write_key_file(&audit_path, &pkcs8).unwrap();
+    map.insert(
+        "MCP_AUDIT_SIGNING_KEY".to_owned(),
+        audit_path.display().to_string(),
+    );
+    map.insert("MCP_AUDIT_CHECKPOINT_RECORDS".to_owned(), "1".to_owned());
+    audit_key.verifying_key()
+}
+
+async fn reject_another_proposal(
+    f: &Fixture,
+    alice: &str,
+    bob: &str,
+    candidate: &str,
+    signature: &str,
+) {
+    assert_eq!(
+        upload_policy(f, alice, candidate, signature).await.status(),
+        202
+    );
+    let id = pending_id(f).await;
+    let route = format!("/console/proposals/{id}/reject");
+    let response = console_post(f, bob, &route, &[("reason", "<script>no</script>")]).await;
+    assert_eq!(response.status(), 200);
+    let html = response.text().await.unwrap();
+    assert!(html.contains("rejected") && !html.contains("<script>no"));
+    assert_eq!(
+        control_records(f).last().unwrap()["kind"],
+        "admin_rejection"
+    );
+    let before = control_records(f).len();
+    assert_eq!(
+        console_post(f, bob, &route, &[("reason", "retry")])
+            .await
+            .status(),
+        409
+    );
+    assert_eq!(control_records(f).len(), before);
+    let response = console_post(f, bob, &format!("/console/proposals/{id}/approve"), &[]).await;
+    assert_eq!(response.status(), 409);
+    assert!(response.text().await.unwrap().contains("proposal_decided"));
+}
+
+fn console_settings(idp: &MockServer) -> ConsoleSettings {
+    ConsoleSettings {
+        client_id: "console-client".into(),
+        redirect_path: "/console/callback".into(),
+        scopes: "openid mcp:admin".into(),
+        issuer: idp.uri(),
+        audience: PUBLIC_URL.into(),
+        profile: Profile::Generic,
+        public_url: PUBLIC_URL.into(),
+    }
 }

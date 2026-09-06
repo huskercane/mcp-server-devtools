@@ -421,6 +421,11 @@ async fn signed_policy_install_is_audited_persistent_and_in_force() {
             .json(&body)
             .send()
     };
+    // Signing/download handoff: even a newline edit invalidates the signature.
+    let edited_signature = f
+        .key
+        .sign(Domain::PolicyBundle, b"version: 2\r\nrules: []\r\n")
+        .to_base64();
     // A candidate that does not verify or does not compile is refused
     // before it becomes an intent: no record, nothing on disk.
     let wrong_domain = f
@@ -435,6 +440,7 @@ async fn signed_policy_install_is_audited_persistent_and_in_force() {
     for body in [
         json!({"document": candidate, "signature": "AAAA"}),
         json!({"document": candidate, "signature": wrong_domain}),
+        json!({"document": candidate, "signature": edited_signature}),
         json!({"document": broken, "signature": broken_signature}),
         json!({"document": candidate}),
     ] {

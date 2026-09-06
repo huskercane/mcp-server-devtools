@@ -36,3 +36,14 @@ Size: 36,716 bytes.
 3. Record the version, source, size, and `sha256sum` here, and update
    the plan's ADR-007 note if the major version changes.
 4. `cargo test --features console` — the digest test is the gate.
+
+## First-party file helper (D.3)
+
+`static/policy-upload.js` is repository source, not another vendored dependency.
+It only reads the two selected UTF-8 files into the signed API JSON envelope
+and submits the ordinary console form. JSON escapes preserve signed newlines
+through form encoding; malformed UTF-8 is refused, not repaired. No editor,
+HTML rendering, token storage, inline script, eval, or package manager was
+added. `tests/console_upload_script_test.cjs` is an optional local Node harness
+for byte handling; neither building the binary nor the Cargo test suite needs
+Node. Browser integration remains unexercised (CF-45).
