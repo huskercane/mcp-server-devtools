@@ -360,7 +360,6 @@ fn session_stores_are_bounded_and_expiring() {
     let pending = PendingLogins::new(2, Duration::from_mins(5));
     let login = |n: u8| PendingLogin {
         state: format!("state-{n}"),
-        nonce: format!("nonce-{n}"),
         verifier: format!("verifier-{n}"),
     };
     let first = pending.insert(login(1));
@@ -477,8 +476,14 @@ async fn login_redirects_with_pkce_and_binds_state_to_the_pre_session_cookie() {
     let state = query_param(&location, "state");
     let challenge = query_param(&location, "code_challenge");
     assert_eq!(state.len(), 43);
-    assert_eq!(query_param(&location, "nonce").len(), 43);
     assert_eq!(challenge.len(), 43);
+    // No `nonce`: it is only meaningful bound to an ID token, and the console
+    // requests none. A parameter that looks like a check but is never
+    // verified is worse than its absence.
+    assert!(
+        location.query_pairs().all(|(key, _)| key != "nonce"),
+        "{location}"
+    );
     let login_line = set_cookie(&start, "mcp_console_login").unwrap();
     for attribute in [
         "HttpOnly",
@@ -528,6 +533,73 @@ async fn login_redirects_with_pkce_and_binds_state_to_the_pre_session_cookie() {
             .iter()
             .all(|r| r.url.path() != "/token")
     );
+}
+
+/// RFC 9207 authorization-response validation (MCP security best practices,
+/// "Mix-up Attacks"): an `iss` that names a different authorization server
+/// than the configured one is refused before the code is redeemed, so a code
+/// minted elsewhere cannot be spent here. A provider that omits `iss` is not
+/// refused for omitting it — the mitigation depends on honest servers
+/// emitting it, and many do not.
+#[tokio::test]
+async fn callback_refuses_a_response_from_an_unexpected_issuer() {
+    let f = fixture(Role::All).await;
+    let begin = || async {
+        let start = f
+            .client
+            .get(format!("{}/console/login", f.url))
+            .send()
+            .await
+            .unwrap();
+        let location = url::Url::parse(start.headers()["location"].to_str().unwrap()).unwrap();
+        let state = query_param(&location, "state");
+        let cookie = cookie_pair(&set_cookie(&start, "mcp_console_login").unwrap());
+        (state, cookie)
+    };
+
+    let (state, login_cookie) = begin().await;
+    let wrong = f
+        .client
+        .get(format!(
+            "{}/console/callback?code=authcode-1&state={state}&iss=https://evil.example",
+            f.url
+        ))
+        .header("cookie", &login_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 403);
+    assert!(set_cookie(&wrong, "mcp_console_session").is_none());
+    assert!(
+        f.idp
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.url.path() != "/token"),
+        "the code must not be redeemed after an issuer mismatch"
+    );
+
+    // The configured issuer is accepted, and so is its trailing-slash
+    // spelling: the two name one origin.
+    for issuer in [f.idp.uri(), format!("{}/", f.idp.uri())] {
+        let (state, login_cookie) = begin().await;
+        let response = f
+            .client
+            .get(format!(
+                "{}/console/callback?code=authcode-1&state={state}&iss={issuer}",
+                f.url
+            ))
+            .header("cookie", &login_cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{issuer}");
+        assert!(
+            set_cookie(&response, "mcp_console_session").is_some(),
+            "{issuer}"
+        );
+    }
 }
 
 #[tokio::test]

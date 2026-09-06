@@ -157,12 +157,11 @@ impl SessionStore {
 #[derive(Clone)]
 pub struct PendingLogin {
     pub state: String,
-    pub nonce: String,
     pub verifier: String,
 }
 
-/// Logins in flight: pre-session id → the state, nonce, and PKCE verifier
-/// bound to it. Consumed by the callback, once.
+/// Logins in flight: pre-session id → the state and PKCE verifier bound to
+/// it. Consumed by the callback, once.
 pub struct PendingLogins {
     inner: Bounded<PendingLogin>,
     ttl: Duration,

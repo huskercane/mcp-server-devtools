@@ -514,8 +514,8 @@ async fn index(
     })
 }
 
-/// Start the flow: a fresh PKCE pair, state, and nonce bound to a
-/// pre-session cookie scoped to the callback path, then the redirect.
+/// Start the flow: a fresh PKCE pair and state bound to a pre-session
+/// cookie scoped to the callback path, then the redirect.
 async fn login(State(console): State<Arc<Console>>) -> Response {
     let endpoints = match console.endpoints().await {
         Ok(endpoints) => endpoints,
@@ -531,14 +531,8 @@ async fn login(State(console): State<Arc<Console>>) -> Response {
     };
     let pkce = login::pkce();
     let state = session::random_id();
-    let nonce = session::random_id();
-    let location = match login::authorize_url(
-        endpoints,
-        &console.settings,
-        &state,
-        &nonce,
-        &pkce.challenge,
-    ) {
+    let location = match login::authorize_url(endpoints, &console.settings, &state, &pkce.challenge)
+    {
         Ok(location) => location,
         Err(error) => {
             warn!(%error, "console login: authorization endpoint unusable");
@@ -552,7 +546,6 @@ async fn login(State(console): State<Arc<Console>>) -> Response {
     };
     let id = console.pending.insert(PendingLogin {
         state,
-        nonce,
         verifier: pkce.verifier,
     });
     let Ok(location) = HeaderValue::from_str(&location) else {
@@ -587,12 +580,64 @@ struct Callback {
     state: String,
     #[serde(default)]
     error: String,
+    /// RFC 9207 `iss`. Absent from many providers' responses, so its
+    /// absence cannot be an error; present and wrong is.
+    #[serde(default)]
+    iss: String,
+}
+
+/// What must hold before a code is redeemed: the provider did not report an
+/// error, the response belongs to the login this browser started, and — when
+/// the provider sends one — the RFC 9207 `iss` names the configured issuer.
+///
+/// Pure, so the refusals are testable without a provider: the caller turns an
+/// `Err` into the error page and clears the pre-session cookie.
+fn check_authorization_response(
+    query: &Callback,
+    pending: &PendingLogin,
+    issuer: &str,
+) -> Result<(), (StatusCode, &'static str)> {
+    if !query.error.is_empty() {
+        warn!("console login: the identity provider returned an error");
+        return Err((
+            StatusCode::FORBIDDEN,
+            "The identity provider did not authorize the sign-in.",
+        ));
+    }
+    if query.state.is_empty() || query.state != pending.state {
+        warn!("console login: state mismatch");
+        return Err((
+            StatusCode::FORBIDDEN,
+            "The sign-in response does not match the one this browser started.",
+        ));
+    }
+    // RFC 9207: bind the authorization response to the authorization server
+    // recorded before the redirect, so a code minted elsewhere cannot be
+    // redeemed here. One issuer is configured today, which is why a mix-up
+    // attack does not apply; this keeps that true if a second one is added.
+    // A provider that omits `iss` cannot be refused for omitting it — the
+    // mitigation depends on honest servers emitting it, and many do not.
+    if !query.iss.is_empty() && query.iss.trim_end_matches('/') != issuer.trim_end_matches('/') {
+        warn!("console login: the response names an unexpected issuer");
+        return Err((
+            StatusCode::FORBIDDEN,
+            "The sign-in response came from a different identity provider than the one configured.",
+        ));
+    }
+    if query.code.is_empty() || query.code.len() > 4096 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "The sign-in response carries no code.",
+        ));
+    }
+    Ok(())
 }
 
 /// The provider's redirect back: the login bound to the pre-session
-/// cookie is consumed (once), `state` must match it, the code is redeemed
-/// with the verifier, and the token is proven against the admin API before
-/// a session exists for it.
+/// cookie is consumed (once), `state` must match it, an RFC 9207 `iss` (if
+/// the provider sent one) must name the configured issuer, the code is
+/// redeemed with the verifier, and the token is proven against the admin API
+/// before a session exists for it.
 async fn callback_handler(
     State(console): State<Arc<Console>>,
     headers: HeaderMap,
@@ -613,25 +658,10 @@ async fn callback_handler(
             "No sign-in is in progress for this browser, or it took longer than five minutes. Start again.",
         );
     };
-    if !query.error.is_empty() {
-        warn!("console login: the identity provider returned an error");
-        return refuse(
-            StatusCode::FORBIDDEN,
-            "The identity provider did not authorize the sign-in.",
-        );
-    }
-    if query.state.is_empty() || query.state != pending.state {
-        warn!("console login: state mismatch");
-        return refuse(
-            StatusCode::FORBIDDEN,
-            "The sign-in response does not match the one this browser started.",
-        );
-    }
-    if query.code.is_empty() || query.code.len() > 4096 {
-        return refuse(
-            StatusCode::BAD_REQUEST,
-            "The sign-in response carries no code.",
-        );
+    if let Err((status, detail)) =
+        check_authorization_response(&query, &pending, &console.settings.issuer)
+    {
+        return refuse(status, detail);
     }
     let Ok(endpoints) = console.endpoints().await else {
         return refuse(

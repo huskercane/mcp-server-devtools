@@ -44,6 +44,13 @@ pub fn pkce() -> Pkce {
 
 /// The authorization request the browser is redirected to.
 ///
+/// No `nonce` is sent: a nonce is only meaningful bound to an ID token, and
+/// the console requests none — the administrator's identity comes from the
+/// access token, which the admin API validates at its own boundary. A
+/// parameter that looks like a check but is never verified is worse than its
+/// absence. `openid` stays in the default scopes because providers expect it
+/// on an OIDC authorization request.
+///
 /// The audience the bearer boundary validates is asked for the way each
 /// profile expects it: Auth0 as `audience`, Keycloak and spec-shaped
 /// providers as RFC 8707 `resource`, Entra through the resource-prefixed
@@ -57,7 +64,6 @@ pub fn authorize_url(
     endpoints: &AuthorizationEndpoints,
     settings: &ConsoleSettings,
     state: &str,
-    nonce: &str,
     challenge: &str,
 ) -> Result<String, String> {
     let mut url = url::Url::parse(&endpoints.authorization_endpoint)
@@ -70,7 +76,6 @@ pub fn authorize_url(
             .append_pair("redirect_uri", &settings.redirect_uri())
             .append_pair("scope", &settings.scopes)
             .append_pair("state", state)
-            .append_pair("nonce", nonce)
             .append_pair("code_challenge", challenge)
             .append_pair("code_challenge_method", "S256");
         match settings.profile {
