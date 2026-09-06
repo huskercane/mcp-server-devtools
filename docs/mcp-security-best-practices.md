@@ -330,7 +330,8 @@ stops a browser, not a local process.
 it is the default and it is reachable only by the client that spawned it — or
 run with `MCP_AUTH_MODE=oidc`. This is a deliberate posture (plan §1.2), not an
 oversight, but it is weaker than the spec's `SHOULD` and should be stated as
-such in any assessment.
+such in any assessment. Whether to close it — a static local token, or a Unix
+domain socket — is tracked as **CF-44**.
 
 ### 2. No private-IP range blocking on control-plane fetches
 
@@ -353,13 +354,19 @@ attacker to control DNS for a name with a valid certificate.
 **Why not fixed in code:** the spec itself advises against hand-rolled IP
 validation, and a correct implementation must pin DNS between check and use. An
 egress proxy enforcing network policy — the spec's own recommendation — is the
-right control, and it belongs in the deployment, not in this binary. See
-`docs/air-gap-runbook.md` for the network posture.
+right control, and it belongs in the deployment, not in this binary.
+
+**Not yet written down:** no runbook currently states the outbound network
+posture. `docs/air-gap-runbook.md` covers offline transfer, JWKS provisioning
+and vendored builds, not egress restriction, and every other occurrence of
+"egress" in `docs/` refers to the *policy* chokepoint in `src/policy/egress.rs`
+rather than network policy. Tracked as **CF-43**.
 
 **Action:** operators running this in a cloud environment should restrict
 egress from the gateway to the identity provider, the SIEM, and the configured
-vendor hosts. Blocking the instance metadata endpoint is the specific control
-worth naming.
+vendor hosts. Blocking the instance metadata endpoint (`169.254.169.254`) is
+the specific control worth naming. Until CF-43 lands, this paragraph is the
+only place that is written down.
 
 ### 3. `openid` is requested but no ID token is validated
 
