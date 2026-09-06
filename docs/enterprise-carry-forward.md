@@ -18,6 +18,13 @@ CF-18's inventory is updated. Fresh gates/allocation evidence is in
 `benchmarks/2026-09-06-d3-authoring.txt`. Real-provider proof remains CF-38;
 CF-40 is backlog only, offline licensing remains CF-10 and D.5 stays gated.
 
+Also recorded: 2026-09-06, after the authorization extensions addendum
+(rev 2.28). CF-42 records client-credentials external evidence and the
+undecided machine-principal scope; CF-35 continues to carry EMA client and
+tenant evidence. CF-43 and CF-44 record the two deviations found by mapping
+the MCP 2026-07-28 security best practices onto this server
+([conformance map](mcp-security-best-practices.md)).
+
 Previously updated: 2026-09-06, after D.4 (rev 2.27). Packaging, TLS Compose,
 file-backed JWKS and vendored-source offline builds landed; actual local
 proof and unchanged allocation evidence are in the D.4 summary. CF-41
@@ -807,6 +814,95 @@ inputs; this is not hosted-CI evidence.
 
 These are review/evidence follow-ups, not a request to implement D.5, offline
 licensing, an editor widget, build-speed work (CF-40), or new shipping profiles.
+
+### CF-42 · Client-credentials external evidence and machine-principal scope
+
+**Open · AE-2 follow-up (2026-09-06); owner: engineering + operations.**
+The [authorization extensions addendum](enterprise-auth-extensions.md) proposes
+`MCP_CLIENT_CREDENTIALS_ENABLED` as an opt-in advertisement setting. Local
+configuration and wire tests can be completed here; the acceptance evidence
+that cannot is the external half — a real authorization server issuing a
+client-credentials or RFC 7523 private-key-JWT token, followed by an allowed
+tool call and a policy-denied call through the real HTTP path, plus credential
+rotation and reacquisition at the client/AS boundary. This is the client
+credentials sibling of CF-35 and carries the same rule: a fixture issuer
+establishes local behaviour, never that a particular tenant or MCP client
+implements the extension. No support claim for any provider/client pair until
+the pair is run.
+
+The extension is specified in `specification/draft/oauth-client-credentials.mdx`
+only — there is no stable file, unlike EMA. Operator documentation must say so;
+a draft extension is a weaker support commitment and may change under us.
+
+Scope still undecided, and blocking before the flag is enabled anywhere an
+administrator can reach: whether a machine principal is admitted at `/admin/*`
+at all. D.2's four-eyes rule refuses self-approval on subject equality within a
+tenant (`src/approvals/mod.rs:291`, `:312`), which two service accounts in one
+tenant satisfy, so `MCP_ADMIN_APPROVALS=required` would admit a fully machine
+approval chain with a correct-looking journal. The control that stands today is
+scope, not the approval rule: `/admin/*` requires `mcp:admin`
+(`src/server/auth.rs:172`), so this needs an operator to have granted that scope
+to two service accounts — plausible for automated policy deployment, and
+unwarned against. Note the exposure does not wait on the proposed flag: the flag
+is advertisement only, and a client-credentials token from the configured issuer
+already validates today. The proposed default is refusal at the
+administrative router on a validated claim; a stronger approval predicate would
+be a D.2 change with its own tests. Related: machine principals are currently
+indistinguishable from employees in the D.1 access review, and the existing
+rate limiter was sized for human request profiles.
+
+### CF-43 · The outbound network posture is not written down
+
+**Open · MCP security best practices (2026-09-06); owner: operations.**
+The [conformance map](mcp-security-best-practices.md) records that we enforce
+https-or-loopback on every control-plane fetch (`require_https_unless_loopback`,
+`src/auth/oidc.rs:495`) and never follow redirects, but do not resolve and
+range-check against the private and reserved ranges RFC 9728 §7.7 lists. The
+spec asks for that blocking and, in the same breath, warns against hand-rolled
+IP validation because of encoding tricks — so the control it actually
+recommends is an egress proxy enforcing network policy, which belongs in the
+deployment and not in this binary.
+
+The residual risk is narrow rather than absent. Attacker-controlled URLs cannot
+reach these paths: tool arguments cannot name a host (`src/policy/canonical.rs`),
+and the only URLs fetched come from operator configuration or from a discovery
+document served by the configured issuer over TLS and checked against it. The
+realistic case is a compromised or misconfigured identity provider naming, say,
+`https://169.254.169.254/...` as its `jwks_uri`.
+
+What is missing is documentation, not code. No runbook states the outbound
+posture: `docs/air-gap-runbook.md` covers offline transfer, JWKS provisioning
+and vendored builds, and every other occurrence of "egress" under `docs/` means
+the *policy* chokepoint in `src/policy/egress.rs`, not network policy. The
+deviations section of the conformance map is currently the only place the
+control is named. It should say: restrict gateway egress to the identity
+provider, the SIEM, and the configured vendor hosts, and block the instance
+metadata endpoint (`169.254.169.254`). A Helm `NetworkPolicy` is the obvious
+home once the chart from C.7 grows one.
+
+### CF-44 · Community-mode HTTP has no inbound credential
+
+**Open (decision, not defect) · MCP security best practices (2026-09-06); owner: engineering.**
+The MCP security best practices say a server intended to run locally should use
+`stdio`, or — if it serves HTTP — require an authorization token or a Unix
+domain socket. With `MCP_AUTH_MODE=off` we do neither: the loopback bind is the
+trust boundary, and `validate_startup_security` (`src/server/http.rs:1198`)
+already refuses to start with a non-loopback bind in that mode. Browser-driven
+DNS rebinding is blocked by the loopback `Origin` allowlist, but any local
+process running as any user on the host can call every tool with the operator's
+full vendor credential set.
+
+This is the deliberate community posture from plan §1.2 and it is defensible —
+`stdio` is the default local transport and is reachable only by the client that
+spawned it. It is recorded here because it is the one place our posture is
+weaker than a spec `SHOULD`, and an assessment should say so rather than let a
+reader infer parity.
+
+Open question, if it is ever worth closing: a static local token read from
+configuration, or a Unix domain socket listener. Both add a configuration
+surface to the community path that currently has none, which is the reason not
+to do it by default. No work is planned; this exists so the answer to "why
+doesn't local HTTP require a token?" has a citation.
 
 ### CF-10 · ADR-002: the enterprise licence
 **Model decided 2026-09-05 · enterprise agreement and contribution terms remain open**
