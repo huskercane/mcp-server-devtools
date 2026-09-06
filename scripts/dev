@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+compose=(docker compose -f "$root/deploy/dev/compose.yaml")
+case "${1:-help}" in
+  up)
+    echo 'Starting the dev stack. The first build can take several minutes; follow progress with scripts/dev logs in another terminal.'
+    "${compose[@]}" up --build -d --wait --wait-timeout 1800
+    printf '\nConsole: https://localhost:8443/console\nAlice: alice / alice-password\nBob: bob / bob-password\nKeycloak: http://localhost:8080 (admin / local-admin-password)\n'
+    ;;
+  down) "${compose[@]}" down ;;
+  restart)
+    "${compose[@]}" restart mcp
+    "${compose[@]}" up -d --wait --wait-timeout 1800
+    ;;
+  smoke) "${compose[@]}" exec -T mcp python3 deploy/dev/smoke.py ;;
+  logs) "${compose[@]}" logs -f --tail 100 ;;
+  status) "${compose[@]}" ps ;;
+  test)
+    shift
+    "${compose[@]}" exec -T mcp cargo test --locked --no-default-features --features console,wrds,secrets-vault "$@"
+    ;;
+  shell) "${compose[@]}" exec mcp bash ;;
+  sign)
+    candidate=${2:?Usage: scripts/dev sign path/to/policy-candidate.yaml}
+    [[ -f "$candidate" ]] || { echo "No file: $candidate" >&2; exit 1; }
+    candidate=$(cd "$(dirname "$candidate")" && pwd)/$(basename "$candidate")
+    signing_dir=$("${compose[@]}" exec -T mcp mktemp -d /tmp/dev-sign.XXXXXX)
+    trap '"${compose[@]}" exec -T mcp rm -rf -- "$signing_dir"' EXIT
+    "${compose[@]}" cp "$candidate" "mcp:$signing_dir/candidate.yaml"
+    "${compose[@]}" exec -T mcp /build/debug/mcp-devtools policy sign \
+      "$signing_dir/candidate.yaml" --key /state/config/policy.key
+    "${compose[@]}" cp "mcp:$signing_dir/candidate.yaml.sig" "$candidate.sig"
+    ;;
+  reset)
+    if [[ "${2:-}" != --yes ]]; then
+      echo 'Deletes dev users, policies, journal, certificates and build caches. Run scripts/dev reset --yes to confirm.' >&2
+      exit 1
+    fi
+    "${compose[@]}" down --volumes
+    ;;
+  *) echo 'Usage: scripts/dev {up|down|restart|logs|status|smoke|sign FILE|test [cargo test arguments]|shell|reset --yes}' ;;
+esac

@@ -29,6 +29,11 @@ The Bitbucket, Jira, and Confluence behavior is ported from the corresponding [`
 
 ## Install
 
+To develop or explore the administration console locally, run
+`./scripts/dev up`. Docker Compose starts the server, a seeded Keycloak identity
+provider, and HTTPS ingress. See the [development quickstart](deploy/dev/README.md)
+for login accounts, testing, and the edit/restart workflow.
+
 Download a prebuilt archive from [GitHub Releases](https://github.com/huskercane/mcp-server-devtools/releases/latest):
 
 | Platform | Archive |
