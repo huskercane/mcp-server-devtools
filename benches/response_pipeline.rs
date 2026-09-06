@@ -532,6 +532,42 @@ fn probe_principal_inventory() {
     });
 }
 
+#[cfg(feature = "console")]
+fn probe_console_activity() {
+    use askama::Template;
+    use mcp_server_devtools::console::{ActivityPage, ActivityQuery};
+    use mcp_server_devtools::ports::activity_reports::ActivityRow;
+
+    // Build the API result before counting: this stage measures HTML rendering,
+    // not report ingestion, JSON decoding, or fixture construction.
+    let rows = (1..=1000)
+        .map(|seq| ActivityRow {
+            seq,
+            timestamp: "2026-09-05T12:00:00Z".into(),
+            kind: "tool_call_outcome".into(),
+            subject: Some("sre@acme.example".into()),
+            tool: Some("grafana_query_logs".into()),
+            vendor: Some("grafana".into()),
+            effect: Some("allow".into()),
+            rule_id: Some("sre-read-qa-datasources".into()),
+            reason: Some("matched policy rule".into()),
+            ..ActivityRow::default()
+        })
+        .collect();
+    let page = ActivityPage::complete(ActivityQuery::default(), rows, 1000);
+    let rendered = probe("ActivityPage::complete render, 1000 rows", 100, || {
+        std::hint::black_box(&page)
+            .render()
+            .expect("activity renders")
+    });
+    println!("   rendered HTML: {} bytes", rendered.len());
+}
+
+#[cfg(not(feature = "console"))]
+fn probe_console_activity() {
+    println!("  skipped: build with --features console to render 1000 activity rows");
+}
+
 fn main() {
     println!("=== output size: is TOON earning its CPU? ===");
     output_size_comparison();
@@ -553,6 +589,8 @@ fn main() {
     probe_usage_path();
     println!("\n=== stage -1e: principal inventory — C.4 ===");
     probe_principal_inventory();
+    println!("\n=== stage -1f: console activity render, 1000 rows (mean of 100) — D.1 ===");
+    probe_console_activity();
     println!("\n=== stage 0: per-tool-call config snapshot (mean of 1000) ===");
     let config = realistic_config();
     let handle = ConfigHandle::new(realistic_config());

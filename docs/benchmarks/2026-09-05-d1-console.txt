@@ -1,0 +1,306 @@
+D.1 console landing — 2026-09-05
+Branch: feat/phase-d-administration; completes WIP 48ee1d0 over 75cccf9.
+
+Dependency evidence (Rust/Cargo 1.96.0; Linux x86_64; Cargo.lock unchanged)
+
+The requested literal commands were run:
+$ cargo tree -e normal --features console -p askama
+error: cannot specify features for packages outside of workspace
+$ cargo tree -e normal --features console -p rust-embed
+error: cannot specify features for packages outside of workspace
+Both exit 101: package selection excludes the workspace feature owner.
+
+Working equivalent: also select the root workspace package to enable console.
+Use --no-dedupe so the selected dependency tree is complete even when Cargo
+prints the root package first. Below are the named top-level subtrees only;
+the unrelated root-package tree is omitted. Normal edges include proc-macro
+compilation dependencies; this is not a list of runtime-linked libraries.
+
+$ cargo tree -e normal --features console -p mcp-server-devtools -p askama --no-dedupe
+askama v0.16.1
+├── askama_macros v0.16.1 (proc-macro)
+│   └── askama_derive v0.16.1
+│       ├── askama_parser v0.16.1
+│       │   ├── rustc-hash v2.1.3
+│       │   ├── serde v1.0.229
+│       │   │   ├── serde_core v1.0.229
+│       │   │   └── serde_derive v1.0.229 (proc-macro)
+│       │   │       ├── proc-macro2 v1.0.107
+│       │   │       │   └── unicode-ident v1.0.24
+│       │   │       ├── quote v1.0.47
+│       │   │       │   └── proc-macro2 v1.0.107
+│       │   │       │       └── unicode-ident v1.0.24
+│       │   │       └── syn v3.0.3
+│       │   │           ├── proc-macro2 v1.0.107
+│       │   │           │   └── unicode-ident v1.0.24
+│       │   │           ├── quote v1.0.47
+│       │   │           │   └── proc-macro2 v1.0.107
+│       │   │           │       └── unicode-ident v1.0.24
+│       │   │           └── unicode-ident v1.0.24
+│       │   ├── serde_derive v1.0.229 (proc-macro)
+│       │   │   ├── proc-macro2 v1.0.107
+│       │   │   │   └── unicode-ident v1.0.24
+│       │   │   ├── quote v1.0.47
+│       │   │   │   └── proc-macro2 v1.0.107
+│       │   │   │       └── unicode-ident v1.0.24
+│       │   │   └── syn v3.0.3
+│       │   │       ├── proc-macro2 v1.0.107
+│       │   │       │   └── unicode-ident v1.0.24
+│       │   │       ├── quote v1.0.47
+│       │   │       │   └── proc-macro2 v1.0.107
+│       │   │       │       └── unicode-ident v1.0.24
+│       │   │       └── unicode-ident v1.0.24
+│       │   ├── unicode-ident v1.0.24
+│       │   └── winnow v1.0.4
+│       │       └── memchr v2.8.3
+│       ├── basic-toml v0.1.10
+│       │   └── serde v1.0.229
+│       │       ├── serde_core v1.0.229
+│       │       └── serde_derive v1.0.229 (proc-macro)
+│       │           ├── proc-macro2 v1.0.107
+│       │           │   └── unicode-ident v1.0.24
+│       │           ├── quote v1.0.47
+│       │           │   └── proc-macro2 v1.0.107
+│       │           │       └── unicode-ident v1.0.24
+│       │           └── syn v3.0.3
+│       │               ├── proc-macro2 v1.0.107
+│       │               │   └── unicode-ident v1.0.24
+│       │               ├── quote v1.0.47
+│       │               │   └── proc-macro2 v1.0.107
+│       │               │       └── unicode-ident v1.0.24
+│       │               └── unicode-ident v1.0.24
+│       ├── glob v0.3.4
+│       ├── memchr v2.8.3
+│       ├── proc-macro2 v1.0.107
+│       │   └── unicode-ident v1.0.24
+│       ├── quote v1.0.47
+│       │   └── proc-macro2 v1.0.107
+│       │       └── unicode-ident v1.0.24
+│       ├── rustc-hash v2.1.3
+│       ├── serde v1.0.229
+│       │   ├── serde_core v1.0.229
+│       │   └── serde_derive v1.0.229 (proc-macro)
+│       │       ├── proc-macro2 v1.0.107
+│       │       │   └── unicode-ident v1.0.24
+│       │       ├── quote v1.0.47
+│       │       │   └── proc-macro2 v1.0.107
+│       │       │       └── unicode-ident v1.0.24
+│       │       └── syn v3.0.3
+│       │           ├── proc-macro2 v1.0.107
+│       │           │   └── unicode-ident v1.0.24
+│       │           ├── quote v1.0.47
+│       │           │   └── proc-macro2 v1.0.107
+│       │           │       └── unicode-ident v1.0.24
+│       │           └── unicode-ident v1.0.24
+│       ├── serde_derive v1.0.229 (proc-macro)
+│       │   ├── proc-macro2 v1.0.107
+│       │   │   └── unicode-ident v1.0.24
+│       │   ├── quote v1.0.47
+│       │   │   └── proc-macro2 v1.0.107
+│       │   │       └── unicode-ident v1.0.24
+│       │   └── syn v3.0.3
+│       │       ├── proc-macro2 v1.0.107
+│       │       │   └── unicode-ident v1.0.24
+│       │       ├── quote v1.0.47
+│       │       │   └── proc-macro2 v1.0.107
+│       │       │       └── unicode-ident v1.0.24
+│       │       └── unicode-ident v1.0.24
+│       └── syn v3.0.3
+│           ├── proc-macro2 v1.0.107
+│           │   └── unicode-ident v1.0.24
+│           ├── quote v1.0.47
+│           │   └── proc-macro2 v1.0.107
+│           │       └── unicode-ident v1.0.24
+│           └── unicode-ident v1.0.24
+├── itoa v1.0.18
+└── percent-encoding v2.3.2
+
+$ cargo tree -e normal --features console -p mcp-server-devtools -p rust-embed --no-dedupe
+rust-embed v8.12.0
+├── rust-embed-impl v8.12.0 (proc-macro)
+│   ├── mime_guess v2.0.5
+│   │   ├── mime v0.3.17
+│   │   └── unicase v2.9.0
+│   ├── proc-macro2 v1.0.107
+│   │   └── unicode-ident v1.0.24
+│   ├── quote v1.0.47
+│   │   └── proc-macro2 v1.0.107
+│   │       └── unicode-ident v1.0.24
+│   ├── rust-embed-utils v8.12.0
+│   │   ├── sha2 v0.11.0
+│   │   │   ├── cfg-if v1.0.4
+│   │   │   ├── cpufeatures v0.3.0
+│   │   │   └── digest v0.11.3
+│   │   │       ├── block-buffer v0.12.1
+│   │   │       │   └── hybrid-array v0.4.14
+│   │   │       │       └── typenum v1.20.1
+│   │   │       ├── const-oid v0.10.2
+│   │   │       └── crypto-common v0.2.2
+│   │   │           └── hybrid-array v0.4.14
+│   │   │               └── typenum v1.20.1
+│   │   └── walkdir v2.5.0
+│   │       └── same-file v1.0.6
+│   ├── syn v2.0.119
+│   │   ├── proc-macro2 v1.0.107
+│   │   │   └── unicode-ident v1.0.24
+│   │   ├── quote v1.0.47
+│   │   │   └── proc-macro2 v1.0.107
+│   │   │       └── unicode-ident v1.0.24
+│   │   └── unicode-ident v1.0.24
+│   └── walkdir v2.5.0
+│       └── same-file v1.0.6
+├── rust-embed-utils v8.12.0
+│   ├── sha2 v0.11.0
+│   │   ├── cfg-if v1.0.4
+│   │   ├── cpufeatures v0.3.0
+│   │   └── digest v0.11.3
+│   │       ├── block-buffer v0.12.1
+│   │       │   └── hybrid-array v0.4.14
+│   │       │       └── typenum v1.20.1
+│   │       ├── const-oid v0.10.2
+│   │       └── crypto-common v0.2.2
+│   │           └── hybrid-array v0.4.14
+│   │               └── typenum v1.20.1
+│   └── walkdir v2.5.0
+│       └── same-file v1.0.6
+└── walkdir v2.5.0
+    └── same-file v1.0.6
+
+Landing scope and deviations
+
+ADR-013 accepted; D.1 read-only console landed. The API remains the bearer
+and authorization enforcement surface. Audience selection follows the IdP
+profile: Okta authorization-server setting, Entra resource-prefixed scope,
+Auth0 audience, Keycloak/generic RFC 8707 resource.
+
+The callback probes one GET /admin/policy rather than calling the validator
+directly (success or 503 permits a session; 503 is not validation proof).
+Health renders health_banner directly because health is not an admin
+operation. Nonce is sent/stored but no ID token is consumed. htmx 4 has no
+allowEval key or code-evaluation path. Session TTL uses bounded expires_in,
+not decoded exp; admin calls enforce actual expiry/revocation. The embedded
+script is console/static/htmx.min.js.
+
+Runbooks cover sign-in, Strict-cookie landing, cookies, headers, Origin,
+401 handling, all pages and profile-specific client registration. Plan rev
+2.26 marks D.1 landed and resolves section 11 item 11 as a design decision.
+CF-37 covers split-topology inventory, restart re-login and no console-session
+listing; CF-38 covers every IdP section and Entra scope form remaining
+unproven against a real tenant, including the known Entra SPA redemption
+Origin gap; CF-39 records D.2's read-only proposals page (approve/reject stay
+CLI). CF-18's would-move inventory gains src/console.
+
+Release binary size (x86_64-unknown-linux-gnu, Rust 1.96.0)
+Measured with stat -c '%s' target/release/mcp-devtools immediately after each
+successful build; repository release profile: opt-level=3, thin LTO,
+codegen-units=1, strip=symbols. Same default features (keychain, wrds,
+secrets-vault) in both builds; console is the only added feature.
+
+$ cargo build --release
+26,989,488 bytes (25.739 MiB), without console
+$ cargo build --release --features console
+27,519,696 bytes (26.245 MiB), with console
+Delta: +530,208 bytes (+0.506 MiB; +1.96%).
+These are native release artifacts, not the debug-symbol-bearing bench binary.
+
+Landing gates (gate script run with bash)
+
+PASS cargo build
+PASS cargo build --no-default-features
+PASS cargo clippy --all-targets -- -D warnings
+PASS cargo clippy --all-targets --no-default-features -- -D warnings
+PASS cargo clippy --all-targets --features console -- -D warnings
+PASS cargo test (1,103 passed, 2 ignored: golden regeneration helper and one doctest)
+PASS cargo test --features console (1,117 passed, 2 ignored: golden regeneration helper and one doctest)
+PASS cargo fmt --all -- --check
+PASS cargo deny --locked check --deny warnings
+PASS cargo bench --bench response_pipeline
+PASS cargo bench --bench response_pipeline --features console
+PASS git diff --check
+
+All three clippy configurations passed with warnings denied. All 14 console
+tests passed, including real-HTTP PKCE/JWKS sign-in, state binding, cookies,
+headers/CSRF, HTML, htmx digest, process scope and API-401 session termination.
+AdminClient conformance and admin API tests passed in both feature modes.
+The first sandboxed tests/console bench could not bind localhost (EPERM);
+the successful reruns used the required local-socket access. No test was
+changed or skipped to bypass that failure. External IdP tenant flows were
+not exercised; CF-38 remains open.
+
+Allocation comparison
+
+Both feature modes: all 31 existing rows match
+2026-09-05-claude-compliance.txt allocation counts and reported KB exactly,
+including both payload sizes and BEFORE/reference rows. Existing probe KB is
+integer-rounded; timings vary and are not equality claims.
+Default build: stage -1f prints skipped.
+Console stage -1f: 432 KB / 9 allocations / 0.18 ms mean of 100 renders;
+231,639 bytes of HTML from ActivityPage::complete at 1,000 ActivityRows.
+Rows/page prepared before measurement; report reads, decoding and fixture
+construction excluded. Recorded as the Phase D baseline in the register.
+JWT cache hit 4.53 us < 50 us; journal append p99 32 us < 200 us.
+
+$ cargo bench --bench response_pipeline --features console
+=== output size: is TOON earning its CPU? ===
+                                            compact     pretty       TOON
+  uniform flat rows (TOON's best case)       12392B     20800B      5016B   TOON is 40% of compact, 24% of pretty
+  nested objects (Jira search shape)         89903B    133723B     99300B   TOON is 110% of compact, 74% of pretty
+
+=== stage -1: policy extractors, per tool call (mean of 2000) ===
+  canonical: short path                            0 KB          4 allocs     0.00 ms
+  canonical: dot-segments + escapes                0 KB          1 allocs     0.00 ms
+  canonical: search URL (long JQL)                 0 KB         10 allocs     0.00 ms
+  jira::extract GET /issue/{key}                   0 KB          6 allocs     0.00 ms
+  jira::extract GET /search/jql (long JQL)         1 KB         17 allocs     0.01 ms
+  jira::project_keys_from_jql (long JQL)           0 KB          9 allocs     0.00 ms
+  jira::extract unmapped (default arm)             0 KB          1 allocs     0.00 ms
+  grafana::query_logs                              0 KB         10 allocs     0.00 ms
+
+=== stage -1b: policy decision, per tool call (mean of 2000) ===
+  ActionContext via for_tool (grafana)             0 KB         21 allocs     0.00 ms
+  FilePolicy::evaluate @ 500 rules                 0 KB          5 allocs     0.02 ms
+
+=== stage -1c: enterprise request path, production components (mean of 2000 / 1000) ===
+  JWT validate: cache hit (budget 50 µs)           1 KB          9 allocs     4.53 µs
+  C.1 JWT authenticate: cached actor chain         1 KB          8 allocs     4.53 µs
+  journal append, sequential (budget p99 200 µs)         1 KB          6 allocs  p50      12 µs  p99      32 µs  max     279 µs
+
+=== stage -1d: usage side of the request path (mean of 2000) — C.6 ===
+  rate limit check, known subject                  0 KB          0 allocs     0.00 ms
+  PrometheusUsageSink::record, known series         0 KB          0 allocs     0.00 ms
+  FanOut(prometheus + channel)::record             0 KB          9 allocs     0.00 ms
+
+=== stage -1e: principal inventory — C.4 ===
+  observe principal, known unchanged               0 KB          0 allocs     0.00 ms
+
+=== stage -1f: console activity render, 1000 rows (mean of 100) — D.1 ===
+  ActivityPage::complete render, 1000 rows       432 KB          9 allocs     0.18 ms
+   rendered HTML: 231639 bytes
+
+=== stage 0: per-tool-call config snapshot (mean of 1000) ===
+  BEFORE: deep clone of Config                     4 KB         73 allocs     0.00 ms
+  NOW:    ConfigHandle::snapshot()                 0 KB          0 allocs     0.00 ms
+
+=== 500 issues / 220 KB compact JSON  (mean of 20) ===
+ -- stage 1: jq filter, no filter supplied (the default path)
+  BEFORE: deep clone of the payload             1469 KB      17507 allocs     3.17 ms
+  NOW:    apply_jq_filter(None) borrows            0 KB          0 allocs     0.00 ms
+ -- stage 2: render
+  BEFORE: eager pretty-JSON, then discard       2249 KB      19053 allocs     6.32 ms
+  NOW:    render(Toon), lazy fallback           1736 KB      19032 allocs     6.04 ms
+  ref:    render(Json) on same data              512 KB         13 allocs     0.84 ms
+ -- stage 3: truncate
+  truncate_for_ai (over budget)                   39 KB          4 allocs     0.00 ms
+   rendered output: 243 KB
+
+=== 5000 issues / 2226 KB compact JSON  (mean of 4) ===
+ -- stage 1: jq filter, no filter supplied (the default path)
+  BEFORE: deep clone of the payload            14703 KB     175007 allocs    37.89 ms
+  NOW:    apply_jq_filter(None) borrows            0 KB          0 allocs     0.00 ms
+ -- stage 2: render
+  BEFORE: eager pretty-JSON, then discard      20643 KB     190051 allocs    77.49 ms
+  NOW:    render(Toon), lazy fallback          16547 KB     190035 allocs    66.94 ms
+  ref:    render(Json) on same data             4096 KB         16 allocs     8.59 ms
+ -- stage 3: truncate
+  truncate_for_ai (over budget)                   39 KB          4 allocs     0.00 ms
+   rendered output: 2455 KB

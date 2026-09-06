@@ -24,6 +24,7 @@ ordered by partner demand and are not scheduled until Gate B passes.
 | 2.23 | 2026-09-05 | Owner selected Apache-2.0 for the current community crate and proprietary commercial licensing for separate enterprise extensions. Current community features remain in this crate; earlier ISC permissions are preserved. Release archives and the container carry license notices. ADR-001/002 amended; enterprise agreement text and contribution terms remain open. See [licensing policy](licensing.md). | Owner |
 | 2.24 | 2026-09-05 | D.0 landed on `feat/phase-d-administration` under ADR-012 as proposed (the owner's instruction that everything lands in this repository; the ADR row still awaits its formal status). `ports::MutationGate` (`MutationIntent` borrowed: kind, principal, target, candidate bytes; `Admission::{Apply, Deferred{proposal}, Refused(cause)}`) is consulted by every admin mutation before its durable `admin_mutation` intent — the deny-list on the *verified* candidate bytes and version — with `DirectGate` as the community adapter; a deferral is `202 {proposal, state:pending, operation}` and no journal record, a refusal `409` with the cause. `MCP_ADMIN_APPROVALS` (`bootstrap::approvals`) is the only reader: unset/`off` is direct, `required` is a typed startup refusal naming D.2 until the adapter exists. `ports::AdminClient` (`AdminMethod`, `AdminRequest`, `AdminResponse`, `AdminClientError` carrying the CLI's existing error codes) with `admin::HttpAdminClient` extracted from `cli::admin` (behaviour unchanged) and `admin::LocalAdminClient` (`tower::ServiceExt::oneshot` on the admin router; `tower` exact-pinned). `router_with_policy` takes the gate; `router` picks the server's. One conformance suite runs over both adapters; the existing admin tests run under `Direct` unchanged. Deviation from §3.10.1 as written: `AdminClient` takes an `AdminRequest` rather than an `AdminOp` enum, since the operation is the path and a closed enum would make every new endpoint a port change. Not done: the gate's name is not yet in the startup log or health banner (D.2 adds it with the adapter that makes it informative). Allocation probe: every stage unchanged. Next: D.2 API-first, starting with `PUT /admin/policy` | Implementation |
 | 2.25 | 2026-09-05 | D.2 landed on `feat/phase-d-administration`, API and CLI; the console page waits for D.1. `PUT /admin/policy` (signed bundle + signature, the mirror of the deny-list `PUT`; `PolicyAdmin::{verify, install}`, the signed pair written by `SignedBundle::install_signed` shared with the deny-list). `approvals::ApprovalGate` is the `MutationGate` adapter for `MCP_ADMIN_APPROVALS=required` and the `ports::ProposalRegistry` behind `/admin/proposals`: policy install and deny-list replacement are journaled as `admin_proposal` records **carrying the exact candidate**, answered `202`; `POST …/{id}/approve` by a different subject of the same tenant with a token inside the B.4 write bound journals `admin_approval`, re-checks the digest, and applies the stored bytes through the ordinary path (its own `admin_mutation`; `applied_seq` reported); `…/reject` and observed expiry (`MCP_ADMIN_APPROVAL_TTL_SECONDS`, default 24 h) journal `admin_rejection`; a repeat approval is idempotent. Pending state is a projection rebuilt from the control journal at startup (`ApprovalGate::open`), so `required` needs `MCP_AUDIT_JOURNAL_DIR` and refuses startup without it. Reload, session revoke, and artifact purge stay direct (§3.10.3). `admin proposals list|show|approve|reject` with `--json`. Deviations from §3.10.3 as written: expiry is journaled when first observed by a decision rather than by a sweeper (no timer, no record for a proposal nobody touches); `MutationIntent` gained the submitted signature so a proposal can be applied as verified; an audit outage reported through the gate answers `503 audit_unavailable`, not `409`; the gate's name is now in the startup log, not yet the health banner. Locked by tests over the real on-disk journal: proposal JSON key order, the three record shapes, restart projection, digest re-check against an altered journal, self/stale/expired refusals. Register: CF-18's would-move list gains the D.2 files; CF-36 records the credential-rotation gap. Allocation probe: every stage unchanged. Next: D.1 after ADR-013 | Implementation |
+| 2.26 | 2026-09-05 | ADR-013 accepted; D.1 landed on `feat/phase-d-administration`: optional `console` feature, exact-pinned askama/rust-embed, vendored digest-checked htmx 4.0.0, PKCE sign-in with bounded server-side sessions, Strict-cookie landing page, CSP and Origin checks, read-only policy/explain, activity, access review, usage, process inventory, proposals and health. `POST /admin/policy/explain` serves both clients. Deviations from §3.10.2 as written: audience requested per profile (Okta authorization-server setting, Entra resource-prefixed scopes, Auth0 `audience`, Keycloak/generic RFC 8707 `resource`); token proven through one `GET /admin/policy` rather than a direct validator call (success or 503 permits landing; 503 is not validation proof); health renders `health_banner` directly since health is not an admin operation; nonce sent/stored but no ID token consumed; htmx 4 has no `allowEval` key and no evaluation path; session TTL uses bounded `expires_in`, not decoded `exp` (the API enforces actual expiry); asset path is `console/static/htmx.min.js`. Stage −1f renders `ActivityPage::complete` at 1,000 rows; Phase D baseline and prior-stage comparison in the register, dependency trees and release-size delta in `benchmarks/2026-09-05-d1-console.txt`. Runbooks/configuration landed. §11 item 11 resolved as the authentication design decision; every IdP registration remains unproven against a real tenant, with Entra SPA redemption compatibility explicitly open. CF-37/38/39 cover split inventory, re-login after restart, no console-session listing, provider evidence and read-only D.2 proposals (approve/reject stay CLI); CF-18 gains `src/console`. Next: D.4; no PR until requested | Implementation |
 | 1 | 2026-08-28 | Initial plan: six phases, two gates, console in Phase 5 | Brief |
 | 1.1 | 2026-08-29 | Admin CLI, policy-engine options, stay-in-Rust decision, Kubernetes topology, container in Phase 1 | Owner |
 | 2 | 2026-08-29 | Canonical `ActionContext` for resource-aware policy; durable `AuditSink` split from lossy `UsageSink`; licensing boundary moved to M0; minimal `CredentialBroker` in the first slice; commercial gates moved before Phase C; wedge vendors demoted to a hypothesis; Phase 5 split into C/D; revocation, canonicalization, client-identity, response-metadata, and availability corrections; business-plan gaps and trial metrics added | Independent review |
@@ -548,6 +549,11 @@ to. No parity test is needed while there is one binary.
 The console is an askama-rendered client of the admin API, served by the
 roles that serve the control plane, behind the `console` Cargo feature.
 
+**D.1 landed (rev 2.26).** The design below is retained as written; the
+rev 2.26 decision-log entry records implementation deviations. Operator
+behavior and limitations are in the [console runbook](console-runbook.md),
+with provider evidence and remaining console scope tracked in CF-37–39.
+
 - **Assets.** `console/htmx.min.js` is the one vendored script, exact
   version and SHA-256 recorded in `console/VENDORED.md`, embedded with
   `rust-embed`, and a test hashes the embedded bytes against the recorded
@@ -633,7 +639,7 @@ purge (bounded blast radius, already journaled). The D.2 row's "credential
 rotation" has no API target because rotation happens in the secret source
 (§3.8); it is recorded in the register at D.2 exit rather than invented
 here. CLI: `admin proposals list|show|approve|reject`, `--json` throughout.
-The console page comes after D.1 and is the last part of D.2. The adapter, its endpoints, and the CLI group are self-contained files so they can move under ADR-012 if the owner ever decides they should.
+The read-only console proposal page landed with D.1 (rev 2.26); approve/reject stay CLI (CF-39). The adapter, its endpoints, and the CLI group are self-contained files so they can move under ADR-012 if the owner ever decides they should.
 
 #### 3.10.4 Packaging and air-gap (D.4)
 
@@ -878,8 +884,8 @@ demand, and D.4 can run in parallel with anything since it touches only
 | WP | Work | Where (ADR-012) | Size |
 |---|---|---|---|
 | D.0 | **Landed (rev 2.24).** Seams (§3.10.1): `ports::MutationGate` with the `Direct` adapter on every admin mutation, selected by `MCP_ADMIN_APPROVALS`; `ports::AdminClient` with the HTTP adapter extracted from `cli::admin` and the in-process adapter; conformance suite across both adapters; existing admin tests unchanged under `Direct` | This repo | S |
-| D.2 | **Landed, API and CLI (rev 2.25); console page after D.1.** Two-person approval (§3.10.3), **API first**: `PUT /admin/policy` (signed bundle + signature; `Direct`-gated until the adapter exists), the approval `MutationGate` adapter with `admin_proposal` / `admin_approval` / `admin_rejection` control records and the startup projection, `POST /admin/proposals/{id}/approve` and `…/reject`, `GET /admin/proposals`, proposer ≠ approver, fresh-token rule, digest re-check, TTL; `admin proposals` CLI group; console page last (after D.1). Locked JSON shapes; journal record shapes locked by tests | This repo; on CF-18's would-move list | M |
-| D.1 | Console v1, read-only (§3.10.2): `console` feature, askama + `rust-embed`, vendored htmx 4.x with digest test, PKCE login and bounded in-memory sessions, strict CSP and CSRF checks, pages for policy + explain, activity, access review, usage, sessions/artifacts, health; `POST /admin/policy/explain` for both clients; probe stage −1f; IdP client-registration runbook sections | This repo (`console` feature) | L |
+| D.2 | **Landed, API and CLI (rev 2.25); read-only console page landed with D.1 (rev 2.26), approve/reject stay CLI (CF-39).** Two-person approval (§3.10.3), **API first**: `PUT /admin/policy` (signed bundle + signature; `Direct`-gated until the adapter exists), the approval `MutationGate` adapter with `admin_proposal` / `admin_approval` / `admin_rejection` control records and the startup projection, `POST /admin/proposals/{id}/approve` and `…/reject`, `GET /admin/proposals`, proposer ≠ approver, fresh-token rule, digest re-check, TTL; `admin proposals` CLI group; read-only proposal page in D.1. Locked JSON shapes; journal record shapes locked by tests | This repo; on CF-18's would-move list | M |
+| D.1 | **Landed (rev 2.26).** Console v1, read-only (§3.10.2): `console` feature, askama + `rust-embed`, vendored htmx 4.x with digest test, PKCE login and bounded in-memory sessions, strict CSP and CSRF checks, pages for policy + explain, activity, access review, usage, sessions/artifacts, health; `POST /admin/policy/explain` for both clients; probe stage −1f; IdP client-registration runbook sections | This repo (`console` feature) | L |
 | D.4 | Packaging (§3.10.4): `.deb`/`.rpm` with a hardened systemd unit and container-install CI proof; compose reference stack; air-gap: `JwksLocation::File`, `auth jwks fetch`, `cargo vendor` tarball with an `--offline` build step, mirrored-image runbook. Offline licence waits on CF-10; OVA on request | This repo | M |
 | D.3 | Console v2, policy authoring (§3.10.2): textarea editor with debounced server-side validate and diff (existing endpoints), candidate download for offline signing, signed-bundle upload that becomes a D.2 proposal; no editor widget unless asked | This repo (`console` feature); on CF-18's would-move list | M (L with an editor widget) |
 | D.5 | Delegated upstream identity (§3.10.5), one vendor per gate: **D.5a** `DelegatedBroker` behind `CredentialBroker`, the ID-JAG downstream path over `OidcExchange`, bounded token cache, `authority` policy matcher, audit unchanged; **D.5b** first authorization-code vendor (Slack by feasibility; decided by §11 item 4) with the `DelegatedTokenStore` port and its SQLite adapter, consent flow on `control`, `--role all` only | This repo | D.5a M; D.5b L per vendor |
@@ -895,28 +901,29 @@ caller's own upstream identity with `authority=delegated` in the record.
 
 **Phase exit gates (in addition to the landing gates in `CLAUDE.md`):**
 
-- [ ] Allocation probe: every existing stage unchanged; new stage −1f
+- [x] Allocation probe: every existing stage unchanged; new stage −1f
       (activity page render at 1,000 rows) recorded as the Phase D baseline
       in the register; the two new dependencies' trees and the binary-size
       delta recorded in D.1's summary.
 - [ ] CF-18's would-move list updated with the D.2/D.3 files, so a later
       segmentation is a recorded file move.
-- [ ] Header and CSRF test on every console route; the htmx digest test.
+- [x] Header and CSRF test on every console route; the htmx digest test (D.1).
 - [ ] Every mutation still appends its durable intent before effect, gated
       or not (`tests/admin_api_tests.rs` extended, not replaced).
 - [ ] Register entries for everything scoped out at each WP exit (the D.2
       "credential rotation" gap; split-topology console inventory; the
       vendors D.5 did not do).
 
-**Status 2026-09-05:** D.0 (rev 2.24) and D.2's API and CLI (rev 2.25)
-landed on `feat/phase-d-administration`; D.2's console page waits for
-D.1, which is next once ADR-013 is decided. ADR-012 is
-applied in practice (everything lands here) and ADR-013 awaits the owner
-before D.1. Gate B remains unrecorded, as it was for Phase C.
+**Status 2026-09-05:** D.0 (rev 2.24), D.2's API/CLI (rev 2.25), and
+D.1's read-only console (rev 2.26) landed on `feat/phase-d-administration`.
+D.2's read-only proposal page is included; approval decisions stay CLI
+(CF-39). ADR-013 is accepted and §11 item 11 resolved, with real-provider
+proof tracked separately in CF-38. ADR-012 is applied in practice
+(everything lands here). Next is D.4. Gate B remains unrecorded.
 
 - [x] D.0 seams — `MutationGate` / `Direct`, `AdminClient` / HTTP + in-process, conformance suite (rev 2.24)
-- [x] D.2 two-person approval, API and CLI (rev 2.25); console page waits for D.1
-- [ ] D.1 console v1, read-only (after ADR-013)
+- [x] D.2 two-person approval, API and CLI (rev 2.25); read-only console page in D.1, approve/reject stay CLI (CF-39)
+- [x] D.1 console v1, read-only (rev 2.26; ADR-013 accepted)
 - [ ] D.4 packaging and air-gap
 - [ ] D.3 console v2, policy authoring
 - [ ] D.5 delegated upstream identity (behind §11 item 4)
@@ -1062,7 +1069,7 @@ that fails on a > 20 % regression against the checked-in baseline.
 8. C.2 placement: the `SecretSource` port, cache, `file://`, and now the `vault://` adapter (rev 2.15) are in the community crate under the CF-18 reading — Vault added no dependency, so the feature costs nothing and the question did not bite. It remains a question only for the two cloud SDK adapters (C.2c, C.2d), where the SDK dependency trees are the real weight: community crate under Cargo features, or the enterprise crate? The packaging line in §6 lists secret providers as a tier differentiator, which argues for the enterprise crate; CF-18 argues for features while the repository is private. **Deferred with C.2c/d (rev 2.16):** decided when a partner asks for a native adapter, with the `aws-config` spike (dependency count, binary size) as the input (CF-30).
 9. Which moat does the partner believe in — governance over a small, resource-classified tool set (this plan) or catalogue breadth with brokered auth (Arcade, MintMCP)? Asked at Gate A; see [`docs/competitive-landscape.md` §5](competitive-landscape.md#5-what-the-survey-changes-taken-together).
 10. ADR-012: confirm that Phase D lands here under features and configuration (the owner said on 2026-09-05 that nothing is in the enterprise repository). The only irreversible consequence is at open-sourcing: anything not moved out first is Apache-2.0, so the would-move list in CF-18 is checked with CF-10 before the repository opens.
-11. ADR-013: can the partner's IdP register the console as a public PKCE client that receives the same audience (`MCP_PUBLIC_URL`) and `mcp:admin` the CLI token carries? Entra's `api://` audience with a SPA registration, Okta's native-app type, and Keycloak's public client each say yes on paper; the runbook section per profile is D.1's to prove.
+11. **Resolved (2026-09-05, rev 2.26): ADR-013 accepted and D.1 landed.** The console is a public PKCE client using the configured issuer and audience, requested per profile; `MCP_CONSOLE_SCOPES` supports Entra's resource-prefixed form. Registration sections exist for every profile. This resolves the design choice, not tenant interoperability: every section and the Entra scope form remain unproven against a real tenant; CF-38 tracks proof and the known Entra SPA/server-side redemption gap.
 12. D.5's first vendor (depends on item 4). Slack by feasibility, Atlassian if the workflow is planning/delivery; Grafana keeps shared authority because its HTTP API has no per-user OAuth.
 
 ## 12. Immediate next steps

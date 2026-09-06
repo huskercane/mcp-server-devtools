@@ -1,5 +1,7 @@
 # Administrative HTTP API
 
+The optional browser UI is covered in the [console runbook](console-runbook.md).
+
 The `all` and `control` roles mount `/admin/*` when inbound authentication is
 configured. The gateway role does not mount these operations. Every request
 requires a validated, non-revoked bearer token with `mcp:admin`; `mcp:tools`

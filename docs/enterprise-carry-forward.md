@@ -10,7 +10,13 @@ removed only when it is done, not when it is explained.
 
 Status legend: **open** · **blocked** (needs a decision) · **done**.
 
-Last updated: 2026-09-04, after C.1 implementation (rev 2.22). Stable
+Last updated: 2026-09-05, after D.1 (rev 2.26). ADR-013 accepted;
+read-only console, provider/runbook documentation and stage −1f landed.
+CF-37/38/39 track topology/session limits, real-provider evidence (including
+Entra SPA redemption), and CLI-only approval decisions. CF-18 gains
+`src/console`; the Phase D allocation baseline is recorded below.
+
+Previously updated: 2026-09-04, after C.1 implementation (rev 2.22). Stable
 ext-auth fetched/read, two issuer grants, opt-in resource discovery and
 synthetic Okta subject/actor fixtures landed. Full 1,077 tests and all gates
 pass. CF-35 tracks real tenant and client evidence; no client interoperability
@@ -617,6 +623,58 @@ policy install and deny-list replacement only; reload, session revoke, and
 artifact purge stay one-person by the §3.10.3 decision. Revisit only if a
 partner's rotation runs through this server rather than their vault.
 
+### CF-37 · Console topology and browser-session lifecycle
+
+**Open · D.1 (rev 2.26); follow-up owner: control-plane/session work.**
+The console uses the local admin router. Sessions/artifacts show the `all`
+process's inventory with `scope:process`; separate `control` cannot list a
+gateway's inventory and renders `admin_backend_unavailable`. No aggregated
+split-topology inventory was added; CF-16/33 remain prerequisites.
+
+Browser console sessions and pending logins are bounded in-memory maps on
+`control ×1`. A restart loses them and requires re-login. They are neither
+persisted nor shared across replicas. The Sessions page lists MCP sessions,
+not console sessions; no console-session listing or individual admin
+revocation UI/API exists. Logout affects only the current browser session.
+Session TTL follows `expires_in` (clamped 1 minute–12 hours, default 1 hour),
+not JWT `exp`; API calls still enforce actual expiry/revocation. Health and
+unsubmitted forms check local session presence without probing the API.
+
+Close with a defined cross-process inventory/session port and proof over a
+split deployment, or explicitly retain the single-control/re-login model;
+any console-session administration needs its own scoped endpoint and tests.
+
+### CF-38 · Console IdP registrations are not real-tenant proof
+
+**Open · D.1 (rev 2.26); follow-up owner: IdP integration/design partner.**
+Every console registration section in `identity-provider-runbook.md` is
+unproven against a real tenant: Okta native/SPA, Entra SPA, Keycloak public,
+Auth0 SPA, and generic. Validator fixtures, a Keycloak validator container,
+and wiremock PKCE tests do not prove browser sign-in/client registration.
+In particular, Entra's `openid api://<resource-app-id>/mcp:admin` scope form
+needs tenant evidence. Microsoft's documented SPA redemption requires an
+Origin header; D.1's server-side token exchange sends none, so that flow is
+expected to fail until the registration/exchange design is resolved.
+Keycloak/generic receive RFC 8707 `resource` in both requests; whether the
+target provider honors it must be proven independently of audience mappers.
+
+ADR-013 and §11 item 11 are resolved as design decisions, not interoperability
+claims. Close per profile with recorded registration settings, a real browser
+callback, correct audience/admin scope, and an authenticated admin call;
+for Entra also settle and test the code-redemption compatibility gap.
+No token values should appear in the evidence.
+
+### CF-39 · D.2 console proposals are read-only
+
+**Open · D.1 (rev 2.26); follow-up owner: D.3 console authoring.**
+D.1 lands `/console/proposals` as the D.2 inventory/state page. Approve and
+reject remain `mcp-devtools admin proposals approve|reject`; no browser
+mutation controls were added. The two-person/fresh-token/digest checks remain
+at the API. Close when browser decisions are explicitly scoped and tested
+through the same `AdminClient` and mutation gate, including CSRF and durable
+intent ordering. D.2's API/CLI landing does not claim the interactive console
+approval acceptance scenario is complete.
+
 ### CF-10 · ADR-002: the enterprise licence
 **Model decided 2026-09-05 · enterprise agreement and contribution terms remain open**
 
@@ -682,7 +740,10 @@ here behind ports so that a later move is a file move: `approvals/mod.rs`
 `MCP_ADMIN_APPROVALS` selection). The ports (`ports::mutation_gate`,
 `ports::proposals`), the `admin_proposal` / `admin_approval` /
 `admin_rejection` record kinds, and `PUT /admin/policy` are community.
-D.3 (console authoring) will add its files here when it lands. The move
+D.1 adds `src/console` (login, sessions, pages and router), together with
+`console/` templates/static assets and the `server::http` composition wiring,
+to the would-move inventory. D.3 (console authoring) will add its files here
+when it lands. The move
 must happen **before** the repository is opened; until then it is a
 licence label.
 
@@ -1135,3 +1196,31 @@ pinned directly. Admin projection batching is bounded and reuses its vector;
 its contention/peak memory are outside the response-pipeline probe.
 See the [full fresh output](benchmarks/2026-09-05-claude-compliance.txt) and
 [compliance review](claude-compliance-review.md) for scope and validation.
+
+
+### Phase D baseline · D.1 console (2026-09-05, rev 2.26)
+
+`cargo bench --bench response_pipeline --features console` and the default
+feature run both match **all 31 existing rows** in
+[`benchmarks/2026-09-05-claude-compliance.txt`](benchmarks/2026-09-05-claude-compliance.txt):
+allocation counts and reported KB are unchanged, including both payload
+sizes and every BEFORE/reference row. KB is rounded down by the existing
+probe; this is not a claim of exact sub-KB byte equality or unchanged timing.
+The feature-off run explicitly prints stage −1f as skipped.
+
+**New stage −1f, Phase D baseline:** `console::ActivityPage::complete` with
+1,000 `ActivityRow`s, rendered through askama: **432 KB / 9 allocations /
+0.18 ms mean of 100 renders**, producing **231,639 bytes of HTML**.
+The rows and page are built before the counter starts; the probe covers
+HTML rendering, excluding report reads, JSON decoding, and fixture creation.
+It does not allocate a separate formatted string per row. Preserve this
+fixture when comparing future template changes.
+
+Console-enabled JWT cache hit was 4.53 µs; cached actor-chain authentication
+was 4.53 µs; journal append was p50 12 µs / p99 32 µs / max 279 µs.
+The cache-hit (<50 µs) and journal p99 (<200 µs) budgets hold. Timings are
+observations on this host, not a comparative speedup claim.
+
+Full console probe output, dependency trees, release-size comparison and
+landing-gate results are in
+[`benchmarks/2026-09-05-d1-console.txt`](benchmarks/2026-09-05-d1-console.txt).
