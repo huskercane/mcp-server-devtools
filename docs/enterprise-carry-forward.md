@@ -10,7 +10,12 @@ removed only when it is done, not when it is explained.
 
 Status legend: **open** · **blocked** (needs a decision) · **done**.
 
-Last updated: 2026-09-06, after D.3 (rev 2.28). Textarea policy authoring,
+Last updated: 2026-09-06, D.0–D.4 closeout (rev 2.29).
+[Review findings and recovery decision](phase-d-closeout-review.md), with
+fresh gates/probes in `benchmarks/2026-09-06-phase-d-closeout.txt`.
+CF-38/41/45 evidence requirements remain open; Gate B remains unrecorded.
+
+Previously updated: 2026-09-06, after D.3 (rev 2.28). Textarea policy authoring,
 validated download/offline signing, signed uploads through the configured
 MutationGate, and interactive proposal decisions landed; CF-39 is closed.
 CF-45 records authoring/review boundaries and unexercised browser evidence.
@@ -776,6 +781,23 @@ evidence remain outstanding.
 ### CF-45 · D.3 authoring review and browser evidence boundaries
 
 **Open · D.3 (rev 2.28, 2026-09-06); owner: console/partner evidence.**
+**Closeout (rev 2.29):** reproduced and fixed duplicate application handoff,
+intent-as-completion restart recovery and unbounded chunked token-response
+accumulation. Explicit `admin_application` records bind completion to proposal
+ID/digest and original intent sequence. Approved proposals without completion
+fail closed (`proposal_incomplete`), including legacy approvals after upgrade;
+operators reconcile disk, active state and signed journal before a new proposal.
+An uncertain decision append blocks retries until a controlled restart projects
+the durable outcome. This does not provide an atomic transaction across the
+journal and two signed files. A crash between file replacements can require
+restoring a known-good signed pair. See the admin and console runbooks.
+Concurrent HTTP and interrupted-projection tests are local evidence, not a
+power-loss/disk-durability campaign or multi-control replica support. Startup
+projection trusts the protected local journal; sequence checking and candidate
+digests do not replace offline cryptographic checkpoint verification with retained
+keys/anchors during recovery. No new startup checkpoint-authentication guarantee
+is claimed.
+
 The initial authoring scope uses existing API operations and adds no editor
 widget or dependency. Deliberate boundaries:
 
@@ -977,6 +999,8 @@ to the would-move inventory. **D.3 (rev 2.28)** adds
 `console/templates/{policy,proposals}.html`, and
 `console/static/policy-upload.js`. Coverage moves with it: D.3 portions of
 `tests/console_tests.rs` and `tests/console_upload_script_test.cjs`.
+Closeout regression coverage in `tests/approval_recovery_tests.rs` and the D.2
+port/API tests moves with the approvals implementation as well.
 Existing `AdminClient` and mutation/proposal ports remain the community seams;
 `tests/admin_api_tests.rs` retains shared signed-install/fail-closed coverage.
 The move
@@ -1495,3 +1519,26 @@ and exact local proof limits are in
 CF-45 retains authoring/review/browser boundaries, CF-38 real-provider evidence;
 no hosted CI or real-tenant proof is claimed. CF-40 stays backlog only, offline
 licensing remains CF-10 and D.5 remains gated.
+
+### Phase D baseline · D.0–D.4 closeout (2026-09-06, rev 2.29)
+
+All CLAUDE.md landing gates passed through bash scripts: both builds;
+default/no-default/console Clippy with warnings denied; full default and
+console tests (**1,114 / 1,134 passed**, two existing ignored in each);
+formatting, cargo-deny, and diff checks. The optional Node upload-helper
+harness also passed. Both allocation probes match **all 31 earlier rows**
+from D.3 at reported KB/allocation precision. Console stage −1f remains
+**432 KB / 9 allocations**, 0.22 ms mean, 231,639 HTML bytes for 1,000 rows.
+Default/console JWT cache-hit means are 4.38 / 4.22 µs; journal p99 is
+40 / 28 µs, within the stated absolute budgets. No allocation regression
+was found. Integer KB and variable timings do not imply exact sub-KB or
+latency equality. Profiles and Cargo dependencies are unchanged.
+
+[Fresh raw evidence](benchmarks/2026-09-06-phase-d-closeout.txt) and the
+[closeout review](phase-d-closeout-review.md) describe the three reproduced
+findings and fixes, including explicit completion and fail-closed incomplete
+approval recovery. The probe excludes admin completion appends, proposal
+history, login exchange and file-JWKS I/O. CF-38/41/45 remain open for their
+stated evidence/operating limits; no real-browser, real-provider or hosted-CI
+proof is claimed. Gate B remains unrecorded, CF-40 backlog only, offline
+licensing blocked on CF-10, and D.5 gated.

@@ -1612,7 +1612,12 @@ async fn console_proposals_enforce_separation_freshness_rejection_and_durable_id
             .iter()
             .map(|r| r["kind"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["admin_proposal", "admin_approval", "admin_mutation"]
+        [
+            "admin_proposal",
+            "admin_approval",
+            "admin_mutation",
+            "admin_application"
+        ]
     );
     assert_eq!(records[0]["proposal"]["document"], candidate);
     assert_eq!(records[0]["proposal"]["signature"], signature);
@@ -1624,7 +1629,7 @@ async fn console_proposals_enforce_separation_freshness_rejection_and_durable_id
     let again = console_post(&f, &bob, &route, &[]).await;
     assert_eq!(again.status(), 200);
     assert_eq!(again.text().await.unwrap(), first);
-    assert_eq!(control_records(&f).len(), 3);
+    assert_eq!(control_records(&f).len(), 4);
     reject_another_proposal(&f, &alice, &bob, candidate, &signature).await;
     let verified = mcp_server_devtools::audit::verify::verify(
         f.dir.path(),

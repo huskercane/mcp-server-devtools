@@ -104,6 +104,8 @@ pub enum ControlEventKind {
     /// A different administrator approved a proposal; the candidate is
     /// applied — under its own `admin_mutation` intent — after this.
     AdminApproval,
+    /// An approved candidate finished applying; binds completion to its proposal.
+    AdminApplication,
     /// A proposal was rejected, or found expired when a decision was asked
     /// for; `reason` says which.
     AdminRejection,
@@ -181,6 +183,9 @@ pub struct ControlEvent {
     /// The proposal a WP D.2 record is about.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proposal: Option<ProposalRecord>,
+    /// Original durable mutation intent, present only on application completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_seq: Option<u64>,
 }
 
 /// What an `admin_proposal` / `admin_approval` / `admin_rejection` record
@@ -220,6 +225,7 @@ impl ControlEvent {
             revoked_tokens: None,
             not_before: None,
             proposal: None,
+            applied_seq: None,
         }
     }
 

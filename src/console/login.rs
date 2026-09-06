@@ -129,7 +129,7 @@ pub async fn exchange(
     if matches!(settings.profile, Profile::Keycloak | Profile::Generic) {
         form.push(("resource", &settings.audience));
     }
-    let response = http
+    let mut response = http
         .post(&endpoints.token_endpoint)
         .header(reqwest::header::ACCEPT, "application/json")
         .form(&form)
@@ -146,12 +146,16 @@ pub async fn exchange(
     {
         return Err("token response too large");
     }
-    let body = response
-        .bytes()
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|_| "token response could not be read")?;
-    if body.len() > EXCHANGE_MAX_BYTES {
-        return Err("token response too large");
+        .map_err(|_| "token response could not be read")?
+    {
+        if chunk.len() > EXCHANGE_MAX_BYTES - body.len() {
+            return Err("token response too large");
+        }
+        body.extend_from_slice(&chunk);
     }
     let parsed: TokenResponse =
         serde_json::from_slice(&body).map_err(|_| "token response is not JSON")?;
@@ -171,4 +175,57 @@ pub async fn exchange(
         .map_or(DEFAULT_SESSION_TTL, Duration::from_secs)
         .clamp(MIN_SESSION_TTL, MAX_SESSION_TTL);
     Ok(Exchanged { access_token, ttl })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[tokio::test]
+    async fn chunked_token_response_is_bounded_before_eof() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10001\r\n")
+                .await
+                .unwrap();
+            stream
+                .write_all(&vec![b' '; EXCHANGE_MAX_BYTES + 1])
+                .await
+                .unwrap();
+            stream.write_all(b"\r\n").await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let settings = ConsoleSettings {
+            client_id: "console".into(),
+            redirect_path: "/console/callback".into(),
+            scopes: "openid mcp:admin".into(),
+            issuer: endpoint.clone(),
+            audience: endpoint.clone(),
+            profile: Profile::Generic,
+            public_url: endpoint.clone(),
+        };
+        let endpoints = AuthorizationEndpoints {
+            authorization_endpoint: endpoint.clone(),
+            token_endpoint: endpoint,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            exchange(
+                &reqwest::Client::new(),
+                &endpoints,
+                &settings,
+                "code",
+                "verifier",
+            ),
+        )
+        .await;
+        server.abort();
+        assert!(matches!(result, Ok(Err("token response too large"))));
+    }
 }

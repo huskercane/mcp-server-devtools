@@ -147,13 +147,14 @@ The flow, every step a control record before it is a state:
 2. A **different** subject in the same tenant calls `approve` with a token
    that satisfies the fresh-token rule for writes
    (`MCP_WRITE_MAX_TOKEN_AGE_SECONDS`, §3.6; a token without an issue time
-   or older than the bound is `403 stale_token`). An `admin_approval`
-   record is made durable, the stored candidate is re-checked against its
-   digest, and the exact stored bytes are applied through the same path a
+   or older than the bound is `403 stale_token`). The stored candidate is
+   checked against its digest before an `admin_approval` record is made
+   durable, and the exact stored bytes are applied through the same path a
    direct call uses, which writes its own `admin_mutation` intent before
-   the effect. The proposal then reports `applied_seq`, that record's
-   sequence. Approving an already approved proposal is idempotent: the
-   same answer, no new record, no second apply.
+   the effect. After the effect, `admin_application` records the proposal ID,
+   candidate digest, operation, version and original intent's `applied_seq`.
+   Only then does the proposal report `applied_seq`. Repeating a completed
+   approval is idempotent: the same answer, no new record, no second apply.
 3. `reject` (by anyone in the tenant, the proposer included) journals an
    `admin_rejection` with the bounded reason. A proposal past its TTL
    (`MCP_ADMIN_APPROVAL_TTL_SECONDS`, default one day) reads as `expired` in
@@ -166,7 +167,31 @@ backend. A proposal whose journaled candidate no longer matches its digest —
 a journal altered between proposal and approval — is never applied
 (`409 proposal_digest_mismatch`). Because the proposal record carries the
 candidate, a large policy makes a large journal record (bounded by the
-4 MB document limit) that the SIEM forwarder ships like any other.
+1,000,000-byte encoded admin request limit) that the SIEM forwarder ships like any other.
+
+**Interrupted application and upgrade recovery:** `409 proposal_incomplete`
+means a decision/application is in flight or its outcome is uncertain. Poll
+`GET /admin/proposals/{id}`; a completed concurrent request will expose
+`applied_seq`. Do not automatically resubmit an incomplete approved proposal:
+an intent proves authorization, not successful file replacement. A restart
+replays explicit completion records by proposal ID and digest, never by a
+shared version label. Older approved proposals have no completion record and
+therefore also appear without `applied_seq` after upgrade; they are not replayed.
+
+If it stays incomplete, quiesce administration, preserve and verify the signed
+journal with `audit verify`, and compare the exact policy/deny-list and detached
+signature with the reviewed candidate. Check both disk and the active API state.
+A crash between signature and document replacement leaves a mismatched pair
+that refuses startup; restore a separately retained known-good signed pair
+before restarting. The [state backup helper](release-operations-runbook.md#backup-and-restore)
+covers journal/checkpoints/rollups, not policy or deny-list files: retain each
+signed document and its detached signature through the deployment backup process. Resolve the underlying storage/audit failure. If the desired
+change is still needed, submit a new signed proposal for independent review and
+fresh-token approval. Do not edit journal records or infer success from the
+version label. There is no automatic exactly-once recovery across filesystem
+writes and the journal. A failed/timeout decision append also blocks further
+in-process decisions; after a controlled restart the durable journal determines
+whether the proposal is pending, decided, or incomplete.
 
 A proposal is `{id, operation, target, candidate_digest, proposer:{tenant,
 subject}, created, expires, state}` with `decided_by`, `decided`, `reason`,
@@ -175,7 +200,7 @@ and `applied_seq` once they apply; `state` is `pending`, `approved`,
 `deny-list/replace`; ids are `p-` and sixteen hex digits. Listings and
 lookups are scoped to the caller's tenant. The endpoint errors, all in the
 ordinary shape: `409 approval_self`, `409 approval_expired`,
-`409 proposal_decided`, `409 proposal_digest_mismatch`, `403 stale_token`,
+`409 proposal_decided`, `409 proposal_digest_mismatch`, `409 proposal_incomplete`, `403 stale_token`,
 `404 not_found`, `503 audit_unavailable`, and `503 approvals_off` when the
 gate is `off`.
 

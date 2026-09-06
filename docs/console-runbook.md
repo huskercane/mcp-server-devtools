@@ -176,8 +176,13 @@ explicit reauthentication. The console neither refreshes tokens nor weakens
 that rule. The API owns digest verification, signature verification, expiry,
 durable approval → mutation intent → effect ordering, and retry behavior.
 An approval is applied when `applied_seq` is present. Repeating an applied
-approval is idempotent. An approved proposal without `applied_seq` can be
-retried after the underlying failure is resolved.
+approval is idempotent. `409 proposal_incomplete` means application is in flight
+or needs reconciliation; poll the proposal before taking further action. An
+approved proposal without `applied_seq` is never automatically reapplied,
+including older approvals after upgrade. Follow the [interrupted-application
+procedure](admin-api-runbook.md#two-person-approval); a new proposal requires a
+new independent review. Completion is journaled after the effect, separately
+from the durable intent.
 
 **Reject proposal** accepts an optional reason (at most 512 UTF-8 bytes;
 multibyte text can reach the API limit before the browser's character limit).

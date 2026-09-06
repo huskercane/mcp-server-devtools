@@ -14,7 +14,9 @@
 //! The journal is the source of truth. This adapter keeps an in-memory
 //! projection of it, rebuilt by [`ApprovalGate::open`] from the control
 //! journal at startup, so a `control` restart loses no proposal and adds
-//! no backend. Every transition is written before it is remembered.
+//! no backend. Completion requires an explicit `admin_application` record.
+//! Uncertain decision appends block retries until restart; approved applications
+//! without completion require operator reconciliation.
 //!
 //! Not gated, by decision (§3.10.3): policy reload, session revoke, and
 //! artifact purge pass straight through as `Apply`.
@@ -52,6 +54,8 @@ struct Entry {
     /// Whether the `admin_rejection { reason: expired }` record exists, so
     /// expiry is journaled once however often it is observed.
     expiry_journaled: bool,
+    /// An append may finish after cancellation; never issue another decision on a guess.
+    decision_started: bool,
 }
 
 /// The adapter. Cheap to share; the boundary holds it as both ports.
@@ -180,6 +184,7 @@ impl ApprovalGate {
                 document: None,
                 signature: None,
             });
+            self.update(&entry.proposal.id, |entry| entry.decision_started = true);
             if self.append(&event).await.is_err() {
                 return ProposalError::AuditUnavailable;
             }
@@ -254,6 +259,7 @@ impl MutationGate for ApprovalGate {
                     signature: signature.to_owned(),
                 },
                 expiry_journaled: false,
+                decision_started: false,
             };
             self.entries
                 .lock()
@@ -290,14 +296,16 @@ impl ProposalRegistry for ApprovalGate {
             let entry = self
                 .snapshot(&approver.tenant, id)
                 .ok_or(ProposalError::NotFound)?;
+            if entry.decision_started && entry.proposal.is_pending() {
+                return Err(ProposalError::Incomplete);
+            }
             match entry.proposal.state {
                 ProposalState::Approved => {
+                    if entry.proposal.applied_seq.is_none() {
+                        return Err(ProposalError::Incomplete);
+                    }
                     return Ok(Approval {
-                        apply: entry
-                            .proposal
-                            .applied_seq
-                            .is_none()
-                            .then_some(entry.candidate.clone()),
+                        apply: None,
                         proposal: entry.proposal,
                     });
                 }
@@ -327,6 +335,7 @@ impl ProposalRegistry for ApprovalGate {
                 document: None,
                 signature: None,
             });
+            self.update(id, |entry| entry.decision_started = true);
             self.append(&event).await?;
             let decided = event.timestamp;
             let proposal = self
@@ -343,8 +352,31 @@ impl ProposalRegistry for ApprovalGate {
         })
     }
 
-    fn applied(&self, id: &str, audit_seq: u64) {
-        self.update(id, |entry| entry.proposal.applied_seq = Some(audit_seq));
+    fn applied<'a>(&'a self, id: &'a str, audit_seq: u64) -> ProposalFuture<'a, ()> {
+        Box::pin(async move {
+            let _decision = self.decisions.lock().await;
+            let proposal = self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(id)
+                .map(|entry| entry.proposal.clone())
+                .ok_or(ProposalError::NotFound)?;
+            let mut event = ControlEvent::now(ControlEventKind::AdminApplication);
+            event.source = Some(proposal.operation.to_owned());
+            event.version = Some(proposal.target.clone());
+            event.applied_seq = Some(audit_seq);
+            event.proposal = Some(ProposalRecord {
+                id: id.to_owned(),
+                candidate_digest: Some(proposal.candidate_digest),
+                expires: None,
+                document: None,
+                signature: None,
+            });
+            self.append(&event).await?;
+            self.update(id, |entry| entry.proposal.applied_seq = Some(audit_seq));
+            Ok(())
+        })
     }
 
     fn reject<'a>(
@@ -358,6 +390,9 @@ impl ProposalRegistry for ApprovalGate {
             let entry = self
                 .snapshot(&principal.tenant, id)
                 .ok_or(ProposalError::NotFound)?;
+            if entry.decision_started && entry.proposal.is_pending() {
+                return Err(ProposalError::Incomplete);
+            }
             match entry.proposal.state {
                 ProposalState::Approved | ProposalState::Rejected => {
                     return Err(ProposalError::Decided);
@@ -383,6 +418,7 @@ impl ProposalRegistry for ApprovalGate {
                 document: None,
                 signature: None,
             });
+            self.update(id, |entry| entry.decision_started = true);
             self.append(&event).await?;
             let decided = event.timestamp;
             let reason = event.reason;
@@ -509,6 +545,7 @@ fn replay(entries: &mut BTreeMap<String, Entry>, seq: u64, kind: &str, value: &V
                         signature,
                     },
                     expiry_journaled: false,
+                    decision_started: false,
                 },
             );
         }
@@ -531,21 +568,21 @@ fn replay(entries: &mut BTreeMap<String, Entry>, seq: u64, kind: &str, value: &V
                 entry.proposal.reason = reason;
             }
         }
-        "admin_mutation" => {
-            // The apply that followed an approval: same operation, same
-            // version label, not yet accounted for.
-            let (Some(source), Some(version)) =
-                (text(value, &["source"]), text(value, &["version"]))
+        "admin_application" => {
+            let Some(entry) = text(value, &["proposal", "id"]).and_then(|id| entries.get_mut(&id))
             else {
                 return;
             };
-            if let Some(entry) = entries.values_mut().find(|entry| {
-                entry.proposal.state == ProposalState::Approved
-                    && entry.proposal.applied_seq.is_none()
-                    && entry.proposal.operation == source
-                    && entry.proposal.target == version
-            }) {
-                entry.proposal.applied_seq = Some(seq);
+            if entry.proposal.state == ProposalState::Approved
+                && text(value, &["proposal", "candidate_digest"]).as_deref()
+                    == Some(&entry.proposal.candidate_digest)
+                && text(value, &["source"]).as_deref() == Some(entry.proposal.operation)
+                && text(value, &["version"]).as_deref() == Some(&entry.proposal.target)
+            {
+                entry.proposal.applied_seq = value
+                    .get("applied_seq")
+                    .and_then(Value::as_u64)
+                    .filter(|applied| *applied < seq);
             }
         }
         _ => {}

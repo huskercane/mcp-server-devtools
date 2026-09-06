@@ -92,6 +92,8 @@ pub enum ProposalError {
     /// under: the journal it was projected from has been altered.
     DigestMismatch,
     AuditUnavailable,
+    /// Application or a decision append is in flight or its outcome needs reconciliation.
+    Incomplete,
 }
 
 impl ProposalError {
@@ -104,6 +106,7 @@ impl ProposalError {
             Self::Expired => "approval_expired",
             Self::Decided => "proposal_decided",
             Self::DigestMismatch => "proposal_digest_mismatch",
+            Self::Incomplete => "proposal_incomplete",
             Self::AuditUnavailable => "audit_unavailable",
         }
     }
@@ -130,8 +133,8 @@ pub trait ProposalRegistry: Send + Sync {
     /// Journal an `admin_approval` by `approver` (who must not be the
     /// proposer) and hand back what to apply.
     fn approve<'a>(&'a self, id: &'a str, approver: &'a Principal) -> ProposalFuture<'a, Approval>;
-    /// Record that the approved candidate was applied under `audit_seq`.
-    fn applied(&self, id: &str, audit_seq: u64);
+    /// Durably record completion under `audit_seq`; an intent alone is not completion.
+    fn applied<'a>(&'a self, id: &'a str, audit_seq: u64) -> ProposalFuture<'a, ()>;
     /// Journal an `admin_rejection` by `principal`, with a bounded reason.
     fn reject<'a>(
         &'a self,

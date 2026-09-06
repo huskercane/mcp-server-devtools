@@ -45,6 +45,7 @@ fn proposal_error(error: ProposalError) -> Error {
         ProposalError::SelfApproval
         | ProposalError::Expired
         | ProposalError::Decided
+        | ProposalError::Incomplete
         | ProposalError::DigestMismatch => StatusCode::CONFLICT,
     };
     Error(status, error.code())
@@ -122,7 +123,10 @@ impl Admin {
             .map_err(proposal_error)?;
         if let Some(candidate) = approval.apply {
             let audit_seq = self.apply(principal, candidate).await?;
-            registry.applied(id, audit_seq);
+            registry
+                .applied(id, audit_seq)
+                .await
+                .map_err(proposal_error)?;
         }
         let proposal = registry.get(&principal.tenant, id).ok_or(NOT_FOUND)?;
         Ok(json!({"proposal": proposal}))

@@ -338,7 +338,7 @@ async fn required_defers_a_policy_install_until_a_second_administrator_approves(
     );
     assert!(approved["decided"].is_string());
     let records = journal(&f);
-    assert_eq!(records.len(), 3, "{records:?}");
+    assert_eq!(records.len(), 4, "{records:?}");
     assert_eq!(records[1]["kind"], "admin_approval");
     assert_eq!(records[1]["principal"]["subject"], "bob");
     assert_eq!(records[1]["proposal"]["id"], id);
@@ -368,7 +368,7 @@ async fn required_defers_a_policy_install_until_a_second_administrator_approves(
     .await;
     assert_eq!(status, 200);
     assert_eq!(again["data"]["proposal"], *approved);
-    assert_eq!(journal(&f).len(), 3);
+    assert_eq!(journal(&f).len(), 4);
     let (status, body) = call(
         &f,
         "bob",
@@ -659,11 +659,11 @@ async fn deny_list_is_gated_and_the_rest_stays_direct_under_required() {
             .contains("alice")
     );
     let records = journal(&f);
-    assert_eq!(records.last().unwrap()["kind"], "admin_mutation");
+    assert_eq!(records.last().unwrap()["kind"], "admin_application");
     assert_eq!(records.last().unwrap()["source"], "deny-list/replace");
     assert_eq!(
         body["data"]["proposal"]["applied_seq"],
-        records.last().unwrap()["seq"]
+        records.last().unwrap()["applied_seq"]
     );
     let (status, _) = call(&f, "alice", "GET", "policy", None).await;
     assert_eq!(status, 401, "the approved list denies alice");
@@ -781,4 +781,88 @@ async fn cli_proposes_lists_and_approves_with_json() {
         std::fs::read_to_string(&f.policy).unwrap(),
         "version: 2\nrules: []\n"
     );
+}
+
+#[tokio::test]
+async fn concurrent_http_approvals_install_once_and_remain_idempotent_after_restart() {
+    let f = fixture(Some("required"), &[]).await;
+    let candidate = "version: 2\nrules: []\n";
+    let (_, proposed) = call(
+        &f,
+        "alice",
+        "PUT",
+        "policy",
+        Some(signed_policy(&f, candidate)),
+    )
+    .await;
+    let id = proposed["data"]["proposal"].as_str().unwrap().to_owned();
+    let path = format!("proposals/{id}/approve");
+    let (a, b) = tokio::join!(
+        call(&f, "bob", "POST", &path, Some(json!({}))),
+        call(&f, "bob", "POST", &path, Some(json!({})))
+    );
+    assert!(a.0 == 200 || b.0 == 200, "{a:?} {b:?}");
+    for (status, body) in [a, b] {
+        assert!(
+            status == 200 || (status == 409 && body["error"] == "proposal_incomplete"),
+            "{status}: {body}"
+        );
+    }
+    let records = journal(&f);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r["kind"] == "admin_mutation")
+            .count(),
+        1
+    );
+    assert_eq!(records.len(), 4);
+    assert_eq!(records[3]["proposal"]["id"], id);
+    assert_eq!(records[3]["applied_seq"], records[2]["seq"]);
+    let (dir, key) = stop(f);
+    let f = start(dir, key, Some("required"), &[]).await;
+    assert_eq!(call(&f, "bob", "POST", &path, Some(json!({}))).await.0, 200);
+    assert_eq!(journal(&f).len(), 4);
+    assert_eq!(std::fs::read_to_string(&f.policy).unwrap(), candidate);
+}
+
+#[tokio::test]
+async fn failed_file_install_after_intent_is_not_retried_or_recovered_as_complete() {
+    let f = fixture(Some("required"), &[]).await;
+    let (_, proposed) = call(
+        &f,
+        "alice",
+        "PUT",
+        "policy",
+        Some(signed_policy(&f, "version: 2\nrules: []\n")),
+    )
+    .await;
+    let id = proposed["data"]["proposal"].as_str().unwrap().to_owned();
+    let path = format!("proposals/{id}/approve");
+    // Force the document replacement to fail after the detached signature write.
+    std::fs::remove_file(&f.policy).unwrap();
+    std::fs::create_dir(&f.policy).unwrap();
+    let (status, body) = call(&f, "bob", "POST", &path, Some(json!({}))).await;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(journal(&f).len(), 3);
+    assert_eq!(journal(&f)[2]["kind"], "admin_mutation");
+    assert_eq!(
+        call(&f, "bob", "POST", &path, Some(json!({}))).await.1["error"],
+        "proposal_incomplete"
+    );
+    // Restore a known-good signed pair, as the operating procedure requires.
+    std::fs::remove_dir(&f.policy).unwrap();
+    let initial = b"version: 1\nrules: []\n";
+    std::fs::write(&f.policy, initial).unwrap();
+    write_detached(&f.policy, &f.key.sign(Domain::PolicyBundle, initial)).unwrap();
+    let (dir, key) = stop(f);
+    let f = start(dir, key, Some("required"), &[]).await;
+    let (_, shown) = call(&f, "bob", "GET", &format!("proposals/{id}"), None).await;
+    assert!(shown["data"]["proposal"].get("applied_seq").is_none());
+    assert_eq!(
+        call(&f, "bob", "POST", &path, Some(json!({}))).await.1["error"],
+        "proposal_incomplete"
+    );
+    assert_eq!(journal(&f).len(), 3);
+    assert_eq!(std::fs::read(&f.policy).unwrap(), initial);
 }
