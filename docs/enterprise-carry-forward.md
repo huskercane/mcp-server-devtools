@@ -14,7 +14,8 @@ Last updated: 2026-09-05, after D.1 (rev 2.26). ADR-013 accepted;
 read-only console, provider/runbook documentation and stage −1f landed.
 CF-37/38/39 track topology/session limits, real-provider evidence (including
 Entra SPA redemption), and CLI-only approval decisions. CF-18 gains
-`src/console`; the Phase D allocation baseline is recorded below.
+`src/console`; the Phase D allocation baseline is recorded below. CF-40 adds
+the requested build-speed backlog after the D.1 release measurements.
 
 Previously updated: 2026-09-04, after C.1 implementation (rev 2.22). Stable
 ext-auth fetched/read, two issuer grants, opt-in resource discovery and
@@ -674,6 +675,29 @@ at the API. Close when browser decisions are explicitly scoped and tested
 through the same `AdminClient` and mutation gate, including CSRF and durable
 intent ordering. D.2's API/CLI landing does not claim the interactive console
 approval acceptance scenario is complete.
+
+### CF-40 · Faster builds for development and validation
+
+**Open · D.1 follow-up (2026-09-05); owner: engineering/build tooling.**
+The D.1 native release builds took 9m 54s without console and 6m 31s with
+console on the same host, sequentially. These are observations with different
+cache states, not evidence that console improves build time. The release
+profile uses optimization level 3, thin LTO and one codegen unit; the first
+run also compiled release dependencies.
+
+Backlog: measure clean and incremental build times, then evaluate a separate
+fast optimized development profile with LTO disabled and more codegen units.
+Document when to use ordinary `cargo build`, the existing bench profile
+(already LTO-off with 16 codegen units), and the shipping release profile.
+Inspect dependency/cache reuse across the default, headless and console
+validation runs before changing their orchestration.
+
+Keep shipping release settings, binary-size comparisons and allocation
+baselines reproducible; faster iteration must not remove required landing
+gates. This work is independent of D.4 and is not a prerequisite for it.
+Close with before/after timings on the same host and feature set, explicit
+cache conditions, documented commands, and passing applicable gates. No
+build-profile or gate changes are included in this backlog entry.
 
 ### CF-10 · ADR-002: the enterprise licence
 **Model decided 2026-09-05 · enterprise agreement and contribution terms remain open**
