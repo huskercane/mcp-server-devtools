@@ -830,6 +830,7 @@ impl OidcKeys {
                 "MCP_OIDC_ISSUER",
                 "MCP_OIDC_AUDIENCE",
                 "MCP_OIDC_JWKS_URL",
+                "MCP_OIDC_JWKS_FILE",
                 "MCP_OIDC_GROUPS_CLAIM",
                 "MCP_OIDC_CLOCK_SKEW_SECONDS",
                 "MCP_OIDC_PROFILE",

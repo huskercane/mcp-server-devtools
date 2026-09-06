@@ -253,9 +253,65 @@ jobs:
           path: artifacts/mcp-devtools-container-digest.txt
           if-no-files-found: error
 
+  packages:
+    name: Native packages and real systemd proof
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Install rootless systemd test runtime
+        run: sudo apt-get update && sudo apt-get install -y podman uidmap
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: mcp-devtools:packages
+          cache-from: type=gha
+      - name: Extract static release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          container=$(docker create mcp-devtools:packages)
+          docker cp "$container:/mcp-devtools" "$RUNNER_TEMP/mcp-devtools-static"
+          docker rm "$container"
+      - name: Install checksum-pinned packaging tools
+        run: |
+          bash scripts/release/install-package-tools.sh "$RUNNER_TEMP/package-tools"
+          echo "$RUNNER_TEMP/package-tools/bin" >> "$GITHUB_PATH"
+      - name: Package and prove Debian and UBI installation
+        run: |
+          bash scripts/release/packages.sh "$RUNNER_TEMP/mcp-devtools-static" "$RUNNER_TEMP/packages"
+          bash scripts/ci/packages-smoke.sh "$RUNNER_TEMP/packages"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcp-devtools-packages
+          path: ${{ runner.temp }}/packages/*
+          if-no-files-found: error
+
+  vendor:
+    name: Checksummed source and offline build
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Vendor locked dependencies
+        run: bash scripts/release/vendor-archive.sh "$RUNNER_TEMP/vendor-archive"
+      - name: Verify archive and build with an empty Cargo home offline
+        run: bash scripts/ci/offline-build.sh "$RUNNER_TEMP/vendor-archive"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcp-devtools-vendor
+          path: ${{ runner.temp }}/vendor-archive/*
+          if-no-files-found: error
+
   release:
     name: Publish release
-    needs: [build, container, sbom]
+    needs: [build, container, sbom, packages, vendor]
     permissions:
       contents: write
       id-token: write
@@ -289,7 +345,7 @@ jobs:
           set -euo pipefail
           for artifact in artifacts/*; do
             case "$artifact" in
-              *.tar.gz|*.zip|*.tgz|*.cdx.json|*.txt)
+              *.tar.gz|*.zip|*.tgz|*.cdx.json|*.txt|*.deb|*.rpm|*.sha256)
                 cosign sign-blob --yes --bundle "${artifact}.sigstore.json" "$artifact"
                 cosign verify-blob --bundle "${artifact}.sigstore.json" \
                   --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \

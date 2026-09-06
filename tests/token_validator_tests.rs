@@ -134,6 +134,20 @@ async fn the_negative_matrix() {
     let server = MockServer::start().await;
     mount_jwks(&server, &["test-key-1"], None).await;
     let validator = validator(settings(&server));
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("jwks.json");
+    tokio::fs::write(&file, jwks(&["test-key-1"]).to_string())
+        .await
+        .unwrap();
+    let file_validator = Arc::new(OidcJwksValidator::new(
+        OidcSettings::new(
+            Profile::Okta,
+            ISSUER,
+            AUDIENCE,
+            JwksLocation::File(file.to_str().unwrap().to_owned()),
+        ),
+        reqwest::Client::new(),
+    ));
     let now = get_current_timestamp();
 
     let mut expired = base_claims();
@@ -260,6 +274,11 @@ async fn the_negative_matrix() {
         ("empty", String::new(), TokenRejection::Malformed),
     ];
     for (label, token, expected) in rows {
+        assert_eq!(
+            file_validator.validate(&token).await.unwrap_err(),
+            expected,
+            "file: {label}"
+        );
         let rejection = validator
             .validate(&token)
             .await
@@ -1026,5 +1045,196 @@ async fn generic_profile_uses_discovery_and_every_profile_accepts_both_scope_sha
     assert_eq!(
         by_email.validate(&sign(&claims)).await.unwrap().subject,
         "alice@acme.example"
+    );
+}
+
+#[tokio::test]
+async fn file_keys_rotate_withdraw_and_fail_closed_even_for_cached_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jwks.json");
+    let validator = validator(OidcSettings::new(
+        Profile::Okta,
+        ISSUER,
+        AUDIENCE,
+        JwksLocation::File(path.to_str().unwrap().to_owned()),
+    ));
+    let first = sign_with_kid(&base_claims(), "first");
+    let second = sign_with_kid(&base_claims(), "second");
+    assert_eq!(
+        validator.validate(&first).await.unwrap_err(),
+        TokenRejection::KeysUnavailable
+    );
+    tokio::fs::write(&path, jwks(&["first"]).to_string())
+        .await
+        .unwrap();
+    validator.validate(&first).await.unwrap();
+    // Atomic replacement with equal-sized contents: timestamps/length are not identity.
+    let next = dir.path().join("next");
+    tokio::fs::write(&next, jwks(&["second"]).to_string())
+        .await
+        .unwrap();
+    tokio::fs::rename(&next, &path).await.unwrap();
+    validator.validate(&second).await.unwrap();
+    assert_eq!(
+        validator.validate(&first).await.unwrap_err(),
+        TokenRejection::UnknownKey
+    );
+    for invalid in ["{bad", "[]"] {
+        tokio::fs::write(&path, invalid).await.unwrap();
+        assert_eq!(
+            validator.validate(&second).await.unwrap_err(),
+            TokenRejection::KeysUnavailable
+        );
+        tokio::fs::write(&path, jwks(&["second"]).to_string())
+            .await
+            .unwrap();
+        validator.validate(&second).await.unwrap();
+    }
+    tokio::fs::write(&path, jwks(&[]).to_string())
+        .await
+        .unwrap();
+    assert_eq!(
+        validator.validate(&second).await.unwrap_err(),
+        TokenRejection::UnknownKey
+    );
+    tokio::fs::write(&path, jwks(&["second"]).to_string())
+        .await
+        .unwrap();
+    validator.validate(&second).await.unwrap();
+    tokio::fs::remove_file(&path).await.unwrap();
+    assert_eq!(
+        validator.validate(&second).await.unwrap_err(),
+        TokenRejection::KeysUnavailable
+    );
+}
+
+#[tokio::test]
+async fn jwks_fetch_uses_bounded_secure_validated_documents() {
+    use mcp_server_devtools::auth::oidc::fetch_jwks;
+    assert!(fetch_jwks("http://keys.example/jwks").await.is_err());
+    let server = MockServer::start().await;
+    mount_jwks(&server, &["test-key-1"], Some(1)).await;
+    let body = fetch_jwks(&format!("{}/keys", server.uri())).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        jwks(&["test-key-1"])
+    );
+    server.reset().await;
+    mount_jwks(&server, &[], Some(1)).await;
+    assert!(fetch_jwks(&format!("{}/keys", server.uri())).await.is_err());
+}
+
+#[test]
+fn file_jwks_configuration_is_explicit_and_excludes_remote_override() {
+    use mcp_server_devtools::config::{Config, OidcKeys};
+    use std::collections::HashMap;
+    let mut values: HashMap<String, String> = [
+        ("MCP_OIDC_PROFILE", "generic"),
+        ("MCP_OIDC_ISSUER", ISSUER),
+        ("MCP_OIDC_AUDIENCE", AUDIENCE),
+        ("MCP_OIDC_JWKS_FILE", "/keys/jwks.json"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+    assert_eq!(
+        OidcSettings::from_config(&Config::from_map(values.clone()), OidcKeys::Oidc)
+            .unwrap()
+            .jwks,
+        JwksLocation::File("/keys/jwks.json".to_owned())
+    );
+    values.insert(
+        "MCP_OIDC_JWKS_URL".to_owned(),
+        "https://keys.example/jwks".to_owned(),
+    );
+    assert!(OidcSettings::from_config(&Config::from_map(values), OidcKeys::Oidc).is_err());
+}
+
+#[tokio::test]
+async fn jwks_fetch_cli_creates_a_private_file_and_refuses_overwrite() {
+    let server = MockServer::start().await;
+    mount_jwks(&server, &["test-key-1"], None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("jwks.json");
+    let run = || {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_mcp-devtools"));
+        command
+            .args([
+                "auth",
+                "jwks",
+                "fetch",
+                "--url",
+                &format!("{}/keys", server.uri()),
+                "--output",
+            ])
+            .arg(&output);
+        command
+    };
+    let result = run().output().await.unwrap();
+    if cfg!(unix) {
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let original = tokio::fs::read(&output).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&original).unwrap(),
+            jwks(&["test-key-1"])
+        );
+        assert!(!run().output().await.unwrap().status.success());
+        assert_eq!(tokio::fs::read(&output).await.unwrap(), original);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                tokio::fs::metadata(&output)
+                    .await
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    } else {
+        assert!(!result.status.success());
+    }
+}
+
+#[tokio::test]
+async fn file_keys_reject_oversize_directories_and_replaced_key_material() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("jwks.json");
+    let validator = validator(OidcSettings::new(
+        Profile::Okta,
+        ISSUER,
+        AUDIENCE,
+        JwksLocation::File(path.to_str().unwrap().to_owned()),
+    ));
+    let token = sign(&base_claims());
+    tokio::fs::write(&path, jwks(&["test-key-1"]).to_string())
+        .await
+        .unwrap();
+    validator.validate(&token).await.unwrap();
+    let mut rotated = jwk_with_kid("test-key-1");
+    let modulus = rotated["n"].as_str().unwrap().to_owned();
+    rotated["n"] = json!(format!("AAAAAAAA{}", &modulus[8..]));
+    tokio::fs::write(&path, json!({"keys": [rotated]}).to_string())
+        .await
+        .unwrap();
+    assert!(validator.validate(&token).await.is_err());
+    tokio::fs::write(&path, vec![b' '; 256 * 1024 + 1])
+        .await
+        .unwrap();
+    assert_eq!(
+        validator.validate(&token).await.unwrap_err(),
+        TokenRejection::KeysUnavailable
+    );
+    tokio::fs::remove_file(&path).await.unwrap();
+    tokio::fs::create_dir(&path).await.unwrap();
+    assert_eq!(
+        validator.validate(&token).await.unwrap_err(),
+        TokenRejection::KeysUnavailable
     );
 }

@@ -15,6 +15,39 @@ pub struct Options {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Exchange(ExchangeOptions),
+    /// Capture public signing keys for an offline deployment.
+    Jwks(JwksOptions),
+}
+#[derive(Debug, Args)]
+pub struct JwksOptions {
+    #[command(subcommand)]
+    pub command: JwksCommand,
+}
+#[derive(Debug, Subcommand)]
+pub enum JwksCommand {
+    Fetch {
+        #[arg(long)]
+        url: String,
+        /// Must not already exist; deploy with an atomic rename after review.
+        #[arg(long)]
+        output: PathBuf,
+    },
+}
+async fn fetch_keys(options: &JwksOptions) -> ExitCode {
+    let JwksCommand::Fetch { url, output } = &options.command;
+    let result = async {
+        let body = crate::auth::oidc::fetch_jwks(url).await?;
+        let body = std::str::from_utf8(&body).map_err(|_| "JWKS is not UTF-8".to_owned())?;
+        write_private(output, body).await.map_err(str::to_owned)
+    }
+    .await;
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("JWKS fetch failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 #[derive(Debug, Args)]
 pub struct ExchangeOptions {
@@ -127,7 +160,10 @@ async fn write_private(_path: &Path, _token: &str) -> Result<(), &'static str> {
     Err("private_output_requires_unix")
 }
 pub async fn dispatch(options: &Options) -> ExitCode {
-    let Command::Exchange(options) = &options.command;
+    let options = match &options.command {
+        Command::Exchange(options) => options,
+        Command::Jwks(options) => return fetch_keys(options).await,
+    };
     let result = run(options).await;
     let body = match result {
         Ok(()) => serde_json::json!({"data":{"written":true}}),

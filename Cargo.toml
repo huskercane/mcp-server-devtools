@@ -222,3 +222,32 @@ module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
+
+# D.4 packages use the static, keychain-free image binary; profile settings stay unchanged.
+[package.metadata.deb]
+name = "mcp-devtools"
+maintainer = "MCP Devtools maintainers"
+depends = "ca-certificates, systemd"
+assets = [
+  ["target/release/mcp-devtools", "usr/bin/mcp-devtools", "755"],
+  ["deploy/packages/mcp-devtools.service", "lib/systemd/system/mcp-devtools.service", "644"],
+  ["deploy/packages/env", "etc/mcp-devtools/env", "600"],
+  ["LICENSE", "usr/share/doc/mcp-devtools/LICENSE", "644"],
+  ["NOTICE", "usr/share/doc/mcp-devtools/NOTICE", "644"],
+  ["licenses/*", "usr/share/doc/mcp-devtools/licenses/", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "mcp-devtools"
+auto-req = "no"
+assets = [
+  { source = "target/release/mcp-devtools", dest = "/usr/bin/mcp-devtools", mode = "755" },
+  { source = "deploy/packages/mcp-devtools.service", dest = "/usr/lib/systemd/system/mcp-devtools.service", mode = "644" },
+  { source = "deploy/packages/env", dest = "/etc/mcp-devtools/env", mode = "600", config = "noreplace" },
+  { source = "LICENSE", dest = "/usr/share/doc/mcp-devtools/LICENSE", mode = "644", doc = true },
+  { source = "NOTICE", dest = "/usr/share/doc/mcp-devtools/NOTICE", mode = "644", doc = true },
+  { source = "licenses/*", dest = "/usr/share/doc/mcp-devtools/licenses/", mode = "644", doc = true },
+]
+[package.metadata.generate-rpm.requires]
+systemd = "*"
+ca-certificates = "*"

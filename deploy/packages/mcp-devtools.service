@@ -1,0 +1,28 @@
+[Unit]
+Description=MCP Devtools gateway and control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/mcp-devtools serve --transport http --role all
+EnvironmentFile=/etc/mcp-devtools/env
+DynamicUser=yes
+StateDirectory=mcp-devtools
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/mcp-devtools
+Environment=HOME=/var/lib/mcp-devtools
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

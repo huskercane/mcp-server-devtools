@@ -10,7 +10,14 @@ removed only when it is done, not when it is explained.
 
 Status legend: **open** · **blocked** (needs a decision) · **done**.
 
-Last updated: 2026-09-05, after D.1 (rev 2.26). ADR-013 accepted;
+Last updated: 2026-09-06, after D.4 (rev 2.27). Packaging, TLS Compose,
+file-backed JWKS and vendored-source offline builds landed; actual local
+proof and unchanged allocation evidence are in the D.4 summary. CF-41
+records hosted CI/release, portability and operating boundaries. CF-40
+remains backlog only, committed separately; shipping profiles are unchanged.
+Offline licensing remains blocked on CF-10; OVA remains on request.
+
+Previously updated: 2026-09-05, after D.1 (rev 2.26). ADR-013 accepted;
 read-only console, provider/runbook documentation and stage −1f landed.
 CF-37/38/39 track topology/session limits, real-provider evidence (including
 Entra SPA redemption), and CLI-only approval decisions. CF-18 gains
@@ -699,6 +706,54 @@ Close with before/after timings on the same host and feature set, explicit
 cache conditions, documented commands, and passing applicable gates. No
 build-profile or gate changes are included in this backlog entry.
 
+### CF-41 · D.4 operating evidence and packaging boundaries
+
+**Open · D.4 follow-up (2026-09-06); owner: release/operations.**
+D.4 adds version/checksum-pinned cargo-deb 3.7.0 and cargo-generate-rpm
+0.21.0, a hardened systemd unit, TLS Compose, file-backed JWKS, and a
+checksummed vendored-source release archive. The D.4 benchmark summary
+records actual local test results; adding a workflow is not hosted CI proof.
+The new hosted package/Compose jobs and tag-triggered release publication
+still need execution evidence. The Rust workflow now supports manual runs
+on a branch without opening a PR. Sigstore publishing evidence remains CF-34.
+
+Justified design deviations: packages reuse the existing static musl image
+binary, avoiding distro libc/keychain dependencies. They are x86_64 with
+WRDS and Vault, without OS keychain or the optional console; native release
+archives and shipping/benchmark profiles keep their existing settings.
+Additional architectures/console package variants require separately tested
+release products. Installation does not auto-start a remotely reachable
+service; the initial protected environment is unauthenticated loopback only.
+The package proof uses real systemd in non-privileged rootless Podman,
+with the shipped unit's protections intact. PID 1 gets mount capability only
+inside the subordinate user namespace, while the service gets none. Bare-metal
+systemd, upgrade/rollback across distro versions, package repositories and
+distro signing infrastructure are not claimed by a fresh-container install.
+
+JWKS uses bounded async request-time reads and content hashes instead of a
+timer watcher: this catches atomic replacement and withdrawal before a warm
+validation-cache hit, with no timestamp/size blind spot. Only changed content
+is parsed/installed. File errors clear trust rather than retaining stale keys;
+no network fallback. The tradeoff is file I/O on each authentication; the
+remote-JWKS cache allocation/latency probe does not measure that path. A
+separate offline-file latency budget/load study remains unproven. The fetch
+CLI reuses the Unix-only private-output writer from `auth exchange`;
+non-Unix capture is a remaining portability item (file validation has no Unix
+gate). File transfer freshness and emergency withdrawal are operator
+responsibilities; neither a local file nor the fetch helper can discover a later IdP change across a gap.
+
+The vendor archive covers Cargo dependencies and embedded assets, not the
+Rust toolchain or OS/C build prerequisites. A disconnected mirror deployment,
+real internal IdP issuance/console flow, and a disconnected Sigstore trust-root
+ceremony remain operating evidence to obtain. File-backed validation does not
+make PKCE discovery/token exchange or vendor APIs network-independent. Existing
+Dockerfile base images still use tags; release images and the new runtime/test
+pins are immutable, but a rebuild needs reviewed/mirrored build inputs.
+Offline licence support remains blocked on CF-10; OVA remains on request.
+CF-40 is backlog only and was committed separately; no build-speed work lands
+with D.4. D.3 authoring, D.5 delegation, CF-36 credential rotation, CF-38
+provider evidence, and CF-39 interactive approvals remain outstanding.
+
 ### CF-10 · ADR-002: the enterprise licence
 **Model decided 2026-09-05 · enterprise agreement and contribution terms remain open**
 
@@ -1248,3 +1303,17 @@ observations on this host, not a comparative speedup claim.
 Full console probe output, dependency trees, release-size comparison and
 landing-gate results are in
 [`benchmarks/2026-09-05-d1-console.txt`](benchmarks/2026-09-05-d1-console.txt).
+
+
+### Phase D baseline · D.4 packaging/air-gap (2026-09-06, rev 2.27)
+
+Both `cargo bench --bench response_pipeline` and its `--features console`
+run passed. All **31 earlier rows** match the D.1 summary's reported KB and
+allocation counts exactly. Console stage −1f remains **432 KB / 9 allocations**
+for 1,000 rows, 0.18 ms mean and 231,639 HTML bytes. No material regression;
+integer KB reporting is not sub-KB equality or a timing-stability claim.
+Default/console JWT cache hits: 4.06 / 3.77 µs; journal p99: 37 / 16 µs,
+within the existing absolute budgets. No release or benchmark profile changes.
+The opt-in file-JWKS I/O path is not measured by the remote cache probe (CF-41).
+Full outputs, all landing gates and actual package/Compose/offline proof are
+in [the D.4 summary](benchmarks/2026-09-06-d4-packaging.txt).

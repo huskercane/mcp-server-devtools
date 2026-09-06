@@ -43,6 +43,12 @@
 //! on every fetch, the document's `issuer` must match the configured one,
 //! and the `jwks_uri` it names is held to the same `https`-or-loopback rule
 //! as a configured URL. `MCP_OIDC_JWKS_URL` overrides either.
+//! `MCP_OIDC_JWKS_FILE` instead reads a bounded regular file before every
+//! authentication, hashes its contents, and installs keys only on change.
+//! File errors clear keys and validated tokens and refuse authentication;
+//! there is no remote fallback. Atomic replacement is recommended. This
+//! intentionally favors immediate withdrawal over a watcher interval, at
+//! the cost of file I/O on the opt-in offline path.
 //!
 //! ## Caches
 //!
@@ -241,17 +247,19 @@ impl Profile {
 pub enum JwksLocation {
     /// A JWKS document at this URL.
     Direct(String),
+    /// A locally provisioned JWKS; checked before every authentication.
+    File(String),
     /// An OIDC discovery document at this URL, whose `jwks_uri` names the
     /// JWKS. Resolved on every fetch.
     Discovery(String),
 }
 
 impl JwksLocation {
-    /// The URL the validator contacts first.
+    /// The URL the validator contacts first, or the configured local file path.
     #[must_use]
     pub fn url(&self) -> &str {
         match self {
-            Self::Direct(url) | Self::Discovery(url) => url,
+            Self::Direct(url) | Self::Discovery(url) | Self::File(url) => url,
         }
     }
 }
@@ -319,13 +327,24 @@ impl OidcSettings {
             .ok_or_else(|| format!("{issuer_key} has no host"))?
             .to_owned();
         let audience = required(config, keys, keys.audience())?;
-        let jwks = match optional(config, keys.jwks_url()) {
-            Some(url) => JwksLocation::Direct(url.to_owned()),
-            None => profile.default_jwks(&issuer),
+        let jwks = if let Some(path) = optional(config, "MCP_OIDC_JWKS_FILE") {
+            if keys != OidcKeys::Oidc || optional(config, keys.jwks_url()).is_some() {
+                return Err(
+                    "MCP_OIDC_JWKS_FILE requires oidc mode and excludes MCP_OIDC_JWKS_URL"
+                        .to_owned(),
+                );
+            }
+            JwksLocation::File(path.to_owned())
+        } else {
+            let location = match optional(config, keys.jwks_url()) {
+                Some(url) => JwksLocation::Direct(url.to_owned()),
+                None => profile.default_jwks(&issuer),
+            };
+            let parsed = url::Url::parse(location.url())
+                .map_err(|error| format!("{} is not a URL: {error}", keys.jwks_url()))?;
+            require_https_unless_loopback(&parsed, keys.jwks_url())?;
+            location
         };
-        let parsed_jwks = url::Url::parse(jwks.url())
-            .map_err(|error| format!("{} is not a URL: {error}", keys.jwks_url()))?;
-        require_https_unless_loopback(&parsed_jwks, keys.jwks_url())?;
         let subject_claim = match keys {
             OidcKeys::Okta => None,
             OidcKeys::Oidc => optional(config, SUBJECT_CLAIM_KEY),
@@ -397,6 +416,26 @@ impl OidcSettings {
             jwks_min_refetch_interval: Duration::from_secs(30),
         }
     }
+}
+
+/// Capture a direct JWKS using the validator's channel, size and key admission rules.
+///
+/// # Errors
+/// Refuses insecure URLs, unavailable or malformed documents, and sets without usable keys.
+pub async fn fetch_jwks(url: &str) -> Result<Vec<u8>, String> {
+    let parsed = url::Url::parse(url).map_err(|_| "JWKS URL is invalid".to_owned())?;
+    require_https_unless_loopback(&parsed, "JWKS URL")?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "cannot build JWKS client".to_owned())?;
+    let body = fetch_bounded(&client, url, JWKS_MAX_BYTES, "JWKS").await?;
+    let set: JwkSet =
+        serde_json::from_slice(&body).map_err(|_| "JWKS document is not valid".to_owned())?;
+    if admit_keys(&set).is_empty() {
+        return Err("JWKS contains no usable signing keys".to_owned());
+    }
+    Ok(body)
 }
 
 /// GET a JSON document with the fetch timeout and a byte bound enforced on
@@ -694,6 +733,7 @@ pub struct OidcJwksValidator {
     /// Serialises fetches: one in flight at a time, and the rate limit for
     /// unknown-`kid` refetches.
     fetch_gate: tokio::sync::Mutex<Option<Instant>>,
+    file_digest: Mutex<Option<[u8; 32]>>,
     refreshing: AtomicBool,
     validated: Mutex<HashMap<[u8; 32], Validated>>,
 }
@@ -726,6 +766,7 @@ impl OidcJwksValidator {
                 generation: 0,
             }),
             fetch_gate: tokio::sync::Mutex::new(None),
+            file_digest: Mutex::new(None),
             refreshing: AtomicBool::new(false),
             validated: Mutex::new(HashMap::new()),
         }
@@ -737,7 +778,7 @@ impl OidcJwksValidator {
     }
 
     /// Fetch the JWKS now (startup warm-up, tests). Failure leaves any
-    /// previously cached keys in place.
+    /// previously cached remote keys in place; file failures clear keys and tokens.
     ///
     /// # Errors
     ///
@@ -749,7 +790,11 @@ impl OidcJwksValidator {
     }
 
     async fn fetch_and_store(&self) -> Result<usize, String> {
+        if let JwksLocation::File(path) = &self.settings.jwks {
+            return self.load_file(path).await;
+        }
         let jwks_url = match &self.settings.jwks {
+            JwksLocation::File(_) => unreachable!("file handled above"),
             JwksLocation::Direct(url) => std::borrow::Cow::Borrowed(url.as_str()),
             JwksLocation::Discovery(url) => std::borrow::Cow::Owned(self.discover(url).await?),
         };
@@ -759,6 +804,66 @@ impl OidcJwksValidator {
         let set: JwkSet =
             serde_json::from_slice(&body).map_err(|_| "JWKS document is not valid".to_owned())?;
         Ok(self.install_keys(admit_keys(&set)))
+    }
+
+    async fn load_file(&self, path: &str) -> Result<usize, String> {
+        use sha2::{Digest as _, Sha256};
+        use tokio::io::AsyncReadExt;
+        let result = tokio::time::timeout(JWKS_FETCH_TIMEOUT, async {
+            if !tokio::fs::metadata(path)
+                .await
+                .map_err(|_| "JWKS file unavailable")?
+                .is_file()
+            {
+                return Err("JWKS path must be a regular file");
+            }
+            let file = tokio::fs::File::open(path)
+                .await
+                .map_err(|_| "JWKS file unavailable")?;
+            if !file
+                .metadata()
+                .await
+                .map_err(|_| "JWKS file unavailable")?
+                .is_file()
+            {
+                return Err("JWKS path must be a regular file");
+            }
+            let mut body = Vec::with_capacity(4096);
+            file.take((JWKS_MAX_BYTES + 1) as u64)
+                .read_to_end(&mut body)
+                .await
+                .map_err(|_| "JWKS file unavailable")?;
+            if body.len() > JWKS_MAX_BYTES {
+                return Err("JWKS file too large");
+            }
+            let hash: [u8; 32] = Sha256::digest(&body).into();
+            if *self
+                .file_digest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                == Some(hash)
+            {
+                return Ok(self.snapshot().keys.len());
+            }
+            let set: JwkSet =
+                serde_json::from_slice(&body).map_err(|_| "JWKS document is not valid")?;
+            let count = self.install_keys(admit_keys(&set));
+            *self
+                .file_digest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hash);
+            Ok(count)
+        })
+        .await
+        .unwrap_or(Err("JWKS file read timed out"));
+        result.map_err(|error| {
+            self.install_keys(HashMap::new());
+            *self
+                .file_digest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            error.to_owned()
+        })
     }
 
     /// Resolve the JWKS URL through the provider's discovery document. The
@@ -865,7 +970,9 @@ impl OidcJwksValidator {
     /// Kick off a background refresh when the keys are older than the
     /// refresh interval. Never blocks the request.
     fn maybe_refresh_in_background(self: &Arc<Self>, fetched_at: Instant) {
-        if fetched_at.elapsed() < self.settings.jwks_refresh {
+        if matches!(self.settings.jwks, JwksLocation::File(_))
+            || fetched_at.elapsed() < self.settings.jwks_refresh
+        {
             return;
         }
         if self
@@ -1107,6 +1214,11 @@ impl TokenValidator for Arc<OidcJwksValidator> {
 
     fn authenticate<'a>(&'a self, token: &'a str) -> AuthenticateFuture<'a> {
         Box::pin(async move {
+            if matches!(self.settings.jwks, JwksLocation::File(_)) {
+                self.refresh_keys()
+                    .await
+                    .map_err(|_| TokenRejection::KeysUnavailable)?;
+            }
             let key = digest(token);
             if let Some(authenticated) = self.cached(&key) {
                 return Ok(authenticated);

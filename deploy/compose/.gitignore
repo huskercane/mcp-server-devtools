@@ -1,0 +1,10 @@
+.env
+mcp.env
+secrets/
+tls/
+jwks/
+*.key
+policy.yaml
+policy.yaml.sig
+revocations.yaml
+revocations.yaml.sig

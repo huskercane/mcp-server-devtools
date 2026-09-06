@@ -1,0 +1,7 @@
+# Root-owned mode 0600; systemd reads this before dropping privileges.
+# Safe initial configuration. Configure OIDC before exposing a remote bind.
+MCP_BIND_ADDR=127.0.0.1
+PORT=3000
+MCP_AUTH_MODE=off
+LOG_STDERR=on
+MCP_AUDIT_JOURNAL_DIR=/var/lib/mcp-devtools/journal
