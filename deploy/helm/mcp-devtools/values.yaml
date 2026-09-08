@@ -1,0 +1,66 @@
+image:
+  repository: ghcr.io/huskercane/mcp-devtools
+  tag: ""
+  digest: ""
+existingSecrets:
+  vendorCredentials: mcp-devtools-vendor-credentials
+  auditSigning: mcp-devtools-audit-signing-key
+policyConfigMap: mcp-devtools-policy
+# Optional pre-populated shared writable policy/revocation volume for admin edits.
+policyClaim: ""
+config:
+  MCP_AUTH_MODE: oidc
+  MCP_OIDC_PROFILE: okta
+  MCP_OIDC_ISSUER: https://YOUR-ORG.okta.com/oauth2/default
+  MCP_OIDC_AUDIENCE: api://mcp-devtools
+  MCP_PUBLIC_URL: https://mcp.example.com
+  MCP_BIND_ADDR: 0.0.0.0
+  MCP_REQUIRED_SCOPE: mcp:tools
+  MCP_POLICY_FILE: /policy/policy.yaml
+  MCP_POLICY_PUBLIC_KEY: REPLACE-WITH-YOUR-PUBLIC-KEY
+  MCP_REVOCATION_FILE: /policy/revocations.yaml
+  MCP_AUDIT_JOURNAL_DIR: /journal
+  MCP_AUDIT_SIGNING_KEY: /keys/audit-signing.key
+  MCP_AUDIT_CHECKPOINT_EXPORT_DIR: /journal/checkpoints
+  MCP_VENDOR_ENVIRONMENT: qa
+  GRAFANA_URL: https://grafana-qa.example.com
+roles:
+  gateway:
+    enabled: true
+    role: gateway
+    replicas: 1
+    storage: 5Gi
+    storageClass: ""
+    existingClaim: ""
+    serviceAccountName: ""
+    env: {}
+    extraVolumes: []
+    extraVolumeMounts: []
+    resources:
+      requests: {cpu: 100m, memory: 64Mi}
+      limits: {memory: 512Mi}
+  control:
+    enabled: true
+    role: control
+    replicas: 1
+    storage: 5Gi
+    storageClass: ""
+    existingClaim: ""
+    serviceAccountName: ""
+    env:
+      MCP_ROLLUP_STORE: sqlite:///journal/usage.sqlite
+    extraVolumes: []
+    extraVolumeMounts: []
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+      limits: {memory: 512Mi}
+ingress:
+  enabled: false
+  className: nginx
+  host: mcp.example.com
+  tlsSecretName: mcp-devtools-tls
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-body-size: 1m
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"

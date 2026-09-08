@@ -1,0 +1,59 @@
+=== output size: is TOON earning its CPU? ===
+                                            compact     pretty       TOON
+  uniform flat rows (TOON's best case)       12392B     20800B      5016B   TOON is 40% of compact, 24% of pretty
+  nested objects (Jira search shape)         89903B    133723B     99300B   TOON is 110% of compact, 74% of pretty
+
+=== stage -1: policy extractors, per tool call (mean of 2000) ===
+  canonical: short path                            0 KB          4 allocs     0.00 ms
+  canonical: dot-segments + escapes                0 KB          1 allocs     0.00 ms
+  canonical: search URL (long JQL)                 0 KB         10 allocs     0.00 ms
+  jira::extract GET /issue/{key}                   0 KB          6 allocs     0.00 ms
+  jira::extract GET /search/jql (long JQL)         1 KB         17 allocs     0.01 ms
+  jira::project_keys_from_jql (long JQL)           0 KB          9 allocs     0.00 ms
+  jira::extract unmapped (default arm)             0 KB          1 allocs     0.00 ms
+  grafana::query_logs                              0 KB         10 allocs     0.00 ms
+
+=== stage -1b: policy decision, per tool call (mean of 2000) ===
+  ActionContext via for_tool (grafana)             0 KB         21 allocs     0.00 ms
+  FilePolicy::evaluate @ 500 rules                 0 KB          5 allocs     0.01 ms
+
+=== stage -1c: enterprise request path, production components (mean of 2000 / 1000) ===
+  JWT validate: cache hit (budget 50 µs)           1 KB          9 allocs     3.69 µs
+  C.1 JWT authenticate: cached actor chain         1 KB          8 allocs     3.99 µs
+  journal append, sequential (budget p99 200 µs)         1 KB          6 allocs  p50      11 µs  p99      15 µs  max      71 µs
+
+=== stage -1d: usage side of the request path (mean of 2000) — C.6 ===
+  rate limit check, known subject                  0 KB          0 allocs     0.00 ms
+  PrometheusUsageSink::record, known series         0 KB          0 allocs     0.00 ms
+  FanOut(prometheus + channel)::record             0 KB          9 allocs     0.00 ms
+
+=== stage -1e: principal inventory — C.4 ===
+  observe principal, known unchanged               0 KB          0 allocs     0.00 ms
+
+=== stage 0: per-tool-call config snapshot (mean of 1000) ===
+  BEFORE: deep clone of Config                     4 KB         73 allocs     0.00 ms
+  NOW:    ConfigHandle::snapshot()                 0 KB          0 allocs     0.00 ms
+
+=== 500 issues / 220 KB compact JSON  (mean of 20) ===
+ -- stage 1: jq filter, no filter supplied (the default path)
+  BEFORE: deep clone of the payload             1469 KB      17507 allocs     1.31 ms
+  NOW:    apply_jq_filter(None) borrows            0 KB          0 allocs     0.00 ms
+ -- stage 2: render
+  BEFORE: eager pretty-JSON, then discard       2249 KB      19053 allocs     2.85 ms
+  NOW:    render(Toon), lazy fallback           1736 KB      19032 allocs     2.39 ms
+  ref:    render(Json) on same data              512 KB         13 allocs     0.38 ms
+ -- stage 3: truncate
+  truncate_for_ai (over budget)                   39 KB          4 allocs     0.00 ms
+   rendered output: 243 KB
+
+=== 5000 issues / 2226 KB compact JSON  (mean of 4) ===
+ -- stage 1: jq filter, no filter supplied (the default path)
+  BEFORE: deep clone of the payload            14703 KB     175007 allocs    14.17 ms
+  NOW:    apply_jq_filter(None) borrows            0 KB          0 allocs     0.00 ms
+ -- stage 2: render
+  BEFORE: eager pretty-JSON, then discard      20643 KB     190051 allocs    32.73 ms
+  NOW:    render(Toon), lazy fallback          16547 KB     190035 allocs    28.22 ms
+  ref:    render(Json) on same data             4096 KB         16 allocs     4.23 ms
+ -- stage 3: truncate
+  truncate_for_ai (over budget)                   39 KB          4 allocs     0.00 ms
+   rendered output: 2455 KB

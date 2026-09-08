@@ -1,0 +1,1070 @@
+// The field-level doc strings below travel as the JSON Schema descriptions
+// published to MCP clients; their wording is pinned to the TS reference.
+#![allow(clippy::doc_markdown)]
+
+//! Argument types for the MCP tools. Mirrors the Zod schemas in
+//! `src/tools/atlassian.api.types.ts` so the JSON Schema published over MCP
+//! matches the reference implementation.
+//!
+//! Struct naming deliberately keeps camelCase JSON field names (`queryParams`,
+//! `outputFormat`) because those are part of the tool's public contract and
+//! are referenced verbatim by LLM prompts and TS tests.
+
+use std::collections::BTreeMap;
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::format::OutputFormat;
+
+/// Serializable/deserializable `OutputFormat` for tool arg surfaces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputFormatArg {
+    #[default]
+    Toon,
+    Json,
+}
+
+impl From<OutputFormatArg> for OutputFormat {
+    fn from(value: OutputFormatArg) -> Self {
+        match value {
+            OutputFormatArg::Toon => Self::Toon,
+            OutputFormatArg::Json => Self::Json,
+        }
+    }
+}
+
+/// Query parameter map. `BTreeMap` is used so the generated JSON Schema has
+/// a deterministic shape and URL encoding is stable order (important for the
+/// raw-response log and test fixtures).
+pub type QueryParams = BTreeMap<String, String>;
+
+/// Arguments for `bb_get` / `bb_delete` (no body).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadArgs {
+    /// The Bitbucket API endpoint path (without base URL). Must start with "/".
+    /// Examples: "/workspaces", "/repositories/{workspace}/{repo_slug}",
+    /// "/repositories/{workspace}/{repo_slug}/pullrequests/{id}"
+    pub path: String,
+
+    /// Optional query parameters as key-value pairs.
+    /// Examples: {"pagelen": "25", "page": "2", "q": "state=\"OPEN\"",
+    /// "fields": "values.title,values.state"}
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_params: Option<QueryParams>,
+
+    /// JMESPath expression to filter/transform the response. IMPORTANT:
+    /// always use this to extract only needed fields and reduce token costs.
+    /// Examples: "values[*].{name: name, slug: slug}",
+    /// "values[0]", "values[*].name". See https://jmespath.org
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default, 30-60% fewer tokens) or "json".
+    /// TOON is optimized for LLMs with tabular arrays and minimal syntax.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `circleci_logs`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CircleCiLogsArgs {
+    /// CircleCI project slug in v2 form: "gh/org/repo" or "bb/org/repo".
+    pub project_slug: String,
+
+    /// CircleCI job number from `/workflow/{workflow-id}/job`.
+    pub job_number: u64,
+
+    /// Retrieve only this one-based CircleCI step number. Omit to consider all
+    /// steps in the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_number: Option<usize>,
+
+    /// Retrieve only actions whose status is failed or whose exit code is
+    /// non-zero. This avoids downloading successful action output.
+    #[serde(default)]
+    pub failed_only: bool,
+
+    /// Return error-relevant lines with surrounding context instead of the
+    /// normal head/tail preview. The complete selected logs are still saved.
+    #[serde(default)]
+    pub condensed: bool,
+
+    /// Number of lines before and after each condensed match (default 3,
+    /// maximum 20).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_lines: Option<usize>,
+
+    /// Output format: "toon" (default, 30-60% fewer tokens) or "json".
+    /// TOON is optimized for LLMs with tabular arrays and minimal syntax.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for resumably reading a server-owned temporary artifact.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactReadArgs {
+    /// Opaque artifact ID returned by a tool such as `circleci_logs`.
+    pub artifact_id: String,
+
+    /// Zero-based byte offset. Use the prior response's `nextOffset` to resume.
+    #[serde(default)]
+    pub offset: u64,
+
+    /// Maximum bytes to return. Defaults to 64 KiB and is capped at 1 MiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
+}
+
+/// Arguments for `bb_clone`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CloneArgs {
+    /// Bitbucket workspace slug containing the repository. If not provided,
+    /// the tool will use your default workspace (either configured via
+    /// `BITBUCKET_DEFAULT_WORKSPACE` or the first workspace in your account).
+    /// Example: "myteam"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_slug: Option<String>,
+
+    /// Repository name/slug to clone. This is the short name of the
+    /// repository. Example: "project-api"
+    pub repo_slug: String,
+
+    /// Directory path where the repository will be cloned. IMPORTANT:
+    /// Absolute paths are strongly recommended (e.g., "/home/user/projects"
+    /// or "C:\\Users\\name\\projects"). Relative paths will be resolved
+    /// relative to the server's working directory, which may not be what you
+    /// expect. The repository will be cloned into a subdirectory at
+    /// targetPath/repoSlug. Make sure you have write permissions to this
+    /// location.
+    pub target_path: String,
+}
+
+/// Arguments for `bb_post` / `bb_put` / `bb_patch` (with body).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteArgs {
+    /// The Bitbucket API endpoint path (without base URL). Must start with "/".
+    pub path: String,
+
+    /// Request body as a JSON object. Structure depends on the endpoint.
+    /// Example for PR:
+    /// `{"title": "My PR", "source": {"branch": {"name": "feature"}}}`
+    pub body: Value,
+
+    /// Optional query parameters as key-value pairs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_params: Option<QueryParams>,
+
+    /// JMESPath expression to filter/transform the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for a read-shaped NinjaOne request. `server` is a configured
+/// alias, never a caller-controlled URL.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NinjaOneReadArgs {
+    /// Optional alias from the `NINJAONE_SERVERS` JSON object. When omitted,
+    /// `NINJAONE_URL` is used. Raw URLs are intentionally not accepted here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+
+    /// API path relative to the selected NinjaOne server. Public API examples
+    /// use `/v2/devices`; private console endpoints use `/ws/...`.
+    pub path: String,
+
+    /// Optional query parameters as key-value pairs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_params: Option<QueryParams>,
+
+    /// Optional JMESPath expression to reduce or reshape the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for a write-shaped NinjaOne request.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NinjaOneWriteArgs {
+    /// Optional alias from the `NINJAONE_SERVERS` JSON object. When omitted,
+    /// `NINJAONE_URL` is used. Raw URLs are intentionally not accepted here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+
+    /// API path relative to the selected NinjaOne server.
+    pub path: String,
+
+    /// JSON request body expected by the selected endpoint.
+    pub body: Value,
+
+    /// Optional query parameters as key-value pairs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_params: Option<QueryParams>,
+
+    /// Optional JMESPath expression to reduce or reshape the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `ninjaone_login`.
+///
+/// Email and password are deliberately absent: they are server-held config
+/// (`NINJAONE_EMAIL` / `NINJAONE_PASSWORD`), so an MCP caller can never
+/// redirect them or supply its own. Only the short-lived one-time code — and,
+/// where a tenant demands it, a reCAPTCHA token — come in as arguments.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NinjaOneLoginArgs {
+    /// Optional alias from the `NINJAONE_SERVERS` JSON object. When omitted,
+    /// `NINJAONE_URL` is used. Raw URLs are intentionally not accepted here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+
+    /// Current multi-factor code for the configured account (6 digits for a
+    /// TOTP authenticator). Required whenever the account has MFA enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mfa_code: Option<String>,
+
+    /// reCAPTCHA token, only when the tenant reports `recaptchaRequired`.
+    /// Normally omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recaptcha_token: Option<String>,
+
+    /// Optional JMESPath expression to reduce or reshape the login summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `newrelic_query`.
+///
+/// New Relic's only API is NerdGraph (a single GraphQL endpoint), so this is a
+/// bespoke tool rather than the five generic REST verbs the other vendors use.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NewRelicQueryArgs {
+    /// NerdGraph GraphQL document to execute. NRQL queries are run by wrapping
+    /// them here, e.g.
+    /// `{ actor { account(id: 123) { nrql(query: "SELECT count(*) FROM Transaction SINCE 1 hour ago") { results } } } }`.
+    pub query: String,
+
+    /// Optional GraphQL variables object, referenced by `$name` in `query`.
+    /// Example: `{"id": 1234567, "q": "SELECT average(duration) FROM Transaction"}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variables: Option<Value>,
+
+    /// JMESPath expression to filter/transform the response. IMPORTANT: always
+    /// use this to extract only needed fields and reduce token costs.
+    /// Example: "data.actor.account.nrql.results".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default, 30-60% fewer tokens) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `grafana_query_logs`.
+///
+/// Reads logs by running a LogQL query against a Loki datasource through
+/// Grafana's datasource proxy. The datasource UID identifies which Loki backend
+/// to query; discover it with `grafana_list_datasources`. Time-range and limit
+/// knobs map directly onto Loki's `query_range` parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GrafanaQueryLogsArgs {
+    /// UID of the Loki datasource to query. Find it via
+    /// `grafana_list_datasources` (the `uid` field of a `type: "loki"` entry).
+    pub datasource_uid: String,
+
+    /// LogQL query, e.g. `{app="api"} |= "error"` or
+    /// `sum by (level) (count_over_time({app="api"}[5m]))`.
+    pub query: String,
+
+    /// Range start: RFC3339 (`2024-01-01T00:00:00Z`) or Unix nanoseconds.
+    /// Defaults to Loki's default window (last hour) when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<String>,
+
+    /// Range end: RFC3339 or Unix nanoseconds. Defaults to "now" when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+
+    /// Split an absolute range into this many requests (2-16). Until the
+    /// partition merge slice lands, the returned artifact is a partition-set
+    /// manifest whose entries identify the retained canonical NDJSON parts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_partitions: Option<u8>,
+
+    /// Max number of log lines to return (Loki defaults to 100). Keep this small
+    /// to reduce token costs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+
+    /// Scan direction: `backward` (newest first, default) or `forward`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+
+    /// Query resolution step for metric queries, e.g. `30s` or `1m`. Only
+    /// meaningful for LogQL metric queries; ignored for log selectors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+
+    /// JMESPath expression to filter/transform the response. IMPORTANT: always
+    /// use this to extract only needed fields and reduce token costs.
+    /// Example: "data.result[*].values".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default, 30-60% fewer tokens) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `grafana_list_datasources`.
+///
+/// Lists configured Grafana datasources so the caller can discover a Loki
+/// datasource's UID for `grafana_query_logs`. Filter to Loki entries with `jq`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GrafanaListDatasourcesArgs {
+    /// JMESPath expression to filter/transform the response. Example to find
+    /// Loki datasources: `[?type=='loki'].{name: name, uid: uid}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `slack_list_channels` (WP B.1).
+///
+/// Lists the channels the token can see so the caller can find a channel id
+/// for the other Slack read tools.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SlackListChannelsArgs {
+    /// Comma-separated channel kinds: `public_channel` (default),
+    /// `private_channel`, `mpim`, `im`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub types: Option<String>,
+
+    /// Omit archived channels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_archived: Option<bool>,
+
+    /// Page size (Slack caps at 1000). Keep this small to reduce token costs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+
+    /// `response_metadata.next_cursor` from the previous page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+
+    /// JMESPath expression to filter/transform the response. Example to find
+    /// a channel by name: `channels[?name=='incidents'].{id: id, name: name}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `slack_channel_info`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SlackChannelInfoArgs {
+    /// The channel id, e.g. `C0123ABCDEF`. Find it with `slack_list_channels`.
+    pub channel_id: String,
+
+    /// JMESPath expression to filter/transform the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `slack_channel_history`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SlackChannelHistoryArgs {
+    /// The channel id, e.g. `C0123ABCDEF`. Find it with `slack_list_channels`.
+    pub channel_id: String,
+
+    /// Only messages after this Unix timestamp (seconds; decimals allowed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest: Option<String>,
+
+    /// Only messages before this Unix timestamp (seconds; decimals allowed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
+
+    /// Include messages exactly at `oldest` / `latest`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inclusive: Option<bool>,
+
+    /// Page size (Slack caps at 999). Keep this small to reduce token costs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+
+    /// `response_metadata.next_cursor` from the previous page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+
+    /// JMESPath expression to filter/transform the response. Example:
+    /// `messages[*].{ts: ts, user: user, text: text}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `slack_thread_replies`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SlackThreadRepliesArgs {
+    /// The channel id, e.g. `C0123ABCDEF`.
+    pub channel_id: String,
+
+    /// The parent message's `ts` (the `thread_ts` on a reply), e.g.
+    /// `1700000000.123456`.
+    pub thread_ts: String,
+
+    /// Only replies after this Unix timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest: Option<String>,
+
+    /// Only replies before this Unix timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
+
+    /// Include replies exactly at `oldest` / `latest`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inclusive: Option<bool>,
+
+    /// Page size (Slack caps at 999).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+
+    /// `response_metadata.next_cursor` from the previous page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+
+    /// JMESPath expression to filter/transform the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `slack_search_messages`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SlackSearchMessagesArgs {
+    /// The search expression, with Slack modifiers (`in:#incidents`,
+    /// `from:@alice`, `after:2026-09-01`, quoted phrases).
+    pub query: String,
+
+    /// Results per page (max 100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u16>,
+
+    /// Page number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u16>,
+
+    /// `score` (default) or `timestamp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<String>,
+
+    /// `asc` or `desc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_dir: Option<String>,
+
+    /// JMESPath expression to filter/transform the response. Example:
+    /// `messages.matches[*].{channel: channel.name, ts: ts, text: text}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `sonarqube_quality_gate`.
+///
+/// Reports the failing quality-gate conditions for a Sonar analysis — the "why
+/// did the CI build fail Sonar" call. The analysis is identified by exactly one
+/// of `analysisId`, `ceTaskId` (resolved to an `analysisId` server-side), or
+/// `projectKey` (+ optional `branch`/`pullRequest`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SonarqubeQualityGateArgs {
+    /// Project key (as shown in Sonar). Combine with `branch` or `pullRequest`
+    /// to target a specific analysis; alone it reports the main branch's latest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+
+    /// Branch name whose latest analysis to report. Mutually exclusive with
+    /// `pullRequest`. Requires `projectKey`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+
+    /// Pull-request id whose analysis to report. Mutually exclusive with
+    /// `branch`. Requires `projectKey`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<String>,
+
+    /// Analysis id (from `/api/project_analyses/search` or a prior `ceTaskId`
+    /// resolution). Used verbatim; takes precedence over the other selectors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_id: Option<String>,
+
+    /// Scanner compute-engine task id — the `ceTaskId` printed in the CI log's
+    /// `report-task.txt`. Resolved to its `analysisId` via `/api/ce/task` first,
+    /// so you can go straight from a CircleCI log to the gate result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ce_task_id: Option<String>,
+
+    /// SonarCloud organization key. Required on SonarCloud; omit for
+    /// self-hosted SonarQube.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+
+    /// JMESPath expression to filter/transform the response. IMPORTANT: always
+    /// use this to extract only needed fields and reduce token costs.
+    /// Example: "projectStatus.conditions[?status=='ERROR']".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default, 30-60% fewer tokens) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `sonarqube_search_issues`.
+///
+/// Lists the individual issues (bugs / vulnerabilities / code smells) for a
+/// project, optionally scoped to a branch or PR — the specific lines behind a
+/// quality-gate failure.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SonarqubeSearchIssuesArgs {
+    /// Component keys to search, comma-separated. Usually a single project key,
+    /// e.g. "my-org_my-repo".
+    pub component_keys: String,
+
+    /// Restrict to a branch's issues. Mutually exclusive with `pullRequest`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+
+    /// Restrict to a pull request's issues. Mutually exclusive with `branch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<String>,
+
+    /// Comma-separated issue types to include: `BUG`, `VULNERABILITY`,
+    /// `CODE_SMELL`. Omit for all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub types: Option<String>,
+
+    /// Comma-separated severities: `INFO`, `MINOR`, `MAJOR`, `CRITICAL`,
+    /// `BLOCKER`. Omit for all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severities: Option<String>,
+
+    /// Comma-separated issue statuses, e.g. `OPEN,CONFIRMED,REOPENED`. Omit for
+    /// all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statuses: Option<String>,
+
+    /// Filter by resolution state: `false` for unresolved (open) issues only,
+    /// `true` for resolved ones. Omit for both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<bool>,
+
+    /// Page size (Sonar's `ps`, max 500). Keep small to reduce token costs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+
+    /// SonarCloud organization key. Required on SonarCloud; omit for
+    /// self-hosted SonarQube.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+
+    /// JMESPath expression to filter/transform the response. IMPORTANT: always
+    /// use this to extract only needed fields and reduce token costs.
+    /// Example: "issues[*].{rule: rule, msg: message, file: component, line: line}".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default, 30-60% fewer tokens) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `splunk_search`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SplunkSearchArgs {
+    /// Splunk Search Processing Language (SPL) query. Searching indexed data
+    /// normally starts with `search`, for example
+    /// `search index=main error | head 20`.
+    pub search: String,
+
+    /// Inclusive earliest time, such as `-15m`, `-24h@h`, or an ISO timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub earliest_time: Option<String>,
+
+    /// Inclusive latest time, such as `now` or an ISO timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_time: Option<String>,
+
+    /// Split an absolute range into this many requests (2-16). Relative or
+    /// imprecise bounds always retain the single-request path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_partitions: Option<u8>,
+
+    /// Maximum seconds Splunk may run the search before finalizing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_time: Option<u32>,
+
+    /// JMESPath expression to filter/transform the JSON rows response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `splunk_create_job`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SplunkCreateJobArgs {
+    /// SPL query to run asynchronously.
+    pub search: String,
+
+    /// Inclusive earliest time. REST searches otherwise default to all time,
+    /// so callers should normally provide this bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub earliest_time: Option<String>,
+
+    /// Inclusive latest time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_time: Option<String>,
+
+    /// Maximum number of stored results, up to Splunk's configured limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_count: Option<u32>,
+
+    /// Maximum seconds Splunk may run the search before finalizing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_time: Option<u32>,
+
+    /// JMESPath expression to filter/transform the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `splunk_job_results`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SplunkJobResultsArgs {
+    /// Search ID returned by `splunk_create_job`.
+    pub sid: String,
+
+    /// Number of results to return. Defaults to Splunk's endpoint default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+
+    /// Zero-based result offset for pagination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+
+    /// JMESPath expression to filter/transform the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `splunk_list_saved_searches`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SplunkListSavedSearchesArgs {
+    /// Optional Splunk collection filter, for example `name="Errors by host"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+
+    /// Number of saved searches to return.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+
+    /// Zero-based offset for pagination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+
+    /// JMESPath expression to filter/transform the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `wrds_query`.
+///
+/// WRDS (Wharton Research Data Services) is a PostgreSQL database, so this tool
+/// runs a single read-only SQL `SELECT`. The session is forced read-only and the
+/// query is wrapped server-side, so only one `SELECT`/`VALUES` statement runs.
+#[cfg(feature = "wrds")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WrdsQueryArgs {
+    /// Read-only SQL SELECT to run against WRDS. Reference tables as
+    /// `library.table` (a WRDS library is a Postgres schema), e.g.
+    /// `SELECT permno, date, ret FROM crsp.dsf WHERE date >= '2023-01-01' LIMIT 100`.
+    /// Discover libraries/tables/columns with `wrds_list_libraries`,
+    /// `wrds_list_tables`, and `wrds_describe_table`.
+    pub sql: String,
+
+    /// Maximum rows to return (token-cost guard). Defaults to 1000; capped at
+    /// 100000. Always prefer a small limit and a tight `WHERE` clause — WRDS
+    /// tables can be enormous.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_limit: Option<u32>,
+
+    /// JMESPath expression to filter/transform the rows. IMPORTANT: always use
+    /// this to extract only needed fields and reduce token costs.
+    /// Example: "[*].{permno: permno, ret: ret}".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default, 30-60% fewer tokens) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `wrds_list_libraries`.
+#[cfg(feature = "wrds")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WrdsListLibrariesArgs {
+    /// JMESPath expression to filter/transform the response.
+    /// Example: "[*].library".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `wrds_list_tables`.
+#[cfg(feature = "wrds")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WrdsListTablesArgs {
+    /// WRDS library (Postgres schema) to list, e.g. "crsp", "comp", "ff".
+    /// Discover available libraries with `wrds_list_libraries`.
+    pub library: String,
+
+    /// Maximum rows to return. Defaults to 1000; capped at 100000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_limit: Option<u32>,
+
+    /// JMESPath expression to filter/transform the response.
+    /// Example: "[*].table_name".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `wrds_describe_table`.
+#[cfg(feature = "wrds")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WrdsDescribeTableArgs {
+    /// WRDS library (Postgres schema) containing the table, e.g. "crsp".
+    pub library: String,
+
+    /// Table or view name within the library, e.g. "dsf".
+    pub table: String,
+
+    /// JMESPath expression to filter/transform the response.
+    /// Example: "[*].{col: column_name, type: data_type}".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Shared optional output controls for typed edX discussion read tools.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EdxDiscussionOutputArgs {
+    /// JMESPath expression to filter/transform the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for `edx_discussion_course`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EdxDiscussionCourseArgs {
+    /// Course key, e.g. "course-v1:edX+DemoX+Demo_Course".
+    pub course_id: String,
+
+    #[serde(default, flatten)]
+    pub output: EdxDiscussionOutputArgs,
+}
+
+/// Arguments for `edx_discussion_topics`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EdxDiscussionTopicsArgs {
+    /// Course key, e.g. "course-v1:edX+DemoX+Demo_Course".
+    pub course_id: String,
+
+    #[serde(default, flatten)]
+    pub output: EdxDiscussionOutputArgs,
+}
+
+/// Arguments for `edx_discussion_threads`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EdxDiscussionThreadsArgs {
+    /// Course key. Required by the edX Discussion API.
+    pub course_id: String,
+
+    /// Retrieve threads only within this topic. Mutually exclusive with
+    /// `following` and `textSearch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic_id: Option<String>,
+
+    /// Retrieve only threads the user is following.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub following: Option<bool>,
+
+    /// Retrieve only unread threads or unanswered question threads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<EdxDiscussionThreadView>,
+
+    /// Full-text search query for matching threads/comments. Mutually
+    /// exclusive with `topicId` and `following`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_search: Option<String>,
+
+    /// Order threads by last activity, comment count, or vote count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_by: Option<EdxDiscussionThreadOrderBy>,
+
+    /// Sort direction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_direction: Option<EdxDiscussionOrderDirection>,
+
+    /// Number of threads per page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+
+    /// Page number to retrieve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
+
+    #[serde(default, flatten)]
+    pub output: EdxDiscussionOutputArgs,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EdxDiscussionThreadView {
+    Unread,
+    Unanswered,
+}
+
+impl EdxDiscussionThreadView {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unread => "unread",
+            Self::Unanswered => "unanswered",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EdxDiscussionThreadOrderBy {
+    LastActivityAt,
+    CommentCount,
+    VoteCount,
+}
+
+impl EdxDiscussionThreadOrderBy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LastActivityAt => "last_activity_at",
+            Self::CommentCount => "comment_count",
+            Self::VoteCount => "vote_count",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum EdxDiscussionOrderDirection {
+    Asc,
+    Desc,
+}
+
+impl EdxDiscussionOrderDirection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
+}
+
+/// Arguments for `edx_discussion_thread_create`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EdxDiscussionThreadCreateArgs {
+    /// Course key.
+    pub course_id: String,
+
+    /// Topic ID to create the thread in.
+    pub topic_id: String,
+
+    /// Thread type: "discussion" or "question".
+    #[serde(rename = "type")]
+    pub thread_type: EdxDiscussionThreadType,
+
+    /// Thread title.
+    pub title: String,
+
+    /// Raw body. May contain Markdown, HTML, and MathJax markup supported by
+    /// the edX discussion service.
+    pub raw_body: String,
+
+    /// Optional cohort/group ID. Privileged roles may set this explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<i64>,
+
+    #[serde(default, flatten)]
+    pub output: EdxDiscussionOutputArgs,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum EdxDiscussionThreadType {
+    Discussion,
+    Question,
+}
+
+impl EdxDiscussionThreadType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Discussion => "discussion",
+            Self::Question => "question",
+        }
+    }
+}
+
+/// Arguments for `edx_discussion_comments`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EdxDiscussionCommentsArgs {
+    /// Thread ID whose comments/responses should be listed.
+    pub thread_id: String,
+
+    /// Retrieve only endorsed or non-endorsed comments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endorsed: Option<bool>,
+
+    /// Number of comments per page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+
+    /// Page number to retrieve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
+
+    #[serde(default, flatten)]
+    pub output: EdxDiscussionOutputArgs,
+}
+
+/// Arguments for `edx_discussion_comment_create`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EdxDiscussionCommentCreateArgs {
+    /// Thread ID to respond to. Omit only when creating a child comment under
+    /// `parentId`, if the target Open edX instance supports that form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+
+    /// Parent comment ID for a nested comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+
+    /// Raw body. May contain Markdown, HTML, and MathJax markup supported by
+    /// the edX discussion service.
+    pub raw_body: String,
+
+    #[serde(default, flatten)]
+    pub output: EdxDiscussionOutputArgs,
+}
+
+/// Download a Jira image attachment without text conversion.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct JiraGetAttachmentArgs {
+    /// Numeric Jira attachment ID from fields.attachment, not a media UUID or blob URL.
+    pub attachment_id: String,
+}

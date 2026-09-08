@@ -1,0 +1,1983 @@
+Community gates: bash scripts/ci/check-editions.sh (Community block)
+
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.75s
+    Checking mcp-server-devtools v0.15.0 (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.15s
+   Compiling mcp-server-devtools v0.15.0 (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.75s
+     Running unittests src/lib.rs (target/debug/deps/mcp_server_devtools-0c8cd465ad09ce99)
+
+running 273 tests
+test audit::export::tests::csv_quotes_only_what_needs_quoting ... ok
+test audit::forward::http::tests::hec_is_inferred_from_the_collector_path_and_needs_a_token ... ok
+test audit::checkpoint::tests::chain_is_order_sensitive_and_labels_round_trip ... ok
+test audit::forward::syslog::tests::adverse_records_are_warnings_and_headers_are_sanitised ... ok
+test audit::forward::syslog::tests::two_frames_concatenate_without_ambiguity ... ok
+test audit::forward::syslog::tests::url_parsing_accepts_only_syslog_tls_host_port ... ok
+test audit::export::tests::groups_file_inverts_to_subjects ... ok
+test audit::journal::tests::corruption_that_is_not_a_torn_tail_refuses_to_open ... ok
+test audit::forward::syslog::tests::loopback_hosts ... ok
+test audit::forward::syslog::tests::frames_an_rfc_5424_message_with_octet_counting ... ok
+test audit::journal::tests::appends_sequence_from_one_and_persist_every_field ... ok
+test audit::journal::tests::a_torn_trailing_record_is_truncated_so_the_next_append_is_readable ... ok
+test audit::journal::tests::create_dir_all_tracked_reports_only_what_it_made ... ok
+test audit::journal::tests::sequence_digits_render_without_allocating ... ok
+test audit::journal::tests::open_fails_when_the_journal_location_is_unusable ... ok
+test audit::journal::tests::a_second_writer_cannot_open_the_same_journal ... ok
+test audit::journal::tests::creating_a_nested_journal_directory_syncs_every_new_entry ... ok
+test audit::journal::tests::sequence_resumes_across_reopen_instead_of_restarting ... ok
+test audit::tests::audit_can_be_disabled_with_common_off_values ... ok
+test audit::tests::oversized_record_is_kept_whole ... ok
+test auth::credential_broker::tests::a_row_whose_account_is_unconfigured_does_not_resolve ... ok
+test auth::credential_broker::tests::an_empty_configured_value_is_not_a_credential ... ok
+test audit::tests::worker_drains_records_before_shutdown ... ok
+test auth::credential_broker::tests::a_slot_resolvable_only_through_the_keychain_is_named_not_called_unconfigured ... ok
+test audit::tests::writer_rotates_and_bounds_archive_count ... ok
+test auth::credential_broker::tests::ninjaone_login_inputs_are_never_named_as_the_acting_credential ... ok
+test auth::credential_broker::tests::label_names_the_configured_slot_and_principal ... ok
+test auth::credential_broker::tests::label_is_stable_across_secret_rotation ... ok
+test auth::credential_broker::tests::label_never_contains_the_secret_value ... ok
+test auth::credential_broker::tests::environment_classification_comes_from_config_and_defaults_closed ... ok
+test auth::credential_broker::tests::the_keychain_sentinel_and_a_plaintext_value_name_the_same_slot ... ok
+test auth::credential_broker::tests::static_broker_pins_identities_for_tests ... ok
+test auth::keychain::tests::delete_missing_returns_not_found ... ok
+test auth::keychain::tests::failing_backend_propagates_reason ... ok
+test auth::credential_broker::tests::observable_vendors_are_still_named_exactly ... ok
+test auth::credential_broker::tests::unobservable_resolution_is_labelled_indeterminate_not_guessed ... ok
+test auth::credential_broker::tests::unconfigured_vendor_still_gets_a_stable_label ... ok
+test auth::keychain::tests::in_memory_distinguishes_kinds ... ok
+test auth::keychain::tests::in_memory_distinguishes_vendors_for_same_principal ... ok
+test auth::keychain::tests::in_memory_roundtrip ... ok
+test auth::keychain::tests::os_keychain_breadcrumb_dedupes_per_triple ... ok
+test auth::keychain::tests::parse_accepts_kebab_and_envvar_forms ... ok
+test auth::keychain::tests::service_names_distinct_per_kind_and_vendor ... ok
+test auth::oidc::tests::group_normalisation_is_keycloaks_alone ... ok
+test auth::oidc::tests::claim_markers_parse_presence_and_value_forms_and_refuse_empty_ones ... ok
+test auth::oidc::tests::mixing_the_two_key_families_is_refused ... ok
+test auth::oidc::tests::okta_family_requires_issuer_and_audience_and_defaults_the_rest ... ok
+test auth::oidc::tests::scope_claims_accept_a_string_or_an_array_and_claims_resolve_by_name_or_path ... ok
+test auth::oidc::tests::oidc_family_reads_claim_markers_and_the_okta_family_ignores_them ... ok
+test auth::oidc::tests::oidc_family_requires_a_profile_and_each_profile_has_its_defaults ... ok
+test auth::revocation::tests::an_empty_list_revokes_nobody_and_an_undated_token_passes_without_a_cutoff ... ok
+test auth::revocation::tests::schema_errors_are_load_errors ... ok
+test auth::revocation::tests::matches_by_subject_token_id_and_cutoff_and_fails_closed_without_iat ... ok
+test bootstrap::secrets::tests::refresh_interval_is_clamped ... ok
+test auth::oidc::tests::settings_refuse_plain_http_and_absurd_skew ... ok
+test auth::revocation::tests::yaml_round_trip_is_deterministic ... ok
+test cli::creds::tests::app_password_rejected_for_non_bitbucket_vendors ... ok
+test cli::creds::tests::fingerprint_masks_short_secrets_completely ... ok
+test cli::creds::tests::get_handler_reports_missing_entry ... ok
+test cli::creds::tests::fingerprint_redacts_long_secrets_to_last_four ... ok
+test cli::creds::tests::get_handler_succeeds_when_entry_exists ... ok
+test cli::creds::tests::ninjaone_kinds_parse_and_scope_by_vendor ... ok
+test cli::creds::tests::ninjaone_login_secrets_are_rejected_for_other_vendors ... ok
+test cli::creds::tests::rm_handler_errors_on_missing ... ok
+test cli::creds::tests::rm_handler_removes_entry ... ok
+test config::auth_mode_tests::unknown_values_error_instead_of_silently_disabling_auth ... ok
+test config::streaming_config_tests::artifact_retention_and_sweep_settings_are_bounded ... ok
+test controllers::grafana::normalization_tests::maps_exact_timestamp_payload_labels_and_documented_source ... ok
+test controllers::grafana::normalization_tests::partition_count_is_narrowly_bounded ... ok
+test controllers::grafana::normalization_tests::source_is_explicitly_unknown_without_conventional_labels ... ok
+test controllers::grafana::normalization_tests::timestamp_parser_rejects_negative_fractional_ambiguous_and_overflowing_values ... ok
+test controllers::splunk::normalization_tests::maps_timestamp_source_payload_and_metadata ... ok
+test controllers::splunk::normalization_tests::partition_eligibility_rejects_transforming_and_embedded_time_searches ... ok
+test config::auth_mode_tests::absent_or_off_is_off_and_oidc_or_its_okta_alias_is_oidc ... ok
+test config::streaming_config_tests::partition_concurrency_defaults_and_stays_within_planner_ceiling ... ok
+test controllers::splunk::normalization_tests::rejects_width_invalid_time_and_nested_values ... ok
+test controllers::splunk::normalization_tests::timestamp_precision_is_conservative ... ok
+test format::join_tests::empty_elements_and_unicode_keep_their_separators ... ok
+test ingestion::tests::interval_overflow_and_nanosecond_bounds_are_explicit ... ok
+test ingestion::tests::intervals_are_contiguous_half_open ... ok
+test ingestion::tests::loki_parser_rejects_ambiguous_shapes_labels_and_tuples ... ok
+test ingestion::tests::loki_parser_streams_values_and_split_utf8_safely ... ok
+test audit::journal::tests::concurrent_appends_are_contiguous_and_ordered ... ok
+test ingestion::tests::cancelled_merge_commits_no_final_artifact ... ok
+test ingestion::tests::merge_orders_and_deduplicates_boundary_records ... ok
+test ingestion::tests::manifest_commit_failure_removes_partial_sidecar ... ok
+test ingestion::tests::preserves_intra_partition_duplicates_and_same_timestamp_distinct_records ... ok
+test ingestion::tests::reverse_merge_and_global_limit_are_bounded ... ok
+test ingestion::tests::injected_manifest_failures_leave_no_sidecar_or_partial ... ok
+test ingestion::tests::splunk_parser_handles_tokens_and_multibyte_utf8_across_reader_buffers ... ok
+test logger::tests::days_to_ymd_known_date ... ok
+test logger::tests::days_to_ymd_unix_epoch ... ok
+test logger::tests::debug_one_enables_debug_everywhere ... ok
+test logger::tests::debug_other_values_do_not_enable_debug ... ok
+test logger::tests::debug_true_enables_debug_everywhere ... ok
+test logger::tests::empty_rust_log_falls_through_to_debug_when_debug_true ... ok
+test audit::forward::http::tests::plaintext_http_is_loopback_only_and_user_info_is_refused ... ok
+test audit::forward::http::tests::hec_body_wraps_each_record_with_time_host_and_sourcetype ... ok
+test audit::forward::http::tests::json_body_is_an_array_of_the_records ... ok
+test ingestion::tests::validates_empty_parts_and_rejects_missing_changed_or_malformed_parts ... ok
+test ingestion::tests::reserved_manifest_transitions_roll_back_or_retain_only_live_files ... ok
+test audit::forward::syslog::tests::client_certificate_halves_must_come_together ... ok
+test logger::tests::leaves_clean_text_unchanged ... ok
+test logger::tests::retention_deletes_files_older_than_max_age ... ok
+test logger::tests::retention_enforces_size_cap_oldest_first ... ok
+test logger::tests::retention_skips_unrelated_files ... ok
+test logger::tests::rust_log_per_target_directive_is_honoured ... ok
+test logger::tests::rust_log_takes_precedence_over_debug ... ok
+test logger::tests::stderr_disabled_by_recognised_off_values ... ok
+test logger::tests::stderr_enabled_by_default_when_unset ... ok
+test logger::tests::stderr_off_switch_is_case_insensitive_and_trimmed ... ok
+test logger::tests::stderr_stays_enabled_for_on_values_and_junk ... ok
+test logger::tests::unset_uses_default ... ok
+test metrics::tests::counters_and_histogram_render_in_exposition_format_without_the_subject ... ok
+test metrics::tests::gauges_render_only_when_supplied ... ok
+test metrics::tests::label_values_are_escaped ... ok
+test policy::canonical::tests::absolute_urls_are_refused_and_doubled_leading_slashes_collapse ... ok
+test policy::canonical::tests::bytes_outside_pchar_are_percent_encoded ... ok
+test policy::canonical::tests::canonicalization_is_idempotent ... ok
+test policy::canonical::tests::dot_segments_are_removed_including_encoded_ones ... ok
+test policy::canonical::tests::duplicate_slashes_collapse_and_a_trailing_slash_is_kept_once ... ok
+test policy::canonical::tests::invalid_input_is_refused_not_guessed ... ok
+test policy::canonical::tests::plain_paths_pass_through_with_a_leading_slash ... ok
+test policy::canonical::tests::plain_segments_build_the_same_form_parse_would ... ok
+test policy::canonical::tests::query_is_decoded_sorted_stably_and_fragment_dropped ... ok
+test policy::canonical::tests::reserved_escapes_are_kept_and_uppercased_unreserved_ones_decoded ... ok
+test policy::engine::tests::documents_with_typos_or_permissive_defaults_do_not_compile ... ok
+test policy::engine::tests::glob_matches_star_only ... ok
+test policy::extractors::slack_tests::a_repeated_channel_key_is_never_classified ... ok
+test policy::extractors::slack_tests::channel_reads_are_scoped_to_the_channel_id_and_invalid_ids_are_unclassified ... ok
+test policy::extractors::slack_tests::list_is_the_collection_and_search_is_unscoped ... ok
+test policy::extractors::slack_tests::passthrough_and_purpose_built_classify_alike ... ok
+test policy::extractors::tests::bare_tokens_in_fields_are_digested_not_passed_through ... ok
+test policy::extractors::tests::caller_supplied_attribute_values_must_parse_or_become_a_digest ... ok
+test logger::tests::redacting_writer_masks_inline_token ... ok
+test policy::extractors::tests::for_vendor_classifies_only_inventoried_vendors ... ok
+test policy::extractors::tests::for_tool_maps_typed_and_passthrough_arguments_and_denies_the_rest ... ok
+test policy::extractors::tests::get_search_reads_jql_from_query_params ... ok
+test policy::extractors::tests::grafana_accepts_the_uid_alphabet_grafana_actually_generates ... ok
+test policy::extractors::tests::grafana_list_datasources_is_a_collection_read_not_an_unscoped_one ... ok
+test policy::extractors::tests::grafana_egress_extractor_agrees_with_the_typed_tool ... ok
+test logger::tests::redacts_authorization_basic_header ... ok
+test auth::oidc::tests::a_validation_against_replaced_keys_is_not_cached ... ok
+test policy::extractors::tests::grafana_query_logs_is_a_datasource_read_with_allowlisted_sorted_attributes ... ok
+test policy::extractors::tests::grafana_rejects_uids_that_could_escape_the_proxy_path_segment ... ok
+test policy::extractors::tests::jira_never_claims_an_escaped_segment_as_an_id ... ok
+test policy::extractors::tests::issue_and_project_reads_extract_their_resource_ids ... ok
+test policy::extractors::tests::malformed_quoting_yields_no_claim_rather_than_a_guess ... ok
+test policy::extractors::tests::negation_and_grouping_of_every_shape_yield_no_claim ... ok
+test policy::extractors::tests::positive_conjunctions_still_produce_claims_in_any_case_and_spacing ... ok
+test policy::extractors::tests::over_long_queries_are_bounded_rather_than_scanned ... ok
+test policy::extractors::tests::post_issue_creation_stays_write_and_unknown_never_a_read ... ok
+test policy::extractors::tests::numeric_values_including_mfa_shaped_codes_are_always_digested ... ok
+test policy::extractors::tests::post_search_ignores_a_body_project_field_and_trusts_only_the_jql ... ok
+test policy::extractors::tests::post_search_is_downgraded_to_a_read_scoped_by_the_jql_project ... ok
+test policy::extractors::tests::post_search_keeps_every_project_of_an_in_list_as_a_structured_constraint ... ok
+test policy::extractors::tests::post_search_makes_no_project_claim_it_cannot_prove ... ok
+test policy::extractors::tests::quoted_project_keys_survive_with_quotes_stripped ... ok
+test policy::extractors::tests::over_long_attribute_values_are_digested_not_truncated ... ok
+test policy::extractors::tests::unmapped_paths_are_passthrough_unknown_with_method_derived_risk ... ok
+test policy::scope::tests::local_principal_and_no_scope_are_the_same_owner ... ok
+test policy::extractors::tests::search_expressions_never_reach_query_attributes_as_text ... ok
+test policy::extractors::tests::well_formed_attribute_values_survive_only_when_enumerated ... ok
+test policy::scope::tests::owner_hashing_cannot_collide_across_kinds_or_boundaries ... ok
+test policy::scope::tests::scope_is_visible_inside_enter_and_absent_outside ... ok
+test logger::tests::redacts_authorization_bearer_header ... ok
+test logger::tests::redacts_atlassian_api_token ... ok
+test policy::tests::a_credential_slot_can_only_come_from_the_registry ... ok
+test policy::tests::action_context_serialized_shape_is_the_section_3_2_field_list ... ok
+test policy::tests::constrained_by_is_a_separate_typed_dimension ... ok
+test policy::tests::context_vendor_and_environment_cannot_contradict_the_upstream_identity ... ok
+test policy::tests::client_reported_values_are_always_digested ... ok
+test policy::tests::credential_label_debug_is_redacted_while_audit_keeps_the_text ... ok
+test policy::tests::correlation_ids_are_digested_but_still_correlate ... ok
+test policy::tests::environment_parse_rejects_unknown_values_instead_of_guessing ... ok
+test policy::tests::local_mode_decision_is_an_explicit_allow_with_a_reason ... ok
+test policy::tests::label_segments_cannot_smuggle_separators_or_control_characters ... ok
+test policy::tests::multi_resource_scope_authorizes_all_of_never_any_of ... ok
+test policy::tests::read_downgrade_always_produces_the_marked_endpoints_classification ... ok
+test policy::tests::read_downgrades_are_limited_to_approved_endpoints ... ok
+test policy::tests::request_risk_derivation_is_conservative_for_post ... ok
+test policy::tests::unscoped_and_collection_are_distinct_and_neither_matches_an_id_rule ... ok
+test ports::audit_forwarder::tests::error_detail_is_bounded ... ok
+test ports::audit_forwarder::tests::refuse_next_fails_that_many_batches_then_acknowledges ... ok
+test ports::audit_sink::tests::appends_are_sequenced_from_one ... ok
+test ports::audit_sink::tests::failing_mode_returns_an_error_and_records_nothing ... ok
+test ports::rollup_store::tests::bucket_labels ... ok
+test ports::rollup_store::tests::window_bounds_are_inclusive_since_exclusive_until ... ok
+test ports::secret_source::tests::error_text_names_the_locator_and_a_category_only ... ok
+test ports::secret_source::tests::fetched_secret_debug_is_redacted ... ok
+test ports::token_validator::tests::rejections_display_only_a_category ... ok
+test ports::token_validator::tests::static_validator_maps_known_tokens_and_rejects_the_rest ... ok
+test ports::usage_sink::tests::closed_consumer_counts_drops_instead_of_erroring ... ok
+test ports::usage_sink::tests::noop_sink_records_and_drops_nothing ... ok
+test secrets::file::tests::absolute_path_is_taken_verbatim ... ok
+test ports::usage_sink::tests::overflow_drops_events_and_counts_them_without_blocking ... ok
+test secrets::file::tests::host_form_is_refused ... ok
+test secrets::reference::tests::cloud_schemes_parse_even_when_no_adapter_is_compiled ... ok
+test secrets::file::tests::version_is_a_short_hash_prefix_that_tracks_content ... ok
+test secrets::reference::tests::file_reference_with_and_without_fragment ... ok
+test secrets::reference::tests::fragment_splits_at_the_first_hash ... ok
+test secrets::reference::tests::keychain_alias_spellings ... ok
+test secrets::reference::tests::literals_are_not_references ... ok
+test secrets::reference::tests::malformed_references_are_errors_not_literals ... ok
+test secrets::resolver::tests::no_references_is_an_empty_snapshot_with_no_fetch ... ok
+test secrets::resolver::tests::one_fetch_serves_every_key_of_a_document ... ok
+test secrets::resolver::tests::every_failure_names_the_reference_and_never_the_document ... ok
+test secrets::snapshot::tests::debug_shows_versions_never_values ... ok
+test secrets::resolver::tests::whole_document_loses_one_trailing_newline_only ... ok
+test secrets::snapshot::tests::merge_keeps_what_the_newer_snapshot_does_not_know ... ok
+test logger::tests::redacts_url_embedded_basic_auth_keeping_scheme ... ok
+test secrets::vault::tests::plain_http_is_loopback_only ... ok
+test secrets::vault::tests::auth_method_is_explicit_and_each_method_names_its_missing_credential ... ok
+test secrets::vault::tests::session_lease_arithmetic ... ok
+test secrets::vault::tests::target_splits_at_the_first_slash ... ok
+test server::auth::tests::admin_principals_parse_default_and_refuse_any_with_required_approvals ... ok
+test server::auth::tests::bearer_scheme_is_case_insensitive_and_empty_tokens_are_absent ... ok
+test secrets::vault::tests::provider_credentials_may_be_files_but_not_other_references ... ok
+test server::http::startup_security_tests::bind_addr_accepts_ip_and_ip_port_forms ... ok
+test server::http::startup_security_tests::bind_addr_defaults_to_loopback_with_the_port_env_port ... ok
+test server::auth::tests::settings_require_a_public_https_url_and_default_the_scope ... ok
+test server::http::startup_security_tests::loopback_with_auth_off_is_todays_behaviour ... ok
+test server::http::startup_security_tests::non_loopback_bind_without_auth_is_refused_with_a_clear_reason ... ok
+test server::http::startup_security_tests::okta_mode_accepts_any_bind_at_this_gate ... ok
+test server::http::startup_security_tests::role_parses_the_three_names_and_refuses_everything_else ... ok
+test logger::tests::redacts_jwt ... ok
+test server::http::tests::loopback_origins_allowed ... ok
+test server::http::tests::non_loopback_origins_rejected ... ok
+test server::rate_limit::tests::burst_then_refill_per_subject ... ok
+test server::rate_limit::tests::settings_parse_and_default_the_burst ... ok
+test server::rate_limit::tests::slow_rates_report_a_longer_retry_after ... ok
+test policy::signing::tests::keys_and_signatures_round_trip_through_base64_and_pkcs8 ... ok
+test policy::signing::tests::detached_signature_lives_next_to_the_file ... ok
+test policy::signing::tests::key_files_are_created_owner_only_and_load_permissions_are_bounded ... ok
+test policy::signing::tests::sign_and_verify_round_trip_and_domains_are_separated ... ok
+test transport::aggregate_quota_tests::checked_aggregate_counters_reject_limits_and_overflow ... ok
+test audit::checkpoint::tests::a_signed_checkpoint_verifies_only_as_written ... ok
+test server::http::tests::full_and_range_downloads_hold_generation_pins_through_expiration ... ok
+test transport::aggregate_quota_tests::cancellation_rolls_back_only_the_waiting_transaction ... ok
+test transport::aggregate_quota_tests::checked_disk_reservation_rejects_quota_underflow_and_overflow ... ok
+test transport::http_observability_tests::transfer_rate_uses_checked_saturating_arithmetic ... ok
+test transport::http_observability_tests::logged_urls_remove_credentials_queries_and_fragments ... ok
+test transport::aggregate_quota_tests::circleci_waits_behind_ingestion_in_fifo_order ... ok
+test transport::aggregate_quota_tests::independent_splunk_and_loki_transactions_share_one_ceiling ... ok
+test transport::raw_response::artifact_writer_fault_tests::abandoned_scavenging_keeps_live_process_sessions ... ok
+test transport::raw_response::artifact_writer_fault_tests::acquired_write_reservation_rolls_back_only_after_partial_cleanup ... ok
+test transport::raw_response::artifact_writer_fault_tests::concurrent_writers_never_exceed_quota_and_roll_back_failures ... ok
+test transport::raw_response::artifact_writer_fault_tests::committed_reservation_is_released_once_after_cleanup ... ok
+test transport::raw_response::artifact_writer_fault_tests::deletion_failure_retains_registry_files_and_reservations_for_retry ... ok
+test transport::raw_response::artifact_writer_fault_tests::commit_failure_releases_full_reservation ... ok
+test transport::raw_response::artifact_writer_fault_tests::expired_pin_blocks_new_reads_and_defers_deletion_until_release ... ok
+test transport::raw_response::artifact_writer_fault_tests::expiration_is_oldest_first_with_artifact_id_as_tie_breaker ... ok
+test transport::raw_response::artifact_writer_fault_tests::injected_commit_failure_leaves_no_partial_or_registry_entry ... ok
+test transport::raw_response::artifact_writer_fault_tests::failed_file_open_releases_its_exact_read_pin ... ok
+test transport::raw_response::artifact_writer_fault_tests::injected_write_failure_leaves_no_partial_or_registry_entry ... ok
+test transport::raw_response::artifact_writer_fault_tests::fifo_waiter_wakes_only_after_pinned_reclamation_physically_succeeds ... ok
+test transport::raw_response::artifact_writer_fault_tests::live_transaction_artifacts_are_not_retention_eligible_before_manifest_transition ... ok
+test transport::raw_response::artifact_writer_fault_tests::missing_file_reconciliation_removes_sidecars_registry_and_reservations ... ok
+test vendor::ninjaone::http_logging_tests::debug_payloads_redact_login_secrets_recursively ... ok
+test vendor::ninjaone::http_logging_tests::non_json_response_content_is_not_logged ... ok
+test vendor::wrds::tests::clamp_row_limit_applies_default_and_bounds ... ok
+test vendor::wrds::tests::wrap_query_strips_trailing_semicolon_and_caps_rows ... ok
+test transport::aggregate_quota_tests::deadline_quota_exhaustion_and_owner_isolation_are_explicit ... ok
+test transport::raw_response::artifact_writer_fault_tests::successful_splunk_expires_while_unexpired_loki_remains_reserved ... ok
+test server::rate_limit::tests::a_map_full_of_active_principals_refuses_new_ones_and_never_exceeds_the_cap ... ok
+test tools::vendor_mapping_tests::every_registered_tool_maps_to_a_vendor_except_artifact_read ... ok
+test server::rate_limit::tests::idle_buckets_are_evicted_past_the_cap ... ok
+test ingestion::tests::oversized_record_fails_without_committing ... ok
+test transport::raw_response::artifact_writer_fault_tests::pinned_pending_entries_do_not_starve_later_expired_artifacts ... ok
+test tools::config_snapshot_tests::config_snapshots_share_one_allocation ... ok
+test transport::raw_response::artifact_writer_fault_tests::each_retention_pass_has_a_strict_reclamation_bound ... ok
+test bootstrap::watcher::tests::watcher_holds_only_a_weak_reference ... ok
+test bootstrap::watcher::tests::reloads_changed_global_config_and_keeps_last_good_json ... ok
+
+test result: ok. 273 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.12s
+
+     Running unittests src/main.rs (target/debug/deps/mcp_devtools-ee4b567b2a4de11a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/admin_api_tests.rs (target/debug/deps/admin_api_tests-d878c1076987c372)
+
+running 16 tests
+test durable_journal_activity_adapter_reads_control_evidence ... ok
+test every_admin_command_accepts_json ... ok
+test session_inventory_lists_and_closes_real_rmcp_sessions ... ok
+test deny_list_reads_release_the_lock_and_admin_budget ... ok
+test admin_limiter_is_independent_of_mcp ... ok
+test signed_deny_list_replace_is_audited_persistent_and_enforced ... ok
+test artifact_purge_uses_real_pin_aware_backend_and_fails_closed ... ok
+test auth_role_and_json_contracts ... ok
+test reports_sqlite_and_inventory_are_live ... ok
+test signed_policy_install_is_audited_persistent_and_in_force ... ok
+test activity_projection_spans_row_count_batches ... ok
+test policy_explain_cli_sends_the_same_inputs ... ok
+test reload_is_fail_closed_and_candidate_shapes_are_locked ... ok
+test admin_cli_uses_the_audited_http_boundary_and_json_errors ... ok
+test policy_explain_is_the_gateway_decision_for_both_clients ... ok
+test activity_projection_spans_payload_byte_batches ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.31s
+
+     Running tests/admin_client_tests.rs (target/debug/deps/admin_client_tests-df1a36cbc1a98077)
+
+running 9 tests
+test http_adapter_reports_transport_failures_as_typed_errors ... ok
+test deferred_admission_answers_202_and_appends_no_intent ... ok
+test deny_list_replacement_is_admitted_on_the_verified_candidate ... ok
+test refused_admission_answers_409_with_the_cause_and_appends_nothing ... ok
+test direct_gate_is_the_default_and_every_mutation_still_journals_its_intent ... ok
+test policy_install_is_admitted_on_the_verified_candidate ... ok
+test http_adapter_refuses_urls_a_bearer_must_not_travel_to ... ok
+test both_adapters_pass_the_conformance_suite_and_agree ... ok
+test approvals_setting_selects_direct_or_refuses_startup_by_name ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running tests/admin_principal_kind_tests.rs (target/debug/deps/admin_principal_kind_tests-a8e472a92c0c8766)
+
+running 3 tests
+test refused_machine_never_appears_as_an_observed_administrator ... ok
+test default_policy_refuses_machines_at_admin_and_nowhere_else ... ok
+test human_only_policy_refuses_unknown_and_any_admits_machines ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+     Running tests/audit_checkpoint_tests.rs (target/debug/deps/audit_checkpoint_tests-2695746fd15ab931)
+
+running 6 tests
+test the_chain_runs_unbroken_across_a_reopen ... ok
+test a_failed_export_is_reported_as_missing_and_duplicates_are_reported ... ok
+test checkpoints_land_every_n_records_signed_and_exported_and_the_close_seals_the_tail ... ok
+test the_verifier_catches_edits_forgeries_wrong_keys_and_a_truncated_tail ... ok
+test audit_keygen_and_verify_at_the_binary_boundary ... ok
+test a_checkpoint_is_written_after_the_time_bound_with_unsealed_records ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.52s
+
+     Running tests/audit_forwarding_tests.rs (target/debug/deps/audit_forwarding_tests-f41c0917bb0fba28)
+
+running 20 tests
+test in_memory_forwarder_conforms ... ok
+test a_cursor_for_another_journal_is_discarded_and_forwarding_restarts ... ok
+test receiver_outage_retains_the_journal_and_the_shipper_catches_up ... ok
+test a_torn_tail_is_left_for_the_next_round_and_a_gap_is_never_skipped ... ok
+test shipper_resumes_from_the_cursor_after_a_restart_without_duplicates_or_holes ... ok
+test shipper_forwards_every_record_in_order_and_persists_the_cursor ... ok
+test hec_rejection_reports_the_collector_text_and_never_the_token ... ok
+test splunk_hec_forwarder_conforms ... ok
+test a_bad_forwarding_url_refuses_startup_at_the_binary_boundary ... ok
+test generic_json_forwarder_conforms ... ok
+test syslog_forwarder_refuses_an_untrusted_receiver_certificate ... ok
+test syslog_receiver_that_requires_a_client_certificate_refuses_without_one ... ok
+test an_unreachable_receiver_does_not_stop_startup ... ok
+test forwarding_with_no_journal_or_an_unknown_scheme_refuses_to_start ... ok
+test syslog_mutual_tls_forwarder_conforms ... ok
+test syslog_tls_forwarder_conforms ... ok
+test a_rotated_forwarding_token_reaches_the_collector_without_a_restart ... ok
+test a_tool_calls_intent_and_outcome_reach_a_splunk_collector_from_the_real_journal ... ok
+test the_append_path_keeps_acknowledging_while_the_receiver_is_down ... ok
+test the_control_role_forwards_and_the_gateway_role_does_not ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.66s
+
+     Running tests/audit_journal_tests.rs (target/debug/deps/audit_journal_tests-0c37545225d9f4f4)
+
+running 5 tests
+test failed_journal_write_refuses_the_call_and_never_contacts_the_vendor ... ok
+test intent_with_upstream_identity_is_journaled_before_dispatch_and_outcome_after ... ok
+test journal_configured_via_config_is_written_through_and_fails_startup_when_unusable ... ok
+test a_stalled_outcome_append_is_not_cancelled_by_the_bound ... ok
+test pending_outcome_appends_are_tracked_for_shutdown_to_drain ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+     Running tests/audit_report_tests.rs (target/debug/deps/audit_report_tests-a6fca9671d37d59b)
+
+running 6 tests
+test time_bounds_keep_sub_millisecond_precision ... ok
+test csv_cells_cannot_become_spreadsheet_formulas ... ok
+test access_review_lists_every_rule_that_applies_to_every_member ... ok
+test metrics_report_the_section_7_figures ... ok
+test activity_export_flattens_every_record_and_filters ... ok
+test reports_are_produced_by_the_cli_and_timed ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/auth_mode_tests.rs (target/debug/deps/auth_mode_tests-edca585cf702c2f8)
+
+running 11 tests
+test unrecognised_auth_mode_is_refused_not_defaulted_to_off ... ok
+test stdio_refuses_okta_mode ... ok
+test http_refuses_non_loopback_bind_with_auth_off ... ok
+test http_refuses_okta_mode_without_a_policy_public_key ... ok
+test local_mode_initialize_response_matches_the_pre_enterprise_golden ... ok
+test http_refuses_okta_mode_without_an_audit_signing_key ... ok
+test stdio_is_byte_identical_with_auth_mode_off_and_unset ... ok
+test http_refuses_okta_mode_without_a_revocation_list ... ok
+test http_refuses_okta_mode_without_its_configuration ... ok
+test http_starts_in_okta_mode_when_fully_configured ... ok
+test loopback_http_is_byte_identical_with_auth_mode_off_and_unset ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+
+     Running tests/auth_tests.rs (target/debug/deps/auth_tests-2de7298f5de96e00)
+
+running 31 tests
+test auth_header_bearer_emits_bearer_scheme ... ok
+test basic_auth_header_bitbucket ... ok
+test basic_auth_header_atlassian ... ok
+test keychain_sentinel_miss_is_hard_error ... ok
+test implicit_failure_breadcrumb_dedupes_per_triple ... ok
+test keychain_implicit_miss_on_both_kinds_returns_none ... ok
+test keychain_backend_error_on_sentinel_is_hard_error ... ok
+test a_plaintext_ninjaone_password_still_wins ... ok
+test keychain_sentinel_hit_expands_to_real_token ... ok
+test app_password_path_only_resolves_for_bitbucket_vendor ... ok
+test keychain_backend_error_on_implicit_falls_through ... ok
+test empty_plaintext_secret_falls_through ... ok
+test falls_back_to_bitbucket_app_password ... ok
+test keychain_implicit_miss_falls_through_to_next_kind ... ok
+test keychain_implicit_fallback_hit_expands_when_secret_absent ... ok
+test keychain_sentinel_per_vendor_isolation ... ok
+test keychain_sentinel_with_missing_principal_is_hard_error ... ok
+test keychain_sentinel_works_for_app_password_kind ... ok
+test ninjaone_password_does_not_read_another_vendors_slot ... ok
+test ninjaone_password_falls_back_to_the_keychain_implicitly ... ok
+test ninjaone_password_resolves_from_the_keychain_sentinel ... ok
+test plaintext_secret_takes_priority_over_keychain_lookup ... ok
+test ninjaone_password_sentinel_without_an_entry_is_a_hard_error ... ok
+test prefers_atlassian_api_token_when_both_present ... ok
+test principal_returns_public_identifier ... ok
+test rejects_empty_strings ... ok
+test require_propagates_keychain_specific_errors ... ok
+test resolves_none_when_neither_set_is_complete ... ok
+test the_totp_seed_uses_its_own_keychain_slot ... ok
+test require_for_errors_when_missing ... ok
+test require_for_async_runs_off_the_runtime ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/binary_tests.rs (target/debug/deps/binary_tests-2130911095ef0b2f)
+
+running 14 tests
+test cli_help_lists_every_subcommand ... ok
+test creds_set_rejects_unknown_kind ... ok
+test version_reported_to_users_is_the_crate_version ... ok
+test creds_help_lists_every_subcommand ... ok
+test cli_subcommands_refuse_to_run_unaudited_while_a_journal_is_configured ... ok
+test http_refuses_to_start_when_the_configured_audit_journal_cannot_open ... ok
+test stdio_transport_answers_initialize ... ok
+test sigterm_triggers_graceful_exit ... ok
+test log_stderr_unrecognised_value_keeps_console_logging ... ok
+test stderr_logging_is_enabled_by_default ... ok
+test http_transport_binds_and_serves_health ... ok
+test stdio_transport_answers_modern_discover_without_initialize ... ok
+test cli_subcommands_still_run_when_no_journal_is_configured ... ok
+test log_stderr_off_silences_console ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+
+     Running tests/bitbucket_error_tests.rs (target/debug/deps/bitbucket_error_tests-536d7a0452e56fe6)
+
+running 14 tests
+test classic_access_denied ... ok
+test classic_not_found ... ok
+test classic_validation_error ... ok
+test classic_rate_limit_error ... ok
+test classify_401_produces_auth_invalid ... ok
+test errors_array_validation ... ok
+test classify_429_produces_api_error_with_429 ... ok
+test network_error_common_messages ... ok
+test network_error_failed_to_fetch ... ok
+test parse_body_composes_message_and_detail ... ok
+test parse_body_handles_flat_message ... ok
+test parse_body_handles_non_json ... ok
+test type_error_forbidden ... ok
+test type_error_not_found ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/canonicalization_tests.rs (target/debug/deps/canonicalization_tests-03a1e70aa5afefeb)
+
+running 3 tests
+test query_pairs_are_decoded_sorted_and_reencoded_for_the_wire ... ok
+test regression_table ... ok
+test seeded_corpus_satisfies_every_invariant ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/circleci_controller_tests.rs (target/debug/deps/circleci_controller_tests-aeee48603469bab7)
+
+running 8 tests
+test logs_rejects_non_vcs_project_slug ... ok
+test logs_build_details_request_is_subject_to_egress_policy ... ok
+test api_404_surfaces_circleci_error_envelope ... ok
+test post_forwards_body_and_returns_created_pipeline ... ok
+test get_sends_bearer_token_and_filters_response ... ok
+test missing_token_surfaces_auth_missing_at_call_time ... ok
+test logs_fetches_build_details_and_flattens_action_output ... ok
+test logs_failed_only_skips_successful_outputs_and_condenses_errors ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/circleci_vendor_tests.rs (target/debug/deps/circleci_vendor_tests-1e05dde1aadb3181)
+
+running 18 tests
+test normalize_path_passes_through_with_leading_slash ... ok
+test name_is_canonical_circleci ... ok
+test normalize_path_does_not_prepend_api_version ... ok
+test normalize_path_prepends_missing_leading_slash ... ok
+test parse_non_json_body_is_passed_through_as_string ... ok
+test classify_empty_body_falls_back_to_status_reason ... ok
+test base_url_override_is_returned_verbatim ... ok
+test base_url_defaults_to_circleci_api_v2 ... ok
+test parse_accepts_error_key_as_alternative_to_message ... ok
+test classify_500_is_server_error ... ok
+test classify_404_is_api_error_with_message ... ok
+test classify_401_is_auth_invalid ... ok
+test parse_prefers_message_over_error ... ok
+test classify_429_is_rate_limit ... ok
+test classify_403_is_auth_invalid_with_status ... ok
+test token_reads_from_circleci_config_section ... ok
+test token_blank_is_treated_as_missing ... ok
+test token_missing_is_auth_missing_error ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/cli_tests.rs (target/debug/deps/cli_tests-8aa95a4115bde649)
+
+running 26 tests
+test bb_get_with_required_path_parses ... ok
+test conf_get_with_required_path_parses ... ok
+test jira_search_jql_accepts_query_params ... ok
+test jira_get_with_required_path_parses ... ok
+test bb_get_accepts_short_flags_and_jq ... ok
+test conf_post_requires_path_and_body ... ok
+test conf_does_not_expose_clone_subcommand ... ok
+test jira_post_requires_path_and_body ... ok
+test bb_get_without_path_is_rejected ... ok
+test conf_search_accepts_cql_query_param ... ok
+test bb_clone_lives_under_bb_group_only ... ok
+test bb_post_requires_path_and_body ... ok
+test legacy_clone_at_top_level_still_parses ... ok
+test parse_query_params_none_stays_none ... ok
+test parse_object_accepts_json_objects ... ok
+test parse_query_params_extracts_string_values ... ok
+test parse_query_params_coerces_numbers_and_bools ... ok
+test legacy_get_at_top_level_still_parses ... ok
+test legacy_post_at_top_level_still_parses ... ok
+test parse_query_params_rejects_nested_objects ... ok
+test parse_object_rejects_malformed_json ... ok
+test output_format_rejects_unknown_value ... ok
+test parse_object_rejects_arrays_and_primitives ... ok
+test legacy_top_level_verbs_are_hidden_from_help ... ok
+test output_format_toon_is_the_default ... ok
+test output_format_json_accepted_on_bb_and_jira_verbs ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/clone_tests.rs (target/debug/deps/clone_tests-a645bd011e794b41)
+
+running 5 tests
+test invalid_slug_is_rejected_before_network ... ok
+test git_failure_surfaces_ssh_troubleshooting ... ok
+test existing_subdir_returns_info_not_error ... ok
+test successful_clone_prefers_ssh_and_invokes_git ... ok
+test falls_back_to_https_when_no_ssh_link ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/config_tests.rs (target/debug/deps/config_tests-8f428f50919690c0)
+
+running 38 tests
+test candidate_keys_for_unscoped_package ... ok
+test candidate_keys_match_ts_priority ... ok
+test extract_via_scoped_name ... ok
+test extract_via_pre_rename_package_name ... ok
+test confluence_short_and_product_aliases_merge_with_priority ... ok
+test extract_all_vendor_sections_canonicalises_aliases ... ok
+test confluence_aliases_resolve_to_confluence_section ... ok
+test extract_via_product_key ... ok
+test extract_via_short_key ... ok
+test extract_via_unscoped_name ... ok
+test coerces_non_string_environment_values ... ok
+test get_for_with_fallback_does_not_leak_unrelated_vendor_sections ... ok
+test conflicting_vendor_sections_force_get_for ... ok
+test falls_back_to_global_when_nothing_overrides ... ok
+test agreeing_vendor_sections_are_unambiguous_for_get ... ok
+test get_for_with_fallback_prefers_primary_when_both_define_the_key ... ok
+test get_for_with_fallback_reads_primary_then_fallback_section ... ok
+test get_collapses_ambiguous_to_none_for_back_compat ... ok
+test get_for_with_fallback_works_in_reverse_direction_too ... ok
+test missing_sources_do_not_error ... ok
+test missing_environments_returns_empty ... ok
+test priority_short_over_product_over_scoped_over_unscoped ... ok
+test get_for_with_fallback_shared_overlay_still_wins ... ok
+test get_for_falls_back_to_shared_but_not_to_other_vendors ... ok
+test dotenv_wins_over_global_when_process_env_absent ... ok
+test resolve_returns_missing_when_key_absent ... ok
+test process_env_overrides_vendor_section_conflicts ... ok
+test resolve_returns_resolved_from_shared ... ok
+test process_env_wins_over_dotenv_and_global ... ok
+test resolve_returns_ambiguous_when_vendor_sections_disagree ... ok
+test resolve_returns_resolved_when_single_vendor_section_defines_key ... ok
+test ts_bitbucket_package_aliases_resolve_to_bitbucket_section ... ok
+test resolve_returns_resolved_when_vendor_sections_agree ... ok
+test typed_getters_behave_like_ts ... ok
+test ts_jira_package_aliases_resolve_to_jira_section ... ok
+test single_bitbucket_section_visible_via_get ... ok
+test resolve_shared_wins_over_vendor_disagreement ... ok
+test vendor_specific_keys_stay_isolated ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/confluence_controller_tests.rs (target/debug/deps/confluence_controller_tests-f225940ff6ae7a40)
+
+running 7 tests
+test missing_site_name_surfaces_at_tool_call_time_not_at_construction ... ok
+test confluence_envelope_404_surfaces_title_and_detail ... ok
+test delete_204_returns_empty_body ... ok
+test confluence_403_is_api_error_not_auth_invalid ... ok
+test post_create_page_forwards_body_and_returns_id ... ok
+test cql_search_query_params_are_appended ... ok
+test get_pipeline_passes_confluence_path_through_unchanged ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/confluence_vendor_tests.rs (target/debug/deps/confluence_vendor_tests-affbb18949342439)
+
+running 31 tests
+test classify_5xx_uses_service_error_prefix ... ok
+test base_url_missing_site_returns_auth_missing ... ok
+test name_is_canonical_confluence ... ok
+test normalize_path_adds_leading_slash_only ... ok
+test normalize_path_does_not_prepend_v2_like_bitbucket ... ok
+test parse_empty_body_yields_default ... ok
+test base_url_from_site_name_env ... ok
+test base_url_empty_site_name_is_treated_as_missing ... ok
+test classify_other_status_uses_request_failed_prefix ... ok
+test classify_429_uses_rate_limit_prefix ... ok
+test classify_401_maps_to_auth_invalid_with_ts_prefix ... ok
+test classify_403_stays_api_error_unlike_jira ... ok
+test classify_404_uses_resource_not_found_prefix ... ok
+test base_url_trims_whitespace_around_site_name ... ok
+test parse_flat_message_only ... ok
+test parse_graphql_errors_array_joins_first_three ... ok
+test parse_graphql_errors_falls_back_to_title_when_no_message ... ok
+test parse_graphql_errors_under_three_no_overflow_suffix ... ok
+test parse_jira_style_error_messages_array_join ... ok
+test parse_message_wins_over_status_code_branch ... ok
+test parse_message_with_reason_appends_reason ... ok
+test base_url_does_not_fall_back_to_bitbucket_section ... ok
+test parse_non_json_body_passes_through_as_string ... ok
+test base_url_falls_back_to_jira_section_when_confluence_section_absent ... ok
+test parse_status_code_with_message_only_when_no_title_or_reason ... ok
+test parse_unrecognised_json_keeps_payload_as_original_with_no_message ... ok
+test parse_v2_problem_details_combines_title_and_detail ... ok
+test parse_v2_skips_duplicate_detail_when_already_in_title ... ok
+test parse_v2_title_only_when_no_detail ... ok
+test with_base_url_resolves_without_any_config ... ok
+test with_base_url_skips_env_lookup_entirely ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/controller_tests.rs (target/debug/deps/controller_tests-344559e15dcdfd29)
+
+running 7 tests
+test normalize_path_adds_leading_slash_and_v2_prefix ... ok
+test missing_credentials_produces_auth_missing_error ... ok
+test delete_returns_empty_body_content ... ok
+test get_pipeline_normalizes_path_and_appends_query ... ok
+test post_body_is_forwarded ... ok
+test text_plain_body_passes_through_unchanged ... ok
+test jq_filter_is_applied_to_response ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/creds_handler_tests.rs (target/debug/deps/creds_handler_tests-62a948f515b949bc)
+
+running 32 tests
+test migrate_app_password_in_jira_section_is_ignored ... ok
+test migrate_alias_conflict_two_plaintext_values_is_hard_error ... ok
+test migrate_alias_conflict_sentinel_vs_plaintext_is_hard_error ... ok
+test migrate_errors_when_file_does_not_exist ... ok
+test migrate_empty_secret_falls_through_as_partial ... ok
+test migrate_atomic_replace_produces_valid_json_on_disk ... ok
+test migrate_alias_agreement_rewrites_all_alias_copies ... ok
+test migrate_errors_on_invalid_json ... ok
+test migrate_app_password_kind_works ... ok
+test migrate_distinct_emails_per_vendor_are_independent ... ok
+test migrate_leaves_the_database_environment_blob_alone ... ok
+test migrate_files_an_entry_without_an_email_under_the_top_level_account ... ok
+test migrate_happy_path_moves_token_and_rewrites_file ... ok
+test migrate_in_sync_skips_keychain_write_but_rewrites_file ... ok
+test migrate_non_string_secret_value_is_hard_error ... ok
+test migrate_principal_present_secret_missing_skips_with_partial ... ok
+test migrate_is_idempotent_when_already_migrated ... ok
+test migrate_refuses_a_server_secret_with_no_account_to_file_it_under ... ok
+test migrate_secret_present_principal_missing_is_hard_error ... ok
+test migrate_rejects_two_entries_that_disagree_about_one_account ... ok
+test migrate_sentinel_with_principal_missing_is_hard_error ... ok
+test migrate_sentinel_with_empty_keychain_entry_is_hard_error ... ok
+test migrate_handles_both_kinds_in_one_run ... ok
+test migrate_moves_non_atlassian_vendor_secrets ... ok
+test migrate_sentinel_without_keychain_entry_is_hard_error ... ok
+test migrate_moves_each_server_entrys_own_credentials ... ok
+test migrate_stale_clobber_blocked_without_force ... ok
+test migrate_stale_clobber_with_force_overwrites ... ok
+test migrate_rolls_back_first_kind_when_second_fails ... ok
+test migrate_unrelated_top_level_sections_are_not_touched ... ok
+test migrate_verifies_a_per_server_sentinel_against_the_keychain ... ok
+test migrate_writes_independent_keychain_entries_per_vendor ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/edition_boundary_tests.rs (target/debug/deps/edition_boundary_tests-71c0a5b8b53d2bbc)
+
+running 2 tests
+test paid_configuration_cannot_silently_fall_back_to_direct_administration ... ok
+test community_has_no_proposal_or_console_routes_and_preserves_admin_authentication ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/edx_controller_tests.rs (target/debug/deps/edx_controller_tests-580dbea134525fc0)
+
+running 7 tests
+test topics_uses_course_topics_endpoint ... ok
+test comments_lists_thread_comments ... ok
+test course_encodes_course_id_path_and_sends_bearer ... ok
+test create_comment_requires_thread_or_parent_id ... ok
+test create_thread_posts_expected_body ... ok
+test threads_builds_filters_and_supports_jq ... ok
+test missing_token_surfaces_auth_missing_at_call_time ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/edx_vendor_tests.rs (target/debug/deps/edx_vendor_tests-dcba94face275037)
+
+running 10 tests
+test name_is_canonical_edx ... ok
+test normalize_path_only_ensures_leading_slash ... ok
+test classify_404_accepts_developer_message ... ok
+test classify_403_is_auth_invalid ... ok
+test parse_field_errors_are_joined ... ok
+test base_url_defaults_to_courses_edx ... ok
+test base_url_reads_edx_api_base_from_config ... ok
+test explicit_base_url_override_wins ... ok
+test token_reads_from_edx_config ... ok
+test token_missing_is_auth_missing ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/ema_tests.rs (target/debug/deps/ema_tests-12d168374a793497)
+
+running 9 tests
+test metadata_refuses_unsupported_profiles_mismatched_issuers_and_redirects ... ok
+test ema_startup_refuses_disabled_auth_and_misspelled_opt_in ... ok
+test okta_subject_and_actor_history_are_distinct_and_cannot_supply_privileges ... ok
+test grants_wrong_audiences_and_malformed_actors_are_refused ... ok
+test both_grants_bind_audience_resource_and_independent_client_authentication ... ok
+test extension_is_opt_in_and_local_mode_does_not_advertise_it ... ok
+test rejected_or_oversized_grants_never_reach_resource_token_endpoint ... ok
+test cli_exchanges_refresh_assertion_and_writes_only_private_access_token ... ok
+test resource_router_exposes_discovery_and_requires_the_final_access_token ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+     Running tests/error_tests.rs (target/debug/deps/error_tests-b04ffa9ab2512df9)
+
+running 15 tests
+test create_auth_invalid_sets_401 ... ok
+test create_api_error_preserves_original ... ok
+test create_unexpected_default_has_expected_message ... ok
+test ensure_mcp_error_returns_same_when_already_mcp ... ok
+test create_auth_missing_uses_default_message ... ok
+test ensure_mcp_error_from_string_handles_strings ... ok
+test ensure_mcp_error_wraps_std_error ... ok
+test format_for_resource_produces_expected_shape ... ok
+test format_for_tool_includes_message ... ok
+test format_for_tool_includes_nested_error_details ... ok
+test get_deep_original_handles_string_payload ... ok
+test format_for_tool_includes_status_and_raw_body ... ok
+test get_deep_original_returns_deepest_in_chain ... ok
+test get_deep_original_stops_at_maximum_depth ... ok
+test mcp_error_has_expected_properties ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/format_output_tests.rs (target/debug/deps/format_output_tests-b0f1fa7b0e85b436)
+
+running 5 tests
+test json_output_is_pretty_printed ... ok
+test parse_recognizes_json ... ok
+test parse_defaults_to_toon ... ok
+test toon_handles_primitive_and_empty ... ok
+test toon_output_contains_data_values ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/grafana_controller_tests.rs (target/debug/deps/grafana_controller_tests-11f0e7fe788e1d1d)
+
+running 8 tests
+test list_datasources_sends_bearer_and_filters_loki ... ok
+test bad_logql_surfaces_loki_error_envelope ... ok
+test query_logs_omits_unset_optional_params ... ok
+test query_logs_proxies_logql_with_bearer_and_params ... ok
+test query_logs_partitions_exact_half_open_nanosecond_bounds ... ok
+test query_logs_applies_backward_limit_once_after_ordered_merge ... ok
+test missing_token_surfaces_auth_missing_at_call_time ... ok
+test query_logs_merges_out_of_order_forward_partitions_deterministically ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests/grafana_vendor_tests.rs (target/debug/deps/grafana_vendor_tests-15c61bcb18208276)
+
+running 18 tests
+test classify_loki_plain_text_error ... ok
+test classify_429_is_rate_limit ... ok
+test classify_500_is_server_error ... ok
+test name_is_canonical_grafana ... ok
+test normalize_path_passes_through_with_leading_slash ... ok
+test normalize_path_prepends_missing_leading_slash ... ok
+test classify_401_is_auth_invalid ... ok
+test classify_loki_400_uses_error_key ... ok
+test classify_403_is_auth_invalid_with_status ... ok
+test base_url_missing_is_auth_missing_error ... ok
+test classify_404_surfaces_grafana_message ... ok
+test base_url_with_base_override_wins_and_trims ... ok
+test base_url_trims_trailing_slash ... ok
+test base_url_blank_is_treated_as_missing ... ok
+test base_url_reads_from_grafana_url_config ... ok
+test token_reads_from_grafana_config_section ... ok
+test token_blank_is_treated_as_missing ... ok
+test token_missing_is_auth_missing_error ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/http_transport_tests.rs (target/debug/deps/http_transport_tests-05052feb0f830c76)
+
+running 13 tests
+test body_over_1mb_is_rejected_with_413 ... ok
+test bad_origin_is_rejected_with_403 ... ok
+test health_endpoint_returns_plaintext_version_banner ... ok
+test modern_http_rejects_missing_standard_method_header ... ok
+test missing_origin_is_allowed ... ok
+test initialize_issues_session_id_header ... ok
+test delete_closes_a_live_session ... ok
+test cors_preflight_mirrors_origin ... ok
+test modern_discover_is_stateless_and_advertises_2026_protocol ... ok
+test modern_tools_list_is_stateless_deterministic_and_cacheable ... ok
+test artifact_download_supports_byte_range_resume ... ok
+test unknown_session_id_returns_404 ... ok
+test idle_sessions_are_reaped_after_ttl ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+
+     Running tests/inbound_auth_tests.rs (target/debug/deps/inbound_auth_tests-12a75f7529a7c8a7)
+
+running 8 tests
+test auth_required_without_a_principal_refuses_rather_than_running_as_local ... ok
+test missing_bearer_is_401_with_a_resource_metadata_challenge ... ok
+test rejected_token_is_401_invalid_token_and_never_logged ... ok
+test token_without_the_required_scope_is_403_insufficient_scope ... ok
+test health_reports_an_unavailable_journal_as_503 ... ok
+test protected_resource_metadata_is_public_and_points_at_the_issuer ... ok
+test valid_token_reaches_the_tool_and_its_principal_reaches_the_journal ... ok
+test local_mode_router_has_no_metadata_route_and_no_challenge ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+     Running tests/jira_controller_tests.rs (target/debug/deps/jira_controller_tests-6a3f37d1c1323749)
+
+running 7 tests
+test missing_site_name_surfaces_at_tool_call_time_not_at_construction ... ok
+test jira_envelope_404_surfaces_error_messages ... ok
+test jira_field_validation_errors_are_concatenated ... ok
+test delete_204_returns_empty_body ... ok
+test get_pipeline_passes_jira_path_through_unchanged ... ok
+test post_create_issue_forwards_body_and_returns_key ... ok
+test search_jql_query_params_are_appended ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/jira_vendor_tests.rs (target/debug/deps/jira_vendor_tests-bd5bec9fd7929362)
+
+running 27 tests
+test name_is_canonical_jira ... ok
+test normalize_path_adds_leading_slash_only ... ok
+test classify_5xx_uses_jira_server_error_prefix ... ok
+test base_url_missing_site_returns_auth_missing ... ok
+test normalize_path_does_not_prepend_v2_like_bitbucket ... ok
+test base_url_from_site_name_env ... ok
+test base_url_empty_site_name_is_treated_as_missing ... ok
+test base_url_trims_whitespace_around_site_name ... ok
+test classify_other_status_uses_request_failed_prefix ... ok
+test classify_429_uses_rate_limit_prefix ... ok
+test parse_array_style_errors_extracts_title_and_detail ... ok
+test parse_all_envelope_shapes_combined ... ok
+test classify_404_uses_resource_not_found_prefix ... ok
+test parse_canonical_envelope_combines_messages_and_field_errors_with_pipe_separator ... ok
+test classify_403_maps_to_auth_invalid_per_ts_parity ... ok
+test classify_401_maps_to_auth_invalid_with_ts_prefix ... ok
+test parse_canonical_envelope_with_field_errors_only ... ok
+test parse_non_json_body_passes_through_as_string ... ok
+test parse_multiple_error_messages_join_with_semicolon ... ok
+test parse_canonical_envelope_with_messages_only ... ok
+test parse_empty_body_yields_default ... ok
+test parse_unrecognised_json_keeps_payload_as_original_with_no_message ... ok
+test base_url_falls_back_to_confluence_section_when_jira_section_absent ... ok
+test with_base_url_skips_env_lookup_entirely ... ok
+test parse_warning_messages_get_warnings_prefix_and_join ... ok
+test parse_flat_message_fallback ... ok
+test with_base_url_resolves_without_any_config ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/jmespath_tests.rs (target/debug/deps/jmespath_tests-d536e50e453e5551)
+
+running 9 tests
+test blank_filter_borrows_instead_of_cloning ... ok
+test applied_filter_returns_owned_result ... ok
+test array_wildcard_projection ... ok
+test empty_filter_returns_original ... ok
+test missing_filter_borrows_instead_of_cloning ... ok
+test invalid_filter_returns_error_envelope ... ok
+test nested_field_projection ... ok
+test simple_field_projection ... ok
+test missing_filter_returns_original ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/keycloak_live_tests.rs (target/debug/deps/keycloak_live_tests-5de6e8de10e208ec)
+
+running 2 tests
+test keycloak_realm_tokens_validate_through_the_keycloak_profile_including_rotation ... ok
+test keycloak_service_account_tokens_are_machines_once_the_client_id_mapper_exists ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/markdown_tests.rs (target/debug/deps/markdown_tests-7df19a66054c8089)
+
+running 3 tests
+test separator_is_triple_dash ... ok
+test heading_level_is_clamped ... ok
+test heading_levels_1_through_6 ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/newrelic_controller_tests.rs (target/debug/deps/newrelic_controller_tests-1124ed626928bd39)
+
+running 6 tests
+test errors_array_in_200_body_surfaces_as_error ... ok
+test non_2xx_surfaces_as_error ... ok
+test query_forwards_variables ... ok
+test auth_error_class_in_200_body_is_auth_error ... ok
+test query_sends_api_key_header_and_wraps_body ... ok
+test missing_api_key_surfaces_auth_missing_at_call_time ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/newrelic_vendor_tests.rs (target/debug/deps/newrelic_vendor_tests-75cabf795d86c029)
+
+running 23 tests
+test classify_429_is_rate_limit ... ok
+test classify_500_is_server_error ... ok
+test classify_401_is_auth_invalid ... ok
+test empty_errors_array_is_success ... ok
+test errors_is_not_an_array_is_treated_as_success ... ok
+test classify_non_2xx_extracts_graphql_errors_array ... ok
+test auth_message_heuristic_becomes_auth_invalid ... ok
+test auth_error_class_becomes_auth_invalid ... ok
+test errors_without_message_falls_back_to_error_class ... ok
+test name_is_canonical_newrelic ... ok
+test no_errors_field_is_success ... ok
+test non_empty_errors_is_api_error_with_joined_messages ... ok
+test normalize_path_prepends_missing_leading_slash ... ok
+test partial_null_data_without_errors_is_success ... ok
+test normalize_path_passes_through_with_leading_slash ... ok
+test base_url_defaults_to_us_region ... ok
+test base_url_eu_region_uses_eu_host ... ok
+test base_url_region_is_case_insensitive ... ok
+test base_url_explicit_base_overrides_region ... ok
+test base_url_with_base_override_wins_over_config ... ok
+test api_key_reads_from_newrelic_config_section ... ok
+test api_key_blank_is_treated_as_missing ... ok
+test api_key_missing_is_auth_missing_error ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/ninjaone_controller_tests.rs (target/debug/deps/ninjaone_controller_tests-9da98566bea8254c)
+
+running 2 tests
+test get_uses_bearer_and_query_parameters ... ok
+test post_supports_the_sample_search_shape_with_cookie_auth ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/ninjaone_session_tests.rs (target/debug/deps/ninjaone_session_tests-8b4272f628c81550)
+
+running 28 tests
+test a_command_printing_junk_is_refused_without_echoing_it ... ok
+test a_failing_command_reports_its_stderr ... ok
+test a_malformed_seed_fails_the_login_with_a_clear_message ... ok
+test a_server_account_never_borrows_the_top_level_password ... ok
+test a_federated_account_is_refused_before_the_password_is_sent ... ok
+test a_rejected_password_is_reported_as_invalid_auth ... ok
+test a_configured_command_supplies_the_code_without_a_tool_argument ... ok
+test a_configured_seed_generates_the_code_in_process ... ok
+test a_recaptcha_tenant_is_told_what_is_missing_and_accepts_a_token ... ok
+test a_server_entry_uses_its_own_totp_seed ... ok
+test a_per_server_command_wins_over_the_global_one ... ok
+test a_server_entry_logs_in_as_its_own_account ... ok
+test a_403_does_not_throw_away_a_working_session ... ok
+test a_minted_session_outranks_a_stale_configured_key ... ok
+test a_vault_command_is_preferred_over_a_stored_seed ... ok
+test a_session_belongs_to_the_account_that_minted_it ... ok
+test login_requires_server_held_credentials ... ok
+test an_explicit_code_overrides_the_configured_command ... ok
+test login_reports_when_an_access_token_still_outranks_the_session ... ok
+test login_honours_a_server_alias_path_prefix ... ok
+test login_does_not_duplicate_a_ws_server_alias_prefix ... ok
+test mfa_required_without_a_code_is_actionable ... ok
+test a_wrong_mfa_code_is_reported_without_caching_a_session ... ok
+test login_without_mfa_returns_the_session_key_directly ... ok
+test login_warms_cached_session_properties_for_the_next_read ... ok
+test an_expired_session_is_evicted_and_reported ... ok
+test missing_authentication_state_endpoint_falls_back_to_login ... ok
+test mfa_login_mints_a_session_key_reused_by_later_calls ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+     Running tests/ninjaone_totp_tests.rs (target/debug/deps/ninjaone_totp_tests-3d26ddd013067b85)
+
+running 13 tests
+test a_bare_base32_secret_is_accepted ... ok
+test a_malformed_secret_is_refused_without_echoing_it ... ok
+test a_password_manager_uri_parses ... ok
+test a_uri_without_a_secret_is_refused ... ok
+test a_custom_period_changes_the_step ... ok
+test a_counter_based_uri_is_refused ... ok
+test an_out_of_range_digit_count_is_refused ... ok
+test debug_output_redacts_the_seed ... ok
+test rfc6238_sha1_vectors ... ok
+test six_digit_defaults_match_the_sha1_vectors ... ok
+test rfc6238_sha256_vectors ... ok
+test secret_formatting_variations_decode_identically ... ok
+test the_current_code_has_the_configured_shape ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/ninjaone_vendor_tests.rs (target/debug/deps/ninjaone_vendor_tests-a5ae5366a5085928)
+
+running 8 tests
+test bearer_token_has_precedence ... ok
+test browser_cookie_is_an_explicit_cookie_header ... ok
+test missing_auth_is_actionable ... ok
+test console_error_envelope_surfaces_error_message ... ok
+test server_alias_rejects_an_invalid_prefix ... ok
+test default_server_uses_ninjaone_url ... ok
+test server_alias_must_come_from_configured_map ... ok
+test server_alias_can_apply_its_own_path_prefix ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/operations_tests.rs (target/debug/deps/operations_tests-33801f28b70b1b52)
+
+running 2 tests
+test helm_preserves_deployment_security_and_refuses_unsupported_scaling ... ok
+test backup_restore_verifies_evidence_and_rejects_tampering ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+
+     Running tests/phase_a_vertical_slice_tests.rs (target/debug/deps/phase_a_vertical_slice_tests-f35b4e21b6ea5123)
+
+running 7 tests
+test egress_records_mark_cache_hits_as_not_sent ... ok
+test allow_all_with_a_journal_records_but_never_denies ... ok
+test a_multi_request_call_lists_every_authorized_egress_on_its_outcome ... ok
+test a_send_cancelled_in_flight_is_recorded_as_an_attempt ... ok
+test an_egress_denial_stops_the_request_and_is_journaled ... ok
+test group_a_is_allowed_group_b_is_denied_and_both_are_in_the_journal_first ... ok
+test egress_records_count_wire_attempts_under_one_authorization ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+
+     Running tests/phase_b_slack_slice_tests.rs (target/debug/deps/phase_b_slack_slice_tests-a10015137720004f)
+
+running 2 tests
+test unknown_methods_and_malformed_ids_never_reach_slack ... ok
+test the_incident_channel_is_readable_other_channels_and_search_are_not ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+     Running tests/policy_admin_port_tests.rs (target/debug/deps/policy_admin_port_tests-9d41a442c033c581)
+
+running 1 test
+test http_uses_injected_policy_port_and_preserves_error_envelopes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/policy_engine_tests.rs (target/debug/deps/policy_engine_tests-85bb1abbc9388f17)
+
+running 5 tests
+test fixture_helpers_are_sound ... ok
+test golden_decision_table ... ok
+test policy_check_command_reports_compiling_and_broken_documents ... ok
+test a_vanished_policy_file_keeps_the_last_policy_and_reports_degraded_health ... ok
+test a_changed_document_is_picked_up_and_a_broken_one_is_ignored ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.58s
+
+     Running tests/policy_explain_tests.rs (target/debug/deps/policy_explain_tests-387eb359a39667b4)
+
+running 3 tests
+test explain_names_the_decisive_rule_and_the_first_key_every_other_rule_fails ... ok
+test explain_at_the_binary_boundary_builds_the_context_the_gateway_would ... ok
+test explain_builds_the_context_a_real_call_is_journaled_with ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+
+     Running tests/policy_signing_tests.rs (target/debug/deps/policy_signing_tests-8c7ef8766c1a8adc)
+
+running 6 tests
+test a_verifying_key_refuses_unsigned_and_missigned_documents ... ok
+test a_server_journals_the_policy_in_force_before_it_serves_or_does_not_serve ... ok
+test sign_refuses_a_key_file_other_users_can_read ... ok
+test keygen_sign_and_check_round_trip_at_the_binary_boundary ... ok
+test a_change_whose_record_cannot_be_journaled_is_not_applied ... ok
+test a_change_is_journaled_before_it_takes_effect_and_rejections_once ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.08s
+
+     Running tests/postman_controller_tests.rs (target/debug/deps/postman_controller_tests-2107cefd58fd4e02)
+
+running 5 tests
+test get_sends_api_key_header_and_filters_response ... ok
+test post_forwards_body_and_returns_created ... ok
+test auth_is_not_sent_in_authorization_header ... ok
+test api_404_surfaces_postman_error_envelope ... ok
+test missing_key_surfaces_auth_missing_at_call_time ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/postman_vendor_tests.rs (target/debug/deps/postman_vendor_tests-8e0bde9441b42609)
+
+running 15 tests
+test name_is_canonical_postman ... ok
+test normalize_path_passes_through_with_leading_slash ... ok
+test normalize_path_prepends_missing_leading_slash ... ok
+test parse_non_json_body_is_passed_through_as_string ... ok
+test classify_empty_body_falls_back_to_status_reason ... ok
+test base_url_override_is_returned_verbatim ... ok
+test base_url_defaults_to_postman_api ... ok
+test parse_falls_back_to_error_name_when_message_absent ... ok
+test classify_500_is_server_error ... ok
+test classify_401_is_auth_invalid ... ok
+test classify_429_is_rate_limit ... ok
+test classify_404_is_api_error_with_message ... ok
+test key_reads_from_postman_config_section ... ok
+test key_blank_is_treated_as_missing ... ok
+test key_missing_is_auth_missing_error ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/principal_partitioning_tests.rs (target/debug/deps/principal_partitioning_tests-7d68b0e810a01a23)
+
+running 4 tests
+test a_session_is_bound_to_the_principal_that_initialized_it ... ok
+test artifact_download_is_owner_only_and_cross_owner_is_404 ... ok
+test artifact_read_tool_is_owner_only ... ok
+test the_response_cache_is_partitioned_by_principal ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/raw_response_tests.rs (target/debug/deps/raw_response_tests-8543822586746ef2)
+
+running 7 tests
+test writes_file_under_tmp_mcp ... ok
+test removing_committed_artifact_unregisters_id_and_path ... ok
+test removing_missing_artifact_unregisters_stale_metadata ... ok
+test request_body_section_contains_body_or_noop ... ok
+test streamed_artifact_enforces_limit_and_hashes_incrementally ... ok
+test artifact_chunks_resume_by_byte_offset ... ok
+test operation_cleanup_removes_only_owned_artifacts ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/revocation_tests.rs (target/debug/deps/revocation_tests-724e6deeddb46204)
+
+running 8 tests
+test startup_refuses_when_the_revocation_list_in_force_cannot_be_journaled ... ok
+test a_token_issued_in_the_future_is_refused_before_revocation_or_freshness_see_it ... ok
+test non_read_calls_need_a_fresh_token_reads_do_not ... ok
+test revoke_cli_edits_and_resigns_the_list_and_refuses_a_list_it_did_not_sign ... ok
+test revoke_edits_serialize_on_the_edit_lock ... ok
+test group_removal_waits_for_the_token_but_revocation_does_not ... ok
+test revoke_all_refuses_tokens_issued_before_the_cutoff_and_closes_their_sessions ... ok
+test a_revoked_subject_is_refused_within_a_poll_and_the_refusal_is_journaled ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s
+
+     Running tests/rmcp_extensions_spike_tests.rs (target/debug/deps/rmcp_extensions_spike_tests-2c978d266f1dd992)
+
+running 2 tests
+test stateless_call_tool_sees_the_axum_extension_principal ... ok
+test session_call_tool_sees_the_axum_extension_principal ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/roles_tests.rs (target/debug/deps/roles_tests-a3616a70704284d4)
+
+running 4 tests
+test unknown_role_is_refused_not_defaulted ... ok
+test control_role_serves_health_and_nothing_else ... ok
+test gateway_role_from_env_serves_the_data_plane ... ok
+test health_probe_exit_status_reflects_the_banner ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+
+     Running tests/rollup_store_tests.rs (target/debug/deps/rollup_store_tests-13e5ee96bfbf94de)
+
+running 8 tests
+test channel_overflow_drops_with_a_counter_and_never_blocks ... ok
+test consumer_prunes_by_retention ... ok
+test in_memory_store_conforms ... ok
+test sqlite_refuses_a_file_from_a_newer_binary ... ok
+test sqlite_in_memory_conforms ... ok
+test sqlite_file_conforms_and_survives_a_reopen ... ok
+test the_consumer_prunes_on_its_cadence_while_no_events_arrive ... ok
+test consumer_batches_events_into_the_store_and_retries_a_failing_store ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.53s
+
+     Running tests/secret_source_tests.rs (target/debug/deps/secret_source_tests-37c49e273e086c81)
+
+running 12 tests
+test keychain_uri_is_an_alias_of_the_sentinel ... ok
+test in_memory_adapter_conforms ... ok
+test file_adapter_refuses_a_host_part_and_a_huge_file ... ok
+test an_unresolved_reference_is_refused_by_name_never_sent_upstream ... ok
+test a_reloaded_config_with_a_reference_is_resolved_before_it_is_swapped_in ... ok
+test file_adapter_conforms ... ok
+test no_references_means_no_snapshot_no_refresher_and_no_meta ... ok
+test startup_fails_closed_on_every_unresolvable_reference ... ok
+test multi_part_credentials_rotate_together_from_one_document ... ok
+test rotation_lock_a_rewritten_file_changes_the_upstream_header_without_a_restart ... ok
+test a_vanished_file_keeps_the_last_good_value_and_degrades_health ... ok
+test vault_rotation_lock_a_new_kv_version_changes_the_upstream_header_and_a_sealed_vault_degrades ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.28s
+
+     Running tests/shell_tests.rs (target/debug/deps/shell_tests-933c6d818ae07d96)
+
+running 7 tests
+test default_timeout_is_five_minutes ... ok
+test missing_binary_yields_error ... ok
+test system_command_runner_actually_runs_the_program ... ok
+test system_command_runner_reports_failure_through_the_port ... ok
+test execute_returns_stdout_on_success ... ok
+test execute_surfaces_stderr_on_failure ... ok
+test timeout_kills_long_running_command ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/siem_live_tests.rs (target/debug/deps/siem_live_tests-f4008d6a2d1bb86e)
+
+running 2 tests
+test syslog_ng_refuses_a_forwarder_without_the_client_certificate ... ok
+test journal_records_reach_syslog_ng_over_mutual_tls_and_resume_after_a_restart ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/slack_controller_tests.rs (target/debug/deps/slack_controller_tests-41bf6458f3067756)
+
+running 5 tests
+test ok_false_in_200_body_surfaces_as_error ... ok
+test ok_false_invalid_auth_in_200_body_is_auth_error ... ok
+test post_forwards_body_and_returns_message ... ok
+test get_sends_bearer_token_and_filters_response ... ok
+test missing_token_surfaces_auth_missing_at_call_time ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/slack_vendor_tests.rs (target/debug/deps/slack_vendor_tests-f54105e0eb06d613)
+
+running 19 tests
+test base_url_defaults_to_slack_api ... ok
+test classify_empty_body_falls_back_to_status_reason ... ok
+test missing_ok_field_is_treated_as_success ... ok
+test classify_429_is_rate_limit ... ok
+test name_is_canonical_slack ... ok
+test classify_500_is_server_error ... ok
+test non_object_body_is_not_an_error ... ok
+test base_url_override_is_returned_verbatim ... ok
+test normalize_path_passes_through_with_leading_slash ... ok
+test normalize_path_prepends_missing_leading_slash ... ok
+test ok_false_channel_not_found_is_404 ... ok
+test ok_false_generic_is_api_error ... ok
+test ok_false_invalid_auth_is_auth_invalid ... ok
+test ok_false_ratelimited_is_429 ... ok
+test ok_false_without_error_code_still_errors ... ok
+test ok_true_is_not_an_error ... ok
+test token_reads_from_slack_config_section ... ok
+test token_blank_is_treated_as_missing ... ok
+test token_missing_is_auth_missing_error ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/sonarqube_controller_tests.rs (target/debug/deps/sonarqube_controller_tests-04fd79ebf2f3ba94)
+
+running 9 tests
+test quality_gate_requires_a_selector ... ok
+test sonar_error_envelope_is_surfaced ... ok
+test quality_gate_rejects_branch_and_pr_together ... ok
+test quality_gate_ce_task_lookup_is_subject_to_egress_policy ... ok
+test search_issues_sends_bearer_and_scoped_params ... ok
+test quality_gate_by_project_and_pr_sends_bearer_and_params ... ok
+test quality_gate_ce_task_without_analysis_id_surfaces_status ... ok
+test quality_gate_by_ce_task_id_resolves_analysis_id_first ... ok
+test missing_token_surfaces_auth_missing_at_call_time ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/sonarqube_vendor_tests.rs (target/debug/deps/sonarqube_vendor_tests-0d559a8872095e8d)
+
+running 18 tests
+test classify_500_is_server_error ... ok
+test classify_429_is_rate_limit ... ok
+test classify_plain_text_error ... ok
+test name_is_canonical_sonarqube ... ok
+test normalize_path_passes_through_with_leading_slash ... ok
+test normalize_path_prepends_missing_leading_slash ... ok
+test classify_401_is_auth_invalid ... ok
+test classify_403_is_auth_invalid_with_status ... ok
+test classify_accepts_legacy_err_msg_key ... ok
+test classify_404_joins_multiple_error_messages ... ok
+test base_url_missing_is_auth_missing_error ... ok
+test base_url_with_base_override_wins_and_trims ... ok
+test base_url_reads_from_sonarqube_url_config ... ok
+test base_url_blank_is_treated_as_missing ... ok
+test base_url_trims_trailing_slash ... ok
+test token_reads_from_sonarqube_config_section ... ok
+test token_blank_is_treated_as_missing ... ok
+test token_missing_is_auth_missing_error ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/splunk_controller_tests.rs (target/debug/deps/splunk_controller_tests-accbba9aafd75030)
+
+running 10 tests
+test invalid_sid_is_rejected_before_dispatch ... ok
+test saved_searches_support_filter_and_pagination ... ok
+test create_job_returns_sid_and_form_options ... ok
+test job_results_uses_v2_endpoint_and_pagination ... ok
+test export_search_posts_urlencoded_form_with_bearer_token ... ok
+test partition_failure_cancels_drains_and_schedules_nothing_later ... ok
+test search_partitions_exact_half_open_splunk_bounds ... ok
+test json_rows_structural_and_timestamp_errors_are_explicit ... ok
+test search_partitions_merge_non_empty_results_in_planned_order ... ok
+test partition_request_send_error_is_retried ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+
+     Running tests/splunk_vendor_tests.rs (target/debug/deps/splunk_vendor_tests-9ee2bda4e39e41e8)
+
+running 6 tests
+test classifier_maps_authentication_errors ... ok
+test classifier_extracts_splunk_messages ... ok
+test splunk_config_aliases_are_vendor_scoped ... ok
+test legacy_splunk_auth_scheme_is_supported ... ok
+test resolves_name_url_token_and_auth_scheme ... ok
+test missing_configuration_fails_at_call_time ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/streaming_transport_tests.rs (target/debug/deps/streaming_transport_tests-25feb15f718fed8a)
+
+running 4 tests
+test encoded_quota_is_enforced_and_partial_artifact_is_cleaned ... ok
+test decoded_quota_is_enforced_during_decompression ... ok
+test explicitly_decodes_and_accounts_for_zstd_without_content_length_assumptions ... ok
+test transient_request_send_errors_are_retried ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running tests/token_validator_tests.rs (target/debug/deps/token_validator_tests-3ca0ef53fc6b3647)
+
+running 26 tests
+test file_jwks_configuration_is_explicit_and_excludes_remote_override ... ok
+test a_valid_token_yields_a_principal_with_claims_mapped ... ok
+test jku_and_x5u_headers_are_ignored_in_favour_of_the_configured_jwks ... ok
+test file_keys_reject_oversize_directories_and_replaced_key_material ... ok
+test an_unknown_kid_refetches_the_jwks_once_within_the_rate_limit ... ok
+test file_keys_rotate_withdraw_and_fail_closed_even_for_cached_tokens ... ok
+test audience_arrays_and_leeway_boundaries_are_accepted_exactly_as_configured ... ok
+test entra_profile_reads_keys_through_discovery_scp_as_a_string_and_oid_as_the_subject ... ok
+test generic_profile_uses_discovery_and_every_profile_accepts_both_scope_shapes ... ok
+test entra_groups_overage_fails_closed_and_app_roles_can_be_the_groups_claim ... ok
+test jwks_fetch_cli_creates_a_private_file_and_refuses_overwrite ... ok
+test republishing_a_kid_with_new_material_evicts_tokens_it_validated ... ok
+test jwks_fetch_uses_bounded_secure_validated_documents ... ok
+test space_separated_scope_claim_and_custom_groups_claim_are_read ... ok
+test key_rotation_is_picked_up_on_refetch ... ok
+test keycloak_profile_requires_a_mapped_audience_and_normalises_group_paths ... ok
+test auth0_profile_accepts_the_trailing_slash_issuer_and_a_namespaced_groups_claim ... ok
+test stale_keys_keep_serving_while_a_background_refresh_fails ... ok
+test oversized_jwks_is_refused_whether_or_not_its_length_is_declared ... ok
+test unreachable_jwks_fails_closed_and_recovers ... ok
+test withdrawing_a_key_evicts_tokens_it_validated_from_the_cache ... ok
+test subject_kind_operator_markers_never_outrank_a_machine_reading ... ok
+test jwks_admission_is_rsa_signing_keys_with_unambiguous_kids ... ok
+test the_negative_matrix ... ok
+test subject_kind_is_read_per_profile_from_validated_claims ... ok
+test subject_kind_auth0_keycloak_generic_and_operator_markers ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+
+     Running tests/tool_schema_tests.rs (target/debug/deps/tool_schema_tests-dfb221314739ffe9)
+
+running 8 tests
+test query_params_preserve_ordering ... ok
+test artifact_read_args_support_resume_offsets ... ok
+test circleci_logs_args_use_camel_case_json ... ok
+test read_args_uses_camel_case_json ... ok
+test sonarqube_quality_gate_args_use_camel_case_json ... ok
+test sonarqube_search_issues_args_use_camel_case_json ... ok
+test write_args_uses_camel_case_json ... ok
+test server_info_reports_expected_identity ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/tool_surface_parity_tests.rs (target/debug/deps/tool_surface_parity_tests-cee0a7c0477cff07)
+
+running 2 tests
+test regenerate_golden ... ignored, regeneration helper; run explicitly after an intended contract change
+test tool_surface_matches_golden ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/toon_golden_tests.rs (target/debug/deps/toon_golden_tests-da9501db0b6453eb)
+
+running 18 tests
+test object_key_order_is_preserved_not_sorted ... ok
+test toon_golden_jira_issue_key ... ok
+test toon_golden_key_order_preserved ... ok
+test toon_golden_numbers ... ok
+test toon_golden_empty_containers ... ok
+test toon_golden_array_root ... ok
+test toon_golden_primitive_root ... ok
+test toon_and_json_formats_stay_distinct ... ok
+test toon_golden_nested_jira_row ... ok
+test toon_golden_quoting_edges ... ok
+test toon_golden_ragged_rows ... ok
+test toon_golden_repo_slug_and_branch ... ok
+test toon_golden_unicode ... ok
+test toon_golden_version_and_ip ... ok
+test toon_golden_tabular_rows ... ok
+test toon_golden_escapes ... ok
+test toon_golden_uuid_and_dates ... ok
+test hyphenated_identifiers_are_not_quoted ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/transport_tests.rs (target/debug/deps/transport_tests-472ed29765d584c5)
+
+running 15 tests
+test not_found_maps_to_404_with_parsed_body ... ok
+test get_json_response_is_classified_and_persisted ... ok
+test delete_204_is_classified_empty ... ok
+test empty_json_body_is_classified_empty ... ok
+test non_json_body_with_default_content_type_falls_back_to_text ... ok
+test auth_failure_maps_to_auth_invalid ... ok
+test oversized_content_length_rejected ... ok
+test empty_body_is_classified_empty ... ok
+test request_body_is_serialized_as_json ... ok
+test text_plain_response_passes_through_without_raw_path ... ok
+test cache_is_isolated_by_resolved_credentials ... ok
+test enabled_cache_reuses_a_successful_get ... ok
+test no_store_response_is_never_reused ... ok
+test timeout_maps_to_408 ... ok
+test wire_bytes_are_the_canonical_form ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests/truncation_tests.rs (target/debug/deps/truncation_tests-c20bc10036c9c96a)
+
+running 7 tests
+test short_content_passes_through_unchanged ... ok
+test exact_boundary_content_passes_through ... ok
+test truncates_at_newline_when_one_is_nearby ... ok
+test head_and_tail_splits_are_utf8_safe ... ok
+test long_unbroken_tail_is_preserved ... ok
+test oversized_content_is_truncated_and_annotated ... ok
+test includes_raw_path_when_provided ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/usage_metrics_tests.rs (target/debug/deps/usage_metrics_tests-6d8813f20436c298)
+
+running 4 tests
+test a_gateway_replica_attaches_no_rollup_channel_and_metrics_are_off_by_default ... ok
+test rollup_and_rate_limit_misconfiguration_refuses_startup ... ok
+test a_principal_over_its_rate_limit_gets_429_with_retry_after_and_the_metric_counts_it ... ok
+test usage_rows_reach_the_sqlite_rollups_for_allowed_and_denied_calls ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+
+     Running tests/vault_contract_tests.rs (target/debug/deps/vault_contract_tests-f32310fc99a7ad72)
+
+running 8 tests
+test sealed_deleted_and_malformed_are_categories_that_never_carry_the_token ... ok
+test vault_adapter_conforms ... ok
+test resolver_from_config_builds_the_adapter_only_when_an_address_is_set ... ok
+test a_secret_id_held_in_a_file_is_reread_at_each_login ... ok
+test kubernetes_login_reads_the_projected_token_at_every_login ... ok
+test approle_logs_in_once_and_again_after_the_token_is_refused ... ok
+test token_auth_sends_the_token_and_the_namespace_and_reports_the_kv_version ... ok
+test a_renewable_lease_is_renewed_past_two_thirds_and_an_expired_one_is_replaced ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.43s
+
+     Running tests/vault_live_tests.rs (target/debug/deps/vault_live_tests-5400a45aa1eccb2b)
+
+running 1 test
+test kv_reads_approle_and_token_leases_and_rotation_against_a_real_server ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/vendor_secrets_tests.rs (target/debug/deps/vendor_secrets_tests-e82e7ff51a81c6a3)
+
+running 13 tests
+test an_account_scoped_secret_uses_the_configured_principal ... ok
+test a_sentinel_without_an_entry_is_a_hard_error ... ok
+test a_principal_less_token_expands_from_the_keychain_sentinel ... ok
+test no_two_rows_share_a_slot ... ok
+test every_known_secret_key_is_registered ... ok
+test an_unregistered_key_is_plaintext_only ... ok
+test an_absent_key_falls_back_to_the_keychain ... ok
+test plaintext_still_wins_over_a_stored_entry ... ok
+test principal_less_secrets_are_addressed_by_key_name ... ok
+test slots_do_not_leak_across_vendors ... ok
+test the_cli_guard_follows_the_registry ... ok
+test the_database_environment_blob_is_not_registered ... ok
+test whitespace_is_trimmed_and_blank_reads_as_missing ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/workspace_tests.rs (target/debug/deps/workspace_tests-27a83ff9eddc24eb)
+
+running 6 tests
+test workspace_cache_clear_resets_state ... ok
+test cache_prevents_second_api_call ... ok
+test empty_api_response_resolves_to_none ... ok
+test api_fallback_returns_first_workspace ... ok
+test separate_caches_do_not_leak_across_instances ... ok
+test env_override_short_circuits_api_call ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/wrds_vendor_tests.rs (target/debug/deps/wrds_vendor_tests-26551fed4fe51e91)
+
+running 6 tests
+test clamp_row_limit_defaults_and_bounds ... ok
+test live_select_one_when_credentials_present ... ok
+test missing_credentials_surface_auth_missing_before_connecting ... ok
+test blank_credentials_are_treated_as_missing ... ok
+test wrds_and_mcp_server_wrds_sections_are_recognised ... ok
+test username_without_password_is_auth_missing_naming_password ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/zoom_controller_tests.rs (target/debug/deps/zoom_controller_tests-770b832d8a8b8acb)
+
+running 9 tests
+test token_exchange_rejection_surfaces_auth_invalid ... ok
+test missing_credentials_surface_auth_missing_at_call_time ... ok
+test api_404_surfaces_zoom_error_envelope ... ok
+test create_meeting_forwards_body_and_returns_start_url ... ok
+test schedule_get_exchanges_token_then_calls_api_with_bearer ... ok
+test token_is_exchanged_once_and_cached_across_calls ... ok
+test rotating_client_secret_invalidates_cached_token ... ok
+test changing_credentials_invalidates_cached_token ... ok
+test expired_token_is_refreshed ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.18s
+
+     Running tests/zoom_vendor_tests.rs (target/debug/deps/zoom_vendor_tests-a6d726d696ef5383)
+
+running 14 tests
+test base_url_defaults_to_zoom_api_v2 ... ok
+test base_url_override_is_returned_verbatim ... ok
+test classify_401_is_auth_invalid ... ok
+test classify_403_is_auth_invalid_with_status ... ok
+test classify_404_is_api_error_with_message ... ok
+test classify_429_is_rate_limit ... ok
+test classify_500_is_server_error ... ok
+test name_is_canonical_zoom ... ok
+test classify_empty_body_falls_back_to_status_reason ... ok
+test normalize_path_does_not_prepend_api_version ... ok
+test normalize_path_passes_through_with_leading_slash ... ok
+test normalize_path_prepends_missing_leading_slash ... ok
+test parse_non_json_body_is_passed_through_as_string ... ok
+test parse_concatenates_field_validation_errors ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests mcp_server_devtools
+
+running 1 test
+test src/bootstrap/vendors.rs - bootstrap::vendors (line 15) ... ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.16s; merged doctests compilation took 0.16s
+   Compiling mcp-server-devtools v0.15.0 (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 53.69s
+    Checking mcp-server-devtools v0.15.0 (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 38.44s
+advisories ok, bans ok, licenses ok, sources ok
+   Compiling mcp-server-devtools v0.15.0 (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 2m 51s
+     Running benches/response_pipeline.rs (target/release/deps/response_pipeline-b20dc5b32d4b7a86)
+=== output size: is TOON earning its CPU? ===
+                                            compact     pretty       TOON
+  uniform flat rows (TOON's best case)       12392B     20800B      5016B   TOON is 40% of compact, 24% of pretty
+  nested objects (Jira search shape)         89903B    133723B     99300B   TOON is 110% of compact, 74% of pretty
+
+=== stage -1: policy extractors, per tool call (mean of 2000) ===
+  canonical: short path                            0 KB          4 allocs     0.00 ms
+  canonical: dot-segments + escapes                0 KB          1 allocs     0.00 ms
+  canonical: search URL (long JQL)                 0 KB         10 allocs     0.00 ms
+  jira::extract GET /issue/{key}                   0 KB          6 allocs     0.00 ms
+  jira::extract GET /search/jql (long JQL)         1 KB         17 allocs     0.01 ms
+  jira::project_keys_from_jql (long JQL)           0 KB          9 allocs     0.00 ms
+  jira::extract unmapped (default arm)             0 KB          1 allocs     0.00 ms
+  grafana::query_logs                              0 KB         10 allocs     0.00 ms
+
+=== stage -1b: policy decision, per tool call (mean of 2000) ===
+  ActionContext via for_tool (grafana)             0 KB         21 allocs     0.00 ms
+  FilePolicy::evaluate @ 500 rules                 0 KB          5 allocs     0.01 ms
+
+=== stage -1c: enterprise request path, production components (mean of 2000 / 1000) ===
+  JWT validate: cache hit (budget 50 µs)           1 KB          9 allocs     3.89 µs
+  C.1 JWT authenticate: cached actor chain         1 KB          8 allocs     4.15 µs
+  journal append, sequential (budget p99 200 µs)         1 KB          6 allocs  p50      15 µs  p99      26 µs  max      93 µs
+
+=== stage -1d: usage side of the request path (mean of 2000) — C.6 ===
+  rate limit check, known subject                  0 KB          0 allocs     0.00 ms
+  PrometheusUsageSink::record, known series         0 KB          0 allocs     0.00 ms
+  FanOut(prometheus + channel)::record             0 KB          9 allocs     0.00 ms
+
+=== stage -1e: principal inventory — C.4 ===
+  observe principal, known unchanged               0 KB          0 allocs     0.00 ms
+
+=== stage 0: per-tool-call config snapshot (mean of 1000) ===
+  BEFORE: deep clone of Config                     4 KB         73 allocs     0.00 ms
+  NOW:    ConfigHandle::snapshot()                 0 KB          0 allocs     0.00 ms
+
+=== 500 issues / 220 KB compact JSON  (mean of 20) ===
+ -- stage 1: jq filter, no filter supplied (the default path)
+  BEFORE: deep clone of the payload             1469 KB      17507 allocs     2.21 ms
+  NOW:    apply_jq_filter(None) borrows            0 KB          0 allocs     0.00 ms
+ -- stage 2: render
+  BEFORE: eager pretty-JSON, then discard       2249 KB      19053 allocs     5.17 ms
+  NOW:    render(Toon), lazy fallback           1736 KB      19032 allocs     3.41 ms
+  ref:    render(Json) on same data              512 KB         13 allocs     0.47 ms
+ -- stage 3: truncate
+  truncate_for_ai (over budget)                   39 KB          4 allocs     0.00 ms
+   rendered output: 243 KB
+
+=== 5000 issues / 2226 KB compact JSON  (mean of 4) ===
+ -- stage 1: jq filter, no filter supplied (the default path)
+  BEFORE: deep clone of the payload            14703 KB     175007 allocs    18.50 ms
+  NOW:    apply_jq_filter(None) borrows            0 KB          0 allocs     0.00 ms
+ -- stage 2: render
+  BEFORE: eager pretty-JSON, then discard      20643 KB     190051 allocs    38.13 ms
+  NOW:    render(Toon), lazy fallback          16547 KB     190035 allocs    32.86 ms
+  ref:    render(Json) on same data             4096 KB         16 allocs     4.79 ms
+ -- stage 3: truncate
+  truncate_for_ai (over budget)                   39 KB          4 allocs     0.01 ms
+   rendered output: 2455 KB
+
+Enterprise gates: same script, Enterprise block (resumed after fixes)
+
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.22s
+    Checking mcp-devtools-enterprise v0.1.0 (/home/rohitsi/work/code/mcp-devtools-enterprise)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.35s
+   Compiling mcp-server-devtools v0.15.0 (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs)
+   Compiling mcp-devtools-enterprise v0.1.0 (/home/rohitsi/work/code/mcp-devtools-enterprise)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 43.82s
+     Running unittests src/lib.rs (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs/target/debug/deps/mcp_devtools_enterprise-dd7540954ed4686e)
+
+running 2 tests
+test console::pages::proposal_view_tests::approval_without_application_evidence_is_never_presented_as_applied ... ok
+test console::login::tests::chunked_token_response_is_bounded_before_eof ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running unittests src/main.rs (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs/target/debug/deps/mcp_devtools_enterprise-7553391d0cd0e7bb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/approval_recovery_tests.rs (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs/target/debug/deps/approval_recovery_tests-38547a7e939538ff)
+
+running 4 tests
+test approval_does_not_hand_out_a_second_application_before_completion ... ok
+test restart_does_not_infer_completion_from_an_intent_or_a_shared_version ... ok
+test failed_decision_or_completion_append_cannot_enable_a_second_application ... ok
+test completed_proposal_is_idempotent_and_does_not_complete_its_same_version_peer ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/approvals_tests.rs (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs/target/debug/deps/approvals_tests-6e5801b236199801)
+
+running 9 tests
+test deny_list_is_gated_and_the_rest_stays_direct_under_required ... ok
+test proposals_are_off_under_the_direct_gate_and_the_setting_is_validated ... ok
+test required_defers_a_policy_install_until_a_second_administrator_approves ... ok
+test refusals_record_nothing_and_shapes_are_checked ... ok
+test failed_file_install_after_intent_is_not_retried_or_recovered_as_complete ... ok
+test concurrent_http_approvals_install_once_and_remain_idempotent_after_restart ... ok
+test pending_proposals_survive_a_restart_and_a_tampered_journal_is_refused ... ok
+test cli_proposes_lists_and_approves_with_json ... ok
+test reject_and_expiry_journal_their_own_records ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.63s
+
+     Running tests/console_tests.rs (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs/target/debug/deps/console_tests-feb51787c482de07)
+
+running 20 tests
+test console_settings_are_read_and_validated ... ok
+test htmx_is_vendored_at_the_recorded_digest_and_has_no_eval_path ... ok
+test activity_page_renders_journal_rows_and_the_stopped_banner_shape ... ok
+test control_role_renders_process_scope_unavailability_honestly ... ok
+test a_token_the_admin_api_refuses_gets_no_session ... ok
+test login_redirects_with_pkce_and_binds_state_to_the_pre_session_cookie ... ok
+test callback_redeems_the_code_with_the_verifier_and_starts_a_strict_session ... ok
+test session_stores_are_bounded_and_expiring ... ok
+test console_proposals_enforce_separation_freshness_rejection_and_durable_idempotent_apply ... ok
+test every_route_carries_the_security_headers ... ok
+test callback_refuses_a_response_from_an_unexpected_issuer ... ok
+test an_api_401_ends_the_session ... ok
+test every_authoring_route_preserves_headers_sessions_and_origin_checks ... ok
+test authoring_validates_diffs_downloads_exact_bytes_and_uploads_through_the_api ... ok
+test proposal_redesign_shows_real_state_and_removes_completed_decision_forms ... ok
+test signs_in_with_a_real_bearer_from_a_wiremock_jwks ... ok
+test report_and_inventory_pages_render_honestly ... ok
+test pages_render_the_api_answers_and_never_the_token ... ok
+test non_get_requests_need_the_public_origin ... ok
+test console_expiry_is_journaled_once_and_never_applies ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.36s
+
+     Running tests/edition_tests.rs (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs/target/debug/deps/edition_tests-ef685dcc0e77f5e1)
+
+running 3 tests
+test enterprise_binary_identifies_itself_and_lists_proposal_commands ... ok
+test enterprise_startup_selects_approval_adapter_with_the_actual_journal ... ok
+test every_proposal_command_accepts_json ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running tests/smoke.rs (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs/target/debug/deps/smoke-08a6956741074ec6)
+
+running 5 tests
+test community_ports_are_visible_at_the_boundary ... ok
+test community_library_links_and_its_config_surface_works ... ok
+test enterprise_core_types_are_part_of_the_library_surface ... ok
+test enterprise_ports_are_part_of_the_library_surface ... ok
+test phase_a_enforcement_surface_is_visible_at_the_boundary ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests mcp_devtools_enterprise
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Compiling mcp-server-devtools v0.15.0 (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs)
+   Compiling mcp-devtools-enterprise v0.1.0 (/home/rohitsi/work/code/mcp-devtools-enterprise)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 37.49s
+    Checking mcp-server-devtools v0.15.0 (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs)
+    Checking mcp-devtools-enterprise v0.1.0 (/home/rohitsi/work/code/mcp-devtools-enterprise)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.10s
+   Compiling hyper v1.11.0
+   Compiling assert-json-diff v2.0.2
+   Compiling deadpool v0.12.3
+   Compiling hyper-util v0.1.20
+   Compiling hyper-rustls v0.27.9
+   Compiling axum v0.8.9
+   Compiling wiremock v0.6.5
+   Compiling reqwest v0.13.4
+   Compiling mcp-server-devtools v0.15.0 (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs)
+   Compiling mcp-devtools-enterprise v0.1.0 (/home/rohitsi/work/code/mcp-devtools-enterprise)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 50.03s
+     Running unittests src/lib.rs (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs/target/debug/deps/mcp_devtools_enterprise-51adff7706ab8e94)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs/target/debug/deps/mcp_devtools_enterprise-6d34d5bb12ca96cf)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/approval_recovery_tests.rs (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs/target/debug/deps/approval_recovery_tests-f78ecc0a6176ef13)
+
+running 4 tests
+test approval_does_not_hand_out_a_second_application_before_completion ... ok
+test restart_does_not_infer_completion_from_an_intent_or_a_shared_version ... ok
+test failed_decision_or_completion_append_cannot_enable_a_second_application ... ok
+test completed_proposal_is_idempotent_and_does_not_complete_its_same_version_peer ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/approvals_tests.rs (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs/target/debug/deps/approvals_tests-92ae05ee0d041d7e)
+
+running 9 tests
+test deny_list_is_gated_and_the_rest_stays_direct_under_required ... ok
+test proposals_are_off_under_the_direct_gate_and_the_setting_is_validated ... ok
+test required_defers_a_policy_install_until_a_second_administrator_approves ... ok
+test cli_proposes_lists_and_approves_with_json ... ok
+test refusals_record_nothing_and_shapes_are_checked ... ok
+test concurrent_http_approvals_install_once_and_remain_idempotent_after_restart ... ok
+test failed_file_install_after_intent_is_not_retried_or_recovered_as_complete ... ok
+test pending_proposals_survive_a_restart_and_a_tampered_journal_is_refused ... ok
+test reject_and_expiry_journal_their_own_records ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.67s
+
+     Running tests/console_tests.rs (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs/target/debug/deps/console_tests-1e062d35691aa2a6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/edition_tests.rs (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs/target/debug/deps/edition_tests-14d700d26560df77)
+
+running 3 tests
+test enterprise_startup_selects_approval_adapter_with_the_actual_journal ... ok
+test enterprise_binary_identifies_itself_and_lists_proposal_commands ... ok
+test every_proposal_command_accepts_json ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+     Running tests/smoke.rs (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs/target/debug/deps/smoke-1913c81dc13021a0)
+
+running 5 tests
+test community_library_links_and_its_config_surface_works ... ok
+test community_ports_are_visible_at_the_boundary ... ok
+test enterprise_ports_are_part_of_the_library_surface ... ok
+test enterprise_core_types_are_part_of_the_library_surface ... ok
+test phase_a_enforcement_surface_is_visible_at_the_boundary ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests mcp_devtools_enterprise
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Compiling serde v1.0.229
+    Checking digest v0.11.3
+   Compiling rmcp-macros v3.1.2
+    Checking jmespath v0.5.0
+   Compiling rust-embed-impl v8.12.0
+    Checking sha2 v0.11.0
+    Checking rmcp v3.1.2
+   Compiling askama_parser v0.16.1
+   Compiling basic-toml v0.1.10
+    Checking rust-embed-utils v8.12.0
+    Checking rust-embed v8.12.0
+   Compiling askama_derive v0.16.1
+    Checking mcp-server-devtools v0.15.0 (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs)
+   Compiling askama_macros v0.16.1
+    Checking askama v0.16.1
+    Checking mcp-devtools-enterprise v0.1.0 (/home/rohitsi/work/code/mcp-devtools-enterprise)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 25.99s
+advisories ok, bans ok, licenses ok, sources ok
+PASS: exact signed bytes, BOM/CRLF/non-ASCII, invalid UTF-8, missing/oversized files, JSON fallback
+   Compiling mcp-server-devtools v0.15.0 (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs)
+   Compiling mcp-devtools-enterprise v0.1.0 (/home/rohitsi/work/code/mcp-devtools-enterprise)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 2m 40s
+     Running benches/response_pipeline.rs (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs/target/release/deps/response_pipeline-9b01cf2e7a90c0d1)
+=== console activity render, 1000 rows (mean of 100) ===
+  ActivityPage::complete render, 1000 rows       444 KB          8 allocs     0.23 ms
+   rendered HTML: 233723 bytes
+
+Enterprise dev-fast headless build
+
+   Compiling mcp-server-devtools v0.15.0 (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs)
+   Compiling mcp-devtools-enterprise v0.1.0 (/home/rohitsi/work/code/mcp-devtools-enterprise)
+    Finished `dev-fast` profile [optimized + debuginfo] target(s) in 2m 19s
+
+Fresh pre-extraction snapshot console comparison
+
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.39s
+     Running benches/response_pipeline.rs (target/release/deps/response_pipeline-4ed279ee41231fb2)
+=== output size: is TOON earning its CPU? ===
+                                            compact     pretty       TOON
+  uniform flat rows (TOON's best case)       12392B     20800B      5016B   TOON is 40% of compact, 24% of pretty
+  nested objects (Jira search shape)         89903B    133723B     99300B   TOON is 110% of compact, 74% of pretty
+
+=== stage -1: policy extractors, per tool call (mean of 2000) ===
+  canonical: short path                            0 KB          4 allocs     0.00 ms
+  canonical: dot-segments + escapes                0 KB          1 allocs     0.00 ms
+  canonical: search URL (long JQL)                 0 KB         10 allocs     0.00 ms
+  jira::extract GET /issue/{key}                   0 KB          6 allocs     0.00 ms
+  jira::extract GET /search/jql (long JQL)         1 KB         17 allocs     0.01 ms
+  jira::project_keys_from_jql (long JQL)           0 KB          9 allocs     0.00 ms
+  jira::extract unmapped (default arm)             0 KB          1 allocs     0.00 ms
+  grafana::query_logs                              0 KB         10 allocs     0.00 ms
+
+=== stage -1b: policy decision, per tool call (mean of 2000) ===
+  ActionContext via for_tool (grafana)             0 KB         21 allocs     0.00 ms
+  FilePolicy::evaluate @ 500 rules                 0 KB          5 allocs     0.01 ms
+
+=== stage -1c: enterprise request path, production components (mean of 2000 / 1000) ===
+  JWT validate: cache hit (budget 50 µs)           1 KB          9 allocs     3.99 µs
+  C.1 JWT authenticate: cached actor chain         1 KB          8 allocs     4.09 µs
+  journal append, sequential (budget p99 200 µs)         1 KB          6 allocs  p50      15 µs  p99      25 µs  max     100 µs
+
+=== stage -1d: usage side of the request path (mean of 2000) — C.6 ===
+  rate limit check, known subject                  0 KB          0 allocs     0.00 ms
+  PrometheusUsageSink::record, known series         0 KB          0 allocs     0.00 ms
+  FanOut(prometheus + channel)::record             0 KB          9 allocs     0.00 ms
+
+=== stage -1e: principal inventory — C.4 ===
+  observe principal, known unchanged               0 KB          0 allocs     0.00 ms
+
+=== stage -1f: console activity render, 1000 rows (mean of 100) — D.1 ===
+  ActivityPage::complete render, 1000 rows       444 KB          8 allocs     0.20 ms
+   rendered HTML: 233723 bytes
+
+=== stage 0: per-tool-call config snapshot (mean of 1000) ===
+  BEFORE: deep clone of Config                     4 KB         73 allocs     0.00 ms
+  NOW:    ConfigHandle::snapshot()                 0 KB          0 allocs     0.00 ms
+
+=== 500 issues / 220 KB compact JSON  (mean of 20) ===
+ -- stage 1: jq filter, no filter supplied (the default path)
+  BEFORE: deep clone of the payload             1469 KB      17507 allocs     1.55 ms
+  NOW:    apply_jq_filter(None) borrows            0 KB          0 allocs     0.00 ms
+ -- stage 2: render
+  BEFORE: eager pretty-JSON, then discard       2249 KB      19053 allocs     3.30 ms
+  NOW:    render(Toon), lazy fallback           1736 KB      19032 allocs     2.81 ms
+  ref:    render(Json) on same data              512 KB         13 allocs     0.39 ms
+ -- stage 3: truncate
+  truncate_for_ai (over budget)                   39 KB          4 allocs     0.00 ms
+   rendered output: 243 KB
+
+=== 5000 issues / 2226 KB compact JSON  (mean of 4) ===
+ -- stage 1: jq filter, no filter supplied (the default path)
+  BEFORE: deep clone of the payload            14703 KB     175007 allocs    17.32 ms
+  NOW:    apply_jq_filter(None) borrows            0 KB          0 allocs     0.00 ms
+ -- stage 2: render
+  BEFORE: eager pretty-JSON, then discard      20643 KB     190051 allocs    34.25 ms
+  NOW:    render(Toon), lazy fallback          16547 KB     190035 allocs    31.19 ms
+  ref:    render(Json) on same data             4096 KB         16 allocs     5.27 ms
+ -- stage 3: truncate
+  truncate_for_ai (over budget)                   39 KB          4 allocs     0.00 ms
+   rendered output: 2455 KB
+
+Docker source-cache regression: python3 tests/build_cache_test.py
+1 test passed (backdated source/template files, matching content, failure/retry).

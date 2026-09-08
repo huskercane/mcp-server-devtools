@@ -1,0 +1,778 @@
+//! Phase A "done when" (`docs/enterprise-product-plan.md` §4), in process:
+//!
+//! > an Okta-issued token reaches [the gateway], `grafana_query_logs`
+//! > against a QA datasource succeeds for group A and is denied for group B
+//! > with a reason, both the denial and the allow are in the journal with
+//! > policy version and upstream identity, and the journal was written
+//! > before dispatch.
+//!
+//! Every component is the production one: RS256 tokens signed with the
+//! test key and validated by `OidcJwksValidator` against a wiremock JWKS;
+//! the real bearer middleware and router; the file policy compiled from
+//! the shipped read-only profile plus a group-B row; the durable
+//! `JournalAuditSink` on disk; Grafana's Loki proxy on wiremock. The TLS
+//! ingress and the container are the only pieces not in the loop, and
+//! `tests/auth_mode_tests.rs` covers the binary boundary.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode, get_current_timestamp};
+use mcp_server_devtools::audit::journal::{JOURNAL_FILE_NAME, JournalAuditSink};
+use mcp_server_devtools::auth::oidc::{JwksLocation, OidcJwksValidator, OidcSettings, Profile};
+use mcp_server_devtools::bootstrap::{ServerBuilder, Vendors};
+use mcp_server_devtools::config::Config;
+use mcp_server_devtools::policy::{ActionContext, FilePolicy, PolicyDecision, PolicyEffect};
+use mcp_server_devtools::ports::{InMemoryAuditSink, PolicyDecisionPoint, StaticValidator};
+use mcp_server_devtools::server::auth::{InboundAuth, InboundAuthSettings};
+use mcp_server_devtools::server::http::build_app_with_server_and_auth;
+use mcp_server_devtools::vendor::grafana::GrafanaVendor;
+use reqwest::StatusCode;
+use serde_json::{Value, json};
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+const PRIVATE_KEY_DER: &[u8] = include_bytes!("fixtures/okta_test_rsa_pkcs1.der");
+const PUBLIC_JWK: &str = include_str!("fixtures/okta_test_jwk.json");
+const ISSUER: &str = "https://acme.okta.com/oauth2/default";
+const AUDIENCE: &str = "api://mcp-devtools";
+const LOKI_QA_PATH: &str = "/api/datasources/proxy/uid/loki-qa/loki/api/v1/query_range";
+
+fn token_for(subject: &str, groups: &[&str]) -> String {
+    let now = get_current_timestamp();
+    let claims = json!({
+        "sub": subject,
+        "iss": ISSUER,
+        "aud": AUDIENCE,
+        "iat": now,
+        "exp": now + 300,
+        "scp": ["mcp:tools"],
+        "groups": groups,
+    });
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some("test-key-1".to_owned());
+    encode(
+        &header,
+        &claims,
+        &EncodingKey::from_rsa_der(PRIVATE_KEY_DER),
+    )
+    .unwrap()
+}
+
+/// The shipped Grafana read-only profile, plus a second group so the
+/// denial is by a real policy decision, not by a missing rule.
+fn phase_a_policy() -> Arc<FilePolicy> {
+    let profile = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/policies/grafana-read-only.yaml"),
+    )
+    .expect("shipped profile");
+    FilePolicy::from_bytes(profile.as_bytes()).expect("shipped profile compiles")
+}
+
+/// Records how many journal lines existed at the moment the upstream saw
+/// the request — the "written before dispatch" witness.
+struct JournalWitness {
+    journal: std::path::PathBuf,
+    lines_at_request: Arc<Mutex<Option<usize>>>,
+    hits: Arc<AtomicUsize>,
+}
+
+impl Respond for JournalWitness {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let lines = std::fs::read_to_string(&self.journal).map_or(0, |text| text.lines().count());
+        *self.lines_at_request.lock().unwrap() = Some(lines);
+        self.hits.fetch_add(1, Ordering::SeqCst);
+        ResponseTemplate::new(200).set_body_json(json!({
+            "status": "success",
+            "data": { "resultType": "streams", "result": [
+                { "stream": {"app": "api"}, "values": [["1700000000000000000", "hello from qa"]] }
+            ] }
+        }))
+    }
+}
+
+struct Slice {
+    base: String,
+    journal: std::path::PathBuf,
+    lines_at_request: Arc<Mutex<Option<usize>>>,
+    hits: Arc<AtomicUsize>,
+    _jwks: MockServer,
+    grafana: MockServer,
+    _dir: tempfile::TempDir,
+}
+
+async fn spawn_slice(policy: Arc<dyn PolicyDecisionPoint>) -> Slice {
+    let jwks = MockServer::start().await;
+    let jwk: Value = serde_json::from_str(PUBLIC_JWK).unwrap();
+    Mock::given(method("GET"))
+        .and(path("/keys"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [jwk] })))
+        .mount(&jwks)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let journal_dir = dir.path().join("journal");
+    if cfg!(windows) {
+        std::fs::create_dir_all(&journal_dir).unwrap();
+        std::fs::File::create(journal_dir.join(JOURNAL_FILE_NAME)).unwrap();
+    }
+    let journal = journal_dir.join(JOURNAL_FILE_NAME);
+    let sink = JournalAuditSink::open(&journal_dir).expect("open journal");
+
+    let grafana = MockServer::start().await;
+    let lines_at_request = Arc::new(Mutex::new(None));
+    let hits = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("GET"))
+        .and(path(LOKI_QA_PATH))
+        .respond_with(JournalWitness {
+            journal: journal.clone(),
+            lines_at_request: Arc::clone(&lines_at_request),
+            hits: Arc::clone(&hits),
+        })
+        .mount(&grafana)
+        .await;
+
+    let config = Config::from_map(HashMap::from([
+        (
+            "GRAFANA_TOKEN".to_owned(),
+            "glsa_qa_service_token".to_owned(),
+        ),
+        ("MCP_VENDOR_ENVIRONMENT".to_owned(), "qa".to_owned()),
+    ]));
+    let server = ServerBuilder::new()
+        .config(config.clone())
+        .vendors(Vendors {
+            grafana: GrafanaVendor::with_base_url(grafana.uri()),
+            ..Vendors::default()
+        })
+        .audit_sink(Arc::new(sink))
+        .policy(policy)
+        .require_inbound_auth(true)
+        .build()
+        .expect("build server");
+
+    let settings = OidcSettings::new(
+        Profile::Okta,
+        ISSUER,
+        AUDIENCE,
+        JwksLocation::Direct(format!("{}/keys", jwks.uri())),
+    )
+    .with_tenant("acme");
+    let validator = Arc::new(OidcJwksValidator::new(settings, reqwest::Client::new()));
+    let auth = Arc::new(InboundAuth::new(
+        Arc::new(validator),
+        InboundAuthSettings::from_config(
+            &Config::from_map(HashMap::from([(
+                "MCP_PUBLIC_URL".to_owned(),
+                "https://mcp.acme.example".to_owned(),
+            )])),
+            "okta",
+            vec![ISSUER.to_owned()],
+        )
+        .unwrap(),
+    ));
+    let app = build_app_with_server_and_auth(
+        server,
+        auth,
+        Duration::from_mins(5),
+        Duration::from_mins(5),
+        CancellationToken::new(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    Slice {
+        base: format!("http://{addr}"),
+        journal,
+        lines_at_request,
+        hits,
+        _jwks: jwks,
+        grafana,
+        _dir: dir,
+    }
+}
+
+async fn query_logs(base: &str, token: &str, uid: &str) -> Value {
+    query_logs_with(
+        base,
+        token,
+        json!({ "datasourceUid": uid, "query": "{app=\"api\"}", "limit": 10 }),
+    )
+    .await
+}
+
+async fn query_logs_with(base: &str, token: &str, arguments: Value) -> Value {
+    let response = reqwest::Client::new()
+        .post(format!("{base}/mcp"))
+        .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", "grafana_query_logs")
+        .header("authorization", format!("Bearer {token}"))
+        .json(&json!({
+            "jsonrpc": "2.0", "id": "req-1", "method": "tools/call",
+            "params": {
+                "name": "grafana_query_logs",
+                "arguments": arguments,
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                    "io.modelcontextprotocol/clientInfo": { "name": "slice-test", "version": "0" }
+                }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
+    serde_json::from_str(&body).unwrap_or_else(|_| {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .find_map(|data| serde_json::from_str(data.trim()).ok())
+            .unwrap_or_else(|| panic!("unparseable: {body}"))
+    })
+}
+
+fn journal_lines(journal: &Path) -> Vec<Value> {
+    std::fs::read_to_string(journal)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("journal line is JSON"))
+        .collect()
+}
+
+// One end-to-end walk of the "done when": splitting it would hide the
+// sequence it exists to show.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn group_a_is_allowed_group_b_is_denied_and_both_are_in_the_journal_first() {
+    let policy = phase_a_policy();
+    let policy_version = policy.version().unwrap();
+    let slice = spawn_slice(policy).await;
+    let alice = token_for("alice@acme.example", &["SRE"]);
+    let bob = token_for("bob@acme.example", &["Developers"]);
+
+    // Group A: allowed, dispatched, answered.
+    let allowed = query_logs(&slice.base, &alice, "loki-qa").await;
+    assert_ne!(allowed["result"]["isError"], true, "{allowed}");
+    assert!(
+        allowed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("hello from qa"),
+        "{allowed}"
+    );
+    assert_eq!(slice.hits.load(Ordering::SeqCst), 1);
+    // …and the intent was on disk before the upstream saw the request.
+    let lines_when_upstream_was_hit = slice.lines_at_request.lock().unwrap().unwrap();
+    assert!(
+        lines_when_upstream_was_hit >= 1,
+        "the intent record must be durable before dispatch"
+    );
+
+    // Group B: denied with a reason, and the upstream never sees it.
+    let denied = query_logs(&slice.base, &bob, "loki-qa").await;
+    assert_eq!(denied["result"]["isError"], true, "{denied}");
+    let text = denied["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Policy denied"), "{text}");
+    assert!(text.contains("no rule allows this call"), "{text}");
+    assert!(
+        text.contains(&policy_version),
+        "the reason names the policy: {text}"
+    );
+    assert_eq!(
+        slice.hits.load(Ordering::SeqCst),
+        1,
+        "denied call must not reach Grafana"
+    );
+
+    // The journal: allow intent, allow outcome, deny intent — sequenced,
+    // with the policy version, the upstream identity, and the principal.
+    let lines = journal_lines(&slice.journal);
+    assert_eq!(lines.len(), 3, "{lines:#?}");
+    let (allow_intent, allow_outcome, deny_intent) = (&lines[0], &lines[1], &lines[2]);
+
+    assert_eq!(allow_intent["seq"], 1);
+    assert_eq!(allow_intent["kind"], "tool_call_intent");
+    assert_eq!(allow_intent["principal"]["subject"], "alice@acme.example");
+    assert_eq!(allow_intent["principal"]["groups"], json!(["SRE"]));
+    assert_eq!(allow_intent["principal"]["authority"], ISSUER);
+    assert_eq!(allow_intent["decision"]["effect"], "allow");
+    assert_eq!(
+        allow_intent["decision"]["rule_id"],
+        "sre-read-qa-datasources"
+    );
+    assert_eq!(allow_intent["decision"]["policy_version"], policy_version);
+    assert_eq!(
+        allow_intent["upstream_identity"]["label"],
+        "grafana/GRAFANA_TOKEN"
+    );
+    assert_eq!(allow_intent["upstream_identity"]["environment"], "qa");
+    assert_eq!(allow_intent["upstream_identity"]["authority"], "shared");
+    assert_eq!(allow_intent["action"]["resource_type"], "datasource");
+    assert_eq!(
+        allow_intent["action"]["resource_scope"]["ids"],
+        json!(["loki-qa"])
+    );
+    assert_eq!(allow_intent["action"]["canonical_path"], LOKI_QA_PATH);
+    assert_eq!(allow_intent["action"]["request_risk"], "read");
+
+    assert_eq!(allow_outcome["seq"], 2);
+    assert_eq!(allow_outcome["kind"], "tool_call_outcome");
+    assert_eq!(allow_outcome["outcome"], "success");
+    assert_eq!(allow_outcome["request_id"], allow_intent["request_id"]);
+    assert_eq!(allow_outcome["decision"]["policy_version"], policy_version);
+    // The outcome names the request that actually went on the wire and the
+    // egress decision it received — the per-request half of the evidence.
+    let egress = &allow_outcome["egress"];
+    assert_eq!(egress["omitted"], 0, "{egress}");
+    assert_eq!(egress["requests"].as_array().map(Vec::len), Some(1));
+    let sent = &egress["requests"][0];
+    assert_eq!(sent["vendor"], "grafana");
+    assert_eq!(sent["method"], "GET");
+    assert!(
+        sent["canonical_target"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("{LOKI_QA_PATH}?")),
+        "{sent}"
+    );
+    assert_eq!(sent["effect"], "allow");
+    assert_eq!(sent["rule_id"], "sre-read-qa-datasources");
+    // …and that it actually went on the wire, once, and was answered.
+    assert_eq!(
+        sent["dispatch"],
+        json!({ "state": "attempted", "attempts": 1, "last_status": 200, "failure": null }),
+        "{sent}"
+    );
+    assert!(
+        allow_intent["egress"].is_null(),
+        "egress is decided after the intent is written"
+    );
+
+    assert_eq!(deny_intent["seq"], 3);
+    assert_eq!(deny_intent["kind"], "tool_call_intent");
+    assert_eq!(deny_intent["principal"]["subject"], "bob@acme.example");
+    assert_eq!(deny_intent["decision"]["effect"], "deny");
+    assert!(deny_intent["decision"]["rule_id"].is_null());
+    assert_eq!(deny_intent["decision"]["policy_version"], policy_version);
+    assert_eq!(
+        deny_intent["upstream_identity"]["label"],
+        "grafana/GRAFANA_TOKEN"
+    );
+
+    // Secrets hygiene: the service token and both bearer tokens are nowhere
+    // in the evidence.
+    let raw = std::fs::read_to_string(&slice.journal).unwrap();
+    for secret in ["glsa_qa_service_token", alice.as_str(), bob.as_str()] {
+        assert!(!raw.contains(secret), "journal leaked a secret");
+    }
+
+    // A datasource outside the profile is denied even for group A, and the
+    // LogQL never reaches the journal as text.
+    let elsewhere = query_logs(&slice.base, &alice, "loki-prod").await;
+    assert_eq!(elsewhere["result"]["isError"], true);
+    assert_eq!(slice.hits.load(Ordering::SeqCst), 1);
+    let raw = std::fs::read_to_string(&slice.journal).unwrap();
+    assert!(
+        !raw.contains("app=\\\"api\\\""),
+        "LogQL text must not be journaled"
+    );
+}
+
+/// A decision point that allows at the tool level and denies at egress, so
+/// the second chokepoint is exercised on its own: the vendor is never
+/// contacted and the denial is journaled with the canonical request.
+struct FlipOnSecond {
+    calls: AtomicUsize,
+}
+
+impl PolicyDecisionPoint for FlipOnSecond {
+    fn evaluate(&self, _context: &ActionContext) -> PolicyDecision {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call.is_multiple_of(2) {
+            PolicyDecision::by_rule(PolicyEffect::Allow, "tool-level-allow", "test")
+        } else {
+            PolicyDecision::by_rule(PolicyEffect::Deny, "egress-deny", "test")
+        }
+    }
+
+    fn version(&self) -> Option<String> {
+        Some("test".to_owned())
+    }
+}
+
+#[tokio::test]
+async fn an_egress_denial_stops_the_request_and_is_journaled() {
+    let slice = spawn_slice(Arc::new(FlipOnSecond {
+        calls: AtomicUsize::new(0),
+    }))
+    .await;
+    let alice = token_for("alice@acme.example", &["SRE"]);
+
+    let denied = query_logs(&slice.base, &alice, "loki-qa").await;
+    assert_eq!(denied["result"]["isError"], true, "{denied}");
+    let text = denied["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("egress-deny"), "{text}");
+    assert_eq!(
+        slice.hits.load(Ordering::SeqCst),
+        0,
+        "egress denial must stop the request"
+    );
+
+    let lines = journal_lines(&slice.journal);
+    let kinds: Vec<&str> = lines
+        .iter()
+        .map(|line| line["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["tool_call_intent", "egress_decision", "tool_call_outcome"]
+    );
+    let egress = &lines[1];
+    assert_eq!(egress["decision"]["effect"], "deny");
+    assert_eq!(egress["decision"]["rule_id"], "egress-deny");
+    assert_eq!(egress["outcome"], "egress_denied");
+    assert_eq!(egress["action"]["canonical_path"], LOKI_QA_PATH);
+    assert_eq!(egress["action"]["method"], "GET");
+    assert_eq!(lines[2]["outcome"], "error");
+    // The outcome lists the denied request too, so the outcome alone says
+    // what the call tried to send and that nothing was allowed out.
+    let listed = &lines[2]["egress"]["requests"];
+    assert_eq!(listed.as_array().map(Vec::len), Some(1), "{listed}");
+    assert_eq!(listed[0]["effect"], "deny");
+    assert_eq!(listed[0]["rule_id"], "egress-deny");
+    assert_eq!(listed[0]["dispatch"]["state"], "denied");
+}
+
+/// An authorized request is not the same as a sent one. The egress record
+/// says what the transport did — here, how many attempts a streamed request
+/// took: answered 503 once, then 200, under one authorization.
+#[tokio::test]
+async fn egress_records_count_wire_attempts_under_one_authorization() {
+    let slice = spawn_slice(phase_a_policy()).await;
+    let alice = token_for("alice@acme.example", &["SRE"]);
+    // Mounted after the witness responder, so it takes precedence for its
+    // single use; the witness answers the retry.
+    Mock::given(method("GET"))
+        .and(path(LOKI_QA_PATH))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&slice.grafana)
+        .await;
+    let body = query_logs(&slice.base, &alice, "loki-qa").await;
+    assert_ne!(body["result"]["isError"], true, "{body}");
+    let outcome = journal_lines(&slice.journal)
+        .into_iter()
+        .find(|line| line["kind"] == "tool_call_outcome")
+        .expect("outcome");
+    let requests = &outcome["egress"]["requests"];
+    assert_eq!(requests.as_array().map(Vec::len), Some(1), "one decision");
+    assert_eq!(
+        requests[0]["dispatch"],
+        json!({ "state": "attempted", "attempts": 2, "last_status": 200, "failure": null }),
+        "two wire attempts under one authorization: {requests}"
+    );
+}
+
+/// Answers the first request with a non-retryable 500 at once and stalls
+/// every later one, so the first partition's failure cancels the others
+/// while their sends are in flight at the vendor.
+struct FailFirstStallRest {
+    seen: AtomicUsize,
+}
+
+impl Respond for FailFirstStallRest {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        if self.seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            ResponseTemplate::new(500)
+        } else {
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(2))
+                .set_body_json(json!({ "status": "success", "data": { "resultType": "streams", "result": [] } }))
+        }
+    }
+}
+
+/// A send that is cancelled while in flight is not "not attempted": the
+/// vendor may have observed it. The record says `attempted` with
+/// `cancelled` as the failure.
+#[tokio::test]
+async fn a_send_cancelled_in_flight_is_recorded_as_an_attempt() {
+    let slice = spawn_slice(phase_a_policy()).await;
+    let alice = token_for("alice@acme.example", &["SRE"]);
+    Mock::given(method("GET"))
+        .and(path(LOKI_QA_PATH))
+        .respond_with(FailFirstStallRest {
+            seen: AtomicUsize::new(0),
+        })
+        .with_priority(1)
+        .mount(&slice.grafana)
+        .await;
+
+    let body = query_logs_with(
+        &slice.base,
+        &alice,
+        json!({
+            "datasourceUid": "loki-qa", "query": "{app=\"api\"}", "limit": 10,
+            "start": "1700000000000000000", "end": "1700000600000000000",
+            "timePartitions": 3,
+        }),
+    )
+    .await;
+    assert_eq!(body["result"]["isError"], true, "{body}");
+
+    let outcome = journal_lines(&slice.journal)
+        .into_iter()
+        .find(|line| line["kind"] == "tool_call_outcome")
+        .expect("outcome");
+    let requests = outcome["egress"]["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 3, "{requests:#?}");
+    let mut failed = 0;
+    let mut cancelled = 0;
+    for request in requests {
+        let dispatch = &request["dispatch"];
+        assert_eq!(dispatch["state"], "attempted", "{dispatch}");
+        assert_eq!(dispatch["attempts"], 1);
+        match (
+            dispatch["last_status"].as_u64(),
+            dispatch["failure"].as_str(),
+        ) {
+            (Some(500), None) => failed += 1,
+            (None, Some("cancelled")) => cancelled += 1,
+            other => panic!("unexpected dispatch {other:?}: {dispatch}"),
+        }
+    }
+    assert_eq!((failed, cancelled), (1, 2));
+}
+
+/// The other way an authorized request stays off the wire: the response
+/// cache. The second of two identical allowed GETs is answered locally and
+/// its egress record says so.
+#[tokio::test]
+async fn egress_records_mark_cache_hits_as_not_sent() {
+    let jira = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/PLAT-1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("cache-control", "max-age=60")
+                .set_body_json(json!({ "key": "PLAT-1" })),
+        )
+        .expect(1)
+        .mount(&jira)
+        .await;
+    let sink = Arc::new(InMemoryAuditSink::new());
+    let policy = FilePolicy::from_bytes(
+        b"version: 1\nrules:\n  - id: read-plat\n    effect: allow\n    subjects: {everyone: true}\n    match: {vendor: jira, resource_type: issue, resource_id: [\"PLAT-*\"]}\n",
+    )
+    .unwrap();
+    let server = ServerBuilder::new()
+        .config(Config::from_map(HashMap::from([
+            (
+                "ATLASSIAN_USER_EMAIL".to_owned(),
+                "svc@acme.example".to_owned(),
+            ),
+            ("ATLASSIAN_API_TOKEN".to_owned(), "svc-token".to_owned()),
+            ("HTTP_CACHE_ENABLED".to_owned(), "true".to_owned()),
+            ("HTTP_CACHE_DEFAULT_TTL_SECONDS".to_owned(), "60".to_owned()),
+        ])))
+        .vendors(Vendors {
+            jira: mcp_server_devtools::vendor::jira::JiraVendor::with_base_url(jira.uri()),
+            ..Vendors::default()
+        })
+        .audit_sink(Arc::<InMemoryAuditSink>::clone(&sink))
+        .policy(policy as Arc<dyn PolicyDecisionPoint>)
+        .build()
+        .unwrap();
+    let app = mcp_server_devtools::server::http::build_app_with_server(
+        server,
+        Duration::from_mins(5),
+        Duration::from_mins(5),
+        CancellationToken::new(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let jira_get = || async {
+        reqwest::Client::new()
+            .post(format!("http://{addr}/mcp"))
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "tools/call")
+            .header("Mcp-Name", "jira_get")
+            .json(&json!({
+                "jsonrpc": "2.0", "id": "req-cache", "method": "tools/call",
+                "params": {
+                    "name": "jira_get",
+                    "arguments": { "path": "/rest/api/3/issue/PLAT-1" },
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                        "io.modelcontextprotocol/clientInfo": { "name": "cache-test", "version": "0" }
+                    }
+                }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+    assert_eq!(jira_get().await, StatusCode::OK);
+    assert_eq!(jira_get().await, StatusCode::OK);
+    let outcomes: Vec<Value> = sink
+        .events()
+        .into_iter()
+        .filter(|event| event["kind"] == "tool_call_outcome")
+        .collect();
+    assert_eq!(outcomes.len(), 2, "{outcomes:#?}");
+    assert_eq!(
+        outcomes[0]["egress"]["requests"][0]["dispatch"],
+        json!({ "state": "attempted", "attempts": 1, "last_status": 200, "failure": null })
+    );
+    assert_eq!(
+        outcomes[1]["egress"]["requests"][0]["dispatch"],
+        json!({ "state": "cache_hit" }),
+        "the second call was authorized but nothing went on the wire"
+    );
+}
+
+/// One tool call, several upstream requests: a partitioned query sends one
+/// request per partition, and the outcome must list each of them as
+/// individually authorized. The intent alone cannot — it describes the tool
+/// call, not the requests it turned into.
+#[tokio::test]
+async fn a_multi_request_call_lists_every_authorized_egress_on_its_outcome() {
+    let slice = spawn_slice(phase_a_policy()).await;
+    let alice = token_for("alice@acme.example", &["SRE"]);
+
+    let body = query_logs_with(
+        &slice.base,
+        &alice,
+        json!({
+            "datasourceUid": "loki-qa", "query": "{app=\"api\"}", "limit": 10,
+            "start": "1700000000000000000", "end": "1700000600000000000",
+            "timePartitions": 3,
+        }),
+    )
+    .await;
+    assert_ne!(body["result"]["isError"], true, "{body}");
+    assert_eq!(
+        slice.hits.load(Ordering::SeqCst),
+        3,
+        "one request per partition"
+    );
+
+    let lines = journal_lines(&slice.journal);
+    let outcome = lines
+        .iter()
+        .find(|line| line["kind"] == "tool_call_outcome")
+        .expect("outcome record");
+    let requests = outcome["egress"]["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 3, "{requests:#?}");
+    assert_eq!(outcome["egress"]["omitted"], 0);
+    let mut windows: Vec<&str> = requests
+        .iter()
+        .map(|request| {
+            assert_eq!(request["effect"], "allow");
+            assert_eq!(request["rule_id"], "sre-read-qa-datasources");
+            request["canonical_target"].as_str().unwrap()
+        })
+        .collect();
+    windows.sort_unstable();
+    windows.dedup();
+    assert_eq!(windows.len(), 3, "each partition is a distinct request");
+    assert!(
+        windows
+            .iter()
+            .all(|target| target.starts_with(LOKI_QA_PATH))
+    );
+}
+
+/// `AllowAll` plus a journal is local mode with evidence: no scope
+/// enforcement, decisions are the local allow, and nothing is denied.
+#[tokio::test]
+async fn allow_all_with_a_journal_records_but_never_denies() {
+    let sink = Arc::new(InMemoryAuditSink::new());
+    let grafana = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(LOKI_QA_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "success", "data": { "resultType": "streams", "result": [] }
+        })))
+        .expect(1)
+        .mount(&grafana)
+        .await;
+    let server = ServerBuilder::new()
+        .config(Config::from_map(HashMap::from([(
+            "GRAFANA_TOKEN".to_owned(),
+            "glsa".to_owned(),
+        )])))
+        .vendors(Vendors {
+            grafana: GrafanaVendor::with_base_url(grafana.uri()),
+            ..Vendors::default()
+        })
+        .audit_sink(Arc::<InMemoryAuditSink>::clone(&sink))
+        .require_inbound_auth(true)
+        .build()
+        .unwrap();
+    let auth = Arc::new(InboundAuth::new(
+        Arc::new(StaticValidator::new().with(
+            "tok",
+            mcp_server_devtools::policy::Principal {
+                tenant: "acme".to_owned(),
+                subject: "x".to_owned(),
+                groups: Vec::new(),
+                scopes: vec!["mcp:tools".to_owned()],
+                authority: mcp_server_devtools::policy::PrincipalAuthority::oidc(
+                    "https://acme.okta.com/oauth2/default",
+                ),
+            },
+        )),
+        InboundAuthSettings::from_config(
+            &Config::from_map(HashMap::from([(
+                "MCP_PUBLIC_URL".to_owned(),
+                "https://mcp.acme.example".to_owned(),
+            )])),
+            "okta",
+            vec![ISSUER.to_owned()],
+        )
+        .unwrap(),
+    ));
+    let app = build_app_with_server_and_auth(
+        server,
+        auth,
+        Duration::from_mins(5),
+        Duration::from_mins(5),
+        CancellationToken::new(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let body = query_logs(&format!("http://{addr}"), "tok", "loki-qa").await;
+    assert_ne!(body["result"]["isError"], true, "{body}");
+    let events = sink.events();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["decision"]["effect"], "allow");
+    assert!(events[0]["decision"]["policy_version"].is_null());
+    assert_eq!(
+        events[0]["action"]["resource_scope"]["ids"],
+        json!(["loki-qa"])
+    );
+}

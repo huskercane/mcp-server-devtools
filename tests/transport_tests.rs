@@ -1,0 +1,452 @@
+//! End-to-end transport tests using a local wiremock. Exercises the full
+//! response contract: auth header injection, each body classification, error
+//! mapping, and raw-response persistence.
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use mcp_server_devtools::auth::Credentials;
+use mcp_server_devtools::config::Config;
+use mcp_server_devtools::error::ErrorKind;
+use mcp_server_devtools::transport::{HttpMethod, RequestOptions, ResponseBody, build_client};
+use pretty_assertions::assert_eq;
+use serde_json::json;
+use wiremock::matchers::{body_json, header, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Wire the transport to talk to a local `MockServer` instead of
+/// `api.bitbucket.org`. We swap the base URL at runtime by pointing reqwest
+/// at an absolute URL built from the mock server's base.
+async fn call_mock(
+    mock_server: &MockServer,
+    path_suffix: &str,
+    options: RequestOptions,
+) -> Result<mcp_server_devtools::transport::TransportResponse, mcp_server_devtools::error::McpError>
+{
+    let client = build_client().unwrap();
+    let creds = Credentials::AtlassianApiToken {
+        email: "alice@example.com".into(),
+        token: "tok".into(),
+    };
+    let config = Config::from_map(HashMap::new());
+
+    // Swap out the base host by using the full URL via path=…; the transport
+    // normalises leading '/' only, it doesn't override the host. We use the
+    // override_url helper below.
+    override_url::fetch(mock_server, &client, &creds, &config, path_suffix, options).await
+}
+
+async fn call_mock_cached(
+    mock_server: &MockServer,
+    path_suffix: &str,
+    credentials: Credentials,
+) -> Result<mcp_server_devtools::transport::TransportResponse, mcp_server_devtools::error::McpError>
+{
+    let client = build_client().unwrap();
+    let config = Config::from_map(HashMap::from([
+        ("HTTP_CACHE_ENABLED".to_owned(), "true".to_owned()),
+        ("HTTP_CACHE_DEFAULT_TTL_SECONDS".to_owned(), "60".to_owned()),
+    ]));
+    override_url::fetch(
+        mock_server,
+        &client,
+        &credentials,
+        &config,
+        path_suffix,
+        RequestOptions::default(),
+    )
+    .await
+}
+
+/// Thin shim that replaces the hard-coded `api.bitbucket.org` base URL with
+/// the wiremock server's URL for the duration of the test. Implemented as an
+/// inline module to keep scope out of the public API.
+mod override_url {
+    use mcp_server_devtools::auth::Credentials;
+    use mcp_server_devtools::config::Config;
+    use mcp_server_devtools::error::McpError;
+    use mcp_server_devtools::transport::{
+        RequestOptions, TransportResponse, fetch_bitbucket_with_base,
+    };
+    use wiremock::MockServer;
+
+    pub async fn fetch(
+        server: &MockServer,
+        client: &reqwest::Client,
+        creds: &Credentials,
+        config: &Config,
+        path: &str,
+        options: RequestOptions,
+    ) -> Result<TransportResponse, McpError> {
+        fetch_bitbucket_with_base(&server.uri(), client, creds, config, path, options).await
+    }
+}
+
+// ---- Tests ----
+
+/// The bytes that go on the wire are the canonical form (plan §3.5), in
+/// every auth mode — what policy evaluates is what is sent. This locks the
+/// exact wire bytes for the inputs where canonicalization is *visible* to
+/// the upstream, so a change in any of these choices is a deliberate diff:
+///
+/// - dot-segments resolved and duplicate slashes collapsed in the path;
+/// - unreserved escapes decoded (`%2D` → `-`), reserved ones kept and
+///   uppercased (`%2f` → `%2F`; a slash inside a segment stays one segment);
+/// - query keys sorted (stable), values decoded once and re-encoded as
+///   `application/x-www-form-urlencoded`: a space is `+` whether the tool
+///   wrote `+` or `%20`, and `~` is `%7E` whether or not it was escaped.
+///
+/// Every upstream this server talks to parses its query string with those
+/// semantics; the tool-supplied spelling was never a contract. Kept under
+/// review as CF-19.
+#[tokio::test]
+async fn wire_bytes_are_the_canonical_form() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&server)
+        .await;
+
+    let cases = [
+        (
+            "/2.0/repos//acme/./web/../api/x%2Dy/refs%2fheads?z=1&a=x+y&a=%7E&m=p%20q",
+            "/2.0/repos/acme/api/x-y/refs%2Fheads",
+            "a=x+y&a=%7E&m=p+q&z=1",
+        ),
+        ("/2.0/plain", "/2.0/plain", ""),
+        ("/2.0/keep/trailing/", "/2.0/keep/trailing/", ""),
+    ];
+    for (input, expected_path, expected_query) in cases {
+        call_mock(&server, input, RequestOptions::default())
+            .await
+            .unwrap();
+        let received = server.received_requests().await.unwrap();
+        let last = received.last().unwrap();
+        assert_eq!(last.url.path(), expected_path, "{input}");
+        assert_eq!(last.url.query().unwrap_or(""), expected_query, "{input}");
+    }
+}
+
+#[tokio::test]
+async fn enabled_cache_reuses_a_successful_get() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.0/cached"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("cache-control", "max-age=60")
+                .set_body_json(json!({"value": 7})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let credentials = Credentials::AtlassianApiToken {
+        email: "cache-user@example.com".into(),
+        token: "cache-token".into(),
+    };
+
+    let first = call_mock_cached(&server, "/2.0/cached", credentials.clone())
+        .await
+        .unwrap();
+    let second = call_mock_cached(&server, "/2.0/cached", credentials)
+        .await
+        .unwrap();
+    assert_eq!(first.data.as_json().unwrap()["value"], 7);
+    assert_eq!(second.data.as_json().unwrap()["value"], 7);
+    assert!(second.raw_response_path.is_none());
+}
+
+#[tokio::test]
+async fn cache_is_isolated_by_resolved_credentials() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.0/identity-cache"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    for (email, token) in [("one@example.com", "one"), ("two@example.com", "two")] {
+        call_mock_cached(
+            &server,
+            "/2.0/identity-cache",
+            Credentials::AtlassianApiToken {
+                email: email.into(),
+                token: token.into(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn no_store_response_is_never_reused() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.0/no-store"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("cache-control", "no-store")
+                .set_body_json(json!({"ok": true})),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    let credentials = Credentials::AtlassianApiToken {
+        email: "no-store@example.com".into(),
+        token: "no-store-token".into(),
+    };
+    call_mock_cached(&server, "/2.0/no-store", credentials.clone())
+        .await
+        .unwrap();
+    call_mock_cached(&server, "/2.0/no-store", credentials)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn get_json_response_is_classified_and_persisted() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.0/workspaces"))
+        .and(header(
+            "authorization",
+            "Basic YWxpY2VAZXhhbXBsZS5jb206dG9r",
+        ))
+        .and(header("accept", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "values": [{"slug":"acme"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let resp = call_mock(&server, "/2.0/workspaces", RequestOptions::default())
+        .await
+        .unwrap();
+    match resp.data {
+        ResponseBody::Json(v) => {
+            assert_eq!(v["values"][0]["slug"], "acme");
+        }
+        other => panic!("expected JSON, got {other:?}"),
+    }
+    let path = resp.raw_response_path.expect("raw path for JSON response");
+    assert!(path.starts_with(std::env::temp_dir().join("mcp").join("mcp-server-devtools")));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn text_plain_response_passes_through_without_raw_path() {
+    let server = MockServer::start().await;
+    let diff = "diff --git a/a b/a\nindex 0..1\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n";
+    Mock::given(method("GET"))
+        .and(path("/2.0/repositories/foo/diff/abc"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(diff)
+                .insert_header("content-type", "text/plain; charset=utf-8"),
+        )
+        .mount(&server)
+        .await;
+
+    let resp = call_mock(
+        &server,
+        "/2.0/repositories/foo/diff/abc",
+        RequestOptions::default(),
+    )
+    .await
+    .unwrap();
+    match resp.data {
+        ResponseBody::Text(s) => assert_eq!(s, diff),
+        other => panic!("expected Text, got {other:?}"),
+    }
+    assert!(resp.raw_response_path.is_none());
+}
+
+#[tokio::test]
+async fn delete_204_is_classified_empty() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/2.0/repositories/foo/branches/bar"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let opts = RequestOptions {
+        method: Some(HttpMethod::Delete),
+        ..Default::default()
+    };
+    let resp = call_mock(&server, "/2.0/repositories/foo/branches/bar", opts)
+        .await
+        .unwrap();
+    assert!(matches!(resp.data, ResponseBody::Empty));
+    assert!(resp.raw_response_path.is_none());
+}
+
+#[tokio::test]
+async fn empty_body_is_classified_empty() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.0/empty"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("")
+                .insert_header("content-type", "text/plain"),
+        )
+        .mount(&server)
+        .await;
+
+    let opts = RequestOptions {
+        method: Some(HttpMethod::Post),
+        body: Some(json!({})),
+        ..Default::default()
+    };
+    let resp = call_mock(&server, "/2.0/empty", opts).await.unwrap();
+    // An empty text/plain body is still "present" by header; we classify as
+    // Text("") here. Use the JSON-default path for the Empty case.
+    assert!(matches!(resp.data, ResponseBody::Text(ref s) if s.is_empty()));
+}
+
+#[tokio::test]
+async fn empty_json_body_is_classified_empty() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.0/empty"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(&[][..], "application/json"))
+        .mount(&server)
+        .await;
+
+    let opts = RequestOptions {
+        method: Some(HttpMethod::Post),
+        body: Some(json!({})),
+        ..Default::default()
+    };
+    let resp = call_mock(&server, "/2.0/empty", opts).await.unwrap();
+    assert!(
+        matches!(resp.data, ResponseBody::Empty),
+        "got {:?}",
+        resp.data
+    );
+}
+
+#[tokio::test]
+async fn non_json_body_with_default_content_type_falls_back_to_text() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.0/plain"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("this is not JSON")
+                .insert_header("content-type", "application/octet-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    let resp = call_mock(&server, "/2.0/plain", RequestOptions::default())
+        .await
+        .unwrap();
+    match resp.data {
+        ResponseBody::Text(s) => assert_eq!(s, "this is not JSON"),
+        other => panic!("expected Text, got {other:?}"),
+    }
+    assert!(resp.raw_response_path.is_none());
+}
+
+#[tokio::test]
+async fn request_body_is_serialized_as_json() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.0/echo"))
+        .and(body_json(json!({"title":"hello"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&server)
+        .await;
+
+    let opts = RequestOptions {
+        method: Some(HttpMethod::Post),
+        body: Some(json!({"title":"hello"})),
+        ..Default::default()
+    };
+    let resp = call_mock(&server, "/2.0/echo", opts).await.unwrap();
+    assert_eq!(resp.data.as_json().unwrap()["ok"], true);
+    if let Some(p) = resp.raw_response_path {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[tokio::test]
+async fn auth_failure_maps_to_auth_invalid() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.0/private"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "type":"error",
+            "error":{"message":"bad credentials"}
+        })))
+        .mount(&server)
+        .await;
+
+    let err = call_mock(&server, "/2.0/private", RequestOptions::default())
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::AuthInvalid);
+    assert_eq!(err.status_code, Some(401));
+    assert!(err.message.contains("bad credentials"));
+}
+
+#[tokio::test]
+async fn not_found_maps_to_404_with_parsed_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.0/missing"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "type":"error",
+            "error":{"message":"Repository not found"}
+        })))
+        .mount(&server)
+        .await;
+
+    let err = call_mock(&server, "/2.0/missing", RequestOptions::default())
+        .await
+        .unwrap_err();
+    assert_eq!(err.status_code, Some(404));
+    assert!(err.message.contains("Repository not found"));
+}
+
+#[tokio::test]
+async fn oversized_content_length_rejected() {
+    // We can't trick wiremock/hyper into sending a fake content-length mismatch
+    // (hyper enforces the invariant server-side). Instead, verify by serving a
+    // body that really is 10MB + 1 byte and letting the guard reject it.
+    let server = MockServer::start().await;
+    let body = "a".repeat(10 * 1024 * 1024 + 1);
+    Mock::given(method("GET"))
+        .and(path("/2.0/huge"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let err = call_mock(&server, "/2.0/huge", RequestOptions::default())
+        .await
+        .unwrap_err();
+    assert_eq!(err.status_code, Some(413));
+    assert!(err.message.contains("exceeds maximum limit"));
+}
+
+#[tokio::test]
+async fn timeout_maps_to_408() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.0/slow"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(500)))
+        .mount(&server)
+        .await;
+
+    let opts = RequestOptions {
+        timeout: Some(Duration::from_millis(50)),
+        ..Default::default()
+    };
+    let err = call_mock(&server, "/2.0/slow", opts).await.unwrap_err();
+    assert_eq!(err.status_code, Some(408));
+    assert!(err.message.to_lowercase().contains("timeout"));
+}

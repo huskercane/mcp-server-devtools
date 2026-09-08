@@ -1,0 +1,255 @@
+# mcp-server-devtools
+
+Single-binary MCP server (`mcp-devtools`) exposing Atlassian, Zoom, CircleCI,
+Slack, Postman, edX, New Relic, Grafana, SonarQube, Splunk, NinjaOne, and WRDS.
+Ports of the TS reference servers with byte-for-byte parity on tool descriptions,
+schemas, output formats, and error envelopes — preserve that parity when touching
+anything LLM-facing.
+
+## Toolchain & baseline (match it, don't fragment it)
+
+- Rust is **pinned**: `rust-toolchain.toml` → `1.96.0`, `edition = "2024"`,
+  `rust-version = "1.96"`. Use stable only — no nightly/unstable/preview features.
+- Dependencies are **exact-pinned** (`=x.y.z`) on purpose. When adding/upgrading a
+  dep, pin it the same way and update `Cargo.lock` deliberately; don't loosen
+  existing pins to a range.
+- "Use latest features" means latest *stable* idioms within this pinned baseline
+  (edition 2024 patterns, current async runtime) — it does **not** mean bumping to
+  newer toolchain/crate versions ad hoc. Raising the baseline is its own reviewed change.
+
+## Build / test / lint (CI gates — all must pass with zero warnings)
+
+```bash
+cargo build                                   # default features (keychain on)
+cargo build --no-default-features             # headless / keychain-off path
+cargo clippy --all-targets -- -D warnings     # warnings are errors; pedantic is on
+cargo test                                    # full suite (integration-heavy)
+cargo fmt --all -- --check                    # rustfmt gate (use cargo fmt --all to fix)
+cargo deny --locked check --deny warnings     # license + advisory + duplication gate
+```
+
+The Rust workflow's Linux `quality` job enforces formatting and dependency
+checks using cargo-deny 0.19.4. `deny.toml` rejects new duplicate dependency
+versions; its exact-version exceptions record incompatible versions required
+by the pinned upstream graph. Those exceptions never suppress license,
+advisory, or source checks. When a duplicate leaves `Cargo.lock`, the gate
+fails with `error[unmatched-skip]` until its `skip` line is deleted; delete
+that line rather than adding a broad duplicate allowance.
+
+## Profiling (not a CI gate)
+
+`benches/` holds two hand-run profiling harnesses, not pass/fail benchmarks
+(`harness = false`, each has its own `main`). The test suite is a poor profiling
+target — it builds at `opt-level = 0`, spins a runtime per `#[tokio::test]`, and
+`wiremock` puts a real loopback HTTP server in every stack — so these run the
+pipeline directly against synthetic payloads instead.
+
+```bash
+cargo bench --bench response_pipeline   # bytes + allocation count + ms per stage
+cargo bench --bench toon_encode_loop    # tight encode loop to attach a profiler to
+```
+
+`response_pipeline` measures each stage against the shape it had before the
+pipeline was de-allocated, so an allocation regression is visible and not just a
+timing wobble. `[profile.bench]` keeps debug symbols (`release` strips them), so
+a sampling profiler resolves frames:
+
+```bash
+./target/release/deps/toon_encode_loop-<hash> 14 &
+/usr/bin/sample $! 10 1 -f /tmp/toon.txt   # built into macOS; no sudo, no SIP fight
+samply record ./target/release/deps/toon_encode_loop-<hash> 10   # interactive flamegraph
+```
+
+The TOON encoder is the pipeline's dominant cost, so it has its own target.
+`serde_toon_format` replaced `toon-format` 0.5.0 here: the old crate treated `-`
+as a structural character and quoted every string containing a hyphen (Jira
+keys, UUIDs, ISO dates, repo slugs, branch names). Measured against the TS
+reference `@toon-format/toon` over a 489-case corpus, the old crate matched 401
+and the current one 449, with **zero** cases the old one encoded correctly and
+the current one gets wrong. `tests/toon_golden_tests.rs` locks the exact output
+bytes and records the three classes that still differ from the reference — all
+of them extra quoting or an alternate empty-array spelling, none of them
+information-losing.
+
+Note `serde_json/preserve_order` arrives via the encoder crate. Key order is
+insertion order, not sorted; `object_key_order_is_preserved_not_sorted` fails if
+a dependency change drops it.
+
+CI (`.github/workflows/rust.yml`) runs build + clippy + test on a
+ubuntu/macos/windows matrix; Linux also builds `--no-default-features`. "No
+compile-time warning or error" is enforced by `-D warnings` — clippy `all` +
+`pedantic` are `warn` (see `[lints]` in `Cargo.toml`); a handful are explicitly
+allowed there, so prefer fixing over adding new `#[allow(...)]`.
+
+## Releasing (one version number, not three)
+
+`Cargo.toml`'s `version` is the **single source of truth**. `src/constants.rs::VERSION`
+derives from it via `env!("CARGO_PKG_VERSION")`, and that constant is what MCP clients
+see in `get_info()`, what `--version` prints, and what the HTTP health banner shows.
+Never write a version literal back into it — `binary_tests::version_reported_to_users_is_the_crate_version`
+fails if you do. (Unrelated to the MCP *protocol* version, which is negotiated
+separately.)
+
+To cut a release:
+
+1. Bump `version` in `Cargo.toml`, and build so `Cargo.lock` picks it up.
+2. Commit both, and get them onto `main`.
+3. Tag `v<version>` on `main` — the tag must match `Cargo.toml` exactly.
+4. Push the tag. `.github/workflows/release.yml` triggers on `v*` and builds the
+   Linux/macOS/Windows matrix (~8 minutes).
+
+`scripts/check-release-tag.sh` enforces step 3, wired as a `PreToolUse` hook in
+`.claude/settings.json`: it denies a tag-creating command whose version disagrees
+with `Cargo.toml`, and ignores everything else (listing, deleting, log ranges, and
+commands that merely mention tagging). It reads the hook JSON payload on stdin, so
+to check by hand:
+
+```bash
+echo '{"tool_input":{"command":"git tag -a v1.2.3 -m x"}}' | scripts/check-release-tag.sh
+```
+
+This exists because the three numbers had silently diverged: releases reached
+`v0.10.0` while `Cargo.toml` said `0.8.0` and the reported version said `3.1.0`
+(inherited from the TS reference server at port time), so a released binary
+introduced itself to every MCP client under a version that was never released.
+
+## Per-phase allocation gate (enterprise plan)
+
+At the end of **every** enterprise-plan phase (M0, A, B, …; see
+`docs/enterprise-product-plan.md`), run the allocation probe and compare
+bytes-allocated and allocation counts per stage against the numbers recorded
+at the previous phase boundary:
+
+```bash
+cargo bench --bench response_pipeline
+```
+
+Excessive allocation growth is a phase-exit blocker, not a nice-to-have:
+investigate any material regression (rule of thumb: > 20 % on any stage,
+matching the §8 budget posture) before declaring the phase done, and record
+the fresh numbers in the phase's PR/summary so the next phase has a baseline.
+This applies to the enterprise repo too — its CLAUDE.md carries the same rule.
+
+## Layout
+
+- `src/vendor/` — per-vendor HTTP clients (auth headers, request/response shapes).
+- `src/controllers/` — orchestration between tools and vendors.
+- `src/tools/` — MCP tool definitions (`rmcp`), schemas, descriptions.
+- `src/transport/` — stdio + streamable-HTTP (axum) transports.
+- `src/auth/`, `src/config/` — credentials (OS keychain via `keyring`, gated by the
+  `keychain` feature) and config/env loading.
+- `src/format/`, `src/pagination.rs`, `src/error.rs` — output formatting, paging, error envelope.
+- `tests/` — integration tests (`*_vendor_tests.rs`, `*_controller_tests.rs`, etc.)
+  using `wiremock` for HTTP and `assert_cmd` for the binary. This is where new
+  behavior gets covered.
+
+## Conventions & priorities
+
+- **Priority order: correctness > security > performance > brevity.** Don't trade
+  away correctness for a micro-optimization; don't log secrets or tokens.
+- **Architecture: follow hexagonal architecture and SOLID principles rigorously.**
+  Keep domain and orchestration logic behind explicit ports, isolate external
+  systems in adapters, and preserve focused responsibilities and dependency
+  direction. Deviate only when doing so avoids serious side effects or a
+  demonstrated, material allocation or performance problem; document the
+  tradeoff where the exception is made.
+- `unsafe_code = "deny"` in production. Test files that must mutate `std::env`
+  (now `unsafe` in edition 2024) opt in locally via `#![allow(unsafe_code)]` — keep
+  that confined to tests.
+- **Async**: this is a tokio (multi-thread) app — use async for I/O (HTTP, fs,
+  process). Keep CPU-bound/sync prep synchronous. For an infallible sync-prep +
+  single tail `.await`, prefer `fn -> impl Future<Output = T> + Send` over
+  `async fn`; do **not** convert when there's a `?` before the await, a branch on
+  the awaited result, multiple sequenced awaits, or a fixed signature (`#[tool]`,
+  axum handler, trait method).
+- **Tests**: new public fn / bug fix / behavior change ⇒ a test. Prefer integration
+  tests against real behavior (wiremock/assert_cmd) over mock-heavy unit tests. A
+  bug-fix test must fail on the unfixed code and pass on the fixed code.
+- **Parity**: tool names, descriptions, schemas, and error envelopes mirror the TS
+  servers. Changing them is a deliberate, called-out change — not incidental.
+
+# Rust Performance & Optimization Guidelines
+
+When reviewing, writing, or refactoring Rust code, enforce these strict guidelines to prevent excess allocations, CPU bottlenecks, and synchronization overhead.
+
+---
+
+## 1. Allocations & Memory Usage
+
+- **Default to Borrowing:** Prefer taking `&str`, `&[T]`, or `&Path` over owned types (`String`, `Vec<T>`, `PathBuf`) unless ownership transfer is strictly required.
+- **Avoid Hidden Clones:**
+  - Watch out for `.clone()` inside loops, iterators, or closure bodies.
+  - Suggest zero-copy alternatives (e.g., `Cow<'a, T>`, `bytes::Bytes`, or referencing fields directly).
+- **Pre-allocate Collections:**
+  - Flag any `Vec`, `HashMap`, `HashSet`, or `String` constructed in a loop or with a known upper bound that doesn't use `with_capacity(cap)`.
+- **Prevent Frequent Small Heap Allocations:**
+  - Recommend `smallvec` or `arrayvec` for collections that almost always hold fewer than 8–16 items.
+  - Flag unnecessary `Box<T>` for small types or lightweight structs.
+- **String Manipulations:**
+  - Flag repeated `+` or `format!()` inside hot loops. Suggest using `push_str()`, `write!`, or pre-allocated `String` buffers.
+
+---
+
+## 2. Synchronization & Concurrency
+
+- **Minimize Lock Contention:**
+  - Keep critical sections inside `MutexGuard` or `RwLockReadGuard`/`RwLockWriteGuard` as short as humanly possible.
+  - Flag any `.await`, heavy computation, or I/O performed while holding a synchronization lock.
+  - Recommend holding locks in short, explicit blocks:
+    ```rust
+    let item = {
+        let guard = state.lock().unwrap();
+        guard.get_item()
+    }; // Lock dropped here before async/heavy work
+    ```
+- **Lock Granularity & Atomics:**
+  - Suggest `AtomicBool`, `AtomicUsize`, or `AtomicPtr` over `Mutex` for simple scalar flags or counters.
+  - Suggest `RwLock` over `Mutex` *only* if read operations drastically outnumber write operations; otherwise, highlight that `Mutex` is often faster under low-to-medium contention.
+- **Lock-Free / Channel Selection:**
+  - Warn when using standard `std::sync::mpsc` in high-throughput async code; suggest `tokio::sync::mpsc` or `crossbeam-channel` instead.
+  - Flag unbounded channels (`mpsc::unbounded_channel`) unless explicitly required, to prevent unbounded memory growth.
+
+---
+
+## 3. CPU & Algorithmic Bottlenecks
+
+- **Hashing Performance:**
+  - Highlight usage of standard `std::collections::HashMap` when HashDoS resilience is not required (e.g., non-web contexts, trusted integer keys).
+  - Suggest fast hashers like `rustc-hash` (`FxHashMap`) or `ahash`.
+- **Iterators vs. Allocations:**
+  - Flag intermediate `.collect::<Vec<_>>()` calls in the middle of iterator chains. Chain operations lazily (`map`, `filter`, `flat_map`) and collect only at the final step.
+- **Monomorphization Bloat:**
+  - Watch for heavy generic functions with complex code generated for many type parameters. Suggest extracting non-generic helper functions (e.g., taking `&[u8]` instead of `impl AsRef<[u8]>`) to reduce compile time and code cache size.
+
+---
+
+## 4. Agent Instructions for Code Reviews & Refactoring
+
+Whenever analyzing code or generating solutions:
+1. **Highlight Hidden Cost:** Point out implicit clones, re-allocations, or broad lock scopes immediately.
+2. **Offer Zero-Allocation Alternatives:** Show how to refactor owned structures to borrowed references or stack-allocated alternatives where feasible.
+3. **Check Async Safety:** Explicitly check if a lock guard (`MutexGuard`) crosses an `.await` point (which breaks `Send` and leads to deadlocks/contention).
+
+## 5. Tokio & Async Performance Guidelines
+
+### Task Allocation & Future Bloat
+- **Minimize Frame Sizes:** Flag large arrays, heavy structs, or deeply nested state machines stored directly inside `async fn` stack frames, as they cause massive task heap allocations.
+- **Avoid Excess `tokio::spawn`:** Warn against spawning tasks inside tight loops for trivial compute. Suggest batching or processing sequentially via `futures::stream::BufferUnordered` / `JoinSet`.
+- **Pre-allocate Channel Buffers:** Always specify bounded capacities (`tokio::sync::mpsc::channel(cap)`) sized according to expected peak load to avoid dynamic queue re-allocations.
+
+### Blocking & Tokio Reactor Health
+- **Flag Sync I/O / Compute in Async Tasks:** Detect blocking calls like `std::fs`, `std::thread::sleep`, or CPU-bound loops (`>1ms`) running directly on worker threads.
+- **Enforce Offloading:** Require `tokio::task::spawn_blocking` or `rayon` for heavy compute / filesystem operations.
+
+### Async Synchronization & Locking
+- **Async vs Sync Mutex Usage:**
+  - Standard `std::sync::Mutex` **is allowed** across regular code if locks are held for quick state updates and *never* across `.await` points.
+  - Require `tokio::sync::Mutex` **only** if the lock must be held across `.await` boundaries.
+- **Detect Mutex Guards Across `.await`:** Flag any standard `MutexGuard` or `RwLockGuard` held when calling `.await` (causes compilation failure or runtime deadlocks/thread starvation).
+- **Favor Tokio Synchronization Primitives:**
+  - Use `tokio::sync::Notify` or `watch` instead of `Mutex<bool>` for signaling task completion or state updates.
+  - Recommend `tokio::sync::Semaphore` for concurrency limiting over manual counter locking.
+
+### Task Cancellation & Resource Leaks
+- **Cancellation Safety:** Flag non-cancellation-safe operations used inside `tokio::select!` branches (e.g., partial reads without buffering, half-completed state modifications).
+- **Graceful Shutdown & JoinSet:** Recommend `tokio::task::JoinSet` over `tokio::spawn` for structured concurrency and ensuring spawned tasks aren't left orphaned.

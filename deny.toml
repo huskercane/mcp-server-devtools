@@ -1,0 +1,70 @@
+# cargo-deny configuration for mcp-server-devtools.
+#
+# Run locally from the repository root; enforced by the Rust quality CI job.
+# Strict mode: every unhandled advisory, license, or ban is a hard error.
+
+[graph]
+all-features = false
+features = []
+
+[output]
+feature-depth = 1
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Every license that must appear in the transitive dep graph to build the
+# crate. Kept explicit so a new dep with an unfamiliar license triggers a
+# review instead of silently landing.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    # Used by `webpki-root-certs`, a cert bundle pulled in by rustls.
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    # `foldhash`, used by rusqlite's prepared-statement cache.
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Fail on new duplication. These exact older versions are required by the
+# pinned upstream dependency graph; they cannot be unified across incompatible
+# APIs without changing that baseline. Remove an exception when its dependency
+# disappears. Exceptions do not bypass advisory, license, or source checks.
+multiple-versions = "deny"
+skip = [
+    { name = "base64", version = "=0.22.1" },
+    { name = "block-buffer", version = "=0.10.4" },
+    { name = "const-oid", version = "=0.9.6" },
+    { name = "cpufeatures", version = "=0.2.17" },
+    { name = "crypto-common", version = "=0.1.7" },
+    { name = "digest", version = "=0.10.7" },
+    { name = "fallible-iterator", version = "=0.2.0" },
+    { name = "getrandom", version = "=0.2.17" },
+    { name = "hmac", version = "=0.12.1" },
+    { name = "linux-raw-sys", version = "=0.4.15" },
+    { name = "rustix", version = "=0.38.44" },
+    { name = "sha2", version = "=0.10.9" },
+    { name = "syn", version = "=2.0.119" },
+    { name = "tower-http", version = "=0.6.11" },
+    { name = "untrusted", version = "=0.7.1" },
+    { name = "wasi", version = "=0.11.1+wasi-snapshot-preview1" },
+    { name = "windows-sys", version = "=0.52.0" },
+    { name = "windows-sys", version = "=0.59.0" },
+]
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

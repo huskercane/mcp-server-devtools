@@ -1,0 +1,244 @@
+[package]
+name         = "mcp-server-devtools"
+version      = "0.15.0"
+edition      = "2024"
+rust-version = "1.96"
+description  = "A unified Rust MCP server for developer tools and services."
+license      = "Apache-2.0"
+repository   = "https://github.com/huskercane/mcp-server-devtools"
+readme       = "README.md"
+publish      = false
+
+[lib]
+name = "mcp_server_devtools"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mcp-devtools"
+path = "src/main.rs"
+
+[features]
+# Enabled by default for desktop builds. Disable with `--no-default-features`
+# for headless Linux (CI, SSH, containers): keyring + libsecret aren't useful
+# without a logged-in desktop session, and disabling avoids the libsecret
+# build dep entirely.
+default  = ["keychain", "wrds", "secrets-vault"]
+# `wrds` activates the WRDS (Wharton Research Data Services) integration. WRDS
+# has no REST API — it is a PostgreSQL database — so this is the one vendor that
+# does not ride the shared `reqwest`/`Vendor` HTTP path. The feature pulls in a
+# Postgres client (`tokio-postgres`) and its rustls TLS bridge
+# (`tokio-postgres-rustls`); the TLS stack itself (`rustls`, `aws-lc-rs`,
+# `rustls-native-certs`) is already linked via `reqwest`, so the marginal cost is
+# only the Postgres wire protocol. Build `--no-default-features --features
+# keychain` to drop the Postgres dependency tree entirely (headless / non-WRDS
+# deployments). At runtime the connection is lazy: nothing dials WRDS until a
+# `wrds_*` tool is actually called.
+wrds     = ["dep:tokio-postgres", "dep:tokio-postgres-rustls"]
+# `dep:keyring` activates the optional `keyring` dep declared per-target below.
+# We pick an explicit credential-store feature on each OS — without one,
+# `keyring` falls back to a mock store that silently no-ops `set` and returns
+# `NoEntry` on `get`.
+keychain = ["dep:keyring"]
+# `secrets-vault` compiles the HashiCorp Vault / OpenBao KV v2 secret source
+# (`vault://…` references, plan §3.8 C.2b). No extra dependencies — KV v2 is
+# a handful of JSON endpoints over the pinned `reqwest` — so it is on by
+# default; the feature exists so a build can prove the "no adapter compiled
+# in" path and so the cloud adapters (`secrets-aws`, `secrets-azure`, which
+# do pull SDKs) follow the same shape.
+secrets-vault = []
+[dependencies]
+# Already present transitively at these versions. FxHashMap is restricted to
+# server-generated integer identifiers; externally influenced keys retain the
+# standard randomized hasher. SmallVec holds the handful of metric outcomes.
+rustc-hash          = "=2.1.3"
+smallvec            = "=1.15.2"
+rmcp                = { version = "=3.1.2", features = ["transport-io", "transport-streamable-http-server"] }
+#rmcp-macros         = "=3.1.0"
+tokio               = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "signal", "io-std", "fs", "sync", "time", "process"] }
+axum                = "=0.8.9"
+tower-http          = { version = "=0.7.0", features = ["cors", "limit"] }
+# `ServiceExt::oneshot` for the in-process admin client (plan §3.10.1,
+# WP D.0): the console drives the admin router without a loopback socket.
+# Already in the tree at this version through axum; no new crate.
+tower               = { version = "=0.5.3", default-features = false, features = ["util"] }
+tokio-util          = { version = "=0.7.19", features = ["rt", "io"] }
+futures             = "=0.3.34"
+serde               = { version = "=1.0.229", features = ["derive"] }
+serde_json          = "=1.0.151"
+tracing             = "=0.1.44"
+tracing-subscriber  = { version = "=0.3.23", features = ["env-filter", "fmt", "registry", "std"] }
+dotenvy             = "=0.15.7"
+base64              = "=0.23.1"
+# RFC 6238 TOTP for NinjaOne console logins, when an operator configures a seed
+# instead of delegating to a vault CLI. `hmac`/`sha2` were already in the tree
+# transitively; `sha1` is the only new crate, and it is what an `otpauth://`
+# URI defaults to. Base32 is decoded in-crate (an encoding, not a primitive).
+hmac                = "=0.12.1"
+sha1                = "=0.10.6"
+sha2                = "=0.10.9"
+dirs                = "=6.0.0"
+uuid                = { version = "=1.24.0", features = ["v4"] }
+regex               = "=1.13.1"
+reqwest             = { version = "=0.13.4", default-features = false, features = ["json", "form", "stream", "rustls", "charset", "http2", "gzip", "brotli", "deflate", "zstd"] }
+async-compression   = { version = "=0.4.36", features = ["tokio", "gzip", "brotli", "deflate", "zstd"] }
+url                 = "=2.5.8"
+jmespath            = "=0.5.0"
+# TOON output encoder. Swapped from `toon-format` 0.5.0, which treats `-` as a
+# structural character (`STRUCTURAL_CHARS` in its constants.rs) and therefore
+# quotes every string containing a hyphen — Jira keys, UUIDs, ISO dates, repo
+# slugs, branch names. Measured against the TS reference `@toon-format/toon`
+# (which agrees with this crate, not the old one, at v2/v3/v4) over a 489-case
+# corpus: `toon-format` matched 401, `serde_toon_format` 449, with **zero**
+# cases the old crate encoded correctly and this one gets wrong. It is also
+# ~3.5x faster and allocates ~5.6x less on a 2 MB payload. `default-features`
+# stays off to leave the optional `rayon` dependency out of the tree.
+serde_toon_format   = { version = "=0.1.2", default-features = false }
+rand                = "=0.10.2"
+schemars            = "=1.2.2"
+clap                = { version = "=4.6.6", features = ["derive", "env", "wrap_help"] }
+atomicwrites        = "=0.4.4"
+rpassword           = "=7.5.4"
+httpdate            = "=1.0.3"
+zstd                = "=0.13.3"
+chrono              = { version = "=0.4.45", default-features = false, features = ["std"] }
+# Inbound bearer-token validation (plan §3.1 `TokenValidator`, WP A.1). The
+# `aws_lc_rs` backend is the same provider rustls already links through
+# `reqwest`, so this adds JWT parsing and JWK handling but no second crypto
+# stack. `use_pem` is off: keys arrive as JWKs from the IdP, never as PEM.
+jsonwebtoken        = { version = "=11.0.0", default-features = false, features = ["aws_lc_rs"] }
+# YAML policy documents (plan ADR-003, WP A.7). `serde_yaml` itself is
+# archived upstream and flagged unmaintained by cargo-deny; this is the
+# maintained fork with the same API and licence.
+serde_norway        = "=0.9.42"
+# Ed25519 detached signatures for policy bundles (WP B.3), the revocation
+# list (WP B.4), and audit checkpoints (WP B.6). Already in the tree as the
+# crypto provider behind `rustls` and `jsonwebtoken`, so this pins the version
+# the lockfile had resolved and adds no second crypto stack.
+aws-lc-rs           = "=1.18.0"
+
+# Usage rollups (plan §3.9, WP C.6): the first `RollupStore` adapter is
+# SQLite, embedded and exact-pinned. `bundled` compiles SQLite into the
+# binary (public-domain C; `libsqlite3-sys` is MIT), so the distroless image
+# needs no shared library and every platform runs the same SQLite. Talks to
+# the domain only through the port's own types — no SQL crosses it.
+rusqlite            = { version = "=0.40.2", default-features = false, features = ["bundled", "cache"] }
+
+# --- WRDS (feature = "wrds") --------------------------------------------------
+# WRDS is PostgreSQL-only; these back the `wrds_*` tools. `with-serde_json-1`
+# lets Postgres do all type -> JSON conversion server-side (via `to_jsonb`), so
+# the client reads each result set as a single `serde_json::Value` and needs no
+# per-column type mapping. TLS reuses the already-linked rustls stack:
+# `rustls-native-certs` supplies the OS trust anchors; `aws-lc-rs` (rustls'
+# default provider, already in the tree via reqwest) supplies the crypto.
+tokio-postgres        = { version = "=0.7.18", optional = true, features = ["with-serde_json-1"] }
+tokio-postgres-rustls = { version = "=0.14.0", optional = true }
+
+# --- TLS stack used directly (WRDS, and the syslog audit forwarder) --------
+# All four were already in the tree through `reqwest` (`rustls`,
+# `rustls-native-certs`, `rustls-pki-types`, `tokio-rustls`), so naming them
+# here pins the versions the lockfile had resolved and adds no crate.
+# `rustls-pki-types` reads the PEM CA and client-certificate files an
+# operator points `MCP_AUDIT_FORWARD_*` at (WP C.3).
+rustls                = { version = "=0.23.39", default-features = false, features = ["aws_lc_rs", "tls12", "logging", "std"] }
+rustls-native-certs   = "=0.8.4"
+rustls-pki-types      = { version = "=1.15.1", features = ["std"] }
+tokio-rustls          = { version = "=0.26.4", default-features = false, features = ["aws_lc_rs", "tls12", "logging"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "=4.1.6", optional = true, default-features = false, features = ["apple-native-keyring-store", "v1"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "=4.1.6", optional = true, default-features = false, features = ["windows-native-keyring-store", "v1"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "=4.1.6", optional = true, default-features = false, features = ["linux-keyutils-keyring-store", "v1"] }
+
+[dev-dependencies]
+tempfile            = "=3.27.0"
+pretty_assertions   = "=1.4.1"
+serial_test         = "=4.0.1"
+wiremock            = "=0.6.5"
+assert_cmd          = "=2.2.2"
+
+# Benchmarks run under release-grade codegen, but keep the symbols a sampling
+# profiler (samply, Instruments, /usr/bin/sample) needs — `release` strips them,
+# which would leave every frame unresolved. LTO is off so the profiling loop
+# stays fast to rebuild. Never shipped: `release` is still the artifact profile.
+# Profiling harnesses, not pass/fail benchmarks — hence `harness = false` (each
+# has its own `fn main`). They are deliberately NOT part of the CI gates; run
+# them by hand when touching the response pipeline:
+#   cargo bench --bench response_pipeline    # allocation + timing per stage
+#   cargo bench --bench toon_encode_loop     # tight loop to attach a profiler to
+[[bench]]
+name    = "response_pipeline"
+harness = false
+
+[[bench]]
+name    = "toon_encode_loop"
+harness = false
+
+[profile.bench]
+inherits      = "release"
+lto           = false
+codegen-units = 16
+debug         = true
+strip         = false
+
+# Optimized local iteration only. Shipping artifacts still use `release`.
+[profile.dev-fast]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+incremental = true
+debug = "line-tables-only"
+strip = false
+
+[profile.release]
+lto              = "thin"
+codegen-units    = 1
+strip            = "symbols"
+opt-level        = 3
+
+[lints.rust]
+# `deny` (not `forbid`), so individual test files that need to mutate
+# `std::env` (which became `unsafe` in the 2024 edition) can opt in via
+# `#![allow(unsafe_code)]`. Production code never opts in.
+unsafe_code = "deny"
+
+[lints.clippy]
+all           = { level = "warn", priority = -1 }
+pedantic      = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+
+# D.4 packages use the static, keychain-free image binary; profile settings stay unchanged.
+[package.metadata.deb]
+name = "mcp-devtools"
+maintainer = "MCP Devtools maintainers"
+depends = "ca-certificates, systemd"
+assets = [
+  ["target/release/mcp-devtools", "usr/bin/mcp-devtools", "755"],
+  ["deploy/packages/mcp-devtools.service", "lib/systemd/system/mcp-devtools.service", "644"],
+  ["deploy/packages/env", "etc/mcp-devtools/env", "600"],
+  ["LICENSE", "usr/share/doc/mcp-devtools/LICENSE", "644"],
+  ["NOTICE", "usr/share/doc/mcp-devtools/NOTICE", "644"],
+  ["licenses/*", "usr/share/doc/mcp-devtools/licenses/", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "mcp-devtools"
+auto-req = "no"
+assets = [
+  { source = "target/release/mcp-devtools", dest = "/usr/bin/mcp-devtools", mode = "755" },
+  { source = "deploy/packages/mcp-devtools.service", dest = "/usr/lib/systemd/system/mcp-devtools.service", mode = "644" },
+  { source = "deploy/packages/env", dest = "/etc/mcp-devtools/env", mode = "600", config = "noreplace" },
+  { source = "LICENSE", dest = "/usr/share/doc/mcp-devtools/LICENSE", mode = "644", doc = true },
+  { source = "NOTICE", dest = "/usr/share/doc/mcp-devtools/NOTICE", mode = "644", doc = true },
+  { source = "licenses/*", dest = "/usr/share/doc/mcp-devtools/licenses/", mode = "644", doc = true },
+]
+[package.metadata.generate-rpm.requires]
+systemd = "*"
+ca-certificates = "*"

@@ -1,0 +1,93 @@
+# Non-secret enterprise settings and the policy document. Edit before applying.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-devtools-config
+  namespace: mcp-devtools
+data:
+  # Identity provider: one of okta, entra, keycloak, auth0, generic — see
+  # docs/identity-provider-runbook.md for each provider's issuer, audience,
+  # and provider-side setup. (`MCP_AUTH_MODE: "okta"` with `MCP_OKTA_*` keys
+  # is the pre-profile spelling and still works.)
+  MCP_AUTH_MODE: "oidc"
+  MCP_OIDC_PROFILE: "okta"
+  MCP_OIDC_ISSUER: "https://YOUR-ORG.okta.com/oauth2/default"
+  MCP_OIDC_AUDIENCE: "api://mcp-devtools"
+  MCP_PUBLIC_URL: "https://mcp.example.com"
+  MCP_REQUIRED_SCOPE: "mcp:tools"
+  MCP_POLICY_FILE: "/policy/policy.yaml"
+  # Base64 Ed25519 public key from `mcp-devtools policy keygen`. The gateway
+  # applies only policy and revocation documents signed with its private half.
+  MCP_POLICY_PUBLIC_KEY: "REPLACE-WITH-THE-PUBLIC-KEY-FROM-policy-keygen"
+  MCP_REVOCATION_FILE: "/policy/revocations.yaml"
+  MCP_AUDIT_JOURNAL_DIR: "/journal"
+  # The gateway's checkpoint signing key (`mcp-devtools audit keygen`),
+  # mounted from the `mcp-devtools-audit-signing-key` Secret (projected as
+  # root:fsGroup 0440; the gateway accepts owner/group-readable, no wider).
+  MCP_AUDIT_SIGNING_KEY: "/keys/audit-signing.key"
+  # A second copy of every checkpoint, for shipping off the pod.
+  MCP_AUDIT_CHECKPOINT_EXPORT_DIR: "/journal/checkpoints"
+  MCP_VENDOR_ENVIRONMENT: "qa"
+  GRAFANA_URL: "https://grafana-qa.example.com"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-devtools-policy
+  namespace: mcp-devtools
+data:
+  # Validate, then sign, before applying:
+  #   mcp-devtools policy check policy.yaml --public-key "$MCP_POLICY_PUBLIC_KEY"
+  #   mcp-devtools policy sign  policy.yaml --key policy-signing.key
+  # and paste the contents of policy.yaml.sig below. Do the same for the
+  # revocation list (`mcp-devtools revoke init --file revocations.yaml --key …`).
+  policy.yaml.sig: "REPLACE-WITH-THE-CONTENTS-OF-policy.yaml.sig"
+  revocations.yaml: |
+    version: 1
+  revocations.yaml.sig: "REPLACE-WITH-THE-CONTENTS-OF-revocations.yaml.sig"
+  policy.yaml: |
+    version: 1
+    default: deny
+    rules:
+      - id: sre-read-qa-datasources
+        effect: allow
+        subjects: { groups: [SRE] }
+        match:
+          vendor: grafana
+          environment: qa
+          request_risk: read
+          normalized_action: query_logs
+          resource_type: datasource
+          resource_id: ["loki-qa", "prom-qa-*"]
+      - id: sre-list-qa-datasources
+        effect: allow
+        subjects: { groups: [SRE] }
+        match:
+          vendor: grafana
+          environment: qa
+          normalized_action: list_datasources
+          resource_type: datasource
+          resource_scope: collection
+---
+# Vendor credentials. Prefer an external secret store (Phase C.2); this is
+# the shape the pod expects.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mcp-devtools-vendor-credentials
+  namespace: mcp-devtools
+type: Opaque
+stringData:
+  GRAFANA_TOKEN: "REPLACE-WITH-A-READ-ONLY-SERVICE-ACCOUNT-TOKEN"
+---
+# The audit checkpoint signing key: `mcp-devtools audit keygen --out audit-signing.key`,
+# then `kubectl create secret generic mcp-devtools-audit-signing-key \
+#   --from-file=audit-signing.key -n mcp-devtools`. Never the policy key.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mcp-devtools-audit-signing-key
+  namespace: mcp-devtools
+type: Opaque
+data:
+  audit-signing.key: "REPLACE-WITH-BASE64-OF-THE-PKCS8-KEY-FILE"

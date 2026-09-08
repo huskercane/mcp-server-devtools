@@ -1,0 +1,34 @@
+# Revocation list (Phase B, WP B.4): the emergency stop that travels with
+# the policy bundle. Every gateway watches this file and applies a change
+# within one poll (≤ 500 ms), on every request, cached validation or not.
+#
+# Do not edit by hand in production — use the CLI, which rewrites the file
+# deterministically and re-signs it with the policy signing key:
+#
+#     mcp-devtools revoke init    --file revocations.yaml --key policy-signing.key
+#     mcp-devtools revoke subject alice@acme.example --reason offboarded \
+#                                 --file revocations.yaml --key policy-signing.key
+#     mcp-devtools revoke token   <jti> --file revocations.yaml --key policy-signing.key
+#     mcp-devtools revoke all     --reason "IdP key rotated" \
+#                                 --file revocations.yaml --key policy-signing.key
+#     mcp-devtools revoke show    --file revocations.yaml --public-key "$MCP_POLICY_PUBLIC_KEY"
+#
+# A hand edit works too, as long as the file is re-signed
+# (`mcp-devtools policy sign revocations.yaml --revocation-list --key …`);
+# an unsigned or missigned list is ignored and the last good list stays in
+# force. Schema: src/auth/revocation.rs. This example shows every field;
+# a fresh deployment starts from `version: 1` alone (`revoke init`).
+version: 1
+subjects:
+  - subject: alice@acme.example
+    revoked_at: 2026-09-03T10:00:00Z
+    reason: offboarded
+token_ids:
+  - token_id: AT.5f3d1c8e-example
+    revoked_at: 2026-09-03T10:05:00Z
+    reason: pasted into a ticket
+# `not_before` refuses every token issued before the instant — `revoke all`.
+# A token with no `iat` cannot be shown to postdate it and is refused too.
+not_before:
+  at: 2026-09-03T09:00:00Z
+  reason: identity-provider signing key rotated after suspected compromise

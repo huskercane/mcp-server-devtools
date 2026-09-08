@@ -1,0 +1,16 @@
+mcp-server-devtools
+Copyright (c) 2026 Rohit Singh
+
+This project is licensed under the Apache License, Version 2.0.
+
+The Bitbucket, Jira, and Confluence behavior is based on the corresponding
+Node.js/TypeScript @aashari MCP servers by Andi Ashari:
+https://github.com/aashari/mcp-server-atlassian-bitbucket
+https://github.com/aashari/mcp-server-atlassian-jira
+https://github.com/aashari/mcp-server-atlassian-confluence
+This attribution identifies the behavioral references for the separate Rust
+implementation; it does not imply upstream authorship or endorsement of it.
+
+Earlier versions of this project were offered under the ISC License. The
+historical notice and license are preserved in licenses/ISC.txt. That file
+does not offer subsequent Apache-2.0 changes under ISC.

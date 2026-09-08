@@ -1,0 +1,33 @@
+//! Rust port of the TypeScript `@aashari/mcp-server-atlassian-bitbucket` and
+//! `@aashari/mcp-server-atlassian-jira` MCP servers, unified into a single
+//! binary that exposes both vendors' tool surfaces.
+//!
+//! Phase 1 scope: foundation modules (config, auth, errors, logger, constants)
+//! and a minimal `rmcp` stdio server skeleton. Tools, CLI, and the streamable
+//! HTTP transport are added in later phases.
+
+#![deny(rust_2018_idioms)]
+
+pub mod admin;
+pub mod audit;
+pub mod auth;
+pub mod bootstrap;
+pub mod cli;
+pub mod config;
+pub mod constants;
+pub mod controllers;
+pub mod error;
+pub mod format;
+pub mod ingestion;
+pub mod logger;
+pub mod metrics;
+pub mod policy;
+pub mod ports;
+pub mod rollups;
+pub mod secrets;
+pub mod server;
+pub mod shell;
+pub mod tools;
+pub mod transport;
+pub mod vendor;
+pub mod workspace;

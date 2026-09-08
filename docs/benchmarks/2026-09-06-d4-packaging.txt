@@ -1,0 +1,254 @@
+D.4 packaging and air-gap landing — 2026-09-06
+Branch: feat/phase-d-administration
+Preceding commit: 19df508 (docs: backlog build-speed improvements).
+CF-40 is backlog only. Cargo.lock and the release/bench profiles are unchanged.
+
+Implementation and boundaries
+
+Version/SHA-256-pinned cargo-deb 3.7.0 and cargo-generate-rpm 0.21.0 package
+the shipping Dockerfile's x86_64 musl binary (wrds,secrets-vault, no keychain
+or console). The unit has DynamicUser, StateDirectory, ProtectSystem=strict,
+NoNewPrivileges and an empty CapabilityBoundingSet; the environment is
+root:root 0600. Installation does not automatically enable/start a service.
+
+Compose runs role all behind TLS with persistent journal/rollup/policy
+volumes, signed policy and revocation bundles, a private checkpoint key,
+file JWKS and an optional mutual-TLS syslog-ng profile. Operating docs cover
+ownership, TLS, initialization, replacement, backup, upgrade and rollback.
+
+File JWKS checks bounded regular-file contents asynchronously before cached
+authentication, reparsing/installing only on content-hash change. File errors
+clear keys and cached tokens, with no network fallback; withdrawal and changed
+material use existing admission/invalidation logic. This replaces the proposed
+timer watcher to observe withdrawal before the next cache hit. Its file-I/O
+latency is outside the remote-cache probe. The fetch helper shares the Unix-only
+private-output writer with auth exchange. CF-41 records portability/evidence
+limits; offline licensing remains CF-10 and OVA remains on request.
+
+Landing gates — scripts executed using bash, Rust/Cargo 1.96.0, Linux x86_64
+
+PASS cargo build
+PASS cargo build --no-default-features
+PASS cargo clippy --all-targets -- -D warnings
+PASS cargo clippy --all-targets --no-default-features -- -D warnings
+PASS cargo clippy --all-targets --features console -- -D warnings
+PASS cargo test (1,108 passed; 2 ignored, existing regeneration helper/doctest)
+PASS cargo test --features console (1,122 passed; 2 ignored, same helpers)
+PASS cargo fmt --all -- --check
+PASS cargo deny --locked check --deny warnings
+PASS cargo bench --bench response_pipeline
+PASS cargo bench --bench response_pipeline --features console
+PASS git diff --check
+PASS ShellCheck 0.11.0 on all six new shell scripts; bash -n; workflow/Compose YAML parse
+
+Five new token-validator tests plus the existing negative matrix exercised
+against both remote and file sources: rotation, cached-key withdrawal, changed
+material under the same kid, empty/malformed/oversized/missing/non-regular
+files and recovery, explicit configuration conflicts, bounded secure capture,
+and real CLI private-file creation/overwrite refusal. Existing algorithm,
+signature, issuer, audience, time and claims refusals remain unchanged.
+
+Actual package/container proof
+
+Docker 29.2.1 built the final shipping Dockerfile; rootless Podman 5.7.0 ran
+the systemd test containers. Both Debian bookworm and UBI 9.6 images are digest
+pinned. PID 1 receives SYS_ADMIN only inside a subordinate user namespace;
+there is no privileged container or host cgroup mount, and the installed
+service's capability set remains empty. A rootless-mode assertion prevents
+running this test with host capabilities.
+
+PASS bash scripts/release/install-package-tools.sh /tmp/d4-tools
+  Both downloaded source archives passed their literal SHA-256 pins before
+  cargo install --locked. Packaging tools used their included lockfiles.
+PASS bash scripts/release/packages.sh /tmp/d4-static /tmp/d4-packages
+PASS bash scripts/ci/packages-smoke.sh /tmp/d4-packages
+  Both packages installed with container networking disabled. Checked root:root
+  0600 env and actual systemd hardening properties. Real unit startup and HTTP
+  health passed first in local community mode, then in OIDC/file-JWKS mode
+  with signed policy/revocations and a private audit key provisioned by a
+  one-shot service using the same DynamicUser/StateDirectory. Unauthenticated
+  admin access returned 401. Changing to auth off / 0.0.0.0 produced unit
+  exit-code failure, the explicit refusal log, and no health listener.
+  This proves offline configured startup; signed file-JWKS token acceptance
+  and withdrawal were exercised separately in Compose and Rust tests.
+PASS bash scripts/ci/compose-smoke.sh mcp-devtools:d4
+  Trusted-CA TLS health; no-bearer 401; signed RS256 bearer accepted at
+  /admin/policy via file JWKS; atomic empty-key-set replacement rejected the
+  same cached bearer. A signed policy_loaded record reached syslog-ng over
+  mutual TLS. The MCP container was replaced, nginx restarted to refresh DNS,
+  health returned, and the three named state volumes remained populated.
+  Only disposable test volumes and fixture keys were used.
+
+Local static binary: 24,878,256 bytes
+SHA-256: 69e1d36162953eef42e0b9d22e679b59da8a49fdfb8e2f90f27a7f6f3709ef87
+Local .deb: 7,460,296 bytes
+SHA-256: ddd1f9c6837c73afbe6fa468b9a3c5aafd43f45b8efc3b46ea6561bff9c6e08b
+Local .rpm: 8,049,141 bytes
+SHA-256: d0b7e518d66fb095c2f8e56b1af90db3013258c19e042d0a3b62e5b02c66ac41
+These are locally generated artifacts; no release/tag/publication was performed.
+
+Actual offline-build proof
+
+PASS bash scripts/release/vendor-archive.sh /tmp/d4-vendor
+PASS bash scripts/ci/offline-build.sh /tmp/d4-vendor
+  Initial GNU/Linux build with an empty Cargo home and new target directory.
+PASS final implementation archive generated in /tmp/d4-vendor-final
+PASS Docker --network none build of that archive using the existing build-stage
+  toolchain image, an empty Cargo home and a new target directory:
+  cargo build --frozen --offline --no-default-features --features wrds,secrets-vault,console
+  The Alpine builder invoked the portable helper through /bin/sh; the repository
+  release workflow and CLAUDE landing scripts use bash. SHA-256 verification
+  passed; the resulting executable printed mcp-devtools 0.15.0. The isolated
+  build completed in 4m 29s. OS/compiler inputs were installed before isolation.
+  Final documentation/evidence edits do not change the compiled source.
+
+No hosted Actions run, release signing/publication, disconnected registry/IdP
+installation, or bare-metal upgrade/rollback is claimed. CF-41 tracks those
+remaining operating boundaries; CF-34 retains signing evidence, CF-38 real
+provider interoperability. D.3 and D.5 remain open. No PR was opened.
+
+Allocation comparison against 2026-09-05-d1-console.txt
+
+All 31 earlier rows match reported KB and allocation counts in both feature
+modes, including all BEFORE/reference rows and both payload sizes. Console
+stage -1f is unchanged: 432 KB / 9 allocations, 0.18 ms mean, 231,639 HTML
+bytes for 1,000 activity rows. No material regression to investigate. Reported
+KB is integer-rounded; timing observations do not imply exact latency equality.
+Default/console JWT cache hit: 4.06 / 3.77 us (<50 us).
+Default/console journal p99: 37 / 16 us (<200 us).
+Release/bench profiles and shipping feature selections were not changed.
+
+$ cargo bench --bench response_pipeline
+   Compiling mcp-server-devtools v0.15.0 (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 4m 13s
+     Running benches/response_pipeline.rs (target/release/deps/response_pipeline-b20dc5b32d4b7a86)
+=== output size: is TOON earning its CPU? ===
+                                            compact     pretty       TOON
+  uniform flat rows (TOON's best case)       12392B     20800B      5016B   TOON is 40% of compact, 24% of pretty
+  nested objects (Jira search shape)         89903B    133723B     99300B   TOON is 110% of compact, 74% of pretty
+
+=== stage -1: policy extractors, per tool call (mean of 2000) ===
+  canonical: short path                            0 KB          4 allocs     0.00 ms
+  canonical: dot-segments + escapes                0 KB          1 allocs     0.00 ms
+  canonical: search URL (long JQL)                 0 KB         10 allocs     0.00 ms
+  jira::extract GET /issue/{key}                   0 KB          6 allocs     0.00 ms
+  jira::extract GET /search/jql (long JQL)         1 KB         17 allocs     0.01 ms
+  jira::project_keys_from_jql (long JQL)           0 KB          9 allocs     0.00 ms
+  jira::extract unmapped (default arm)             0 KB          1 allocs     0.00 ms
+  grafana::query_logs                              0 KB         10 allocs     0.00 ms
+
+=== stage -1b: policy decision, per tool call (mean of 2000) ===
+  ActionContext via for_tool (grafana)             0 KB         21 allocs     0.00 ms
+  FilePolicy::evaluate @ 500 rules                 0 KB          5 allocs     0.02 ms
+
+=== stage -1c: enterprise request path, production components (mean of 2000 / 1000) ===
+  JWT validate: cache hit (budget 50 µs)           1 KB          9 allocs     4.06 µs
+  C.1 JWT authenticate: cached actor chain         1 KB          8 allocs     4.43 µs
+  journal append, sequential (budget p99 200 µs)         1 KB          6 allocs  p50      13 µs  p99      37 µs  max     182 µs
+
+=== stage -1d: usage side of the request path (mean of 2000) — C.6 ===
+  rate limit check, known subject                  0 KB          0 allocs     0.00 ms
+  PrometheusUsageSink::record, known series         0 KB          0 allocs     0.00 ms
+  FanOut(prometheus + channel)::record             0 KB          9 allocs     0.00 ms
+
+=== stage -1e: principal inventory — C.4 ===
+  observe principal, known unchanged               0 KB          0 allocs     0.00 ms
+
+=== stage -1f: console activity render, 1000 rows (mean of 100) — D.1 ===
+  skipped: build with --features console to render 1000 activity rows
+
+=== stage 0: per-tool-call config snapshot (mean of 1000) ===
+  BEFORE: deep clone of Config                     4 KB         73 allocs     0.00 ms
+  NOW:    ConfigHandle::snapshot()                 0 KB          0 allocs     0.00 ms
+
+=== 500 issues / 220 KB compact JSON  (mean of 20) ===
+ -- stage 1: jq filter, no filter supplied (the default path)
+  BEFORE: deep clone of the payload             1469 KB      17507 allocs     2.72 ms
+  NOW:    apply_jq_filter(None) borrows            0 KB          0 allocs     0.00 ms
+ -- stage 2: render
+  BEFORE: eager pretty-JSON, then discard       2249 KB      19053 allocs     7.64 ms
+  NOW:    render(Toon), lazy fallback           1736 KB      19032 allocs     6.17 ms
+  ref:    render(Json) on same data              512 KB         13 allocs     0.60 ms
+ -- stage 3: truncate
+  truncate_for_ai (over budget)                   39 KB          4 allocs     0.00 ms
+   rendered output: 243 KB
+
+=== 5000 issues / 2226 KB compact JSON  (mean of 4) ===
+ -- stage 1: jq filter, no filter supplied (the default path)
+  BEFORE: deep clone of the payload            14703 KB     175007 allocs    35.24 ms
+  NOW:    apply_jq_filter(None) borrows            0 KB          0 allocs     0.00 ms
+ -- stage 2: render
+  BEFORE: eager pretty-JSON, then discard      20643 KB     190051 allocs    75.95 ms
+  NOW:    render(Toon), lazy fallback          16547 KB     190035 allocs    64.50 ms
+  ref:    render(Json) on same data             4096 KB         16 allocs    11.76 ms
+ -- stage 3: truncate
+  truncate_for_ai (over budget)                   39 KB          4 allocs     0.01 ms
+   rendered output: 2455 KB
+
+$ cargo bench --bench response_pipeline --features console
+   Compiling mcp-server-devtools v0.15.0 (/home/rohitsi/work/code/mcp-server-atlassian-bitbucket-rs)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 1m 53s
+     Running benches/response_pipeline.rs (target/release/deps/response_pipeline-4ed279ee41231fb2)
+=== output size: is TOON earning its CPU? ===
+                                            compact     pretty       TOON
+  uniform flat rows (TOON's best case)       12392B     20800B      5016B   TOON is 40% of compact, 24% of pretty
+  nested objects (Jira search shape)         89903B    133723B     99300B   TOON is 110% of compact, 74% of pretty
+
+=== stage -1: policy extractors, per tool call (mean of 2000) ===
+  canonical: short path                            0 KB          4 allocs     0.00 ms
+  canonical: dot-segments + escapes                0 KB          1 allocs     0.00 ms
+  canonical: search URL (long JQL)                 0 KB         10 allocs     0.00 ms
+  jira::extract GET /issue/{key}                   0 KB          6 allocs     0.00 ms
+  jira::extract GET /search/jql (long JQL)         1 KB         17 allocs     0.01 ms
+  jira::project_keys_from_jql (long JQL)           0 KB          9 allocs     0.00 ms
+  jira::extract unmapped (default arm)             0 KB          1 allocs     0.00 ms
+  grafana::query_logs                              0 KB         10 allocs     0.00 ms
+
+=== stage -1b: policy decision, per tool call (mean of 2000) ===
+  ActionContext via for_tool (grafana)             0 KB         21 allocs     0.00 ms
+  FilePolicy::evaluate @ 500 rules                 0 KB          5 allocs     0.01 ms
+
+=== stage -1c: enterprise request path, production components (mean of 2000 / 1000) ===
+  JWT validate: cache hit (budget 50 µs)           1 KB          9 allocs     3.77 µs
+  C.1 JWT authenticate: cached actor chain         1 KB          8 allocs     3.98 µs
+  journal append, sequential (budget p99 200 µs)         1 KB          6 allocs  p50      11 µs  p99      16 µs  max      85 µs
+
+=== stage -1d: usage side of the request path (mean of 2000) — C.6 ===
+  rate limit check, known subject                  0 KB          0 allocs     0.00 ms
+  PrometheusUsageSink::record, known series         0 KB          0 allocs     0.00 ms
+  FanOut(prometheus + channel)::record             0 KB          9 allocs     0.00 ms
+
+=== stage -1e: principal inventory — C.4 ===
+  observe principal, known unchanged               0 KB          0 allocs     0.00 ms
+
+=== stage -1f: console activity render, 1000 rows (mean of 100) — D.1 ===
+  ActivityPage::complete render, 1000 rows       432 KB          9 allocs     0.18 ms
+   rendered HTML: 231639 bytes
+
+=== stage 0: per-tool-call config snapshot (mean of 1000) ===
+  BEFORE: deep clone of Config                     4 KB         73 allocs     0.00 ms
+  NOW:    ConfigHandle::snapshot()                 0 KB          0 allocs     0.00 ms
+
+=== 500 issues / 220 KB compact JSON  (mean of 20) ===
+ -- stage 1: jq filter, no filter supplied (the default path)
+  BEFORE: deep clone of the payload             1469 KB      17507 allocs     1.36 ms
+  NOW:    apply_jq_filter(None) borrows            0 KB          0 allocs     0.00 ms
+ -- stage 2: render
+  BEFORE: eager pretty-JSON, then discard       2249 KB      19053 allocs     2.96 ms
+  NOW:    render(Toon), lazy fallback           1736 KB      19032 allocs     2.54 ms
+  ref:    render(Json) on same data              512 KB         13 allocs     0.39 ms
+ -- stage 3: truncate
+  truncate_for_ai (over budget)                   39 KB          4 allocs     0.00 ms
+   rendered output: 243 KB
+
+=== 5000 issues / 2226 KB compact JSON  (mean of 4) ===
+ -- stage 1: jq filter, no filter supplied (the default path)
+  BEFORE: deep clone of the payload            14703 KB     175007 allocs    14.45 ms
+  NOW:    apply_jq_filter(None) borrows            0 KB          0 allocs     0.00 ms
+ -- stage 2: render
+  BEFORE: eager pretty-JSON, then discard      20643 KB     190051 allocs    33.59 ms
+  NOW:    render(Toon), lazy fallback          16547 KB     190035 allocs    28.88 ms
+  ref:    render(Json) on same data             4096 KB         16 allocs     4.41 ms
+ -- stage 3: truncate
+  truncate_for_ai (over budget)                   39 KB          4 allocs     0.00 ms
+   rendered output: 2455 KB

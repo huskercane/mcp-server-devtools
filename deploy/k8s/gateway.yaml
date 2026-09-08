@@ -1,0 +1,105 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mcp-devtools-journal
+  namespace: mcp-devtools
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-devtools-gateway
+  namespace: mcp-devtools
+  labels: { app: mcp-devtools, role: gateway }
+spec:
+  # One replica with one journal claim keeps the durable-journal property
+  # unambiguous; see README.md before scaling.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: mcp-devtools, role: gateway }
+  template:
+    metadata:
+      labels: { app: mcp-devtools, role: gateway }
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: gateway
+          # A release tag, never `latest`: a moving tag makes "which build
+          # is running" unanswerable. Better still, pin the digest the
+          # release workflow prints (`image@sha256:...`).
+          image: ghcr.io/huskercane/mcp-devtools:v0.15.0
+          args: ["--role", "gateway"]
+          ports:
+            - name: http
+              containerPort: 3000
+          envFrom:
+            - configMapRef: { name: mcp-devtools-config }
+            - secretRef: { name: mcp-devtools-vendor-credentials }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: journal, mountPath: /journal }
+            - { name: policy, mountPath: /policy, readOnly: true }
+            - { name: audit-signing-key, mountPath: /keys, readOnly: true }
+          readinessProbe:
+            exec: { command: ["/mcp-devtools", "health"] }
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            exec: { command: ["/mcp-devtools", "health"] }
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 100m, memory: 64Mi }
+            limits: { memory: 512Mi }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 2Gi }
+        - name: journal
+          persistentVolumeClaim: { claimName: mcp-devtools-journal }
+        - name: policy
+          configMap: { name: mcp-devtools-policy }
+        - name: audit-signing-key
+          # With `fsGroup` set above, Kubernetes projects this file as
+          # root:65532 mode 0440 (the defaultMode ORed with group read), which
+          # is what the gateway accepts: owner or group readable, nothing
+          # wider, never group-writable. Do not add subPath (it freezes the
+          # projection) or a wider defaultMode (the gateway refuses it).
+          secret: { secretName: mcp-devtools-audit-signing-key, defaultMode: 0400 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-devtools-gateway
+  namespace: mcp-devtools
+spec:
+  selector: { app: mcp-devtools, role: gateway }
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mcp-devtools-gateway
+  namespace: mcp-devtools
+spec:
+  maxUnavailable: 0
+  selector:
+    matchLabels: { app: mcp-devtools, role: gateway }

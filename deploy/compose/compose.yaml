@@ -1,0 +1,53 @@
+name: mcp-devtools
+services:
+  mcp:
+    image: ${MCP_IMAGE:?set MCP_IMAGE to the mirrored release image@sha256 digest}
+    command: ["--role", "all"]
+    env_file: ${MCP_ENV_FILE:-./mcp.env}
+    environment:
+      MCP_BIND_ADDR: 0.0.0.0
+      PORT: "3000"
+      MCP_AUDIT_JOURNAL_DIR: /journal
+      MCP_ROLLUP_STORE: sqlite:///rollups/usage.sqlite
+      MCP_POLICY_FILE: /policies/policy.yaml
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+    volumes:
+      - journal:/journal
+      - rollups:/rollups
+      - policies:/policies
+      - ${MCP_JWKS_DIR:-./jwks}:/jwks:ro
+      - ${MCP_SECRETS_DIR:-./secrets}:/secrets:ro
+      - ${MCP_TLS_DIR:-./tls}:/tls:ro
+    restart: unless-stopped
+  proxy:
+    image: ${MCP_PROXY_IMAGE:?set MCP_PROXY_IMAGE to an nginx image@sha256 digest}
+    depends_on:
+      mcp:
+        condition: service_healthy
+    ports: ["${MCP_TLS_BIND:-127.0.0.1}:${MCP_TLS_PORT:-8443}:8443"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    user: "101:101"
+    tmpfs: [/tmp]
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ${MCP_TLS_DIR:-./tls}:/tls:ro
+    restart: unless-stopped
+  syslog:
+    profiles: [syslog]
+    image: ${MCP_SYSLOG_IMAGE:-balabit/syslog-ng:4.10.1@sha256:e33caf68a522bdebf0a822b6446176a0c2555a4d32b1da1e16f996315ba27c8a}
+    command: ["-F", "--no-caps"]
+    volumes:
+      - ../../tests/fixtures/syslog-ng/syslog-ng.conf:/etc/syslog-ng/syslog-ng.conf:ro
+      - ${MCP_TLS_DIR:-./tls}:/etc/syslog-ng/tls:ro
+      - syslog:/var/log/mcp-audit
+    security_opt: [no-new-privileges:true]
+volumes:
+  journal:
+  rollups:
+  policies:
+  syslog:

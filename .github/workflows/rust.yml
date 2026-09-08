@@ -1,0 +1,356 @@
+name: Rust
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+    - name: Restore pinned dependency auditor
+      # Building cargo-deny from source costs minutes per run; the binary is
+      # keyed on its exact version so a bump rebuilds it and nothing else.
+      id: cargo-deny
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/cargo-deny
+        key: cargo-deny-0.19.4-${{ runner.os }}
+    - name: Install pinned dependency auditor
+      if: steps.cargo-deny.outputs.cache-hit != 'true'
+      run: cargo install cargo-deny --version 0.19.4 --locked
+    - name: Audit dependencies
+      # `--deny warnings` also turns an unmatched `[bans] skip` entry into a
+      # failure, so a duplicate leaving Cargo.lock must have its skip removed.
+      run: cargo deny --locked check --deny warnings
+
+  build:
+    # Three-OS matrix. Sharp edges in this codebase (keychain backend
+    # selection, atomic-replace semantics) are target-specific, so we
+    # build + test on each desktop OS we support. Headless Linux is also
+    # exercised via `--no-default-features` to confirm the keychain-off
+    # build path stays green.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Cache Rust dependencies and build artifacts
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: rust-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+        restore-keys: |
+          rust-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+    - name: Show toolchain
+      # rust-toolchain.toml is the source of truth — `cargo` auto-installs
+      # and uses it. Echo the resolved version so CI logs make the pin
+      # explicit (helps when investigating "works locally" reports).
+      run: rustc --version && cargo --version
+    - name: Install Linux keyring build deps
+      # `keyring`'s sync-secret-service backend links libsecret + dbus.
+      # GitHub-hosted ubuntu-latest images already ship these, but
+      # installing explicitly makes the dependency obvious for self-hosted
+      # runners and locked-down forks.
+      #
+      # GitHub-hosted images ship third-party apt repos (packages.microsoft.com /
+      # azure-cli) whose CDN intermittently serves a corrupt InRelease, making
+      # `apt-get update` exit 100. We only need libsecret/libdbus from the Ubuntu
+      # archive, so drop those repos before updating to stay resilient to outages.
+      if: runner.os == 'Linux'
+      run: |
+        set -eu
+        sudo find /etc/apt/sources.list.d -type f \
+          -exec grep -qE 'packages\.microsoft\.com|azure-cli' {} \; \
+          -exec rm -vf {} \; 2>/dev/null || true
+        sudo apt-get update
+        sudo apt-get install -y libsecret-1-dev libdbus-1-dev
+    - name: Build (default features)
+      run: cargo build --verbose
+    - name: Clippy
+      run: cargo clippy --all-targets -- -D warnings
+    - name: Run tests
+      run: cargo test --verbose
+    - name: Build (no default features) — headless / keychain-off
+      # End-to-end keychain interaction can't be exercised on headless CI
+      # runners (no Keychain ACL UI on macOS, no logged-in DPAPI session
+      # on Windows-runner under some configs, no D-Bus on Linux runners
+      # by default). The matrix proves the cross-target *compile* of both
+      # keychain-on and keychain-off paths; the in-process tests cover
+      # behaviour against InMemoryKeychain. Real-keychain validation is
+      # done manually via the README smoke checklist before release.
+      if: runner.os == 'Linux'
+      run: cargo build --no-default-features --verbose
+    - name: Clippy (headless)
+      if: runner.os == 'Linux'
+      run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
+
+  keycloak:
+    # The real-identity-provider proof for the OIDC validator (plan §3.9,
+    # WP C.1b): `tests/keycloak_live_tests.rs` obtains tokens from a real
+    # Keycloak realm — imported from `tests/fixtures/keycloak/` — and
+    # validates them through the Keycloak profile, including a key rotation
+    # and withdrawal driven through the admin API. Every other validator
+    # test signs its own tokens; this one is the check that a provider's
+    # actual claim shapes match what those fixtures assume. The test skips
+    # itself unless `MCP_KEYCLOAK_URL` is set, so `cargo test` elsewhere
+    # stays hermetic; ubuntu only, because it needs Docker.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Cache Rust dependencies and build artifacts
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: rust-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+        restore-keys: |
+          rust-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+    - name: Show toolchain
+      run: rustc --version && cargo --version
+    - name: Install Linux keyring build deps
+      run: |
+        set -eu
+        sudo find /etc/apt/sources.list.d -type f \
+          -exec grep -qE 'packages\.microsoft\.com|azure-cli' {} \; \
+          -exec rm -vf {} \; 2>/dev/null || true
+        sudo apt-get update
+        sudo apt-get install -y libsecret-1-dev libdbus-1-dev
+    - name: Start Keycloak with the test realm
+      # Pinned to an exact image so a Keycloak release cannot change the
+      # token shape under the test unnoticed; bump deliberately, and re-read
+      # the Keycloak row of docs/identity-provider-runbook.md when you do.
+      run: |
+        set -eu
+        docker run -d --name keycloak -p 127.0.0.1:8080:8080 \
+          -e KC_BOOTSTRAP_ADMIN_USERNAME=admin \
+          -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+          -v "$PWD/tests/fixtures/keycloak:/opt/keycloak/data/import:ro" \
+          quay.io/keycloak/keycloak:26.5.7 start-dev --import-realm
+    - name: Build the live test while Keycloak boots
+      run: cargo test --test keycloak_live_tests --no-run
+    - name: Run the live test
+      env:
+        MCP_KEYCLOAK_URL: http://127.0.0.1:8080
+      run: cargo test --test keycloak_live_tests -- --nocapture
+    - name: Keycloak logs on failure
+      if: failure()
+      run: docker logs keycloak
+
+  vault:
+    # The real-provider proof for the `vault://` secret source (plan §3.8,
+    # WP C.2b): `tests/vault_live_tests.rs` sets up a policy, an AppRole,
+    # and a KV v2 secret on a real server in dev mode, then reads through
+    # the adapter with token and AppRole auth, renews a short lease,
+    # rotates the secret, and checks the failure categories. Skips itself
+    # unless `MCP_TEST_VAULT_ADDR` is set. Runs against HashiCorp Vault and
+    # OpenBao — one adapter, both servers — each pinned to an exact image.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["hashicorp/vault:1.21.4", "openbao/openbao:2.6.2"]
+    steps:
+    - uses: actions/checkout@v4
+    - name: Cache Rust dependencies and build artifacts
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: rust-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+        restore-keys: |
+          rust-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+    - name: Show toolchain
+      run: rustc --version && cargo --version
+    - name: Install Linux keyring build deps
+      run: |
+        set -eu
+        sudo find /etc/apt/sources.list.d -type f \
+          -exec grep -qE 'packages\.microsoft\.com|azure-cli' {} \; \
+          -exec rm -vf {} \; 2>/dev/null || true
+        sudo apt-get update
+        sudo apt-get install -y libsecret-1-dev libdbus-1-dev
+    - name: Start ${{ matrix.image }} in dev mode
+      run: |
+        set -eu
+        docker run -d --name vault -p 127.0.0.1:8200:8200 "${{ matrix.image }}" \
+          server -dev -dev-root-token-id=root -dev-listen-address=0.0.0.0:8200
+    - name: Build the live test while the server boots
+      run: cargo test --test vault_live_tests --no-run
+    - name: Run the live test
+      env:
+        MCP_TEST_VAULT_ADDR: http://127.0.0.1:8200
+        MCP_TEST_VAULT_TOKEN: root
+      run: cargo test --test vault_live_tests -- --nocapture
+    - name: Server logs on failure
+      if: failure()
+      run: docker logs vault
+
+  siem:
+    # The real-receiver proof for audit forwarding (plan §3.9, WP C.3):
+    # `tests/siem_live_tests.rs` writes a real journal, ships it through
+    # the syslog adapter to a syslog-ng container over **mutual TLS**
+    # (`tests/fixtures/syslog-ng/syslog-ng.conf`, certificates from
+    # `tests/fixtures/tls/`), reads the receiver's output file back, and
+    # checks the lines are the journal's own bytes, in order, once — then
+    # restarts the shipper and checks the resume sends only what is new.
+    # The HEC and generic-JSON adapters are proven against wiremock in
+    # `tests/audit_forwarding_tests.rs` on every OS. Skips itself unless
+    # `MCP_TEST_SYSLOG_ADDR` is set; ubuntu only, because it needs Docker.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Cache Rust dependencies and build artifacts
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: rust-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+        restore-keys: |
+          rust-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+    - name: Show toolchain
+      run: rustc --version && cargo --version
+    - name: Install Linux keyring build deps
+      run: |
+        set -eu
+        sudo find /etc/apt/sources.list.d -type f \
+          -exec grep -qE 'packages\.microsoft\.com|azure-cli' {} \; \
+          -exec rm -vf {} \; 2>/dev/null || true
+        sudo apt-get update
+        sudo apt-get install -y libsecret-1-dev libdbus-1-dev
+    - name: Start syslog-ng with the test configuration
+      # Pinned to an exact image; bump deliberately and re-run the live
+      # test, because the receiver's framing and TLS defaults are what it
+      # proves. `--no-caps` because the container runs unprivileged.
+      run: |
+        set -eu
+        mkdir -p "$RUNNER_TEMP/mcp-audit" && chmod 777 "$RUNNER_TEMP/mcp-audit"
+        docker run -d --name syslog-ng -p 127.0.0.1:6514:6514 \
+          -v "$PWD/tests/fixtures/syslog-ng/syslog-ng.conf:/etc/syslog-ng/syslog-ng.conf:ro" \
+          -v "$PWD/tests/fixtures/tls:/etc/syslog-ng/tls:ro" \
+          -v "$RUNNER_TEMP/mcp-audit:/var/log/mcp-audit" \
+          balabit/syslog-ng:4.10.1 -F --no-caps
+    - name: Build the live test while the receiver boots
+      run: cargo test --test siem_live_tests --no-run
+    - name: Run the live test
+      env:
+        MCP_TEST_SYSLOG_ADDR: syslog+tls://127.0.0.1:6514
+        MCP_TEST_SYSLOG_OUTPUT: ${{ runner.temp }}/mcp-audit/messages
+      run: cargo test --test siem_live_tests -- --nocapture
+    - name: Receiver logs and output on failure
+      if: failure()
+      run: |
+        docker logs syslog-ng || true
+        cat "$RUNNER_TEMP/mcp-audit/messages" || true
+
+  image:
+    # The published-image proof (plan §3.8, "Published image"): build the
+    # repository Dockerfile — the same image `release.yml` publishes — and
+    # run it with a `vault://` reference against a real Vault, asserting the
+    # health banner, one tool call whose upstream saw the secret from Vault,
+    # and the fail-closed refusal for an unresolvable reference. This is
+    # what proves the distroless, non-root, read-only, keychain-off image
+    # can reach a provider at all.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: docker/setup-buildx-action@v3
+    - name: Build the image
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        load: true
+        push: false
+        tags: mcp-devtools:ci
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    - name: Smoke-test TLS Compose reference stack
+      run: bash scripts/ci/compose-smoke.sh mcp-devtools:ci
+    - name: Start Vault in dev mode
+      run: |
+        set -eu
+        docker run -d --name vault -p 127.0.0.1:8200:8200 hashicorp/vault:1.21.4 \
+          server -dev -dev-root-token-id=root -dev-listen-address=0.0.0.0:8200
+    - name: Smoke-test the image against Vault
+      env:
+        VAULT_ADDR: http://127.0.0.1:8200
+        VAULT_TOKEN: root
+      run: scripts/ci/image-vault-smoke.sh mcp-devtools:ci
+    - name: Logs on failure
+      if: failure()
+      run: |
+        docker logs vault || true
+        docker logs mcp-smoke || true
+
+  operations:
+    name: Helm and verified restore
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install checksum-pinned Helm
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mcp-helm"
+          cd "$RUNNER_TEMP/mcp-helm"
+          curl -fsSL https://get.helm.sh/helm-v3.19.0-linux-amd64.tar.gz -o helm.tar.gz
+          printf '%s  %s\n' a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496 helm.tar.gz | sha256sum --check
+          tar -xzf helm.tar.gz
+          echo "MCP_TEST_HELM_BIN=$RUNNER_TEMP/mcp-helm/linux-amd64/helm" >> "$GITHUB_ENV"
+      - name: Restore and verify signed evidence; render Helm security contracts
+        run: cargo test --locked --no-default-features --test operations_tests
+
+  packages:
+    name: Debian and UBI systemd installation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rootless systemd test runtime
+        run: sudo apt-get update && sudo apt-get install -y podman uidmap
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: mcp-devtools:packages
+          cache-from: type=gha
+      - name: Install pinned tooling and package static binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/release/install-package-tools.sh "$RUNNER_TEMP/package-tools"
+          export PATH="$RUNNER_TEMP/package-tools/bin:$PATH"
+          container=$(docker create mcp-devtools:packages)
+          docker cp "$container:/mcp-devtools" "$RUNNER_TEMP/mcp-devtools-static"
+          docker rm "$container"
+          bash scripts/release/packages.sh "$RUNNER_TEMP/mcp-devtools-static" "$RUNNER_TEMP/packages"
+          bash scripts/ci/packages-smoke.sh "$RUNNER_TEMP/packages"

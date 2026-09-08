@@ -1,0 +1,955 @@
+//! C.4 contracts over real HTTP, real signed files and `SQLite`.
+use mcp_server_devtools::{
+    bootstrap::ServerBuilder,
+    config::Config,
+    policy::{
+        FilePolicy, Principal, PrincipalAuthority,
+        signing::{Domain, SigningKey, write_detached},
+    },
+    ports::{InMemoryAuditSink, StaticValidator},
+    server::{
+        auth::{InboundAuth, InboundAuthSettings},
+        http::{Role, build_app_for_role},
+        rate_limit::{RateLimitSettings, RateLimiter},
+    },
+};
+use serde_json::{Value, json};
+use std::{collections::HashMap, sync::Arc, time::Duration};
+use tokio_util::sync::CancellationToken;
+
+struct Fixture {
+    dir: tempfile::TempDir,
+    url: String,
+    sink: Arc<InMemoryAuditSink>,
+    policy: std::path::PathBuf,
+    key: SigningKey,
+    cancel: CancellationToken,
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+async fn fixture(role: Role) -> Fixture {
+    fixture_with_policy(role, b"version: 1\nrules: []\n").await
+}
+async fn fixture_with_policy(role: Role, document: &[u8]) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = dir.path().join("policy.yaml");
+    let (key, _) = SigningKey::generate().unwrap();
+    std::fs::write(&policy, document).unwrap();
+    write_detached(&policy, &key.sign(Domain::PolicyBundle, document)).unwrap();
+    let revocation_path = dir.path().join("revocations.yaml");
+    let revocation_bytes = b"version: 1\nsubjects: []\ntoken_ids: []\n";
+    std::fs::write(&revocation_path, revocation_bytes).unwrap();
+    write_detached(
+        &revocation_path,
+        &key.sign(Domain::RevocationList, revocation_bytes),
+    )
+    .unwrap();
+    let revocations = mcp_server_devtools::auth::revocation::RevocationList::load_verified(
+        &revocation_path,
+        key.verifying_key(),
+    )
+    .unwrap();
+    let sink = Arc::new(InMemoryAuditSink::new());
+    let config = Config::from_map(HashMap::from([
+        ("MCP_POLICY_FILE".into(), policy.display().to_string()),
+        (
+            "MCP_POLICY_PUBLIC_KEY".into(),
+            key.verifying_key().to_base64(),
+        ),
+        (
+            "MCP_ROLLUP_STORE".into(),
+            format!("sqlite://{}", dir.path().join("rollups.sqlite").display()),
+        ),
+    ]));
+    let server = ServerBuilder::new()
+        .config(config)
+        .serves_control(true)
+        .audit_sink(sink.clone())
+        .build()
+        .unwrap();
+    let principal = |scopes: &[&str]| Principal {
+        tenant: "tenant".into(),
+        subject: "alice".into(),
+        groups: vec![],
+        scopes: scopes.iter().map(|s| (*s).into()).collect(),
+        authority: PrincipalAuthority::oidc("https://issuer.example"),
+    };
+    let auth = Arc::new(
+        InboundAuth::new(
+            Arc::new(
+                StaticValidator::new()
+                    .with("admin", principal(&["mcp:admin"]))
+                    .with("tools", principal(&["mcp:tools"]))
+                    .with("both", principal(&["mcp:tools", "mcp:admin"])),
+            ),
+            InboundAuthSettings {
+                public_url: "https://mcp.example".into(),
+                authorization_servers: vec!["https://issuer.example".into()],
+                required_scope: "mcp:tools".into(),
+            },
+        )
+        .with_revocations(revocations)
+        .with_rate_limit(Arc::new(RateLimiter::new(RateLimitSettings {
+            per_second: 0.01,
+            burst: 1.0,
+        }))),
+    );
+    let cancel = CancellationToken::new();
+    let app = build_app_for_role(
+        role,
+        server,
+        Some(auth),
+        Duration::from_mins(10),
+        Duration::from_mins(10),
+        cancel.clone(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let stop = cancel.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(stop.cancelled_owned())
+            .await
+            .unwrap();
+    });
+    Fixture {
+        dir,
+        url,
+        sink,
+        policy,
+        key,
+        cancel,
+    }
+}
+async fn post(f: &Fixture, op: &str, body: Value) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{}/admin/{op}", f.url))
+        .bearer_auth("admin")
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+#[tokio::test]
+async fn auth_role_and_json_contracts() {
+    let f = fixture(Role::Control).await;
+    let client = reqwest::Client::new();
+    for (token, status) in [("", 401), ("tools", 403), ("admin", 200)] {
+        let response = client
+            .get(format!("{}/admin/policy", f.url))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), status);
+        let body: Value = response.json().await.unwrap();
+        if status == 200 {
+            assert_eq!(body["data"]["document"], "version: 1\nrules: []\n");
+            assert_eq!(body["data"]["signature"]["verified"], true);
+            assert_eq!(body["data"].as_object().unwrap().len(), 3);
+        } else {
+            assert!(body["error"].is_string());
+        }
+    }
+    assert_eq!(
+        client
+            .post(format!("{}/mcp", f.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    assert_eq!(
+        client
+            .get(format!("{}/admin/sessions", f.url))
+            .bearer_auth("admin")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap(),
+        json!({"error":"admin_backend_unavailable", "error_description":"admin_backend_unavailable"})
+    );
+    let f = fixture(Role::Gateway).await;
+    assert_eq!(
+        client
+            .get(format!("{}/admin/policy", f.url))
+            .bearer_auth("admin")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+}
+#[tokio::test]
+async fn reload_is_fail_closed_and_candidate_shapes_are_locked() {
+    let f = fixture(Role::All).await;
+    let candidate = "version: 1\nrules: []\n# new revision\n";
+    let body = post(&f, "policy/validate", json!({"document":candidate}))
+        .await
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(body["data"]["valid"], true);
+    assert_eq!(body["data"]["signature_verified"], false);
+    assert_eq!(body["data"].as_object().unwrap().len(), 4);
+    let diff = post(&f, "policy/diff", json!({"document":candidate}))
+        .await
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(diff["data"].as_object().unwrap().len(), 4);
+    assert_ne!(
+        diff["data"]["current_version"],
+        diff["data"]["candidate_version"]
+    );
+    f.sink.set_failing(true);
+    std::fs::write(&f.policy, candidate).unwrap();
+    assert_eq!(post(&f, "policy/reload", json!({})).await.status(), 400);
+    write_detached(
+        &f.policy,
+        &f.key.sign(Domain::PolicyBundle, candidate.as_bytes()),
+    )
+    .unwrap();
+    assert_eq!(
+        post(&f, "policy/reload", json!({}))
+            .await
+            .json::<Value>()
+            .await
+            .unwrap(),
+        json!({"error":"audit_unavailable", "error_description":"audit_unavailable"})
+    );
+    let unchanged: Value = reqwest::Client::new()
+        .get(format!("{}/admin/policy", f.url))
+        .bearer_auth("admin")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        unchanged["data"]["version"],
+        diff["data"]["current_version"]
+    );
+    f.sink.set_failing(false);
+    let result = post(&f, "policy/reload", json!({}))
+        .await
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(result["data"]["version"], diff["data"]["candidate_version"]);
+    let records = f.sink.events();
+    let admin = records
+        .iter()
+        .find(|record| record["seq"] == result["data"]["audit_seq"])
+        .unwrap();
+    assert_eq!(admin["kind"], "admin_mutation");
+    assert_eq!(admin["principal"]["subject"], "alice");
+    if result["data"]["changed"] == true {
+        assert_eq!(admin["version"], diff["data"]["candidate_version"]);
+    } else {
+        // The watcher may legitimately win after audit recovers. Its durable
+        // change record must precede the administrator's no-change intent.
+        assert!(
+            records
+                .iter()
+                .any(|record| record["kind"] == "policy_changed"
+                    && record["version"] == diff["data"]["candidate_version"]
+                    && record["seq"].as_u64().unwrap() < admin["seq"].as_u64().unwrap())
+        );
+    }
+}
+#[tokio::test]
+async fn reports_sqlite_and_inventory_are_live() {
+    let f = fixture(Role::All).await;
+    let usage = post(&f, "usage", json!({"report":"totals","window":{}}))
+        .await
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(usage["data"]["shape"], "totals");
+    assert_eq!(usage["data"]["rows"], 0);
+    let access = post(
+        &f,
+        "reports/access-review",
+        json!({"groups":{},"tenant":"tenant"}),
+    )
+    .await
+    .json::<Value>()
+    .await
+    .unwrap();
+    assert_eq!(access, json!({"data":{"rows":[]}}));
+    let lookup = post(
+        &f,
+        "principals/lookup",
+        json!({"subject":"alice","tenant":"tenant"}),
+    )
+    .await
+    .json::<Value>()
+    .await
+    .unwrap();
+    assert_eq!(
+        lookup,
+        json!({"data":{"subject":"alice","tenant":"tenant","scope":"process","principal":{"tenant":"tenant","subject":"alice","groups":[],"scopes":["mcp:admin"],"authority":"https://issuer.example"},"sessions":[],"subject_denied":false}})
+    );
+    assert_eq!(
+        post(&f, "sessions/revoke", json!({"id":"unknown"}))
+            .await
+            .status(),
+        404
+    );
+    assert_eq!(
+        f.sink.events().len(),
+        1,
+        "attempt durably recorded even when target disappeared"
+    );
+    assert_eq!(
+        post(
+            &f,
+            "policy/validate",
+            json!({"document":"bad","unexpected":true})
+        )
+        .await
+        .json::<Value>()
+        .await
+        .unwrap(),
+        json!({"error":"invalid_request","error_description":"invalid_request"})
+    );
+}
+#[tokio::test]
+async fn admin_limiter_is_independent_of_mcp() {
+    let f = fixture(Role::All).await;
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        client
+            .post(format!("{}/mcp", f.url))
+            .bearer_auth("both")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+    }
+    let response = client
+        .get(format!("{}/admin/policy", f.url))
+        .bearer_auth("both")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let mut limited = false;
+    for _ in 0..20 {
+        if client
+            .get(format!("{}/admin/policy", f.url))
+            .bearer_auth("both")
+            .send()
+            .await
+            .unwrap()
+            .status()
+            == 429
+        {
+            limited = true;
+            break;
+        }
+    }
+    assert!(limited);
+}
+
+#[tokio::test]
+async fn signed_deny_list_replace_is_audited_persistent_and_enforced() {
+    let f = fixture(Role::All).await;
+    let client = reqwest::Client::new();
+    let document = "version: 1\nsubjects:\n- subject: alice\n  revoked_at: 2026-09-04T00:00:00Z\ntoken_ids: []\n";
+    let request = json!({"document": document, "signature": f.key.sign(Domain::RevocationList, document.as_bytes()).to_base64()});
+    f.sink.set_failing(true);
+    let response = client
+        .put(format!("{}/admin/deny-list", f.url))
+        .bearer_auth("admin")
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    let path = f.dir.path().join("revocations.yaml");
+    assert!(!std::fs::read_to_string(&path).unwrap().contains("alice"));
+    f.sink.set_failing(false);
+    let response = client
+        .put(format!("{}/admin/deny-list", f.url))
+        .bearer_auth("admin")
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["data"].as_object().unwrap().len(), 2);
+    assert_eq!(f.sink.events()[0]["source"], "deny-list/replace");
+    let reloaded = mcp_server_devtools::auth::revocation::RevocationList::load_verified(
+        &path,
+        f.key.verifying_key(),
+    )
+    .unwrap();
+    assert!(reloaded.snapshot().document.revokes_subject("alice"));
+    assert_eq!(
+        client
+            .get(format!("{}/admin/policy", f.url))
+            .bearer_auth("admin")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+}
+
+#[tokio::test]
+async fn signed_policy_install_is_audited_persistent_and_in_force() {
+    let f = fixture(Role::All).await;
+    let client = reqwest::Client::new();
+    let original = std::fs::read_to_string(&f.policy).unwrap();
+    let candidate = "version: 2\nrules: []\n";
+    let put = |body: Value| {
+        client
+            .put(format!("{}/admin/policy", f.url))
+            .bearer_auth("admin")
+            .json(&body)
+            .send()
+    };
+    // Signing/download handoff: even a newline edit invalidates the signature.
+    let edited_signature = f
+        .key
+        .sign(Domain::PolicyBundle, b"version: 2\r\nrules: []\r\n")
+        .to_base64();
+    // A candidate that does not verify or does not compile is refused
+    // before it becomes an intent: no record, nothing on disk.
+    let wrong_domain = f
+        .key
+        .sign(Domain::RevocationList, candidate.as_bytes())
+        .to_base64();
+    let broken = "version: 2\nrules: [\n";
+    let broken_signature = f
+        .key
+        .sign(Domain::PolicyBundle, broken.as_bytes())
+        .to_base64();
+    for body in [
+        json!({"document": candidate, "signature": "AAAA"}),
+        json!({"document": candidate, "signature": wrong_domain}),
+        json!({"document": candidate, "signature": edited_signature}),
+        json!({"document": broken, "signature": broken_signature}),
+        json!({"document": candidate}),
+    ] {
+        let response = put(body.clone()).await.unwrap();
+        assert_eq!(response.status(), 400, "{body}");
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"],
+            "invalid_request"
+        );
+    }
+    assert!(f.sink.events().is_empty());
+    assert_eq!(std::fs::read_to_string(&f.policy).unwrap(), original);
+    // The intent must be durable before anything is written.
+    let request = json!({"document": candidate, "signature": f.key.sign(Domain::PolicyBundle, candidate.as_bytes()).to_base64()});
+    f.sink.set_failing(true);
+    assert_eq!(put(request.clone()).await.unwrap().status(), 503);
+    assert_eq!(std::fs::read_to_string(&f.policy).unwrap(), original);
+    f.sink.set_failing(false);
+    let response = put(request).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["data"].as_object().unwrap().len(), 2);
+    let events = f.sink.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["kind"], "admin_mutation");
+    assert_eq!(events[0]["source"], "policy/install");
+    assert_eq!(events[0]["seq"], body["data"]["audit_seq"]);
+    assert_eq!(events[0]["version"], body["data"]["version"]);
+    assert_eq!(events[0]["principal"]["subject"], "alice");
+    // On disk: the exact bytes and a signature the offline loader accepts.
+    assert_eq!(std::fs::read_to_string(&f.policy).unwrap(), candidate);
+    let reloaded = FilePolicy::load_verified(&f.policy, f.key.verifying_key()).unwrap();
+    assert_eq!(reloaded.version(), body["data"]["version"]);
+    // In force, with its verified signature.
+    let read: Value = client
+        .get(format!("{}/admin/policy", f.url))
+        .bearer_auth("admin")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(read["data"]["document"], candidate);
+    assert_eq!(read["data"]["version"], body["data"]["version"]);
+    assert_eq!(read["data"]["signature"]["verified"], true);
+    // The file the watcher reads is the document in force: a reload has
+    // nothing to change.
+    let reload = post(&f, "policy/reload", json!({}))
+        .await
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(reload["data"]["changed"], false, "{reload}");
+    assert_eq!(reload["data"]["version"], body["data"]["version"]);
+}
+
+#[tokio::test]
+async fn artifact_purge_uses_real_pin_aware_backend_and_fails_closed() {
+    use mcp_server_devtools::transport::raw_response;
+    let f = fixture(Role::All).await;
+    let path = raw_response::save_artifact("admin-test", "fixture body")
+        .await
+        .unwrap();
+    let artifact = raw_response::artifact_for_path(&path).unwrap();
+    let pin =
+        raw_response::pin_artifact(&artifact.id, &mcp_server_devtools::policy::OwnerKey::Local)
+            .unwrap();
+    let response = reqwest::Client::new()
+        .get(format!("{}/admin/artifacts", f.url))
+        .bearer_auth("admin")
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let row = response["data"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == artifact.id)
+        .unwrap();
+    assert_eq!(row.as_object().unwrap().len(), 4);
+    assert!(row.get("path").is_none());
+    f.sink.set_failing(true);
+    assert_eq!(
+        post(&f, "artifacts/purge", json!({"id":artifact.id}))
+            .await
+            .status(),
+        503
+    );
+    assert!(raw_response::artifact(&artifact.id).is_some());
+    f.sink.set_failing(false);
+    let response = post(&f, "artifacts/purge", json!({"id":artifact.id}))
+        .await
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(
+        response,
+        json!({"data":{"audit_seq":1,"id":artifact.id,"scope":"process"}})
+    );
+    assert!(raw_response::artifact(&artifact.id).is_none());
+    assert!(path.exists(), "existing read pin delays physical deletion");
+    drop(pin);
+}
+
+#[tokio::test]
+async fn durable_journal_activity_adapter_reads_control_evidence() {
+    use mcp_server_devtools::{
+        audit::{
+            export::{ActivityFilter, JournalActivityReports},
+            journal::{JOURNAL_FILE_NAME, JournalAuditSink},
+        },
+        ports::{AuditSink, ControlEvent, ControlEventKind, activity_reports::ActivityReports},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let sink = JournalAuditSink::open(directory.path()).unwrap();
+    let event = ControlEvent::now(ControlEventKind::AdminMutation);
+    let seq = sink.append_control(&event).await.unwrap();
+    let reports = JournalActivityReports::new(directory.path().join(JOURNAL_FILE_NAME));
+    let result = reports.activity(&ActivityFilter::default()).await.unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].seq, seq);
+    assert_eq!(result.rows[0].kind, "admin_mutation");
+    assert!(result.stopped.is_none());
+}
+
+/// Project `count` control records whose subject is `subject_len` bytes long,
+/// then compare the projection with the journal adapter row for row. Every
+/// sequence must appear once, and later polls must not replay the reused batch.
+async fn project_and_compare(subject_len: usize, count: usize) {
+    use mcp_server_devtools::{
+        audit::{
+            activity_sqlite::SqliteActivityReports,
+            export::{ActivityFilter, JournalActivityReports},
+            journal::{JOURNAL_FILE_NAME, JournalAuditSink},
+        },
+        ports::{AuditSink, ControlEvent, ControlEventKind, activity_reports::ActivityReports},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let sink = JournalAuditSink::open(directory.path()).unwrap();
+    let mut event = ControlEvent::now(ControlEventKind::AdminMutation);
+    event.source = Some("policy/reload".into());
+    let mut principal = Principal::local();
+    principal.subject = "s".repeat(subject_len);
+    event.principal = Some(principal);
+    for _ in 0..count {
+        sink.append_control(&event).await.unwrap();
+    }
+    let source = directory.path().join(JOURNAL_FILE_NAME);
+    let file = JournalActivityReports::new(source.clone());
+    let store = SqliteActivityReports::open(&directory.path().join("reports.sqlite")).unwrap();
+    let cancel = CancellationToken::new();
+    store.spawn(source, cancel.clone());
+    let filter = ActivityFilter::default();
+    let projected = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(result) = store.activity(&filter).await {
+                break result;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let direct = file.activity(&filter).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(projected.rows).unwrap(),
+        serde_json::to_value(direct.rows).unwrap()
+    );
+    cancel.cancel();
+    drop(sink);
+    std::fs::remove_file(directory.path().join(JOURNAL_FILE_NAME)).unwrap();
+    assert_eq!(
+        store.activity(&filter).await.unwrap().rows.len(),
+        count,
+        "query reads the projection"
+    );
+}
+
+#[tokio::test]
+async fn activity_projection_spans_row_count_batches() {
+    // Short records: 1,001 rows stay far below the payload budget, so the
+    // 1,000-row limit is the batch terminator and the last row is its own poll.
+    project_and_compare(1, 1001).await;
+}
+
+#[tokio::test]
+async fn activity_projection_spans_payload_byte_batches() {
+    // A 2 KiB subject makes the 1 MiB retained-payload limit bind after a few
+    // hundred rows, well before the row count would.
+    project_and_compare(2048, 1001).await;
+}
+
+#[tokio::test]
+async fn session_inventory_lists_and_closes_real_rmcp_sessions() {
+    use mcp_server_devtools::{
+        ports::admin_inventory::SessionStore, server::session::ReapingSessionManager,
+    };
+    use rmcp::transport::streamable_http_server::SessionManager;
+    let manager = ReapingSessionManager::new(Duration::from_mins(10));
+    let (id, _transport) = manager.create_session().await.unwrap();
+    let owner = mcp_server_devtools::policy::OwnerKey::Local;
+    manager.bind_owner(&id, owner.clone()).await;
+    let rows = manager.list().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, id.as_ref());
+    assert_eq!(rows[0].owner, Some(owner));
+    manager.revoke(id.as_ref()).await.unwrap();
+    assert!(manager.list().await.unwrap().is_empty());
+    assert!(manager.revoke(id.as_ref()).await.is_err());
+}
+
+#[tokio::test]
+async fn admin_cli_uses_the_audited_http_boundary_and_json_errors() {
+    let f = fixture(Role::All).await;
+    let token = f.dir.path().join("admin-token");
+    std::fs::write(&token, "admin\n").unwrap();
+    let run = |args: &[&str]| {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_mcp-devtools"));
+        command
+            .env("MCP_AUTH_MODE", "oidc")
+            .env("GRAFANA_TOKEN", "vault://unconfigured/vendor#token");
+        command
+            .args(["admin", "--url", &f.url, "--token-file"])
+            .arg(&token)
+            .args(args);
+        async move { command.output().await.unwrap() }
+    };
+    let output = run(&["policy", "read", "--json"]).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["data"]["document"], "version: 1\nrules: []\n");
+    let output = run(&["policy", "reload", "--json"]).await;
+    assert!(output.status.success());
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["data"]["audit_seq"], f.sink.events()[0]["seq"]);
+    assert_eq!(f.sink.events()[0]["source"], "policy/reload");
+    f.sink.set_failing(true);
+    let output = run(&["policy", "reload", "--json"]).await;
+    assert!(!output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({"error":"audit_unavailable","error_description":"audit_unavailable"})
+    );
+    // `policy install` sends the file's exact bytes and the detached
+    // signature `policy sign` wrote beside it.
+    f.sink.set_failing(false);
+    let candidate = f.dir.path().join("candidate.yaml");
+    std::fs::write(&candidate, "version: 2\nrules: []\n").unwrap();
+    let signature = write_detached(
+        &candidate,
+        &f.key.sign(Domain::PolicyBundle, b"version: 2\nrules: []\n"),
+    )
+    .unwrap();
+    let output = run(&[
+        "policy",
+        "install",
+        candidate.to_str().unwrap(),
+        "--signature",
+        signature.to_str().unwrap(),
+        "--json",
+    ])
+    .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let events = f.sink.events();
+    assert_eq!(events.last().unwrap()["source"], "policy/install");
+    assert_eq!(events.last().unwrap()["seq"], body["data"]["audit_seq"]);
+    assert_eq!(
+        std::fs::read_to_string(&f.policy).unwrap(),
+        "version: 2\nrules: []\n"
+    );
+}
+
+#[test]
+fn every_admin_command_accepts_json() {
+    use clap::Parser as _;
+    let commands: &[&[&str]] = &[
+        &["policy", "read"],
+        &["policy", "validate", "policy.yaml"],
+        &["policy", "diff", "policy.yaml"],
+        &["policy", "reload"],
+        &[
+            "policy",
+            "install",
+            "policy.yaml",
+            "--signature",
+            "policy.sig",
+        ],
+        &["principals", "--tenant", "t", "--subject", "s"],
+        &["sessions", "list"],
+        &["sessions", "remove", "s"],
+        &["artifacts", "list"],
+        &["artifacts", "remove", "a"],
+        &["deny-list", "read"],
+        &[
+            "deny-list",
+            "replace",
+            "list.yaml",
+            "--signature",
+            "list.sig",
+        ],
+        &["report", "activity", "--request", "q.json"],
+        &["report", "access-review", "--request", "q.json"],
+        &["usage", "--request", "q.json"],
+    ];
+    for command in commands {
+        let mut args = vec![
+            "mcp-devtools",
+            "admin",
+            "--url",
+            "https://mcp.example",
+            "--token-file",
+            "token",
+        ];
+        args.extend_from_slice(command);
+        args.push("--json");
+        assert!(
+            mcp_server_devtools::cli::Cli::try_parse_from(args).is_ok(),
+            "{command:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn deny_list_reads_release_the_lock_and_admin_budget() {
+    let f = fixture(Role::Control).await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    // More reads than the four-permit admin budget also catch leaked permits.
+    for _ in 0..5 {
+        let response = client
+            .get(format!("{}/admin/deny-list", f.url))
+            .bearer_auth("admin")
+            .send()
+            .await
+            .expect("deny-list read must finish without reacquiring its own mutex");
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(
+            body["data"]["document"],
+            "version: 1\nsubjects: []\ntoken_ids: []\n"
+        );
+        assert_eq!(body["data"]["signature"]["verified"], true);
+        assert_eq!(body["data"].as_object().unwrap().len(), 3);
+    }
+    let document = "version: 2\nsubjects: []\ntoken_ids: []\n";
+    let response = client
+        .put(format!("{}/admin/deny-list", f.url))
+        .bearer_auth("admin")
+        .json(&json!({"document": document, "signature": f.key.sign(Domain::RevocationList, document.as_bytes()).to_base64()}))
+        .send()
+        .await
+        .expect("reads must leave the mutation lock available");
+    assert_eq!(response.status(), 200);
+    assert_eq!(f.sink.events()[0]["source"], "deny-list/replace");
+}
+
+/// `POST /admin/policy/explain` (plan §3.10.2) is `policy explain` asked
+/// of the policy in force: the same extractor, the server's own
+/// configuration for the upstream identity, the caller's tenant unless
+/// one is given, and the CLI's JSON shape — through the API and through
+/// `mcp-devtools admin policy explain`.
+#[tokio::test]
+async fn policy_explain_is_the_gateway_decision_for_both_clients() {
+    let f = fixture_with_policy(
+        Role::All,
+        b"version: 1\ndefault: deny\nrules:\n  - id: sre-read-qa-loki\n    effect: allow\n    subjects: { groups: [SRE] }\n    match:\n      vendor: grafana\n      environment: qa\n      request_risk: read\n      resource_type: datasource\n      resource_id: [loki-qa]\n",
+    )
+    .await;
+    let arguments = json!({"datasourceUid": "loki-qa", "query": "{app=\"api\"}", "limit": 10});
+    let response = post(
+        &f,
+        "policy/explain",
+        json!({"tool": "grafana_query_logs", "arguments": arguments, "groups": ["SRE"], "environment": "qa"}),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    let data = &body["data"];
+    assert_eq!(data["explanation"]["decision"]["effect"], "allow");
+    assert_eq!(
+        data["explanation"]["decision"]["rule_id"],
+        "sre-read-qa-loki"
+    );
+    assert_eq!(data["explanation"]["rules"][0]["decisive"], true);
+    assert_eq!(data["explanation"]["unclassified"], false);
+    // The what-if override is reported against what configuration says.
+    assert_eq!(data["configured_environment"], "unclassified");
+    assert_eq!(data["action"]["environment"], "qa");
+    assert_eq!(data["action"]["tool_name"], "grafana_query_logs");
+    assert_eq!(data["action"]["principal"]["tenant"], "tenant");
+    assert_eq!(data["action"]["principal"]["subject"], "someone@example");
+    assert_eq!(data["action"]["principal"]["scopes"], json!(["mcp:tools"]));
+    assert_eq!(
+        data["action"]["principal"]["authority"],
+        "https://issuer.example"
+    );
+    assert!(data["policy_version"].is_string());
+    assert_eq!(body.as_object().unwrap().len(), 1);
+
+    // Without the override the configured (unclassified) environment is
+    // what the rule fails on: the CLI's "first key" trace, from the API.
+    let response = post(
+        &f,
+        "policy/explain",
+        json!({"tool": "grafana_query_logs", "arguments": arguments, "groups": ["SRE"], "subject": "alice", "tenant": "other"}),
+    )
+    .await;
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["data"]["explanation"]["decision"]["effect"], "deny");
+    assert_eq!(
+        body["data"]["explanation"]["rules"][0]["mismatch"],
+        "environment"
+    );
+    assert_eq!(body["data"]["action"]["principal"]["tenant"], "other");
+    assert_eq!(body["data"]["action"]["principal"]["subject"], "alice");
+    // Nothing is journaled by an explanation.
+    assert!(f.sink.events().is_empty());
+
+    // Refusals: an unknown tool, an environment that does not parse, an
+    // unknown field, and the wrong method.
+    for body in [
+        json!({"tool": "no_such_tool"}),
+        json!({"tool": "grafana_query_logs", "environment": "pord"}),
+        json!({"tool": "grafana_query_logs", "file": "policy.yaml"}),
+    ] {
+        let response = post(&f, "policy/explain", body).await;
+        assert_eq!(response.status(), 400);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"],
+            "invalid_request"
+        );
+    }
+    let response = reqwest::Client::new()
+        .get(format!("{}/admin/policy/explain", f.url))
+        .bearer_auth("admin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 405);
+}
+
+/// `mcp-devtools admin policy explain`: the flags of `policy explain`,
+/// sent to the API, the same answer.
+#[tokio::test]
+async fn policy_explain_cli_sends_the_same_inputs() {
+    let f = fixture_with_policy(
+        Role::All,
+        b"version: 1\ndefault: deny\nrules:\n  - id: sre-read-qa-loki\n    effect: allow\n    subjects: { groups: [SRE] }\n    match:\n      vendor: grafana\n      environment: qa\n      request_risk: read\n      resource_type: datasource\n      resource_id: [loki-qa]\n",
+    )
+    .await;
+    let arguments = json!({"datasourceUid": "loki-qa", "query": "{app=\"api\"}", "limit": 10});
+    let token = f.dir.path().join("admin-token");
+    std::fs::write(&token, "admin\n").unwrap();
+    let run = |args: &[&str]| {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_mcp-devtools"));
+        command
+            .env("MCP_AUTH_MODE", "oidc")
+            .args(["admin", "--url", &f.url, "--token-file"])
+            .arg(&token)
+            .args(args)
+            .arg("--json");
+        async move {
+            let output = command.output().await.unwrap();
+            (
+                output.status.success(),
+                serde_json::from_slice::<Value>(&output.stdout).unwrap_or(Value::Null),
+            )
+        }
+    };
+    let (ok, body) = run(&[
+        "policy",
+        "explain",
+        "--tool",
+        "grafana_query_logs",
+        "--arguments",
+        &arguments.to_string(),
+        "--group",
+        "SRE",
+        "--environment",
+        "qa",
+    ])
+    .await;
+    assert!(ok, "{body}");
+    assert_eq!(body["data"]["explanation"]["decision"]["effect"], "allow");
+    assert_eq!(body["data"]["configured_environment"], "unclassified");
+    let (ok, body) = run(&[
+        "policy",
+        "explain",
+        "--tool",
+        "grafana_query_logs",
+        "--arguments",
+        "[]",
+    ])
+    .await;
+    assert!(!ok);
+    assert_eq!(body["error"], "invalid_json");
+}

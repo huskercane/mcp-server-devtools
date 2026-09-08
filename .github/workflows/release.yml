@@ -1,0 +1,365 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name to publish under (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: mcp-devtools
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  validate:
+    name: Validate release source
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Require the tag to match Cargo.toml
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          python3 - <<'PYTHON'
+          import os, pathlib, re
+          text = pathlib.Path('Cargo.toml').read_text()
+          version = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M).group(1)
+          if os.environ['RELEASE_TAG'] != 'v' + version:
+              raise SystemExit('release tag must match the Cargo.toml package version')
+          PYTHON
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            asset: mcp-devtools-linux-x86_64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            asset: mcp-devtools-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            asset: mcp-devtools-macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            asset: mcp-devtools-windows-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Ensure target installed
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Linux keyring build deps
+        # `keyring`'s sync-secret-service backend links libsecret + dbus.
+        # Mirrors the install step in rust.yml so the release build sees
+        # the same toolchain inputs as CI.
+        #
+        # GitHub-hosted images ship third-party apt repos (packages.microsoft.com /
+        # azure-cli) whose CDN intermittently serves a corrupt InRelease, making
+        # `apt-get update` exit 100 and taking the release down with it (this sank
+        # the v0.7.0 build). We only need libsecret/libdbus from the Ubuntu archive,
+        # so drop those repos before updating to stay resilient to their outages.
+        if: runner.os == 'Linux'
+        run: |
+          set -eu
+          sudo find /etc/apt/sources.list.d -type f \
+            -exec grep -qE 'packages\.microsoft\.com|azure-cli' {} \; \
+            -exec rm -vf {} \; 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y libsecret-1-dev libdbus-1-dev
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="${{ matrix.asset }}"
+          mkdir -p "$staging"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$staging/"
+          cp README.md LICENSE NOTICE "$staging/"
+          cp -R licenses "$staging/"
+          mkdir -p "$staging/docs"
+          cp docs/licensing.md "$staging/docs/"
+          tar -czf "${staging}.tar.gz" "$staging"
+          shasum -a 256 "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $staging = "${{ matrix.asset }}"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/$env:BIN_NAME.exe" "$staging/"
+          Copy-Item README.md, LICENSE, NOTICE "$staging/"
+          Copy-Item -Recurse licenses "$staging/"
+          New-Item -ItemType Directory -Force -Path "$staging/docs" | Out-Null
+          Copy-Item docs/licensing.md "$staging/docs/"
+          Compress-Archive -Path "$staging/*" -DestinationPath "$staging.zip"
+          (Get-FileHash "$staging.zip" -Algorithm SHA256).Hash.ToLower() + "  $staging.zip" `
+            | Out-File -Encoding ascii "$staging.zip.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}.${{ matrix.archive }}
+            ${{ matrix.asset }}.${{ matrix.archive }}.sha256
+          if-no-files-found: error
+
+  sbom:
+    name: Source dependency SBOM
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: CycloneDX source dependency inventory
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0, verified 2026-09-04
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: mcp-devtools-source.cdx.json
+          artifact-name: mcp-devtools-source-sbom
+          upload-release-assets: false
+
+  container:
+    # One image, every role (plan ADR-010, WP A.9). Built from the same
+    # Dockerfile an operator can build locally, published to GHCR, and its
+    # digest becomes a release asset so a deployment can pin by digest.
+    name: Build and publish container
+    needs: validate
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${REQUESTED_TAG}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/mcp-devtools
+          tags: |
+            type=raw,value=${{ steps.tag.outputs.name }}
+            type=raw,value=latest
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+        with:
+          cosign-release: v3.0.6
+
+      - name: Sign and verify immutable image
+        env:
+          IMAGE_REF: ghcr.io/${{ github.repository_owner }}/mcp-devtools@${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "$IMAGE_REF"
+          cosign verify --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com "$IMAGE_REF"
+
+      - name: Record digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          {
+            echo "image: ghcr.io/${{ github.repository_owner }}/mcp-devtools:${{ steps.tag.outputs.name }}"
+            echo "digest: ${{ steps.push.outputs.digest }}"
+            echo "pin: ghcr.io/${{ github.repository_owner }}/mcp-devtools@${{ steps.push.outputs.digest }}"
+          } > artifacts/mcp-devtools-container-digest.txt
+          cat artifacts/mcp-devtools-container-digest.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcp-devtools-container-digest
+          path: artifacts/mcp-devtools-container-digest.txt
+          if-no-files-found: error
+
+  packages:
+    name: Native packages and real systemd proof
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Install rootless systemd test runtime
+        run: sudo apt-get update && sudo apt-get install -y podman uidmap
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: mcp-devtools:packages
+          cache-from: type=gha
+      - name: Extract static release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          container=$(docker create mcp-devtools:packages)
+          docker cp "$container:/mcp-devtools" "$RUNNER_TEMP/mcp-devtools-static"
+          docker rm "$container"
+      - name: Install checksum-pinned packaging tools
+        run: |
+          bash scripts/release/install-package-tools.sh "$RUNNER_TEMP/package-tools"
+          echo "$RUNNER_TEMP/package-tools/bin" >> "$GITHUB_PATH"
+      - name: Package and prove Debian and UBI installation
+        run: |
+          bash scripts/release/packages.sh "$RUNNER_TEMP/mcp-devtools-static" "$RUNNER_TEMP/packages"
+          bash scripts/ci/packages-smoke.sh "$RUNNER_TEMP/packages"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcp-devtools-packages
+          path: ${{ runner.temp }}/packages/*
+          if-no-files-found: error
+
+  vendor:
+    name: Checksummed source and offline build
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Vendor locked dependencies
+        run: bash scripts/release/vendor-archive.sh "$RUNNER_TEMP/vendor-archive"
+      - name: Verify archive and build with an empty Cargo home offline
+        run: bash scripts/ci/offline-build.sh "$RUNNER_TEMP/vendor-archive"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcp-devtools-vendor
+          path: ${{ runner.temp }}/vendor-archive/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [build, container, sbom, packages, vendor]
+    permissions:
+      contents: write
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${REQUESTED_TAG}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+        with:
+          cosign-release: v3.0.6
+
+      - name: Sign release files and verify bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+          for artifact in artifacts/*; do
+            case "$artifact" in
+              *.tar.gz|*.zip|*.tgz|*.cdx.json|*.txt|*.deb|*.rpm|*.sha256)
+                cosign sign-blob --yes --bundle "${artifact}.sigstore.json" "$artifact"
+                cosign verify-blob --bundle "${artifact}.sigstore.json" \
+                  --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+                  --certificate-oidc-issuer https://token.actions.githubusercontent.com "$artifact"
+                ;;
+            esac
+          done
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          body: |
+            Container image: `ghcr.io/${{ github.repository_owner }}/mcp-devtools@${{ needs.container.outputs.digest }}`
+          files: artifacts/*

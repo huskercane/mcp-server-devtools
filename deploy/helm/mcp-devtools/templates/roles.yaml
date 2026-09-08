@@ -1,0 +1,128 @@
+{{- $root := . -}}
+{{- range $name, $role := .Values.roles }}
+{{- if $role.enabled }}
+{{- if ne (int $role.replicas) 1 }}
+{{- fail "one replica per role is required until shared session and journal adapters land (CF-16)" }}
+{{- end }}
+{{- if not $role.existingClaim }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "mcp.fullname" $root }}-{{ $name }}
+  namespace: {{ $root.Release.Namespace }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [ReadWriteOnce]
+{{- if $role.storageClass }}
+  storageClassName: {{ $role.storageClass | quote }}
+{{- end }}
+  resources:
+    requests:
+      storage: {{ $role.storage }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mcp.fullname" $root }}-{{ $name }}
+  namespace: {{ $root.Release.Namespace }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: {{ include "mcp.fullname" $root }}, role: {{ $name }}}
+  template:
+    metadata:
+      labels: {app: {{ include "mcp.fullname" $root }}, role: {{ $name }}}
+    spec:
+      automountServiceAccountToken: false
+{{- with $role.serviceAccountName }}
+      serviceAccountName: {{ . }}
+{{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "mcp.image" $root | quote }}
+          args: ["--role", {{ $role.role | quote }}]
+          ports: [{name: http, containerPort: 3000}]
+          envFrom:
+            - configMapRef: {name: {{ include "mcp.fullname" $root }}-config}
+{{- if eq $name "gateway" }}
+            - secretRef: {name: {{ $root.Values.existingSecrets.vendorCredentials }}}
+{{- end }}
+{{- with $role.env }}
+          env:
+{{- range $key, $value := . }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+{{- end }}
+{{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+            - {name: journal, mountPath: /journal}
+            - {name: policy, mountPath: /policy, readOnly: {{ not $root.Values.policyClaim }}}
+            - {name: audit-signing-key, mountPath: /keys, readOnly: true}
+{{- with $role.extraVolumeMounts }}
+{{ toYaml . | indent 12 }}
+{{- end }}
+          readinessProbe:
+            exec: {command: ["/mcp-devtools", "health"]}
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            exec: {command: ["/mcp-devtools", "health"]}
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+{{ toYaml $role.resources | indent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 2Gi}
+        - name: journal
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-%s" (include "mcp.fullname" $root) $name) $role.existingClaim }}
+        - name: policy
+{{- if $root.Values.policyClaim }}
+          persistentVolumeClaim: {claimName: {{ $root.Values.policyClaim }}}
+{{- else }}
+          configMap: {name: {{ $root.Values.policyConfigMap }}}
+{{- end }}
+        - name: audit-signing-key
+          secret: {secretName: {{ $root.Values.existingSecrets.auditSigning }}, defaultMode: 0400}
+{{- with $role.extraVolumes }}
+{{ toYaml . | indent 8 }}
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mcp.fullname" $root }}-{{ $name }}
+  namespace: {{ $root.Release.Namespace }}
+spec:
+  selector: {app: {{ include "mcp.fullname" $root }}, role: {{ $name }}}
+  ports: [{name: http, port: 80, targetPort: http}]
+{{- if eq $name "gateway" }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "mcp.fullname" $root }}-{{ $name }}
+  namespace: {{ $root.Release.Namespace }}
+spec:
+  maxUnavailable: 0
+  selector:
+    matchLabels: {app: {{ include "mcp.fullname" $root }}, role: {{ $name }}}
+{{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,96 @@
+# Incident-investigation profile (Phase B, WP B.2): Grafana + Slack together.
+#
+# The plan's first workflow hypothesis (§11.3): an engineer investigating an
+# incident reads the QA logs through Grafana and the incident channels in
+# Slack. This is the two read-only profiles composed into one document, with
+# the resource-aware rules that make it safe to hand to a shared service
+# account:
+#
+#   - the datasource UID and the channel id are the resources, and every
+#     rule names exactly which ones;
+#   - the environment comes from the gateway's configuration, never the
+#     request, so the same document denies the same call against prod;
+#   - a contractor is denied everything in prod whatever else they belong to
+#     (a deny wins over every allow);
+#   - anything the extractors cannot classify — an unknown Slack method, a
+#     malformed channel id, a Grafana path outside the two mapped reads — is
+#     denied before any rule is consulted.
+#
+# Edit the group names, environment, datasource UIDs, and channel ids, then
+#
+#     mcp-devtools policy check deploy/policies/incident-investigation.yaml
+#     mcp-devtools policy explain deploy/policies/incident-investigation.yaml \
+#         --group SRE --environment qa \
+#         --tool slack_channel_history --arguments '{"channelId":"C0INCIDENTS"}'
+#
+# Schema: src/policy/engine.rs.
+version: 1
+default: deny
+rules:
+  # --- Grafana: QA logs -----------------------------------------------------
+  - id: sre-read-qa-datasources
+    effect: allow
+    subjects:
+      groups: [SRE]
+    match:
+      vendor: grafana
+      environment: qa
+      request_risk: read
+      normalized_action: query_logs
+      resource_type: datasource
+      resource_id: ["loki-qa", "prom-qa-*"]
+
+  - id: sre-list-qa-datasources
+    effect: allow
+    subjects:
+      groups: [SRE]
+    match:
+      vendor: grafana
+      environment: qa
+      normalized_action: list_datasources
+      resource_type: datasource
+      resource_scope: collection
+
+  # --- Slack: the incident channels ------------------------------------------
+  - id: sre-list-channels
+    effect: allow
+    subjects:
+      groups: [SRE]
+    match:
+      vendor: slack
+      normalized_action: list_channels
+      resource_type: channel
+      resource_scope: collection
+
+  - id: sre-read-incident-channels
+    effect: allow
+    subjects:
+      groups: [SRE]
+    match:
+      vendor: slack
+      request_risk: read
+      normalized_action: [read_channel, read_channel_history, read_thread]
+      resource_type: channel
+      resource_id: ["C0INCIDENTS", "C0INCIDENTS2"]
+
+  # --- Incident commanders may also search ----------------------------------
+  - id: incident-commanders-search
+    description: >-
+      Search reaches every channel the token can see, so it is an unscoped
+      read that only the incident commanders get.
+    effect: allow
+    subjects:
+      groups: [IncidentCommanders]
+    match:
+      vendor: slack
+      normalized_action: search_messages
+      resource_type: channel
+      resource_scope: unscoped
+
+  # --- Contractors never touch prod, whatever else they are ------------------
+  - id: contractors-never-prod
+    effect: deny
+    subjects:
+      groups: [Contractors]
+    match:
+      environment: prod
