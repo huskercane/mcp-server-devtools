@@ -26,16 +26,16 @@
 
 use std::time::Duration;
 
-use reqwest::Client;
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue};
+use http::header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue};
 use serde_json::Value;
 use tracing::debug;
 
 use super::{
-    CacheMetadata, Config, Credentials, HttpCallLog, HttpMethod, McpError, ResponseBody,
-    TransportResponse, Vendor, canonical_target, classify_body, enforce_content_length_cap,
-    log_http_status_failure, log_http_transport_failure, map_reqwest_error, raw_response,
-    report_attempt, resolve_timeout, response_cache, unexpected, validate_auth,
+    CacheMetadata, Config, Credentials, HttpCallLog, HttpClient, HttpMethod, McpError,
+    ResponseBody, TransportResponse, Vendor, canonical_target, classify_body,
+    enforce_content_length_cap, log_http_status_failure, log_http_transport_failure,
+    map_transport_error, raw_response, report_attempt, resolve_timeout, response_cache, unexpected,
+    validate_auth,
 };
 
 /// One file part of a multipart body. Borrowed throughout so encoding is
@@ -245,7 +245,7 @@ fn upload_timeout(base: Duration, body_len: usize) -> Duration {
 /// persisted as a raw response (with no request body recorded, so file
 /// contents never land on disk twice). Exactly one attempt is made.
 pub async fn post_multipart(
-    client: &Client,
+    client: &HttpClient,
     vendor: &dyn Vendor,
     credentials: &Credentials,
     config: &Config,
@@ -293,7 +293,7 @@ pub async fn post_multipart(
         .map_err(|error| {
             report_attempt(ticket.as_ref(), None, Some("transport_error"));
             log_http_transport_failure(call, &error, false);
-            map_reqwest_error(&error, &url)
+            map_transport_error(&error, &url)
         })?;
     let duration = start.elapsed();
 

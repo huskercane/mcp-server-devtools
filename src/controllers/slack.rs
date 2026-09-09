@@ -18,7 +18,7 @@
 //! through the extractor as channel-scoped reads; the passthrough `slack_get`
 //! reaches the same endpoints and is classified the same way.
 
-use reqwest::Client;
+use crate::transport::HttpClient;
 use serde_json::Value;
 
 use crate::auth::Credentials;
@@ -38,13 +38,13 @@ use crate::vendor::slack::SlackVendor;
 /// `&dyn Vendor`) so the token read can be driven, plus the shared client and
 /// config.
 pub struct SlackContext<'a> {
-    pub client: &'a Client,
+    pub client: &'a HttpClient,
     pub config: &'a Config,
     pub vendor: &'a SlackVendor,
 }
 
 impl<'a> SlackContext<'a> {
-    pub fn new(client: &'a Client, config: &'a Config, vendor: &'a SlackVendor) -> Self {
+    pub fn new(client: &'a HttpClient, config: &'a Config, vendor: &'a SlackVendor) -> Self {
         Self {
             client,
             config,

@@ -11,8 +11,8 @@
 //! error classification, output rendering — is the same code the Atlassian
 //! vendors use.
 
+use crate::transport::HttpClient;
 use futures::{StreamExt as _, stream};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::OnceLock;
@@ -39,13 +39,13 @@ fn output_downloads() -> &'static Semaphore {
 /// (not a `&dyn Vendor`) so the token read can be driven, plus the shared
 /// client and config.
 pub struct CircleCiContext<'a> {
-    pub client: &'a Client,
+    pub client: &'a HttpClient,
     pub config: &'a Config,
     pub vendor: &'a CircleCiVendor,
 }
 
 impl<'a> CircleCiContext<'a> {
-    pub fn new(client: &'a Client, config: &'a Config, vendor: &'a CircleCiVendor) -> Self {
+    pub fn new(client: &'a HttpClient, config: &'a Config, vendor: &'a CircleCiVendor) -> Self {
         Self {
             client,
             config,
@@ -306,7 +306,7 @@ impl Vendor for LegacyBuildApi<'_> {
         self.0.normalize_path(path)
     }
 
-    fn classify_error(&self, status: reqwest::StatusCode, body: &str) -> McpError {
+    fn classify_error(&self, status: http::StatusCode, body: &str) -> McpError {
         self.0.classify_error(status, body)
     }
 }

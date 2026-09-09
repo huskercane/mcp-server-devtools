@@ -489,7 +489,7 @@ impl DevtoolsServer {
     }
 
     /// WRDS-specific context. WRDS is PostgreSQL, not HTTP, so this context
-    /// carries no `reqwest::Client` — just config and the Postgres vendor.
+    /// carries no `HttpClient` — just config and the Postgres vendor.
     #[cfg(feature = "wrds")]
     fn wrds_ctx<'a>(&'a self, config: &'a Config) -> WrdsContext<'a> {
         WrdsContext::new(config, &self.components.vendors.wrds)

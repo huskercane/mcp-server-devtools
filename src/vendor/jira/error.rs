@@ -24,7 +24,7 @@
 //! - 5xx → `api_error(status)`, prefix `"Jira server error. Detail: "`
 //! - other → `api_error(status)`, prefix `"Jira API request failed. Detail: "`
 
-use reqwest::StatusCode;
+use http::StatusCode;
 use serde_json::Value;
 
 use crate::error::{McpError, OriginalError, api_error, auth_invalid};

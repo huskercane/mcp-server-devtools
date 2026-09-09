@@ -21,6 +21,7 @@
 //! thin shims that construct a [`BitbucketVendor`] and call [`fetch`].
 //! New code should call [`fetch`] directly with the vendor it needs.
 
+pub mod client;
 pub mod image;
 pub mod multipart;
 pub mod raw_response;
@@ -31,6 +32,7 @@ mod response_cache;
 /// consumers continue to compile after the parser moved into
 /// [`crate::vendor::bitbucket::error`].
 pub use crate::vendor::bitbucket::error as bitbucket_error;
+pub use client::{HttpClient, HttpClientBuilder, HttpError, HttpRequest, HttpResponse};
 
 use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, VecDeque};
@@ -41,10 +43,10 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures::TryStreamExt as _;
-use reqwest::header::{
+use http::header::{
     ACCEPT, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue,
 };
-use reqwest::{Client, Method, StatusCode};
+use http::{Method, StatusCode};
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, BufReader};
 use tokio_util::io::StreamReader;
@@ -59,7 +61,7 @@ use crate::vendor::Vendor;
 use crate::vendor::bitbucket::BitbucketVendor;
 
 fn sanitized_log_url(url: &str) -> String {
-    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+    let Ok(mut parsed) = url::Url::parse(url) else {
         return "<unparseable-url>".to_owned();
     };
     let _ = parsed.set_username("");
@@ -82,7 +84,7 @@ fn bytes_per_second(bytes: u64, elapsed: Duration) -> u64 {
     u64::try_from(rate).unwrap_or(u64::MAX)
 }
 
-fn reqwest_error_kind(error: &reqwest::Error) -> &'static str {
+fn transport_error_kind(error: &HttpError) -> &'static str {
     if error.is_timeout() {
         "timeout"
     } else if error.is_connect() {
@@ -98,8 +100,8 @@ fn reqwest_error_kind(error: &reqwest::Error) -> &'static str {
     }
 }
 
-fn is_retryable_stream_request_error(error: &reqwest::Error) -> bool {
-    // Reqwest classifies some connection resets while sending as request
+fn is_retryable_stream_request_error(error: &HttpError) -> bool {
+    // The adapter classifies some connection resets while sending as request
     // errors rather than connect errors. All current streaming endpoints are
     // read-only queries, including Splunk's POST export endpoint.
     error.is_connect() || error.is_timeout() || error.is_request()
@@ -137,14 +139,14 @@ impl<'a> HttpCallLog<'a> {
 
 pub(crate) fn log_http_transport_failure(
     call: HttpCallLog<'_>,
-    error: &reqwest::Error,
+    error: &HttpError,
     will_retry: bool,
 ) {
     warn!(
         component = call.component,
         method = call.method,
         url = %sanitized_log_url(call.url),
-        error_kind = reqwest_error_kind(error),
+        error_kind = transport_error_kind(error),
         elapsed_ms = elapsed_millis(call.started.elapsed()),
         attempt = call.attempt,
         max_attempts = call.max_attempts,
@@ -1066,7 +1068,7 @@ pub async fn fetch_streamed_artifact_with_policy(
                 Ok(Err(error)) => {
                     report(None, Some("transport_error"));
                     log_http_transport_failure(call, &error, false);
-                    return Err(map_reqwest_error(&error, &url));
+                    return Err(map_transport_error(&error, &url));
                 }
                 Err(_) if attempt < attempts => {
                     report(None, Some("timeout"));
@@ -1118,7 +1120,7 @@ type BoxRead = Pin<Box<dyn AsyncRead + Send>>;
 type BoxBufRead = Pin<Box<dyn AsyncBufRead + Send>>;
 
 fn decoded_reader(
-    response: reqwest::Response,
+    response: HttpResponse,
     policy: &StreamingPolicy,
     encoded: Arc<AtomicU64>,
 ) -> Result<BoxRead, McpError> {
@@ -1194,7 +1196,7 @@ fn decoded_reader(
 }
 
 async fn persist_decoded_response(
-    response: reqwest::Response,
+    response: HttpResponse,
     filename_prefix: &str,
     extension: &str,
     content_type: &str,
@@ -1284,7 +1286,7 @@ pub async fn fetch_streamed_url(
                 }
                 Ok(Err(error)) => {
                     log_http_transport_failure(call, &error, false);
-                    return Err(map_reqwest_error(&error, url));
+                    return Err(map_transport_error(&error, url));
                 }
                 Err(_) if attempt < attempts => {
                     log_http_timeout_failure(call, true);
@@ -1384,7 +1386,7 @@ impl HttpMethod {
         }
     }
 
-    fn as_reqwest_method(self) -> Method {
+    fn as_method(self) -> Method {
         match self {
             Self::Get => Method::GET,
             Self::Post => Method::POST,
@@ -1521,7 +1523,7 @@ fn log_ninjaone_response(
 /// place. The transport itself only joins base + path.
 #[allow(clippy::too_many_lines)] // Cache lookup, upstream fetch, and admission form one request lifecycle.
 pub async fn fetch(
-    client: &Client,
+    client: &HttpClient,
     vendor: &dyn Vendor,
     credentials: &Credentials,
     config: &Config,
@@ -1596,7 +1598,7 @@ pub async fn fetch(
     let response = req.send().await.map_err(|error| {
         report_attempt(ticket.as_ref(), None, Some("transport_error"));
         log_http_transport_failure(call, &error, false);
-        map_reqwest_error(&error, &url)
+        map_transport_error(&error, &url)
     })?;
     let duration = start.elapsed();
 
@@ -1669,7 +1671,7 @@ pub async fn fetch(
 /// fresh [`BitbucketVendor`]. Preserved for back-compat; new code should
 /// call [`fetch`] with the vendor explicitly.
 pub async fn fetch_bitbucket(
-    client: &Client,
+    client: &HttpClient,
     credentials: &Credentials,
     config: &Config,
     path: &str,
@@ -1684,7 +1686,7 @@ pub async fn fetch_bitbucket(
 /// [`BitbucketVendor::with_base_url`].
 pub async fn fetch_bitbucket_with_base(
     base_url: &str,
-    client: &Client,
+    client: &HttpClient,
     credentials: &Credentials,
     config: &Config,
     path: &str,
@@ -1694,35 +1696,24 @@ pub async fn fetch_bitbucket_with_base(
     fetch(client, &vendor, credentials, config, path, options).await
 }
 
-/// Construct a shared reqwest client with sensible defaults. Callers should
-/// cache this for the lifetime of the process.
-pub fn build_client() -> Result<Client, McpError> {
-    Client::builder()
-        .user_agent(format!(
-            "{}/{}",
-            crate::constants::UNSCOPED_PACKAGE_NAME,
-            crate::constants::VERSION
-        ))
+/// Construct the shared vendor HTTP client with sensible defaults. Callers
+/// should cache this for the lifetime of the process.
+pub fn build_client() -> Result<HttpClient, McpError> {
+    HttpClient::builder()
+        .crate_user_agent()
         .build()
         .map_err(|e| unexpected(format!("failed to build HTTP client: {e}"), None))
 }
 
 /// Dedicated client for ingestion bodies. Automatic decompression is disabled
 /// so the transport can account for wire bytes before bounded decoding.
-fn streaming_client() -> Result<&'static Client, McpError> {
-    static CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
+fn streaming_client() -> Result<&'static HttpClient, McpError> {
+    static CLIENT: OnceLock<Result<HttpClient, String>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
-            Client::builder()
-                .user_agent(format!(
-                    "{}/{}",
-                    crate::constants::UNSCOPED_PACKAGE_NAME,
-                    crate::constants::VERSION
-                ))
-                .gzip(false)
-                .brotli(false)
-                .deflate(false)
-                .zstd(false)
+            HttpClient::builder()
+                .crate_user_agent()
+                .no_decompression()
                 .build()
                 .map_err(|error| error.to_string())
         })
@@ -1740,7 +1731,7 @@ fn streaming_client() -> Result<&'static Client, McpError> {
 /// Refuse a streamed response whose declared length already exceeds the
 /// encoded-bytes cap, before a byte of the body is read.
 fn enforce_streamed_length_cap(
-    response: &reqwest::Response,
+    response: &HttpResponse,
     policy: &StreamingPolicy,
 ) -> Result<(), McpError> {
     if response
@@ -1824,16 +1815,16 @@ fn resolve_timeout(config: &Config, override_timeout: Option<Duration>) -> Durat
 }
 
 fn build_request(
-    client: &Client,
+    client: &HttpClient,
     method: HttpMethod,
     url: &str,
     auth_name: &HeaderName,
     auth: &HeaderValue,
     options: &RequestOptions,
     timeout: Duration,
-) -> reqwest::RequestBuilder {
+) -> HttpRequest {
     let mut req = client
-        .request(method.as_reqwest_method(), url)
+        .request(method.as_method(), url)
         .timeout(timeout)
         .header(auth_name.clone(), auth.clone())
         .header(ACCEPT, HeaderValue::from_static("application/json"));
@@ -1852,7 +1843,7 @@ fn build_request(
     req
 }
 
-fn enforce_content_length_cap(response: &reqwest::Response) -> Result<(), McpError> {
+fn enforce_content_length_cap(response: &HttpResponse) -> Result<(), McpError> {
     let Some(value) = response.headers().get(CONTENT_LENGTH) else {
         return Ok(());
     };
@@ -1876,7 +1867,7 @@ fn enforce_content_length_cap(response: &reqwest::Response) -> Result<(), McpErr
     Ok(())
 }
 
-async fn classify_body(response: reqwest::Response) -> Result<ResponseBody, McpError> {
+async fn classify_body(response: HttpResponse) -> Result<ResponseBody, McpError> {
     if response.status() == StatusCode::NO_CONTENT {
         return Ok(ResponseBody::Empty);
     }
@@ -1911,7 +1902,7 @@ async fn classify_body(response: reqwest::Response) -> Result<ResponseBody, McpE
     }
 }
 
-fn map_reqwest_error(err: &reqwest::Error, url: &str) -> McpError {
+fn map_transport_error(err: &HttpError, url: &str) -> McpError {
     if err.is_timeout() {
         return api_error(
             format!("Request timeout: API did not respond in time at {url}"),

@@ -7,7 +7,7 @@
 //! both keys. We surface the human-readable text and key the typed error off
 //! the HTTP status, mirroring the Jira/Confluence/Zoom classifiers.
 
-use reqwest::StatusCode;
+use http::StatusCode;
 use serde_json::Value;
 
 use crate::error::{McpError, OriginalError, api_error, auth_invalid};

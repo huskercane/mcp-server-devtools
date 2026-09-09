@@ -1,16 +1,16 @@
 //! Bounded image downloads that never decode binary bodies as text.
 
 use super::{
-    CONTENT_TYPE, Client, Config, Credentials, HttpCallLog, HttpMethod, McpError, Vendor,
+    CONTENT_TYPE, Config, Credentials, HttpCallLog, HttpClient, HttpMethod, McpError, Vendor,
     api_error, canonical_target, log_http_status_failure, log_http_transport_failure,
-    map_reqwest_error, report_attempt, resolve_timeout, validate_auth,
+    map_transport_error, report_attempt, resolve_timeout, validate_auth,
 };
 
 /// Maximum unencoded image size (base64 adds roughly one third).
 pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
 pub async fn fetch_image(
-    client: &Client,
+    client: &HttpClient,
     vendor: &dyn Vendor,
     credentials: &Credentials,
     config: &Config,
@@ -34,7 +34,7 @@ pub async fn fetch_image(
         .map_err(|error| {
             report_attempt(ticket.as_ref(), None, Some("transport_error"));
             log_http_transport_failure(call, &error, false);
-            map_reqwest_error(&error, &url)
+            map_transport_error(&error, &url)
         })?;
     let status = response.status();
     report_attempt(ticket.as_ref(), Some(status.as_u16()), None);
@@ -75,7 +75,7 @@ pub async fn fetch_image(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|error| map_reqwest_error(&error, &url))?
+        .map_err(|error| map_transport_error(&error, &url))?
     {
         if chunk.len() > MAX_IMAGE_BYTES - bytes.len() {
             return Err(image_too_large());

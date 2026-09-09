@@ -1,4 +1,4 @@
-//! The remote adapter: one `reqwest` client per `HttpAdminClient`.
+//! The remote adapter: one HTTP client per `HttpAdminClient`.
 use crate::ports::{
     AdminCallFuture, AdminClient, AdminClientError, AdminMethod, AdminRequest, AdminResponse,
     MAX_RESPONSE_BYTES,
@@ -8,7 +8,7 @@ use std::time::Duration;
 /// A client of a remote admin boundary at a validated base URL.
 pub struct HttpAdminClient {
     base: url::Url,
-    client: reqwest::Client,
+    client: crate::transport::HttpClient,
 }
 
 impl HttpAdminClient {
@@ -37,8 +37,8 @@ impl HttpAdminClient {
         {
             return Err(AdminClientError::InvalidUrl);
         }
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
+        let client = crate::transport::HttpClient::builder()
+            .no_redirects()
             .timeout(Duration::from_mins(1))
             .build()
             .map_err(|_| AdminClientError::Unavailable)?;
@@ -51,9 +51,9 @@ impl HttpAdminClient {
         request: AdminRequest<'_>,
     ) -> Result<AdminResponse, AdminClientError> {
         let method = match request.method {
-            AdminMethod::Get => reqwest::Method::GET,
-            AdminMethod::Post => reqwest::Method::POST,
-            AdminMethod::Put => reqwest::Method::PUT,
+            AdminMethod::Get => http::Method::GET,
+            AdminMethod::Post => http::Method::POST,
+            AdminMethod::Put => http::Method::PUT,
         };
         let url = self
             .base

@@ -11,7 +11,7 @@
 //! error classification, output rendering — is the same code the other vendors
 //! use.
 
-use reqwest::Client;
+use crate::transport::HttpClient;
 use serde_json::Value;
 
 use crate::auth::Credentials;
@@ -27,13 +27,13 @@ use crate::vendor::postman::{API_KEY_HEADER, PostmanVendor};
 /// (not a `&dyn Vendor`) so the key read can be driven, plus the shared client
 /// and config.
 pub struct PostmanContext<'a> {
-    pub client: &'a Client,
+    pub client: &'a HttpClient,
     pub config: &'a Config,
     pub vendor: &'a PostmanVendor,
 }
 
 impl<'a> PostmanContext<'a> {
-    pub fn new(client: &'a Client, config: &'a Config, vendor: &'a PostmanVendor) -> Self {
+    pub fn new(client: &'a HttpClient, config: &'a Config, vendor: &'a PostmanVendor) -> Self {
         Self {
             client,
             config,

@@ -23,7 +23,7 @@
 
 pub mod error;
 
-use reqwest::StatusCode;
+use http::StatusCode;
 
 use crate::config::{Config, VENDOR_GRAFANA};
 use crate::error::{McpError, auth_missing};

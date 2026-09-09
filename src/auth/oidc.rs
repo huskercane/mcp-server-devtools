@@ -622,8 +622,8 @@ impl OidcSettings {
 pub async fn fetch_jwks(url: &str) -> Result<Vec<u8>, String> {
     let parsed = url::Url::parse(url).map_err(|_| "JWKS URL is invalid".to_owned())?;
     require_https_unless_loopback(&parsed, "JWKS URL")?;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
+    let client = crate::transport::HttpClient::builder()
+        .no_redirects()
         .build()
         .map_err(|_| "cannot build JWKS client".to_owned())?;
     let body = fetch_bounded(&client, url, JWKS_MAX_BYTES, "JWKS").await?;
@@ -639,7 +639,7 @@ pub async fn fetch_jwks(url: &str) -> Result<Vec<u8>, String> {
 /// the declared length *and* while the body streams. Shared by the key
 /// fetch and the console's discovery.
 async fn fetch_bounded(
-    client: &reqwest::Client,
+    client: &crate::transport::HttpClient,
     url: &str,
     max_bytes: usize,
     what: &str,
@@ -651,7 +651,7 @@ async fn fetch_bounded(
         .timeout(JWKS_FETCH_TIMEOUT)
         .send()
         .await
-        .map_err(|error| format!("{what} fetch failed: {}", redacted_reqwest_error(&error)))?;
+        .map_err(|error| format!("{what} fetch failed: {}", redacted_transport_error(&error)))?;
     let status = response.status();
     if !status.is_success() {
         return Err(format!("{what} fetch returned HTTP {}", status.as_u16()));
@@ -789,7 +789,7 @@ pub struct AuthorizationEndpoints {
 ///
 /// A message naming what was wrong with the document; never a token.
 pub async fn discover_endpoints(
-    client: &reqwest::Client,
+    client: &crate::transport::HttpClient,
     issuer: &str,
 ) -> Result<AuthorizationEndpoints, String> {
     let issuer = issuer.trim_end_matches('/');
@@ -924,7 +924,7 @@ pub struct OidcJwksValidator {
     settings: OidcSettings,
     /// Built once: every principal this validator produces shares it.
     authority: PrincipalAuthority,
-    client: reqwest::Client,
+    client: crate::transport::HttpClient,
     validation: Validation,
     keys: RwLock<KeyCache>,
     /// Serialises fetches: one in flight at a time, and the rate limit for
@@ -940,7 +940,7 @@ impl OidcJwksValidator {
     /// validation fetches keys, so a misconfigured identity provider surfaces as a 503 on
     /// the first request rather than as a startup hang.
     #[must_use]
-    pub fn new(settings: OidcSettings, client: reqwest::Client) -> Self {
+    pub fn new(settings: OidcSettings, client: crate::transport::HttpClient) -> Self {
         let mut validation = Validation::new(Algorithm::RS256);
         // One origin, two spellings: the configured issuer is trimmed, and
         // the token may carry the slash (Auth0 always does; Entra v1 does).
@@ -1495,10 +1495,10 @@ fn is_rs256_signing_key(jwk: &Jwk) -> bool {
             .is_none_or(|algorithm| algorithm == KeyAlgorithm::RS256)
 }
 
-/// A reqwest error can quote the URL it was sent to (which is the JWKS
+/// A transport error can quote the URL it was sent to (which is the JWKS
 /// URL, not secret) but never a token; still, keep to the error kind so a
 /// future header-quoting variant cannot leak.
-fn redacted_reqwest_error(error: &reqwest::Error) -> &'static str {
+fn redacted_transport_error(error: &crate::transport::HttpError) -> &'static str {
     if error.is_timeout() {
         "timeout"
     } else if error.is_connect() {
@@ -1889,7 +1889,7 @@ mod tests {
                 OidcKeys::Okta,
             )
             .unwrap(),
-            reqwest::Client::new(),
+            crate::transport::HttpClient::builder().build().unwrap(),
         );
         let key_named = |kid: &str, material: u8| {
             HashMap::from([(

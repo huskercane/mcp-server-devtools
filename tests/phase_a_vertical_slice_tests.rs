@@ -29,6 +29,7 @@ use mcp_server_devtools::policy::{ActionContext, FilePolicy, PolicyDecision, Pol
 use mcp_server_devtools::ports::{InMemoryAuditSink, PolicyDecisionPoint, StaticValidator};
 use mcp_server_devtools::server::auth::{InboundAuth, InboundAuthSettings};
 use mcp_server_devtools::server::http::build_app_with_server_and_auth;
+use mcp_server_devtools::transport::build_client;
 use mcp_server_devtools::vendor::grafana::GrafanaVendor;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -163,7 +164,7 @@ async fn spawn_slice(policy: Arc<dyn PolicyDecisionPoint>) -> Slice {
         JwksLocation::Direct(format!("{}/keys", jwks.uri())),
     )
     .with_tenant("acme");
-    let validator = Arc::new(OidcJwksValidator::new(settings, reqwest::Client::new()));
+    let validator = Arc::new(OidcJwksValidator::new(settings, build_client().unwrap()));
     let auth = Arc::new(InboundAuth::new(
         Arc::new(validator),
         InboundAuthSettings::from_config(

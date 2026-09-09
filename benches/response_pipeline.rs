@@ -29,6 +29,7 @@ use mcp_server_devtools::policy::{
 };
 use mcp_server_devtools::ports::PolicyDecisionPoint;
 use mcp_server_devtools::transport::HttpMethod;
+use mcp_server_devtools::transport::build_client;
 use serde_json::{Value, json};
 
 static BYTES: AtomicU64 = AtomicU64::new(0);
@@ -350,7 +351,7 @@ fn enterprise_request_path_stage() {
                     JwksLocation::Direct(format!("{}/keys", jwks.uri())),
                 )
                 .with_tenant("acme"),
-            reqwest::Client::new(),
+            build_client().unwrap(),
         ));
         let now = jsonwebtoken::get_current_timestamp();
         let claims = json!({

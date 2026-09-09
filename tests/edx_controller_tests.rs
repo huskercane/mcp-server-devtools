@@ -13,7 +13,7 @@ use mcp_server_devtools::tools::args::{
     EdxDiscussionThreadOrderBy, EdxDiscussionThreadType, EdxDiscussionThreadsArgs,
     EdxDiscussionTopicsArgs, OutputFormatArg,
 };
-use mcp_server_devtools::transport::build_client;
+use mcp_server_devtools::transport::{HttpClient, build_client};
 use mcp_server_devtools::vendor::edx::EdxVendor;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -33,11 +33,7 @@ fn output() -> EdxDiscussionOutputArgs {
     }
 }
 
-fn ctx<'a>(
-    client: &'a reqwest::Client,
-    config: &'a Config,
-    vendor: &'a EdxVendor,
-) -> EdxContext<'a> {
+fn ctx<'a>(client: &'a HttpClient, config: &'a Config, vendor: &'a EdxVendor) -> EdxContext<'a> {
     EdxContext::new(client, config, vendor)
 }
 

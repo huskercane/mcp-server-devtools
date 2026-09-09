@@ -34,7 +34,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use reqwest::{Client, StatusCode};
+use crate::transport::HttpClient;
+use http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
@@ -145,7 +146,7 @@ impl SessionCache {
     /// this must not short-circuit on a cached entry.
     pub async fn login(
         &self,
-        client: &Client,
+        client: &HttpClient,
         request: LoginRequest<'_>,
     ) -> Result<LoginOutcome, McpError> {
         match fetch_auth_state(client, request).await {
@@ -236,7 +237,7 @@ impl SessionCache {
     /// the session key.
     async fn complete_mfa(
         &self,
-        client: &Client,
+        client: &HttpClient,
         request: LoginRequest<'_>,
         login: &LoginResponse,
     ) -> Result<LoginResponse, McpError> {
@@ -307,7 +308,7 @@ fn preview(session_key: &str) -> String {
 /// even classify the principal, the subsequent login would fail anyway and a
 /// vague error at step 2 would be harder to act on.
 async fn fetch_auth_state(
-    client: &Client,
+    client: &HttpClient,
     request: LoginRequest<'_>,
 ) -> Result<AuthStateResponse, McpError> {
     let body = json!({ "email": request.email });
@@ -327,7 +328,7 @@ async fn fetch_auth_state(
 }
 
 async fn post_step(
-    client: &Client,
+    client: &HttpClient,
     url: &str,
     body: &Value,
     step: &str,
@@ -344,7 +345,12 @@ async fn post_step(
 /// POST JSON and return the raw body, mapping transport and non-2xx failures
 /// to typed errors. The request body carries the password on the `login` step,
 /// so nothing here logs or echoes it.
-async fn send(client: &Client, url: &str, body: &Value, step: &str) -> Result<String, McpError> {
+async fn send(
+    client: &HttpClient,
+    url: &str,
+    body: &Value,
+    step: &str,
+) -> Result<String, McpError> {
     debug!(
         target: HTTP_LOG_TARGET,
         method = "POST",
@@ -356,8 +362,8 @@ async fn send(client: &Client, url: &str, body: &Value, step: &str) -> Result<St
     let call = crate::transport::HttpCallLog::new("ninjaone-session", "POST", url);
     let response = client
         .post(url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header(reqwest::header::ACCEPT, "application/json")
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::ACCEPT, "application/json")
         .json(body)
         .send()
         .await

@@ -76,7 +76,7 @@ pub type TokenSource = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 /// The HTTP adapter.
 pub struct HttpForwarder {
-    client: reqwest::Client,
+    client: crate::transport::HttpClient,
     url: url::Url,
     format: HttpFormat,
     token: TokenSource,
@@ -162,14 +162,10 @@ impl HttpForwarder {
                 super::TOKEN_KEY
             ));
         }
-        let mut builder = reqwest::Client::builder()
-            .user_agent(format!(
-                "{}/{}",
-                crate::constants::UNSCOPED_PACKAGE_NAME,
-                crate::constants::VERSION
-            ))
+        let mut builder = crate::transport::HttpClient::builder()
+            .crate_user_agent()
             .timeout(timeout)
-            .redirect(reqwest::redirect::Policy::none());
+            .no_redirects();
         if let Some(path) = ca_file {
             let pem = std::fs::read(path).map_err(|error| {
                 format!(
@@ -179,14 +175,13 @@ impl HttpForwarder {
                     error.kind()
                 )
             })?;
-            let certificate = reqwest::Certificate::from_pem(&pem).map_err(|_| {
+            builder = builder.add_root_certificate_pem(&pem).map_err(|_| {
                 format!(
                     "{}: {} is not a PEM certificate",
                     super::CA_FILE_KEY,
                     path.display()
                 )
             })?;
-            builder = builder.add_root_certificate(certificate);
         }
         let client = builder
             .build()
@@ -292,14 +287,14 @@ impl AuditForwarder for HttpForwarder {
             let mut request = self
                 .client
                 .post(self.url.clone())
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(http::header::CONTENT_TYPE, "application/json")
                 .body(body);
             if let Some(token) = token {
                 let value = match self.format {
                     HttpFormat::SplunkHec => format!("Splunk {token}"),
                     HttpFormat::Json => format!("Bearer {token}"),
                 };
-                request = request.header(reqwest::header::AUTHORIZATION, value);
+                request = request.header(http::header::AUTHORIZATION, value);
             }
             let response = request.send().await.map_err(|error| {
                 let category = if error.is_timeout() {
@@ -309,7 +304,7 @@ impl AuditForwarder for HttpForwarder {
                 } else {
                     ForwardError::INTERRUPTED
                 };
-                // The reqwest error text can quote the URL; the URL holds
+                // The transport error text can quote the URL; the URL holds
                 // no credential (user-info is refused), so that is fine,
                 // but keep it to the kind.
                 ForwardError::new(category, describe(&error))
@@ -342,7 +337,7 @@ impl AuditForwarder for HttpForwarder {
     }
 }
 
-fn describe(error: &reqwest::Error) -> String {
+fn describe(error: &crate::transport::HttpError) -> String {
     if error.is_timeout() {
         "request timed out".to_owned()
     } else if error.is_connect() {

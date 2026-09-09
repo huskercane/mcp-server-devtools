@@ -15,7 +15,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use reqwest::header::{AUTHORIZATION, HeaderName};
+use http::header::{AUTHORIZATION, HeaderName};
 
 use crate::config::Config;
 use crate::error::{McpError, auth_invalid, auth_missing};

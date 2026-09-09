@@ -14,6 +14,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode, get_current_timestamp
 use mcp_server_devtools::auth::oidc::{JwksLocation, OidcJwksValidator, OidcSettings, Profile};
 use mcp_server_devtools::policy::PrincipalAuthority;
 use mcp_server_devtools::ports::{SubjectKind, TokenRejection, TokenValidator};
+use mcp_server_devtools::transport::build_client;
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -54,7 +55,7 @@ fn settings(server: &MockServer) -> OidcSettings {
 }
 
 fn validator(settings: OidcSettings) -> Arc<OidcJwksValidator> {
-    Arc::new(OidcJwksValidator::new(settings, reqwest::Client::new()))
+    Arc::new(OidcJwksValidator::new(settings, build_client().unwrap()))
 }
 
 fn base_claims() -> Value {
@@ -146,7 +147,7 @@ async fn the_negative_matrix() {
             AUDIENCE,
             JwksLocation::File(file.to_str().unwrap().to_owned()),
         ),
-        reqwest::Client::new(),
+        build_client().unwrap(),
     ));
     let now = get_current_timestamp();
 

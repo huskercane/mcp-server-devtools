@@ -33,6 +33,7 @@ use mcp_server_devtools::ports::{
 use mcp_server_devtools::server::auth::{InboundAuth, InboundAuthSettings};
 use mcp_server_devtools::server::http::build_app_with_server_and_auth;
 use mcp_server_devtools::tools::DevtoolsServer;
+use mcp_server_devtools::transport::build_client;
 use mcp_server_devtools::vendor::grafana::GrafanaVendor;
 use mcp_server_devtools::vendor::jira::JiraVendor;
 use pretty_assertions::assert_eq;
@@ -648,7 +649,7 @@ async fn group_removal_waits_for_the_token_but_revocation_does_not() {
             JwksLocation::Direct(format!("{}/keys", jwks.uri())),
         )
         .with_tenant("acme"),
-        reqwest::Client::new(),
+        build_client().unwrap(),
     ));
     let signed = Signed::empty();
     let base = spawn_with(server, Arc::new(validator), signed.load(), &sink).await;
@@ -741,7 +742,7 @@ async fn a_token_issued_in_the_future_is_refused_before_revocation_or_freshness_
             JwksLocation::Direct(format!("{}/keys", jwks.uri())),
         )
         .with_tenant("acme"),
-        reqwest::Client::new(),
+        build_client().unwrap(),
     ));
     let signed = Signed::empty();
     // Everything issued before now is revoked. A token dated an hour from

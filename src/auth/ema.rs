@@ -94,16 +94,16 @@ struct TokenResponse {
 /// Redirects and automatic retries are disabled: assertions must never be
 /// sent to a redirected endpoint or replayed after an ambiguous response.
 pub struct OidcExchange {
-    client: reqwest::Client,
+    client: crate::transport::HttpClient,
 }
 impl OidcExchange {
     /// # Errors
     /// Returns a category if TLS/client initialization fails.
     pub fn new() -> Result<Self, &'static str> {
         Ok(Self {
-            client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .retry(reqwest::retry::never())
+            client: crate::transport::HttpClient::builder()
+                .no_redirects()
+                .no_retries()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .map_err(|_| "http_client_unavailable")?,
@@ -112,7 +112,7 @@ impl OidcExchange {
 
     async fn json<T: serde::de::DeserializeOwned>(
         &self,
-        request: reqwest::RequestBuilder,
+        request: crate::transport::HttpRequest,
     ) -> Result<T, &'static str> {
         let mut response = request.send().await.map_err(|_| "issuer_unavailable")?;
         if !response.status().is_success() {

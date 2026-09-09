@@ -9,7 +9,7 @@
 //! query encoding, transport, error classification, output rendering — is the
 //! same code the Atlassian vendors use.
 
-use reqwest::Client;
+use crate::transport::HttpClient;
 use serde_json::Value;
 
 use crate::auth::Credentials;
@@ -25,13 +25,13 @@ use crate::vendor::zoom::ZoomVendor;
 /// `&dyn Vendor`) so the token lifecycle can be driven, plus the shared client
 /// and config.
 pub struct ZoomContext<'a> {
-    pub client: &'a Client,
+    pub client: &'a HttpClient,
     pub config: &'a Config,
     pub vendor: &'a ZoomVendor,
 }
 
 impl<'a> ZoomContext<'a> {
-    pub fn new(client: &'a Client, config: &'a Config, vendor: &'a ZoomVendor) -> Self {
+    pub fn new(client: &'a HttpClient, config: &'a Config, vendor: &'a ZoomVendor) -> Self {
         Self {
             client,
             config,

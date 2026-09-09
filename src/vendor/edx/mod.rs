@@ -14,7 +14,7 @@
 
 pub mod error;
 
-use reqwest::StatusCode;
+use http::StatusCode;
 
 use crate::config::{Config, VENDOR_EDX};
 use crate::error::{McpError, auth_missing};

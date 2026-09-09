@@ -7,7 +7,7 @@
 //! human-readable `message` (falling back to `name`) and key the typed error
 //! off the HTTP status, mirroring the other REST classifiers.
 
-use reqwest::StatusCode;
+use http::StatusCode;
 use serde_json::Value;
 
 use crate::error::{McpError, OriginalError, api_error, auth_invalid};

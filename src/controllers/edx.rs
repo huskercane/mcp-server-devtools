@@ -8,7 +8,7 @@
 //! dispatcher, output rendering, raw-response persistence, and JMESPath
 //! filtering.
 
-use reqwest::Client;
+use crate::transport::HttpClient;
 use serde_json::{Value, json};
 
 use crate::auth::Credentials;
@@ -25,13 +25,13 @@ use crate::transport::HttpMethod;
 use crate::vendor::edx::EdxVendor;
 
 pub struct EdxContext<'a> {
-    pub client: &'a Client,
+    pub client: &'a HttpClient,
     pub config: &'a Config,
     pub vendor: &'a EdxVendor,
 }
 
 impl<'a> EdxContext<'a> {
-    pub fn new(client: &'a Client, config: &'a Config, vendor: &'a EdxVendor) -> Self {
+    pub fn new(client: &'a HttpClient, config: &'a Config, vendor: &'a EdxVendor) -> Self {
         Self {
             client,
             config,

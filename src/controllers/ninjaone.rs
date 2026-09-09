@@ -1,6 +1,6 @@
 //! Generic NinjaOne request controller.
 
-use reqwest::Client;
+use crate::transport::HttpClient;
 use serde_json::{Value, json};
 
 use crate::config::Config;
@@ -13,13 +13,13 @@ use crate::vendor::Vendor;
 use crate::vendor::ninjaone::{AuthSource, NinjaOneVendor};
 
 pub struct NinjaOneContext<'a> {
-    pub client: &'a Client,
+    pub client: &'a HttpClient,
     pub config: &'a Config,
     pub vendor: &'a NinjaOneVendor,
 }
 
 impl<'a> NinjaOneContext<'a> {
-    pub fn new(client: &'a Client, config: &'a Config, vendor: &'a NinjaOneVendor) -> Self {
+    pub fn new(client: &'a HttpClient, config: &'a Config, vendor: &'a NinjaOneVendor) -> Self {
         Self {
             client,
             config,

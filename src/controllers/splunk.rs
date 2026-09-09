@@ -2,9 +2,9 @@
 
 //! Splunk search and saved-search controller path.
 
+use crate::transport::HttpClient;
 use futures::{StreamExt, stream::FuturesUnordered};
-use reqwest::Client;
-use reqwest::header::AUTHORIZATION;
+use http::header::AUTHORIZATION;
 use serde_json::{Map, Value};
 
 use crate::auth::Credentials;
@@ -26,13 +26,13 @@ use crate::vendor::splunk::{
 };
 
 pub struct SplunkContext<'a> {
-    pub client: &'a Client,
+    pub client: &'a HttpClient,
     pub config: &'a Config,
     pub vendor: &'a SplunkVendor,
 }
 
 impl<'a> SplunkContext<'a> {
-    pub fn new(client: &'a Client, config: &'a Config, vendor: &'a SplunkVendor) -> Self {
+    pub fn new(client: &'a HttpClient, config: &'a Config, vendor: &'a SplunkVendor) -> Self {
         Self {
             client,
             config,

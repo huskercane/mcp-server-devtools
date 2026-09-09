@@ -13,7 +13,7 @@
 //!    body and, when `ok` is `false`, turns the short `error` code (e.g.
 //!    `channel_not_found`, `invalid_auth`, `ratelimited`) into a typed error.
 
-use reqwest::StatusCode;
+use http::StatusCode;
 use serde_json::Value;
 
 use crate::error::{McpError, OriginalError, api_error, auth_invalid};

@@ -20,7 +20,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 
-use reqwest::Client;
+use crate::transport::HttpClient;
 use serde_json::Value;
 use tracing::debug;
 use url::form_urlencoded;
@@ -42,13 +42,13 @@ use crate::workspace::WorkspaceCache;
 /// the server state can back many concurrent requests without allocation.
 #[derive(Clone, Copy)]
 pub struct HandleContext<'a> {
-    pub client: &'a Client,
+    pub client: &'a HttpClient,
     pub config: &'a Config,
     pub vendor: &'a dyn Vendor,
 }
 
 impl<'a> HandleContext<'a> {
-    pub fn new(client: &'a Client, config: &'a Config, vendor: &'a dyn Vendor) -> Self {
+    pub fn new(client: &'a HttpClient, config: &'a Config, vendor: &'a dyn Vendor) -> Self {
         Self {
             client,
             config,
@@ -80,7 +80,7 @@ impl<'a> BitbucketContext<'a> {
     /// canonical name as belt-and-braces in case the trait impl ever
     /// drifts.
     pub fn new(
-        client: &'a Client,
+        client: &'a HttpClient,
         config: &'a Config,
         vendor: &'a BitbucketVendor,
         cache: &'a WorkspaceCache,

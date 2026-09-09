@@ -11,7 +11,7 @@ use mcp_server_devtools::controllers::api::{HandleContext, handle_request};
 use mcp_server_devtools::error::ErrorKind;
 use mcp_server_devtools::format::OutputFormat;
 use mcp_server_devtools::tools::args::QueryParams;
-use mcp_server_devtools::transport::{HttpMethod, build_client};
+use mcp_server_devtools::transport::{HttpClient, HttpMethod, build_client};
 use mcp_server_devtools::vendor::confluence::ConfluenceVendor;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -26,7 +26,7 @@ fn creds() -> HashMap<String, String> {
 }
 
 fn ctx<'a>(
-    client: &'a reqwest::Client,
+    client: &'a HttpClient,
     config: &'a Config,
     vendor: &'a ConfluenceVendor,
 ) -> HandleContext<'a> {

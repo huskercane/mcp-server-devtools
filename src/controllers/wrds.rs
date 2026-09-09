@@ -24,7 +24,7 @@ use crate::vendor::wrds::{WrdsVendor, clamp_row_limit};
 
 /// WRDS-specific request context. Carries the concrete [`WrdsVendor`] (which
 /// owns the Postgres connection path) plus config. Unlike the HTTP vendors there
-/// is no shared `reqwest::Client` to thread through.
+/// is no shared `HttpClient` to thread through.
 pub struct WrdsContext<'a> {
     pub config: &'a Config,
     pub vendor: &'a WrdsVendor,

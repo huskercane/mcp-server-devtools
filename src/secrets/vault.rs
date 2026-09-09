@@ -36,7 +36,7 @@
 //!
 //! Compiled in under the `secrets-vault` feature (on by default; no extra
 //! dependencies — KV v2 is a handful of JSON endpoints over the pinned
-//! `reqwest`). Constructed by [`crate::secrets::SecretResolver::from_config`]
+//! shared HTTP client). Constructed by [`crate::secrets::SecretResolver::from_config`]
 //! when `MCP_VAULT_ADDR` is set; a `vault://` reference with no address is a
 //! typed startup error.
 
@@ -329,7 +329,7 @@ impl Session {
 /// Reads `vault://<mount>/<path>` KV v2 documents.
 pub struct VaultSecretSource {
     settings: VaultSettings,
-    client: reqwest::Client,
+    client: crate::transport::HttpClient,
     /// Held across the login `await`s on purpose: one login at a time, and
     /// every concurrent fetch waits for it rather than logging in too.
     session: tokio::sync::Mutex<Option<Session>>,
@@ -345,12 +345,8 @@ impl VaultSecretSource {
     /// When the CA file cannot be read or is not PEM, or the HTTP client
     /// cannot be built.
     pub fn new(settings: VaultSettings) -> Result<Self, String> {
-        let mut builder = reqwest::Client::builder()
-            .user_agent(format!(
-                "{}/{}",
-                crate::constants::UNSCOPED_PACKAGE_NAME,
-                crate::constants::VERSION
-            ))
+        let mut builder = crate::transport::HttpClient::builder()
+            .crate_user_agent()
             .timeout(REQUEST_TIMEOUT);
         if let Some(path) = &settings.ca_cert {
             let pem = std::fs::read(path).map_err(|error| {
@@ -360,10 +356,9 @@ impl VaultSecretSource {
                     error.kind()
                 )
             })?;
-            let certificate = reqwest::Certificate::from_pem(&pem).map_err(|_| {
+            builder = builder.add_root_certificate_pem(&pem).map_err(|_| {
                 format!("{CACERT_KEY}: {} is not a PEM certificate", path.display())
             })?;
-            builder = builder.add_root_certificate(certificate);
         }
         let client = builder
             .build()
@@ -409,9 +404,9 @@ impl VaultSecretSource {
 
     fn request(
         &self,
-        request: reqwest::RequestBuilder,
+        request: crate::transport::HttpRequest,
         token: Option<&str>,
-    ) -> reqwest::RequestBuilder {
+    ) -> crate::transport::HttpRequest {
         let mut request = request;
         if let Some(namespace) = &self.settings.namespace {
             request = request.header("X-Vault-Namespace", namespace);
@@ -518,7 +513,7 @@ impl VaultSecretSource {
             .request(self.client.post(self.url(path)).json(body), None)
             .send()
             .await
-            .map_err(|error| redacted_reqwest_error(&error))?;
+            .map_err(|error| redacted_transport_error(&error))?;
         let status = response.status();
         if !status.is_success() {
             return Err(match status.as_u16() {
@@ -549,7 +544,7 @@ impl VaultSecretSource {
             )
             .send()
             .await
-            .map_err(|error| redacted_reqwest_error(&error))?;
+            .map_err(|error| redacted_transport_error(&error))?;
         if !response.status().is_success() {
             return Err(status_class(response.status()));
         }
@@ -571,7 +566,7 @@ impl VaultSecretSource {
             )
             .send()
             .await
-            .map_err(|error| redacted_reqwest_error(&error))?;
+            .map_err(|error| redacted_transport_error(&error))?;
         if !response.status().is_success() {
             return Err(status_class(response.status()));
         }
@@ -602,7 +597,7 @@ impl VaultSecretSource {
             )
             .send()
             .await
-            .map_err(|error| unavailable(redacted_reqwest_error(&error)))?;
+            .map_err(|error| unavailable(redacted_transport_error(&error)))?;
         let status = response.status();
         match status.as_u16() {
             200 => {}
@@ -745,7 +740,7 @@ struct KvMetadata {
 }
 
 async fn read_json<T: serde::de::DeserializeOwned>(
-    response: reqwest::Response,
+    response: crate::transport::HttpResponse,
 ) -> Result<T, &'static str> {
     if response
         .content_length()
@@ -760,7 +755,7 @@ async fn read_json<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&bytes).map_err(|_| "response not json")
 }
 
-const fn status_class(status: reqwest::StatusCode) -> &'static str {
+const fn status_class(status: http::StatusCode) -> &'static str {
     match status.as_u16() {
         400..=499 => "http 4xx",
         500..=599 => "http 5xx",
@@ -768,9 +763,9 @@ const fn status_class(status: reqwest::StatusCode) -> &'static str {
     }
 }
 
-/// A reqwest error can quote the URL; keep to the kind so nothing else can
+/// A transport error can quote the URL; keep to the kind so nothing else can
 /// ride along.
-fn redacted_reqwest_error(error: &reqwest::Error) -> &'static str {
+fn redacted_transport_error(error: &crate::transport::HttpError) -> &'static str {
     if error.is_timeout() {
         "timeout"
     } else if error.is_connect() {

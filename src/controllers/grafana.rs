@@ -15,8 +15,8 @@
 //! error classification, output rendering, raw-response persistence, and
 //! JMESPath filtering — is the same code the other vendors use.
 
+use crate::transport::HttpClient;
 use futures::{StreamExt, stream::FuturesUnordered};
-use reqwest::Client;
 
 use crate::auth::Credentials;
 use crate::config::Config;
@@ -35,13 +35,13 @@ use crate::vendor::grafana::{
 /// (not a `&dyn Vendor`) so the token read can be driven, plus the shared
 /// client and config.
 pub struct GrafanaContext<'a> {
-    pub client: &'a Client,
+    pub client: &'a HttpClient,
     pub config: &'a Config,
     pub vendor: &'a GrafanaVendor,
 }
 
 impl<'a> GrafanaContext<'a> {
-    pub fn new(client: &'a Client, config: &'a Config, vendor: &'a GrafanaVendor) -> Self {
+    pub fn new(client: &'a HttpClient, config: &'a Config, vendor: &'a GrafanaVendor) -> Self {
         Self {
             client,
             config,

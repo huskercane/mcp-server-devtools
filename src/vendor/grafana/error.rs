@@ -15,7 +15,7 @@
 //! "`200 OK` with an error" quirk to handle — `classify_success_json` is left at
 //! its default no-op.
 
-use reqwest::StatusCode;
+use http::StatusCode;
 use serde_json::Value;
 
 use crate::error::{McpError, OriginalError, api_error, auth_invalid};

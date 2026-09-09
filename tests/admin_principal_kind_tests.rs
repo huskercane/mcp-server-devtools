@@ -7,6 +7,7 @@
 //! name — is refused at `/admin/*` while the same token still reaches
 //! `/mcp`, where its policy applies as before.
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode, get_current_timestamp};
+use mcp_server_devtools::transport::build_client;
 use mcp_server_devtools::{
     auth::oidc::{JwksLocation, OidcJwksValidator, OidcSettings, Profile},
     bootstrap::ServerBuilder,
@@ -80,7 +81,7 @@ async fn fixture(jwks: &MockServer, policy: AdminPrincipals) -> Fixture {
             JwksLocation::Direct(format!("{}/keys", jwks.uri())),
         )
         .with_tenant("acme"),
-        reqwest::Client::new(),
+        build_client().unwrap(),
     ));
     let auth = Arc::new(
         InboundAuth::new(

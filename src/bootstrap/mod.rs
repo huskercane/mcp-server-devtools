@@ -31,7 +31,7 @@ pub mod watcher;
 
 use std::sync::Arc;
 
-use reqwest::Client;
+use crate::transport::HttpClient;
 
 pub use config_handle::ConfigHandle;
 pub use vendors::Vendors;
@@ -52,7 +52,7 @@ use crate::workspace::WorkspaceCache;
 /// cloning; owned outright by the CLI, which uses it once and drops it.
 pub struct Components {
     pub config: ConfigHandle,
-    pub client: Client,
+    pub client: HttpClient,
     pub vendors: Vendors,
     /// Per-instance workspace cache. Not a process global, so multi-server
     /// embedders never leak one account's default workspace into another's.
@@ -141,7 +141,7 @@ pub type GateFactory = fn(
 /// comes from [`Default`].
 pub struct ServerBuilder {
     config: Option<Config>,
-    client: Option<Client>,
+    client: Option<HttpClient>,
     vendors: Option<Vendors>,
     watch_config: bool,
     credential_broker: Option<Arc<dyn CredentialBroker>>,
@@ -209,7 +209,7 @@ impl ServerBuilder {
     /// Use a caller-supplied HTTP client (connection-pool sharing, custom
     /// timeouts, or a test client).
     #[must_use]
-    pub fn client(mut self, client: Client) -> Self {
+    pub fn client(mut self, client: HttpClient) -> Self {
         self.client = Some(client);
         self
     }
@@ -652,7 +652,7 @@ fn load_configured_policy(
 /// `Vendor::new()`.
 pub struct CliRuntime {
     pub config: Arc<Config>,
-    pub client: Client,
+    pub client: HttpClient,
     pub vendors: Vendors,
     pub workspace_cache: WorkspaceCache,
 }

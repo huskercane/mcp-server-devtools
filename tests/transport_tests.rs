@@ -66,13 +66,13 @@ mod override_url {
     use mcp_server_devtools::config::Config;
     use mcp_server_devtools::error::McpError;
     use mcp_server_devtools::transport::{
-        RequestOptions, TransportResponse, fetch_bitbucket_with_base,
+        HttpClient, RequestOptions, TransportResponse, fetch_bitbucket_with_base,
     };
     use wiremock::MockServer;
 
     pub async fn fetch(
         server: &MockServer,
-        client: &reqwest::Client,
+        client: &HttpClient,
         creds: &Credentials,
         config: &Config,
         path: &str,

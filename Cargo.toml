@@ -80,6 +80,13 @@ dirs                = "=6.0.0"
 uuid                = { version = "=1.24.0", features = ["v4"] }
 regex               = "=1.13.1"
 reqwest             = { version = "=0.13.4", default-features = false, features = ["json", "form", "stream", "rustls", "charset", "http2", "gzip", "brotli", "deflate", "zstd"] }
+# The outbound HTTP boundary (`src/transport/client.rs`) is the only module
+# that names `reqwest`; everything else in the crate sees `http` types and
+# `bytes::Bytes` through that facade. Both were already in the tree at these
+# versions (via `axum`, `hyper`, and `reqwest` itself), so naming them pins
+# what the lockfile had resolved and adds no crate.
+http                = "=1.5.0"
+bytes               = "=1.12.1"
 async-compression   = { version = "=0.4.36", features = ["tokio", "gzip", "brotli", "deflate", "zstd"] }
 url                 = "=2.5.8"
 jmespath            = "=0.5.0"

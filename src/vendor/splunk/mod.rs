@@ -4,7 +4,7 @@
 
 pub mod error;
 
-use reqwest::StatusCode;
+use http::StatusCode;
 
 use crate::config::{Config, VENDOR_SPLUNK};
 use crate::error::{McpError, auth_missing};

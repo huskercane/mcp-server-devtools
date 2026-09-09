@@ -29,7 +29,7 @@ pub async fn dispatch(opts: &HealthOpts) -> ExitCode {
             .unwrap_or(3000);
         format!("http://127.0.0.1:{port}/")
     });
-    let client = match reqwest::Client::builder()
+    let client = match crate::transport::HttpClient::builder()
         .timeout(Duration::from_secs(opts.timeout_seconds.max(1)))
         .build()
     {

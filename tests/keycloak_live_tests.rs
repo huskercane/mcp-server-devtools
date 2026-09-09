@@ -22,6 +22,7 @@ use mcp_server_devtools::auth::oidc::{OidcJwksValidator, OidcSettings};
 use mcp_server_devtools::config::{Config, OidcKeys};
 use mcp_server_devtools::policy::PrincipalAuthority;
 use mcp_server_devtools::ports::{SubjectKind, TokenRejection, TokenValidator};
+use mcp_server_devtools::transport::build_client;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -151,7 +152,7 @@ async fn keycloak_realm_tokens_validate_through_the_keycloak_profile_including_r
     let issuer = format!("{base}/realms/{REALM}");
     let validator = Arc::new(OidcJwksValidator::new(
         settings(&base),
-        reqwest::Client::new(),
+        build_client().unwrap(),
     ));
 
     // 1. A token from the client with the audience mapper: the profile's
@@ -552,7 +553,7 @@ async fn keycloak_service_account_tokens_are_machines_once_the_client_id_mapper_
     let client_url = create_service_account_client(&http, &base, &admin).await;
     let validator = Arc::new(OidcJwksValidator::new(
         settings(&base),
-        reqwest::Client::new(),
+        build_client().unwrap(),
     ));
 
     // 1. Out of the box: whatever this Keycloak emits, the profile's answer

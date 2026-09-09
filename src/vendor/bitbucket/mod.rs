@@ -10,7 +10,7 @@
 
 pub mod error;
 
-use reqwest::StatusCode;
+use http::StatusCode;
 
 use crate::config::{Config, VENDOR_BITBUCKET};
 use crate::error::McpError;

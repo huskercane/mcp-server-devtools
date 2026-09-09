@@ -41,7 +41,7 @@ pub mod splunk;
 pub mod wrds;
 pub mod zoom;
 
-use reqwest::StatusCode;
+use http::StatusCode;
 
 use crate::config::Config;
 use crate::error::McpError;

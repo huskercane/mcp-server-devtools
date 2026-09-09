@@ -27,7 +27,7 @@
 
 pub mod error;
 
-use reqwest::StatusCode;
+use http::StatusCode;
 use serde_json::Value;
 
 use crate::config::{Config, VENDOR_NEWRELIC};

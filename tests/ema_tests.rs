@@ -1,4 +1,5 @@
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use mcp_server_devtools::transport::build_client;
 use mcp_server_devtools::{
     auth::{
         ema::{self, ClientCredentials, ExchangeRequest, OidcExchange, SubjectType},
@@ -53,7 +54,7 @@ async fn validator() -> (MockServer, Arc<OidcJwksValidator>) {
     .with_tenant("acme");
     (
         server,
-        Arc::new(OidcJwksValidator::new(settings, reqwest::Client::new())),
+        Arc::new(OidcJwksValidator::new(settings, build_client().unwrap())),
     )
 }
 #[tokio::test]

@@ -11,7 +11,7 @@
 //! `errors`-array reclassification, output rendering, raw-response persistence,
 //! and JMESPath filtering — is the same code the other vendors use.
 
-use reqwest::Client;
+use crate::transport::HttpClient;
 use serde_json::{Value, json};
 
 use crate::auth::Credentials;
@@ -27,13 +27,13 @@ use crate::vendor::newrelic::{API_KEY_HEADER, GRAPHQL_PATH, NewRelicVendor};
 /// (not a `&dyn Vendor`) so the API-key read can be driven, plus the shared
 /// client and config.
 pub struct NewRelicContext<'a> {
-    pub client: &'a Client,
+    pub client: &'a HttpClient,
     pub config: &'a Config,
     pub vendor: &'a NewRelicVendor,
 }
 
 impl<'a> NewRelicContext<'a> {
-    pub fn new(client: &'a Client, config: &'a Config, vendor: &'a NewRelicVendor) -> Self {
+    pub fn new(client: &'a HttpClient, config: &'a Config, vendor: &'a NewRelicVendor) -> Self {
         Self {
             client,
             config,

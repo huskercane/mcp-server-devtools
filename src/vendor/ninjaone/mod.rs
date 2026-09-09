@@ -28,7 +28,8 @@ pub mod totp;
 
 use std::sync::Arc;
 
-use reqwest::{Client, StatusCode};
+use crate::transport::HttpClient;
+use http::StatusCode;
 use serde_json::Value;
 
 use crate::auth::{Credentials, SecretKind, resolve_configured_secret_async, vendor_secret};
@@ -258,7 +259,7 @@ impl NinjaOneVendor {
     /// on its own. Email and password always come from server-held config.
     pub async fn login(
         &self,
-        client: &Client,
+        client: &HttpClient,
         config: &Config,
         mfa_code: Option<&str>,
         recaptcha_token: Option<&str>,
@@ -699,7 +700,7 @@ impl Vendor for NinjaOneVendor {
 }
 
 fn validate_base_url(url: &str) -> Result<(), McpError> {
-    let parsed = reqwest::Url::parse(url)
+    let parsed = url::Url::parse(url)
         .map_err(|error| unexpected(format!("Invalid NinjaOne base URL: {error}"), None))?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
         return Err(unexpected(

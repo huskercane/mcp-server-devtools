@@ -5,9 +5,7 @@ use std::io::Cursor;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use reqwest::header::{
-    CACHE_CONTROL, EXPIRES, HeaderMap, HeaderName, HeaderValue, SET_COOKIE, VARY,
-};
+use http::header::{CACHE_CONTROL, EXPIRES, HeaderMap, HeaderName, HeaderValue, SET_COOKIE, VARY};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 

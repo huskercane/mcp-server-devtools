@@ -19,9 +19,10 @@
 
 use std::time::{Duration, Instant};
 
+use crate::transport::HttpClient;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use reqwest::{Client, StatusCode};
+use http::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -92,7 +93,7 @@ impl TokenCache {
     /// identity, or within [`EXPIRY_SKEW`] of expiry.
     pub async fn bearer(
         &self,
-        client: &Client,
+        client: &HttpClient,
         account_id: &str,
         client_id: &str,
         client_secret: &str,
@@ -143,13 +144,13 @@ impl TokenCache {
 /// Perform the OAuth `account_credentials` exchange. Returns the raw token and
 /// Zoom's reported lifetime (skew is applied by the caller).
 async fn exchange(
-    client: &Client,
+    client: &HttpClient,
     key: &TokenKey,
     client_secret: &str,
 ) -> Result<(String, Duration), McpError> {
     let basic = STANDARD.encode(format!("{}:{}", key.client_id, client_secret));
-    // Encode the body ourselves (reqwest's `.form()` is feature-gated and this
-    // crate trims default features) — same `form_urlencoded` the controller
+    // Encode the body ourselves (the shared `form()` helper serialises a map; this
+    // is two fixed pairs) — same `form_urlencoded` the controller
     // layer uses for query strings.
     let body = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("grant_type", "account_credentials")
@@ -160,7 +161,7 @@ async fn exchange(
         .post(&key.token_url)
         .header("Authorization", format!("Basic {basic}"))
         .header(
-            reqwest::header::CONTENT_TYPE,
+            http::header::CONTENT_TYPE,
             "application/x-www-form-urlencoded",
         )
         .body(body)

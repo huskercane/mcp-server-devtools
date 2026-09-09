@@ -10,7 +10,7 @@
 //! Note: token-exchange (OAuth) errors use a *different* envelope
 //! (`{"reason", "error"}`) and are handled in [`super::token`], not here.
 
-use reqwest::StatusCode;
+use http::StatusCode;
 use serde_json::Value;
 
 use crate::error::{McpError, OriginalError, api_error, auth_invalid};

@@ -20,7 +20,8 @@ pub mod token;
 
 use std::sync::Arc;
 
-use reqwest::{Client, StatusCode};
+use crate::transport::HttpClient;
+use http::StatusCode;
 
 use crate::config::{Config, VENDOR_ZOOM};
 use crate::error::{McpError, auth_missing};
@@ -88,7 +89,7 @@ impl ZoomVendor {
     /// Resolve a valid bearer for the configured Server-to-Server OAuth app,
     /// exchanging and caching as needed. This is the Zoom credential entry
     /// point — the shared Atlassian resolver is never consulted.
-    pub async fn bearer(&self, client: &Client, config: &Config) -> Result<String, McpError> {
+    pub async fn bearer(&self, client: &HttpClient, config: &Config) -> Result<String, McpError> {
         let account_id = require_cred(config, "ZOOM_ACCOUNT_ID")?;
         let client_id = require_cred(config, "ZOOM_CLIENT_ID")?;
         // Only the secret is keychain-backed; the account and client ids are
