@@ -39,7 +39,7 @@ spec:
           # A release tag, never `latest`: a moving tag makes "which build
           # is running" unanswerable. Better still, pin the digest the
           # release workflow prints (`image@sha256:...`).
-          image: ghcr.io/huskercane/mcp-devtools:v0.15.0
+          image: ghcr.io/huskercane/mcp-devtools:v0.16.0
           args: ["--role", "gateway"]
           ports:
             - name: http
