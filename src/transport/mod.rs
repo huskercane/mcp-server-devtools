@@ -22,6 +22,7 @@
 //! New code should call [`fetch`] directly with the vendor it needs.
 
 pub mod image;
+pub mod multipart;
 pub mod raw_response;
 mod response_cache;
 

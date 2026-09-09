@@ -5,6 +5,7 @@
 //! tool/CLI handlers as thin adapters.
 
 pub mod api;
+pub mod bitbucket_downloads;
 pub mod circleci;
 pub mod clone;
 pub mod edx;
@@ -16,11 +17,13 @@ pub mod postman;
 pub mod slack;
 pub mod sonarqube;
 pub mod splunk;
+pub mod upload;
 #[cfg(feature = "wrds")]
 pub mod wrds;
 pub mod zoom;
 
 pub use api::{BitbucketContext, ControllerResponse, HandleContext, handle_request};
+pub use bitbucket_downloads::upload_downloads;
 pub use circleci::CircleCiContext;
 pub use clone::handle_clone;
 pub use edx::EdxContext;

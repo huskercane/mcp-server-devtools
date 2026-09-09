@@ -46,7 +46,6 @@ use crate::server::session::{DEFAULT_IDLE_TTL, DEFAULT_SWEEP_INTERVAL, ReapingSe
 use crate::server::shutdown;
 use crate::tools::DevtoolsServer;
 
-const BODY_LIMIT_BYTES: usize = 1_000_000;
 const DEFAULT_PORT: u16 = 3000;
 
 /// A control-plane router constructor supplied by the executable.
@@ -652,6 +651,7 @@ fn build_app_inner(
 ) -> Router {
     let manager = Arc::new(ReapingSessionManager::new(idle_ttl));
     manager.spawn_reaper(sweep_interval);
+    let body_limit = shared_server.config().http_request_body_limit_bytes();
     let admin = if serves_control {
         auth.as_ref().map_or_else(Router::new, |auth| {
             super::admin::router_with_extension(
@@ -699,13 +699,14 @@ fn build_app_inner(
         ]))
         .allow_headers(AllowHeaders::mirror_request());
 
-    // 1 MB body cap applies only to /mcp routes — TS used `express.json({ limit
+    // The body cap applies only to /mcp routes — TS used `express.json({ limit
     // '1mb' })` which only activates on JSON bodies; the Rust parallel is to
     // scope the raw body-limit to /mcp, where the only body-bearing handlers
-    // live.
+    // live. 1 MB by default; `HTTP_REQUEST_BODY_LIMIT_BYTES` raises it so
+    // upload tools can take larger inline files over HTTP.
     let mcp_routes = Router::new()
         .route("/mcp", any_service(streamable))
-        .layer(RequestBodyLimitLayer::new(BODY_LIMIT_BYTES));
+        .layer(RequestBodyLimitLayer::new(body_limit));
 
     // Everything a principal acts through. In enterprise mode the bearer
     // middleware wraps exactly this set; the health banner and the RFC 9728

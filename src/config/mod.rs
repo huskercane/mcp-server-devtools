@@ -224,6 +224,44 @@ impl Config {
         )
     }
 
+    /// Cap on one streamable-HTTP request body on `/mcp`
+    /// (`HTTP_REQUEST_BODY_LIMIT_BYTES`). Bounds the inline base64 an upload
+    /// tool can receive over HTTP. Never below the 1 MB default (the contract
+    /// existing clients rely on) and never above the hard ceiling; anything
+    /// unparseable is the default.
+    pub fn http_request_body_limit_bytes(&self) -> usize {
+        use crate::constants::data_limits::{
+            DEFAULT_HTTP_REQUEST_BODY_LIMIT_BYTES, MAX_HTTP_REQUEST_BODY_LIMIT_BYTES,
+        };
+        self.get("HTTP_REQUEST_BODY_LIMIT_BYTES")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_HTTP_REQUEST_BODY_LIMIT_BYTES)
+            .clamp(
+                DEFAULT_HTTP_REQUEST_BODY_LIMIT_BYTES,
+                MAX_HTTP_REQUEST_BODY_LIMIT_BYTES,
+            )
+    }
+
+    /// Per-file decoded size ceiling for upload tools (`UPLOAD_MAX_FILE_BYTES`),
+    /// read through the vendor cascade so one vendor section can tighten it.
+    /// Unparseable or non-positive values fall back to the default; anything
+    /// above the in-memory hard ceiling is clamped down to it.
+    pub fn upload_max_file_bytes(&self, vendor: &str) -> u64 {
+        bounded_upload_bytes(
+            self.get_for(vendor, "UPLOAD_MAX_FILE_BYTES"),
+            crate::constants::data_limits::DEFAULT_UPLOAD_MAX_FILE_BYTES,
+        )
+    }
+
+    /// Whole-call decoded size ceiling for upload tools (`UPLOAD_MAX_TOTAL_BYTES`).
+    /// Same parsing rules as [`Self::upload_max_file_bytes`].
+    pub fn upload_max_total_bytes(&self, vendor: &str) -> u64 {
+        bounded_upload_bytes(
+            self.get_for(vendor, "UPLOAD_MAX_TOTAL_BYTES"),
+            crate::constants::data_limits::DEFAULT_UPLOAD_MAX_TOTAL_BYTES,
+        )
+    }
+
     pub(crate) fn streaming_artifact_sweep_interval(&self) -> std::time::Duration {
         bounded_duration_seconds(
             self.get("STREAMING_ARTIFACT_SWEEP_INTERVAL_SECONDS"),
@@ -479,6 +517,15 @@ impl Config {
     pub fn is_empty(&self) -> bool {
         self.shared.is_empty() && self.by_vendor.values().all(HashMap::is_empty)
     }
+}
+
+/// Parse an upload byte limit: a positive integer, clamped to the in-memory
+/// hard ceiling; anything else is the default.
+fn bounded_upload_bytes(raw: Option<&str>, default: u64) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+        .min(crate::constants::data_limits::MAX_UPLOAD_BYTES_CEILING)
 }
 
 fn bounded_duration_seconds(

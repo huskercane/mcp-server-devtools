@@ -122,6 +122,11 @@ These settings use the same three-source cascade. When placed in `configs.json`,
 | `STREAMING_PARTITION_CONCURRENCY` | `4`; `1`–`16` | Maximum concurrent time-partition requests. |
 | `STREAMING_ARTIFACT_RETENTION_SECONDS` | `3600`; clamped to `300`–`604800` | How long completed download artifacts remain readable. |
 | `STREAMING_ARTIFACT_SWEEP_INTERVAL_SECONDS` | `60`; clamped to `5`–`3600` | Interval between expired-artifact sweeps. |
+| `HTTP_REQUEST_BODY_LIMIT_BYTES` | `1000000` (1 MB); clamped to `1000000`–`536870912` | Largest request body accepted on `/mcp` over streamable HTTP. Raise it so upload tools can receive larger inline (base64) files from remote clients; the cap never drops below the 1 MB default. Stdio is unaffected. |
+| `UPLOAD_MAX_FILE_BYTES` | `10485760` (10 MiB); positive integer, capped at 256 MiB | Largest single file an upload tool (`bb_upload`) accepts, measured after base64 decoding. May be set in one vendor section to tighten it for that vendor only. |
+| `UPLOAD_MAX_TOTAL_BYTES` | `26214400` (25 MiB); positive integer, capped at 256 MiB | Largest decoded total across every file in one upload call. Same vendor-section override as above. |
+
+Upload tools receive file contents inline (base64) or by server-side artifact id; they never read client-local paths. Over streamable HTTP the whole `tools/call` request must also fit the `/mcp` request body cap (`HTTP_REQUEST_BODY_LIMIT_BYTES`, 1 MB by default), so inline uploads there are bounded to roughly three quarters of that cap in decoded bytes; raise the cap, use `artifactId`, or use stdio for larger files.
 
 ## Enterprise mode (opt-in)
 

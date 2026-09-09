@@ -2,13 +2,13 @@
 
 A unified Rust MCP server that connects AI assistants to the developer tools and services they use every day.
 
-One binary exposes 70 tools across Atlassian, CI/CD, observability, collaboration, API development, device management, learning, and financial research platforms. It supports stdio and streamable HTTP, keeps credentials out of tool arguments, and provides bounded output with resumable artifacts for large responses.
+One binary exposes 71 tools across Atlassian, CI/CD, observability, collaboration, API development, device management, learning, and financial research platforms. It supports stdio and streamable HTTP, keeps credentials out of tool arguments, and provides bounded output with resumable artifacts for large responses.
 
 ## Integrations
 
 | Integration | MCP tools | Authentication |
 |---|---|---|
-| Bitbucket Cloud | `bb_get`, `bb_post`, `bb_put`, `bb_patch`, `bb_delete`, `bb_clone` | Atlassian API token or Bitbucket app password |
+| Bitbucket Cloud | `bb_get`, `bb_post`, `bb_put`, `bb_patch`, `bb_delete`, `bb_clone`, `bb_upload` | Atlassian API token or Bitbucket app password |
 | Jira Cloud | `jira_get`, `jira_get_attachment`, `jira_post`, `jira_put`, `jira_patch`, `jira_delete` | Atlassian API token |
 | Confluence Cloud | `conf_get`, `conf_post`, `conf_put`, `conf_patch`, `conf_delete` | Atlassian API token |
 | Zoom | `zoom_get`, `zoom_post`, `zoom_put`, `zoom_patch`, `zoom_delete` | Server-to-Server OAuth |
@@ -23,7 +23,7 @@ One binary exposes 70 tools across Atlassian, CI/CD, observability, collaboratio
 | NinjaOne | `ninjaone_login`, `ninjaone_get`, and write verbs | Bearer, session, or console credentials |
 | WRDS | Four `wrds_*` discovery and query tools | WRDS username and password |
 
-`artifact_read` is shared across integrations and lets stdio clients retrieve large temporary artifacts in resumable base64 chunks. WRDS contributes four of the 70 tools and is enabled by the default `wrds` Cargo feature.
+`artifact_read` is shared across integrations and lets stdio clients retrieve large temporary artifacts in resumable base64 chunks. WRDS contributes four of the 71 tools and is enabled by the default `wrds` Cargo feature.
 
 The Bitbucket, Jira, and Confluence behavior is ported from the corresponding [`@aashari` Atlassian MCP servers](https://github.com/aashari). The other integrations are native to this project.
 
@@ -143,6 +143,14 @@ cp examples/configs.json ~/.mcp/configs.json
 
 The server watches the global config and reloads changes without a restart. Startup settings such as `TRANSPORT_MODE`, `PORT`, and logging/audit controls must be process environment variables; see the reference for the exact source boundaries.
 
+Upload tools (`bb_upload`) take their size ceilings from three settings, all documented in the reference:
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `UPLOAD_MAX_FILE_BYTES` | 10 MiB | Largest single file, measured after base64 decoding. May be set per vendor section. |
+| `UPLOAD_MAX_TOTAL_BYTES` | 25 MiB | Largest decoded total across one upload call. |
+| `HTTP_REQUEST_BODY_LIMIT_BYTES` | 1 MB | Request body cap on `/mcp` over streamable HTTP. Raise it so remote clients can send larger inline files; base64 adds about a third, so allow roughly 1.4× the file size. Stdio is unaffected. |
+
 ### Store secrets in the OS keychain
 
 Desktop builds can store every registered vendor secret in macOS Keychain, Windows Credential Manager, or the Linux keyring. The safest starting point is to migrate plaintext secrets already present in `~/.mcp/configs.json`:
@@ -218,7 +226,7 @@ Restart Claude Desktop after changing its configuration.
 TRANSPORT_MODE=http PORT=3000 ./mcp-devtools
 ```
 
-Use `http://127.0.0.1:3000/mcp` as the MCP endpoint. `GET /` returns a health response. The server binds to loopback, enforces a local-origin allowlist and a 1 MiB request-body limit, and supports resumable downloads at `/artifacts/{artifactId}`.
+Use `http://127.0.0.1:3000/mcp` as the MCP endpoint. `GET /` returns a health response. The server binds to loopback, enforces a local-origin allowlist and a request-body limit (1 MB by default, raised with `HTTP_REQUEST_BODY_LIMIT_BYTES`), and supports resumable downloads at `/artifacts/{artifactId}`.
 
 ## Tool behavior
 
@@ -226,6 +234,7 @@ The REST-style tools accept a relative `path`, optional `queryParams`, optional 
 
 Specialized tools use typed inputs:
 
+- `bb_upload` publishes files to a repository's Downloads section from base64 content or a server-side artifact, refuses name collisions unless told to replace, and returns links for PR comments.
 - `circleci_logs` can select failed steps, condense output, and spill large logs to a resumable artifact.
 - `edx_discussion_*` provides typed course, topic, thread, comment, and create operations.
 - `newrelic_query` accepts a NerdGraph query and variables.

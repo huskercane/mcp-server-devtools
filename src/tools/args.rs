@@ -182,6 +182,76 @@ pub struct WriteArgs {
     pub output_format: Option<OutputFormatArg>,
 }
 
+/// Where an uploaded artifact's name collides with an existing one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ConflictPolicy {
+    /// Refuse the whole upload before sending anything (default).
+    #[default]
+    Fail,
+    /// Overwrite the existing artifact deliberately.
+    Replace,
+}
+
+/// One file in a `bb_upload` call.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadFileArg {
+    /// Artifact name as it will appear under Downloads and in its URL. One
+    /// path segment of at most 255 bytes: no `/`, `\`, `:`, `*`, `?`, `"`,
+    /// `<`, `>`, `|`, control characters, leading/trailing whitespace, or
+    /// `..`. Example: "postman-collection.json"
+    pub filename: String,
+
+    /// MIME type sent with the file, e.g. "application/json". Defaults to
+    /// "application/octet-stream", or to the source artifact's own type when
+    /// `artifactId` is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+
+    /// File contents as standard base64 (padding optional; not a `data:` URL).
+    /// Required unless `artifactId` is given. Use this from remote MCP
+    /// clients: the server cannot read paths on the client machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_base64: Option<String>,
+
+    /// Upload a server-side temporary artifact returned by another tool (for
+    /// example `circleci_logs`) without round-tripping its bytes through the
+    /// client. Mutually exclusive with `contentBase64`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+}
+
+/// Arguments for `bb_upload`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadArgs {
+    /// Bitbucket workspace slug containing the repository. If not provided,
+    /// the tool will use your default workspace (either configured via
+    /// `BITBUCKET_DEFAULT_WORKSPACE` or the first workspace in your account).
+    /// Example: "myteam"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_slug: Option<String>,
+
+    /// Repository slug that owns the Downloads section. Example: "project-api"
+    pub repo_slug: String,
+
+    /// Files to upload in one request (1 to 20). Every entry needs `filename`
+    /// plus exactly one of `contentBase64` or `artifactId`.
+    pub files: Vec<UploadFileArg>,
+
+    /// What to do when an artifact with the same name already exists:
+    /// "fail" (default) refuses the whole upload before sending anything,
+    /// because Bitbucket replaces same-name artifacts silently; "replace"
+    /// overwrites them deliberately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_conflict: Option<ConflictPolicy>,
+
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
 /// Arguments for a read-shaped NinjaOne request. `server` is a configured
 /// alias, never a caller-controlled URL.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

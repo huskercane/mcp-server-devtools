@@ -26,6 +26,7 @@ pub(crate) use crate::transport::HttpMethod;
 
 pub(crate) use crate::controllers::api::{handle_read, handle_write};
 pub(crate) use crate::controllers::handle_clone;
+pub(crate) use crate::controllers::upload_downloads;
 
 pub(crate) use super::args::{
     ArtifactReadArgs, CircleCiLogsArgs, CloneArgs, EdxDiscussionCommentCreateArgs,
@@ -35,7 +36,7 @@ pub(crate) use super::args::{
     NinjaOneWriteArgs, ReadArgs, SlackChannelHistoryArgs, SlackChannelInfoArgs,
     SlackListChannelsArgs, SlackSearchMessagesArgs, SlackThreadRepliesArgs,
     SonarqubeQualityGateArgs, SonarqubeSearchIssuesArgs, SplunkCreateJobArgs, SplunkJobResultsArgs,
-    SplunkListSavedSearchesArgs, SplunkSearchArgs, WriteArgs,
+    SplunkListSavedSearchesArgs, SplunkSearchArgs, UploadArgs, WriteArgs,
 };
 #[cfg(feature = "wrds")]
 pub(crate) use super::args::{

@@ -92,6 +92,20 @@ impl DevtoolsServer {
     ) -> Result<CallToolResult, RmcpError> {
         Ok(run_clone(self, &args).await)
     }
+
+    #[doc = include_str!("descriptions/bb_upload.md")]
+    #[tool(annotations(
+        read_only_hint = false,
+        destructive_hint = false,
+        idempotent_hint = false,
+        open_world_hint = true,
+    ))]
+    async fn bb_upload(
+        &self,
+        Parameters(args): Parameters<UploadArgs>,
+    ) -> Result<CallToolResult, RmcpError> {
+        Ok(run_upload(self, &args).await)
+    }
 }
 
 async fn run_read_bb(
@@ -133,6 +147,14 @@ async fn run_clone(server: &DevtoolsServer, args: &CloneArgs) -> CallToolResult 
     )
     .await
     {
+        Ok(resp) => success_response(&resp),
+        Err(err) => error_to_result(&err),
+    }
+}
+
+async fn run_upload(server: &DevtoolsServer, args: &UploadArgs) -> CallToolResult {
+    let config = server.config();
+    match upload_downloads(&server.bitbucket_typed_ctx(&config), args).await {
         Ok(resp) => success_response(&resp),
         Err(err) => error_to_result(&err),
     }

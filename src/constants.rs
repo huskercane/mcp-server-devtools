@@ -32,6 +32,23 @@ pub mod network_timeouts {
 
 pub mod data_limits {
     pub const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
+    /// Default ceiling for one uploaded file, measured after base64 decoding
+    /// (`UPLOAD_MAX_FILE_BYTES`).
+    pub const DEFAULT_UPLOAD_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+    /// Default ceiling for the decoded bytes of every file in one upload call
+    /// (`UPLOAD_MAX_TOTAL_BYTES`).
+    pub const DEFAULT_UPLOAD_MAX_TOTAL_BYTES: u64 = 25 * 1024 * 1024;
+    /// Hard ceiling an operator cannot raise either upload limit past: the
+    /// multipart body is assembled in memory before it is sent.
+    pub const MAX_UPLOAD_BYTES_CEILING: u64 = 256 * 1024 * 1024;
+    /// Maximum number of files accepted by one upload call.
+    pub const MAX_UPLOAD_FILES: usize = 20;
+    /// Default cap on one streamable-HTTP request body on `/mcp`
+    /// (`HTTP_REQUEST_BODY_LIMIT_BYTES`). TS parity: `express.json({ limit: '1mb' })`.
+    pub const DEFAULT_HTTP_REQUEST_BODY_LIMIT_BYTES: usize = 1_000_000;
+    /// Largest value an operator may set the request body cap to: enough for
+    /// a base64-encoded upload at the upload hard ceiling, plus envelope.
+    pub const MAX_HTTP_REQUEST_BODY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
     /// Hard decoded-byte ceiling for streamed log artifacts. This is enforced
     /// while consuming the body, including chunked responses.
     pub const MAX_STREAMED_ARTIFACT_SIZE: u64 = 512 * 1024 * 1024;

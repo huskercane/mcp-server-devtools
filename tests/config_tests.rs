@@ -786,3 +786,62 @@ fn get_collapses_ambiguous_to_none_for_back_compat() {
     assert_eq!(cfg.get("ATLASSIAN_API_TOKEN"), None);
     assert_eq!(cfg.get("NONEXISTENT_KEY"), None);
 }
+
+#[test]
+fn http_request_body_limit_is_clamped_to_its_bounds() {
+    use mcp_server_devtools::constants::data_limits::{
+        DEFAULT_HTTP_REQUEST_BODY_LIMIT_BYTES, MAX_HTTP_REQUEST_BODY_LIMIT_BYTES,
+    };
+    let limit = |value: Option<&str>| {
+        let mut map = std::collections::HashMap::new();
+        if let Some(value) = value {
+            map.insert("HTTP_REQUEST_BODY_LIMIT_BYTES".to_owned(), value.to_owned());
+        }
+        Config::from_map(map).http_request_body_limit_bytes()
+    };
+    assert_eq!(limit(None), DEFAULT_HTTP_REQUEST_BODY_LIMIT_BYTES);
+    assert_eq!(
+        limit(Some("garbage")),
+        DEFAULT_HTTP_REQUEST_BODY_LIMIT_BYTES
+    );
+    assert_eq!(limit(Some("10")), DEFAULT_HTTP_REQUEST_BODY_LIMIT_BYTES);
+    assert_eq!(limit(Some("4000000")), 4_000_000);
+    assert_eq!(
+        limit(Some("999999999999")),
+        MAX_HTTP_REQUEST_BODY_LIMIT_BYTES
+    );
+}
+
+#[test]
+fn upload_limits_default_and_clamp_per_vendor() {
+    use mcp_server_devtools::constants::data_limits::{
+        DEFAULT_UPLOAD_MAX_FILE_BYTES, DEFAULT_UPLOAD_MAX_TOTAL_BYTES, MAX_UPLOAD_BYTES_CEILING,
+    };
+    let empty = Config::from_map(std::collections::HashMap::new());
+    assert_eq!(
+        empty.upload_max_file_bytes("bitbucket"),
+        DEFAULT_UPLOAD_MAX_FILE_BYTES
+    );
+    assert_eq!(
+        empty.upload_max_total_bytes("bitbucket"),
+        DEFAULT_UPLOAD_MAX_TOTAL_BYTES
+    );
+    let set = Config::from_map(std::collections::HashMap::from([
+        ("UPLOAD_MAX_FILE_BYTES".to_owned(), "1024".to_owned()),
+        ("UPLOAD_MAX_TOTAL_BYTES".to_owned(), "0".to_owned()),
+    ]));
+    assert_eq!(set.upload_max_file_bytes("bitbucket"), 1024);
+    assert_eq!(
+        set.upload_max_total_bytes("bitbucket"),
+        DEFAULT_UPLOAD_MAX_TOTAL_BYTES,
+        "zero is not a limit"
+    );
+    let huge = Config::from_map(std::collections::HashMap::from([(
+        "UPLOAD_MAX_FILE_BYTES".to_owned(),
+        "99999999999".to_owned(),
+    )]));
+    assert_eq!(
+        huge.upload_max_file_bytes("bitbucket"),
+        MAX_UPLOAD_BYTES_CEILING
+    );
+}

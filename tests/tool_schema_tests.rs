@@ -7,7 +7,7 @@ use mcp_server_devtools::bootstrap::ServerBuilder;
 use mcp_server_devtools::config::Config;
 use mcp_server_devtools::tools::args::{
     ArtifactReadArgs, CircleCiLogsArgs, OutputFormatArg, QueryParams, ReadArgs,
-    SonarqubeQualityGateArgs, SonarqubeSearchIssuesArgs, WriteArgs,
+    SonarqubeQualityGateArgs, SonarqubeSearchIssuesArgs, UploadArgs, WriteArgs,
 };
 use rmcp::ServerHandler;
 use serde_json::json;
@@ -136,4 +136,44 @@ fn query_params_preserve_ordering() {
     let s = serde_json::to_string(&qp).unwrap();
     // BTreeMap → alphabetical order, reliable for URL encoding and fixtures.
     assert_eq!(s, r#"{"a":"1","b":"2","c":"3"}"#);
+}
+
+#[test]
+fn upload_args_use_camel_case_json_and_default_to_failing_on_conflict() {
+    let args: UploadArgs = serde_json::from_value(json!({
+        "workspaceSlug": "myteam",
+        "repoSlug": "project-api",
+        "files": [
+            {"filename": "a.json", "mimeType": "application/json", "contentBase64": "e30="},
+            {"filename": "b.log", "artifactId": "artifact-1"}
+        ],
+        "onConflict": "replace",
+        "outputFormat": "json"
+    }))
+    .unwrap();
+    assert_eq!(args.workspace_slug.as_deref(), Some("myteam"));
+    assert_eq!(args.repo_slug, "project-api");
+    assert_eq!(args.files.len(), 2);
+    assert_eq!(args.files[0].mime_type.as_deref(), Some("application/json"));
+    assert_eq!(args.files[0].content_base64.as_deref(), Some("e30="));
+    assert_eq!(args.files[1].artifact_id.as_deref(), Some("artifact-1"));
+    assert_eq!(
+        args.on_conflict,
+        Some(mcp_server_devtools::tools::args::ConflictPolicy::Replace)
+    );
+    assert_eq!(args.output_format, Some(OutputFormatArg::Json));
+
+    let minimal: UploadArgs = serde_json::from_value(json!({
+        "repoSlug": "project-api",
+        "files": [{"filename": "a.txt", "contentBase64": "eA=="}]
+    }))
+    .unwrap();
+    assert_eq!(minimal.on_conflict, None);
+    assert_eq!(
+        serde_json::to_value(&minimal).unwrap(),
+        json!({
+            "repoSlug": "project-api",
+            "files": [{"filename": "a.txt", "contentBase64": "eA=="}]
+        })
+    );
 }
