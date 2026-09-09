@@ -109,6 +109,17 @@ impl Vendor for CircleCiVendor {
         }
     }
 
+    fn cache_reads(&self, path: &str) -> bool {
+        // Status and discovery lists can change at any point, including after
+        // a terminal result (reruns). Never reuse or admit these responses.
+        !path
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(path)
+            .split('/')
+            .any(|part| matches!(part, "pipeline" | "workflow" | "job"))
+    }
+
     fn classify_error(&self, status: StatusCode, body: &str) -> McpError {
         error::classify(status, body)
     }

@@ -101,6 +101,35 @@ pub async fn handle_read(
     .await
 }
 
+/// CircleCI GET with explicit local-cache bypass.
+pub async fn handle_fresh_read(
+    ctx: &CircleCiContext<'_>,
+    args: &crate::tools::args::CircleCiReadArgs,
+) -> Result<ControllerResponse, McpError> {
+    let token = ctx.vendor.token(ctx.config).await?;
+    let creds = Credentials::Bearer { token };
+    let handle = HandleContext::new(ctx.client, ctx.config, ctx.vendor);
+    let path = crate::controllers::api::normalize_and_append(
+        ctx.vendor,
+        &args.read.path,
+        args.read.query_params.as_ref(),
+    );
+    crate::controllers::api::dispatch_with_options(
+        &handle,
+        &creds,
+        &path,
+        args.read.jq.as_deref(),
+        args.read
+            .output_format
+            .map_or(OutputFormat::Toon, Into::into),
+        crate::transport::RequestOptions {
+            fresh: args.fresh,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
 /// Write-shaped convenience wrapper (POST / PUT / PATCH).
 pub async fn handle_write(
     ctx: &CircleCiContext<'_>,

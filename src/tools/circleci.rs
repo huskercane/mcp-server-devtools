@@ -18,9 +18,23 @@ impl DevtoolsServer {
     ))]
     async fn circleci_get(
         &self,
-        Parameters(args): Parameters<ReadArgs>,
+        Parameters(args): Parameters<super::args::CircleCiReadArgs>,
     ) -> Result<CallToolResult, RmcpError> {
-        Ok(run_read_circleci(self, HttpMethod::Get, &args).await)
+        let config = self.config();
+        Ok(
+            match crate::controllers::circleci::handle_fresh_read(
+                &self.circleci_ctx(&config),
+                &args,
+            )
+            .await
+            {
+                Ok(resp) => {
+                    let text = truncate_for_ai(&resp.content, resp.raw_response_path.as_deref());
+                    CallToolResult::success(vec![Content::text(text)])
+                }
+                Err(err) => error_to_result(&err),
+            },
+        )
     }
 
     #[doc = include_str!("descriptions/circleci_logs.md")]

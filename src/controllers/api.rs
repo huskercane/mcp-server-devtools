@@ -202,7 +202,7 @@ pub async fn dispatch_form_with_creds(
     dispatch_with_options(ctx, creds, &normalized, jq, output_format, opts).await
 }
 
-async fn dispatch_with_options(
+pub(crate) async fn dispatch_with_options(
     ctx: &HandleContext<'_>,
     creds: &Credentials,
     normalized: &str,
@@ -210,9 +210,24 @@ async fn dispatch_with_options(
     output_format: OutputFormat,
     opts: RequestOptions,
 ) -> Result<ControllerResponse, McpError> {
+    let is_get = opts.method.unwrap_or(HttpMethod::Get) == HttpMethod::Get;
     let response: TransportResponse =
         fetch(ctx.client, ctx.vendor, creds, ctx.config, normalized, opts).await?;
 
+    if ctx.vendor.name() == crate::config::VENDOR_CIRCLECI && is_get {
+        let data = match &response.data {
+            ResponseBody::Json(value) => apply_jq_filter(value, jq).into_owned(),
+            ResponseBody::Text(text) => Value::String(text.clone()),
+            ResponseBody::Empty => serde_json::json!({}),
+        };
+        return Ok(ControllerResponse {
+            content: render(
+                &serde_json::json!({"data": data, "cache": response.cache}),
+                output_format,
+            ),
+            raw_response_path: response.raw_response_path,
+        });
+    }
     Ok(render_response(&response, jq, output_format))
 }
 

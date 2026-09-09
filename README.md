@@ -276,6 +276,19 @@ Attach Instruments, `sample`, or `samply` to that workload when call-stack data 
 
 CI builds and tests the default and headless feature sets across Linux, macOS, and Windows. Releases publish checksummed archives for all supported targets.
 
+## CircleCI deployment monitoring
+
+CircleCI deployment monitoring always fetches pipeline, workflow, and job status
+paths upstream, including discovery lists and terminal states. Other CircleCI
+GETs can use the configured HTTP cache; top-level `fresh: true` bypasses lookup
+and storage and removes the previous entry without adding upstream query parameters.
+`circleci_get` returns `{data, cache}` (also in TOON): `jq` filters `data` before
+wrapping; `cache.hit`, `cache.ageMs`, and `cache.fetchedAt` expose local reuse,
+residence age, and the original UTC fetch timestamp. Poll workflow/job status
+until completion; pipeline creation alone does not establish deployment success.
+See the [tool documentation](src/tools/descriptions/circleci_get.md) and
+[incident investigation](docs/circleci-status-freshness.md).
+
 ## License
 
 The community edition is licensed under [Apache-2.0](LICENSE). Commercial use,

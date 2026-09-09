@@ -11,7 +11,7 @@ use reqwest::header::{
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
-use super::{RequestOptions, ResponseBody};
+use super::{CacheMetadata, RequestOptions, ResponseBody};
 use crate::config::Config;
 
 const DEFAULT_TTL_SECONDS: u64 = 60;
@@ -153,6 +153,7 @@ struct Entry {
     stored_bytes: usize,
     expires_at: Instant,
     stored_at: Instant,
+    fetched_at: String,
     ttl: Duration,
     response_bytes: usize,
     upstream_latency_ms: u128,
@@ -210,7 +211,7 @@ pub(super) fn request_is_cacheable(
         )
 }
 
-pub(super) fn get(key: &CacheKey) -> Option<ResponseBody> {
+pub(super) fn get(key: &CacheKey) -> Option<(ResponseBody, CacheMetadata)> {
     let fingerprint = key.audit_fingerprint();
     let mut cache = cache().lock().ok()?;
     let now = Instant::now();
@@ -251,7 +252,15 @@ pub(super) fn get(key: &CacheKey) -> Option<ResponseBody> {
         response_bytes = Some(entry.response_bytes);
         entry_bytes = Some(entry.stored_bytes);
         compressed = Some(matches!(&entry.bytes, StoredBytes::Zstd(_)));
-        entry.decode()
+        let body = entry.decode()?;
+        Some((
+            body,
+            CacheMetadata {
+                hit: true,
+                age_ms: now.saturating_duration_since(entry.stored_at).as_millis(),
+                fetched_at: entry.fetched_at.clone(),
+            },
+        ))
     });
     let outcome = if result.is_some() {
         cache.hits = cache.hits.saturating_add(1);
@@ -301,6 +310,7 @@ pub(super) fn store(
     headers: &HeaderMap,
     config: &CacheConfig,
     upstream_latency: Duration,
+    metadata: &CacheMetadata,
 ) {
     if headers.contains_key(SET_COOKIE)
         && !key
@@ -359,6 +369,7 @@ pub(super) fn store(
             stored_bytes,
             expires_at: now + ttl,
             stored_at: now,
+            fetched_at: metadata.fetched_at.clone(),
             ttl,
             response_bytes,
             upstream_latency_ms: upstream_latency.as_millis(),
@@ -403,6 +414,15 @@ fn plain_len(body: &ResponseBody) -> usize {
         ResponseBody::Text(text) => text.len(),
         ResponseBody::Empty => 0,
     }
+}
+
+/// Discard a previous representation before an explicit fresh read, so a
+/// later ordinary read cannot fall back to the older cached snapshot.
+pub(super) fn invalidate(key: &CacheKey) {
+    let Ok(mut cache) = cache().lock() else {
+        return;
+    };
+    remove(&mut cache, key);
 }
 
 pub(super) fn invalidate_namespace(vendor: &str, base_url: &str) {

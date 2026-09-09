@@ -69,6 +69,17 @@ pub struct ReadArgs {
     pub output_format: Option<OutputFormatArg>,
 }
 
+/// Arguments for `circleci_get`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CircleCiReadArgs {
+    #[serde(flatten)]
+    pub read: ReadArgs,
+    /// Fetch from upstream, bypassing MCP cache lookup and storage. Never sent as a query parameter.
+    #[serde(default)]
+    pub fresh: bool,
+}
+
 /// Arguments for `circleci_logs`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]

@@ -427,3 +427,159 @@ async fn missing_token_surfaces_auth_missing_at_call_time() {
     assert_eq!(err.kind, ErrorKind::AuthMissing);
     assert!(err.message.contains("CIRCLECI_TOKEN"));
 }
+
+fn cached_config(ttl: &str) -> Config {
+    let mut values = creds();
+    // Wiremock can reuse origins across tests; isolate the process-local cache.
+    values.insert("CIRCLECI_TOKEN".into(), uuid::Uuid::new_v4().to_string());
+    values.insert("HTTP_CACHE_ENABLED".into(), "true".into());
+    values.insert("HTTP_CACHE_DEFAULT_TTL_SECONDS".into(), ttl.into());
+    Config::from_map(values)
+}
+
+async fn read_status(ctx: &CircleCiContext<'_>, path: &str, fresh: bool) -> serde_json::Value {
+    let args = serde_json::from_value(json!({
+        "path": path, "fresh": fresh, "outputFormat": "json", "jq": "items[*].status"
+    }))
+    .unwrap();
+    let response = mcp_server_devtools::controllers::circleci::handle_fresh_read(ctx, &args)
+        .await
+        .unwrap();
+    if let Some(path) = response.raw_response_path {
+        let _ = std::fs::remove_file(path);
+    }
+    serde_json::from_str(&response.content).unwrap()
+}
+
+#[tokio::test]
+async fn mutable_status_polling_observes_success_and_failure_despite_long_upstream_ttl() {
+    for endpoint in [
+        "/workflow/df722a5b-dd0f-437c-a426-efbda3a7a597/job",
+        "/workflow/w1",
+        "/pipeline/p1/workflow",
+        "/pipeline/p1",
+        "/project/bb/acme/web/pipeline",
+        "/project/bb/acme/web/pipeline/mine",
+        "/project/bb/acme/web/job/5185",
+    ] {
+        for terminal in ["success", "failed"] {
+            let server = MockServer::start().await;
+            let count = std::sync::atomic::AtomicUsize::new(0);
+            Mock::given(method("GET"))
+                .and(path(endpoint))
+                .respond_with(move |_: &wiremock::Request| {
+                    let status = if count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                        "running"
+                    } else {
+                        terminal
+                    };
+                    ResponseTemplate::new(200)
+                        .insert_header("cache-control", "max-age=3600")
+                        .set_body_json(json!({"items": [{"status": status}]}))
+                })
+                .expect(4)
+                .mount(&server)
+                .await;
+            let client = build_client().unwrap();
+            let config = cached_config("600");
+            let vendor = vendor(&server);
+            let ctx = CircleCiContext::new(&client, &config, &vendor);
+            for expected in ["running", "running", terminal, terminal] {
+                let result = read_status(&ctx, &format!("{endpoint}?page-token=next"), false).await;
+                assert_eq!(result["data"], json!([expected]));
+                assert_eq!(result["cache"]["hit"], false);
+                assert_eq!(result["cache"]["ageMs"], 0);
+                chrono::DateTime::parse_from_rfc3339(
+                    result["cache"]["fetchedAt"].as_str().unwrap(),
+                )
+                .unwrap();
+            }
+            for request in server.received_requests().await.unwrap() {
+                assert_eq!(request.url.query(), Some("page-token=next"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn cache_hits_age_without_extending_ttl_and_expiry_fetches_again() {
+    let server = MockServer::start().await;
+    let count = std::sync::atomic::AtomicUsize::new(0);
+    Mock::given(method("GET"))
+        .and(path("/me"))
+        .respond_with(move |_: &wiremock::Request| {
+            let status = if count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                "running"
+            } else {
+                "success"
+            };
+            ResponseTemplate::new(200).set_body_json(json!({"items": [{"status": status}]}))
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let client = build_client().unwrap();
+    let config = cached_config("1");
+    let vendor = vendor(&server);
+    let ctx = CircleCiContext::new(&client, &config, &vendor);
+    let first = read_status(&ctx, "/me", false).await;
+    assert_eq!(first["cache"]["hit"], false);
+    for _ in 0..3 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let hit = read_status(&ctx, "/me", false).await;
+        assert_eq!(hit["data"], json!(["running"]));
+        assert_eq!(hit["cache"]["hit"], true);
+        assert!(hit["cache"]["ageMs"].as_u64().unwrap() >= 50);
+        assert_eq!(hit["cache"]["fetchedAt"], first["cache"]["fetchedAt"]);
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let expired = read_status(&ctx, "/me", false).await;
+    assert_eq!(expired["data"], json!(["success"]));
+    assert_eq!(expired["cache"]["hit"], false);
+    assert_eq!(expired["cache"]["ageMs"], 0);
+    assert_ne!(expired["cache"]["fetchedAt"], first["cache"]["fetchedAt"]);
+}
+
+#[tokio::test]
+async fn fresh_reads_bypass_warm_cache_without_changing_upstream_query() {
+    for terminal in ["success", "failed"] {
+        let server = MockServer::start().await;
+        let count = std::sync::atomic::AtomicUsize::new(0);
+        Mock::given(method("GET"))
+            .and(path("/me"))
+            .respond_with(move |_: &wiremock::Request| {
+                let status = if count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    "running"
+                } else {
+                    terminal
+                };
+                ResponseTemplate::new(200).set_body_json(json!({"items": [{"status": status}]}))
+            })
+            .expect(4)
+            .mount(&server)
+            .await;
+        let client = build_client().unwrap();
+        let config = cached_config("600");
+        let vendor = vendor(&server);
+        let ctx = CircleCiContext::new(&client, &config, &vendor);
+        assert_eq!(
+            read_status(&ctx, "/me", false).await["data"],
+            json!(["running"])
+        );
+        assert_eq!(read_status(&ctx, "/me", false).await["cache"]["hit"], true);
+        for _ in 0..2 {
+            let fresh = read_status(&ctx, "/me", true).await;
+            assert_eq!(fresh["data"], json!([terminal]));
+            assert_eq!(fresh["cache"]["hit"], false);
+            assert_eq!(fresh["cache"]["ageMs"], 0);
+        }
+        let ordinary = read_status(&ctx, "/me", false).await;
+        assert_eq!(ordinary["data"], json!([terminal]));
+        assert_eq!(ordinary["cache"]["hit"], false);
+        assert_eq!(read_status(&ctx, "/me", false).await["cache"]["hit"], true);
+        for request in server.received_requests().await.unwrap() {
+            assert_eq!(request.url.query(), None);
+            assert!(request.body.is_empty());
+        }
+    }
+}

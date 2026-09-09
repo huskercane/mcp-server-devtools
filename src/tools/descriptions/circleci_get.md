@@ -25,6 +25,12 @@ Authenticates with a personal API token (`CIRCLECI_TOKEN`) sent as a Bearer toke
 
 **Pagination:** CircleCI uses a `next_page_token` in the response. Pass it back as the `page-token` query param to fetch the next page.
 
+**Deployment monitoring and freshness:** Pipeline, workflow, and job paths (including discovery lists) always fetch upstream and are never stored in the MCP HTTP cache, even if CircleCI sends a long `max-age`. Poll `/pipeline/{id}/workflow`, then `/workflow/{id}` or `/workflow/{id}/job` until the target workflow/jobs reach a terminal status; queued, running, and approval-waiting states are not completion. A pipeline being created does not mean its deployment succeeded. Terminal status reads also remain uncached to observe reruns.
+
+For any other GET, set top-level `fresh: true` to bypass MCP cache lookup and storage and discard the previous entry. For example: `{"path":"/workflow/df722a5b-dd0f-437c-a426-efbda3a7a597/job","fresh":true,"jq":"items[*].{name:name,status:status}","outputFormat":"json"}`. This is a local control, never an upstream query parameter. Do not add `_fresh` timestamps to `queryParams` or the path.
+
+**Response metadata:** GET results have a `data` and `cache` envelope in both formats. `jq` filters the upstream body before it is placed in `data`; metadata is always retained. `cache.hit` reports local MCP cache reuse, `cache.ageMs` is elapsed local cache residence (zero on an upstream fetch), and `cache.fetchedAt` is the UTC timestamp when MCP finished reading that upstream body. Hits retain the original fetch timestamp and do not extend TTL. These fields describe MCP provenance, not when CircleCI last updated its state or whether an upstream proxy cached it. JSON example: `{"data":[{"status":"success"}],"cache":{"hit":false,"ageMs":0,"fetchedAt":"2026-09-09T16:39:07Z"}}`.
+
 **Output format:** TOON (default) or JSON (`outputFormat: "json"`).
 
 **JQ examples:** `items[*].{id: id, state: state, created: created_at}`, `items[*].number`, `{login: login, id: id}`

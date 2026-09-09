@@ -64,6 +64,11 @@ pub trait Vendor: Send + Sync {
     /// Bitbucket auto-prepends `/2.0`; Jira just ensures a leading `/`.
     fn normalize_path(&self, path: &str) -> String;
 
+    /// Whether GET responses for this normalized path may use the local cache.
+    fn cache_reads(&self, _path: &str) -> bool {
+        true
+    }
+
     /// Convert a non-2xx response (status + body text) into the typed
     /// [`McpError`] for this vendor's error envelope shape(s).
     fn classify_error(&self, status: StatusCode, body: &str) -> McpError;

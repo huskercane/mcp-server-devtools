@@ -1397,6 +1397,8 @@ impl HttpMethod {
 /// Request options for a single API call. Matches TS `RequestOptions`.
 #[derive(Debug, Clone, Default)]
 pub struct RequestOptions {
+    /// Bypass local cache lookup and admission for this request.
+    pub fresh: bool,
     pub method: Option<HttpMethod>,
     pub headers: Vec<(String, String)>,
     pub body: Option<Value>,
@@ -1413,8 +1415,18 @@ pub struct RequestOptions {
 /// written.
 #[derive(Debug, Clone)]
 pub struct TransportResponse {
+    pub cache: CacheMetadata,
     pub data: ResponseBody,
     pub raw_response_path: Option<std::path::PathBuf>,
+}
+
+/// Provenance of the local HTTP response, independent of upstream cache age.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheMetadata {
+    pub hit: bool,
+    pub age_ms: u128,
+    pub fetched_at: String,
 }
 
 /// Typed response body. `Json` is the canonical successful case; the other
@@ -1506,6 +1518,7 @@ fn log_ninjaone_response(
 /// controller layer) are expected to have already applied
 /// [`Vendor::normalize_path`] so that path normalisation lives in one
 /// place. The transport itself only joins base + path.
+#[allow(clippy::too_many_lines)] // Cache lookup, upstream fetch, and admission form one request lifecycle.
 pub async fn fetch(
     client: &Client,
     vendor: &dyn Vendor,
@@ -1539,16 +1552,21 @@ pub async fn fetch(
         &options.headers,
         &crate::policy::OwnerKey::current(),
     );
+    if options.fresh {
+        response_cache::invalidate(&cache_key);
+    }
+    let cacheable = cache_config.enabled
+        && !options.fresh
+        && vendor.cache_reads(path)
+        && response_cache::request_is_cacheable(&url, &auth_name, &options);
     if method != HttpMethod::Get {
         response_cache::invalidate_namespace(vendor.name(), &base);
-    } else if cache_config.enabled
-        && response_cache::request_is_cacheable(&url, &auth_name, &options)
-        && let Some(body) = response_cache::get(&cache_key)
-    {
+    } else if cacheable && let Some((body, metadata)) = response_cache::get(&cache_key) {
         report_cache_hit(ticket.as_ref());
         debug!(vendor = vendor.name(), %url, "HTTP response cache hit");
         return Ok(TransportResponse {
             data: body,
+            cache: metadata,
             raw_response_path: None,
         });
     }
@@ -1609,11 +1627,20 @@ pub async fn fetch(
         return Err(err);
     }
 
-    if method == HttpMethod::Get
-        && cache_config.enabled
-        && response_cache::request_is_cacheable(&url, &auth_name, &options)
-    {
-        response_cache::store(cache_key, &body, &response_headers, &cache_config, duration);
+    let metadata = CacheMetadata {
+        hit: false,
+        age_ms: 0,
+        fetched_at: crate::logger::iso_timestamp(),
+    };
+    if method == HttpMethod::Get && cacheable {
+        response_cache::store(
+            cache_key,
+            &body,
+            &response_headers,
+            &cache_config,
+            duration,
+            &metadata,
+        );
     }
 
     let raw_path = if let ResponseBody::Json(value) = &body {
@@ -1632,6 +1659,7 @@ pub async fn fetch(
 
     Ok(TransportResponse {
         data: body,
+        cache: metadata,
         raw_response_path: raw_path,
     })
 }
