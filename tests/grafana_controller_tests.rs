@@ -120,7 +120,7 @@ async fn query_logs_proxies_logql_with_bearer_and_params() {
         assert_eq!(manifest["encoded_bytes"], manifest["decoded_bytes"]);
         assert_eq!(
             manifest["final_sha256"],
-            format!("{:x}", Sha256::digest(&bytes))
+            hex::encode(Sha256::digest(&bytes))
         );
         remove_artifact(&p);
     }
@@ -273,7 +273,7 @@ async fn query_logs_merges_out_of_order_forward_partitions_deterministically() {
     assert_eq!(manifest["final_bytes"], bytes.len());
     assert_eq!(
         manifest["final_sha256"],
-        format!("{:x}", Sha256::digest(&bytes))
+        hex::encode(Sha256::digest(&bytes))
     );
     assert!(manifest["encoded_bytes"].as_u64().unwrap() > 0);
     assert_eq!(manifest["encoded_bytes"], manifest["decoded_bytes"]);

@@ -74,7 +74,7 @@ async fn export_search_posts_urlencoded_form_with_bearer_token() {
     assert_eq!(manifest["total_records"], 1);
     assert_eq!(
         manifest["final_sha256"],
-        format!("{:x}", Sha256::digest(&canonical_bytes))
+        hex::encode(Sha256::digest(&canonical_bytes))
     );
     assert!(manifest["encoded_bytes"].as_u64().unwrap() > 0);
     assert!(response.content.contains("Start of response"));
@@ -373,7 +373,7 @@ async fn search_partitions_merge_non_empty_results_in_planned_order() {
     assert_eq!(manifest["final_bytes"], u64::try_from(bytes.len()).unwrap());
     assert_eq!(
         manifest["final_sha256"],
-        format!("{:x}", Sha256::digest(&bytes))
+        hex::encode(Sha256::digest(&bytes))
     );
     assert_eq!(manifest["encoded_bytes"], manifest["decoded_bytes"]);
     assert!(manifest["encoded_bytes"].as_u64().unwrap() > 0);

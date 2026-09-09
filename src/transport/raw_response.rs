@@ -373,7 +373,7 @@ impl ArtifactWriter {
         self.committed = true;
         Ok(StreamedArtifact {
             artifact: metadata,
-            sha256: format!("{:x}", self.hasher.clone().finalize()),
+            sha256: hex::encode(self.hasher.clone().finalize()),
             head: String::from_utf8_lossy(&self.head).into_owned(),
             tail: String::from_utf8_lossy(self.tail.make_contiguous()).into_owned(),
             encoded_bytes: self.size,

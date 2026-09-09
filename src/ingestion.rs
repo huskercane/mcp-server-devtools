@@ -598,10 +598,10 @@ impl CanonicalRecord {
             hash.update(labels.to_string().as_bytes());
         }
         format!(
-            "{:?}\0{}\0{:x}",
+            "{:?}\0{}\0{}",
             self.timestamp_ns,
             self.source,
-            hash.finalize()
+            hex::encode(hash.finalize())
         )
     }
 }
@@ -938,7 +938,7 @@ pub async fn validate_partition(
             .checked_add(1)
             .ok_or_else(|| std::io::Error::other("partition record counter overflow"))?;
     }
-    let sha256 = format!("{:x}", hasher.finalize());
+    let sha256 = hex::encode(hasher.finalize());
     if bytes != declared.decoded_bytes || records != declared.records || sha256 != declared.sha256 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,

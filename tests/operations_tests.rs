@@ -147,7 +147,7 @@ async fn backup_restore_verifies_evidence_and_rejects_tampering() {
     let mut manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&manifest_file).unwrap()).unwrap();
     manifest["files"]["journal/audit-journal.jsonl"] =
-        format!("{:x}", Sha256::digest(altered.as_bytes())).into();
+        hex::encode(Sha256::digest(altered.as_bytes())).into();
     std::fs::write(manifest_file, serde_json::to_vec(&manifest).unwrap()).unwrap();
     let rejected = directory.path().join("rejected");
     let output = run(&[
