@@ -46,9 +46,12 @@
 //! - **re-encoded** so the canonical path is pure ASCII in the `pchar` set:
 //!   bytes outside it (space, quotes, non-ASCII UTF-8, …) become `%XX`.
 //!
-//! Redirects and DNS pinning are transport properties: the shared
-//! `reqwest::Client` does not follow redirects across hosts, and the host is
-//! always the configured base.
+//! Redirects and DNS pinning are transport properties, not guarantees of this
+//! canonicalizer. The shared clients currently retain reqwest's default redirect
+//! behavior; canonicalizing the initial path does not authorize later destinations.
+//! Explicit per-hop transport enforcement is tracked as CF-15 in
+//! `docs/enterprise-carry-forward.md`. Do not assume the final host is the
+//! configured base.
 //!
 //! ## Budget
 //!

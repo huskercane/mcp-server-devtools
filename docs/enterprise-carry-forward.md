@@ -460,15 +460,40 @@ configured host) when those vendors get read profiles. The JWKS fetch and
 health probes remain control-plane traffic and stay exempt.
 
 ### CF-15 · Response-provided absolute URLs bypass canonicalization
-**Open · Phase B (with the CircleCI read profile)**
+**Open · Community transport prerequisite; integration expansion step 1**
 
-`transport::fetch_streamed_url` downloads CircleCI's signed log-output URL
-exactly as the vendor response supplied it: no credential is attached, but
-no canonicalization, host pinning, or egress policy applies either. Every
-other outbound request goes through `CanonicalTarget` and the configured
-base. Resolve when CircleCI gets a read profile: either pin the host to an
-allowlist derived from the CircleCI base URL, or fetch the artifact through
-the authenticated API path instead.
+Expanded September 9, 2026. Reuse the byte-to-disk writer, but close these
+three request-path gaps before adding signed-URL/export integrations:
+
+1. `transport::fetch_streamed_url` has no `authorize_egress` call and logs as
+   `streaming-url`. Add originating vendor/tool/principal attribution and
+   destination-origin authorization. Origin is unconditionally new policy
+   context: `CanonicalTarget` has only path/query and `ActionDetails` no host.
+2. `build_client` and `streaming_client` retain reqwest's default redirects.
+   Inventory existing endpoint dependencies before disabling automatic follows;
+   implement policy-authorized, bounded per-hop redirects for supported flows.
+   The canonicalizer comment now describes this gap rather than claiming hosts
+   are pinned. Release the behavior change with compatibility fixtures, release
+   notes, and a Cargo version bump/tag consistent with the release workflow.
+3. Custom credential headers such as `PRIVATE-TOKEN` and `X-Figma-Token` cannot
+   rely on automatic cross-host stripping. Build destination-aware headers for
+   each hop; use GitLab Bearer and never forward the Figma PAT to export hosts.
+
+Also replace unbounded non-success `response.text()` reads in all three paths:
+`fetch_streamed_artifact_with_policy`, `fetch_streamed_url`, and shared `fetch`.
+Declared Content-Length checks alone do not bound actual error bodies.
+
+Exit evidence: blocked absolute/hop targets cause no request; allowed hops
+retain vendor/principal attribution; signed queries are redacted; custom token
+headers do not reach another origin; loops/deadlines/body caps hold; existing
+redirect-dependent endpoints retain documented behavior. Test both HTTP clients
+and all three error readers. Existing credential-bootstrap exceptions remain
+separately tracked in CF-17. SDK/browser network paths need their own adapters.
+
+See [the integration plan](integration-expansion-plan.md#known-transport-gaps--step-1-prerequisites)
+for the implementation contract. This entry, the plan, and the canonicalizer
+comment correction belong in the same documentation commit. Runtime fixes
+remain unimplemented; no release is claimed.
 
 ### CF-9 · `POST /rest/api/3/issue/bulkfetch`
 **Blocked · needs its own review**

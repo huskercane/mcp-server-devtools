@@ -2,7 +2,7 @@
 
 A unified Rust MCP server that connects AI assistants to the developer tools and services they use every day.
 
-One binary exposes 65 tools across Atlassian, CI/CD, observability, collaboration, API development, device management, learning, and financial research platforms. It supports stdio and streamable HTTP, keeps credentials out of tool arguments, and provides bounded output with resumable artifacts for large responses.
+One binary exposes 70 tools across Atlassian, CI/CD, observability, collaboration, API development, device management, learning, and financial research platforms. It supports stdio and streamable HTTP, keeps credentials out of tool arguments, and provides bounded output with resumable artifacts for large responses.
 
 ## Integrations
 
@@ -23,7 +23,7 @@ One binary exposes 65 tools across Atlassian, CI/CD, observability, collaboratio
 | NinjaOne | `ninjaone_login`, `ninjaone_get`, and write verbs | Bearer, session, or console credentials |
 | WRDS | Four `wrds_*` discovery and query tools | WRDS username and password |
 
-`artifact_read` is shared across integrations and lets stdio clients retrieve large temporary artifacts in resumable base64 chunks. WRDS contributes four of the 65 tools and is enabled by the default `wrds` Cargo feature.
+`artifact_read` is shared across integrations and lets stdio clients retrieve large temporary artifacts in resumable base64 chunks. WRDS contributes four of the 70 tools and is enabled by the default `wrds` Cargo feature.
 
 The Bitbucket, Jira, and Confluence behavior is ported from the corresponding [`@aashari` Atlassian MCP servers](https://github.com/aashari). The other integrations are native to this project.
 
