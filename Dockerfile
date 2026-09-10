@@ -28,7 +28,7 @@
 # ---- build ---------------------------------------------------------------
 # Alpine ships musl; aws-lc-sys (the TLS/JWT crypto, via rustls and
 # jsonwebtoken) needs cmake, a C compiler, and perl to build from source.
-FROM rust:1.96-alpine AS build
+FROM rust:1.98-alpine AS build
 RUN apk add --no-cache build-base cmake perl pkgconfig linux-headers
 WORKDIR /src
 # Dependency layer first, so a source-only change does not rebuild the world.

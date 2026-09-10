@@ -27,6 +27,27 @@ pub mod multipart;
 pub mod raw_response;
 mod response_cache;
 
+/// Expire idle cache entries and close observations before the audit writer stops.
+/// The caller must stop serving requests before signaling shutdown.
+pub async fn maintain_response_cache(mut shutdown: tokio::sync::oneshot::Receiver<()>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let closing = tokio::select! {
+            _ = &mut shutdown => true,
+            _ = interval.tick() => false,
+        };
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || response_cache::maintain(closing)).await
+        {
+            tracing::warn!(%error, "cache observation maintenance failed");
+        }
+        if closing {
+            break;
+        }
+    }
+}
+
 /// Re-export of the Bitbucket error parser at its old path. Kept so
 /// downstream tests (`tests/bitbucket_error_tests.rs`) and any external
 /// consumers continue to compile after the parser moved into
@@ -1641,7 +1662,7 @@ pub async fn fetch(
             &body,
             &response_headers,
             &cache_config,
-            duration,
+            start.elapsed(),
             &metadata,
         );
     }

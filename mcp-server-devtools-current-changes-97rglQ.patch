@@ -1,0 +1,1705 @@
+diff --git c/README.md w/README.md
+index ab923fcd1203bdef6c8d04ec54fe148b341ea534..d4208a58b71cd604246885b9946b19e0b4776372 100644
+--- c/README.md
++++ w/README.md
+@@ -95,9 +95,12 @@ arguments, credentials, URLs, cache contents, or response content. Cache keys
+ are represented by short one-way fingerprints so repeated lookups can be
+ correlated safely. Cache events also include the admission action, TTL, age,
+ remaining TTL, response and stored sizes, compression state, upstream latency,
+-and cumulative hit/miss totals. Those observations are suitable for evaluating
+-future cache-admission or TTL bandits offline. Each process keeps at most five
+-10 MiB segments by default and prunes
++and cumulative hit/miss totals. Schema-2 observations include decision IDs,
++action probabilities, cumulative reward components, and terminal outcomes. Optional randomized collection supports
++future cache-admission/TTL experiments; fixed-policy logs alone do not cover
++alternative actions. See [collecting cache-policy training data](docs/cache-training-data.md)
++for setup, reward limitations, retention, and the readiness checker. Each
++process keeps at most five 10 MiB segments by default and prunes
+ prior-session audit data after 30 days or when it exceeds 100 MiB. Configure
+ this with `AUDIT_LOG_MAX_BYTES`, `AUDIT_LOG_MAX_FILES`,
+ `AUDIT_LOG_RETENTION_DAYS`, and `AUDIT_LOG_RETENTION_MAX_BYTES`; set
+diff --git c/docs/cache-training-data.md w/docs/cache-training-data.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..2b3852d5c1fdc4981fd405a2df584c7afbc2e699
+--- /dev/null
++++ w/docs/cache-training-data.md
+@@ -0,0 +1,164 @@
++# Collecting cache-policy training data
++
++Cache observations are written to the existing `~/.mcp/data/*.audit.jsonl`
++stream when audit logging and HTTP caching are enabled. Schema version 2 adds
++correlated decisions, cumulative reward components, terminal outcomes, and an
++optional randomized collection policy. It does not train or load a model.
++
++## Enable collection
++
++Configure each server process that should collect exploratory data:
++
++```dotenv
++HTTP_CACHE_ENABLED=true
++HTTP_CACHE_EXPLORATION_ENABLED=true
++AUDIT_LOG=on
++```
++
++The two `HTTP_CACHE_*` settings can also go in the server working directory’s
++`.env`. Audit settings are process-environment settings; auditing is on by
++default, so ensure `AUDIT_LOG` is not set to `off` in the launch environment.
++
++Restart that process using the rebuilt binary. Installing a new binary without
++restarting existing MCP clients does not update their instrumentation. With
++exploration disabled (the default), the server retains the fixed admission
++policy and still records the richer telemetry as `fixed-v2`.
++
++`collect-v2` samples once after a successful, cache-eligible upstream read,
++using independent randomness from the first byte of a v4 UUID:
++
++| Action | Probability | Behavior |
++|---|---:|---|
++| `admit` | 0.75 | Store for the ordinary, capped TTL. |
++| `admit_half_ttl` | 0.125 | Store for half that TTL. |
++| `reject` | 0.125 | Return the fetched response without storing it. |
++
++These probabilities are represented exactly by 192, 32, and 32 of the 256
++possible byte values. `candidateActions` and `candidateProbabilities` are
++parallel arrays; `actionProbability` is the probability of the selected action.
++`baseTtlMs` defines the full-TTL action for that particular decision. The policy
++never chooses a TTL longer than the fixed policy would have selected.
++
++Exploration can increase upstream request volume. Vendor exclusions (including
++CircleCI status reads), explicit fresh reads, sensitive requests, response cache
++restrictions, and size limits still apply. Response-level exclusions emit
++`http_cache_ineligible`, not randomized decisions. Disabled caching, request-level
++exclusions, and upstream failures do not produce admission decisions.
++
++The sample is **per admission opportunity**, not per user or session. Multiple
++concurrent misses can produce separate decisions for the same key; replacement
++closes the earlier entry. A rejected concurrent admission leaves any existing
++entry untouched. Consequently, this is data for an entry-residency objective;
++it is not by itself an unbiased estimate of a different policy's long-run
++request volume or workload distribution.
++
++## Recorded fields and joins
++
++All cache records have `schemaVersion: 2`, `serverVersion`, `sessionId`, and a
++process-local `cacheEventSequence`. Sequence numbers may arrive out of order
++under concurrency; gaps in a retained snapshot identify missing records, such
++as retention/rotation loss, failed writes, or incomplete collection. Audit write
++failures produce a diagnostic warning. JSONL remains best-effort telemetry, not
++the enterprise durable compliance journal.
++
++Join decision, lookup, and outcome records using `(sessionId, decisionId)`.
++Do not rely on line order or timestamps to identify an entry: two requests can
++race. There is one terminal record per removed entry during normal execution.
++
++- **Decision context:** vendor, hashed resource identity, baseline TTL and its
++  source, validator presence, response bytes, would-be stored bytes,
++  compression state/cost, upstream fetch latency, cache occupancy before the
++  decision, and configured cache limits.
++- **Action:** policy version, candidate actions and their probabilities,
++  selected action/probability, and chosen TTL.
++- **Progress:** each hit includes cumulative hit count, estimated saved latency,
++  decode cost, byte-milliseconds of residency, entry age, and remaining TTL.
++- **Correlation:** `originCallId`/`originTool` identify the admitting tool call;
++  `callId`/`tool` identify the call causing the current event when available.
++  Maintenance events have no current tool call. Task-local correlation is not
++  automatically inherited by separately spawned tasks; decision IDs remain
++  the authoritative join even when call correlation is absent.
++
++Resource fingerprints are domain-separated SHA-256 hashes of vendor plus full
++URL, with no identity component. Cache-key fingerprints also partition by
++credentials, representation, and owner as before. Neither field logs the URL,
++arguments, headers, credentials, or response contents. Resource fingerprints in
++schema 2 are not interchangeable with older fingerprint algorithms.
++
++Context fields describe information available **after fetching and preparing a
++response, before choosing its admission/TTL**. `entriesBefore` and
++`cacheBytesBefore` are inputs; `entries` and `cacheBytes` are post-action cache
++state and must not be used as decision-time features. Likewise, hit counts,
++remaining TTL at a later lookup, residency, and saved latency are outcome data,
++not training features. `tool` on an invalidation event describes the invalidating
++call, not the original decision context; use `originTool` for that context.
++
++## Outcomes and reward semantics
++
++Terminal outcomes are `expired`, `evicted`, `invalidated`, `replaced`,
++`rejected`, `decode_failed`, or `session_end`. A once-per-second maintenance
++pass expires idle entries, so collecting an outcome no longer depends on a
++subsequent lookup. Clean process shutdown expires overdue entries, closes
++survivors, and then drains the audit writer.
++
++`observationComplete` is false for `session_end` and `decode_failed`: these
++records contain partial measurements and must not be treated as completed
++zero-reward observations. A hard kill may leave no terminal event; retain any
++hit progress as partial evidence, or exclude the decision from complete-case
++training. Complete-case filtering can itself bias the sample, so report
++censoring by action/session and choose its treatment explicitly.
++
++The raw reward components let a future trainer choose its tradeoff:
++
++- `estimatedSavedLatencyMs = hitCount × upstreamLatencyMs`. In schema 2 the
++  upstream measurement includes fetching and classifying the response body,
++  not just receiving HTTP headers. It is an estimate of avoided work, not a
++  measured counterfactual or proof that the cache stayed fresh.
++- `decodeDurationUs` is cumulative local cache decoding time, including a
++  failed decode attempt. `compressionDurationUs` measures storage preparation
++  after serialization; it includes the compression attempt when applicable.
++  Preparation happens before sampling, so rejected admissions also pay this
++  cost. Serialization, lookup, and locking overhead are not included in these
++  two counters.
++- `residencyByteMs` measures stored **payload** bytes times elapsed residency.
++  It includes the maintenance delay after TTL expiry, because the bytes really
++  remain allocated until removal. It excludes key/metadata overhead.
++- Rejection has zero saved latency and zero residency by definition of this
++  entry-level objective; it does not claim the rejected resource will never
++  be reused. `entryBytes` on rejection is the would-be stored size.
++
++For example, an experiment could optimize estimated saved time minus decode
++and compression costs and a weighted byte-time cost. Choose and version those
++weights in the trainer, and keep units consistent. Longer TTLs also have a
++freshness tradeoff that these observations do not label: validator **presence**
++does not measure stale responses. This collection policy only shortens existing
++TTLs and does not authorize learning a policy that exceeds them.
++
++## Check the accumulated data
++
++```bash
++python3 scripts/operations/cache-training-readiness.py ~/.mcp/data
++```
++
++The checker reads current and rotated audit segments without changing them.
++It reports corrupt records, schema/policy coverage, sequence gaps, duplicate or
++unmatched IDs, censored outcomes, complete exploratory counts by action/vendor,
++positive-hit outcomes, and independent session count. Older logs remain useful
++for baseline analysis, but their missing fields are not fabricated. Pre-schema-2
++decisions are reported separately as legacy data, not invalid policy records.
++
++Do not declare readiness from the total number of JSONL lines. Require useful
++complete coverage for every sampled action in the target workload, sufficient
++independent sessions and positive outcomes, and a chosen reward. Evaluate on
++held-out sessions or later dates, retaining a fixed-policy baseline. Report
++uncertainty and censoring rather than assuming any fixed row count guarantees
++readiness. Before adopting a learned policy, validate its actual workload-level
++benefit online as well as its entry-level offline objective.
++
++Default audit retention is 30 days/100 MiB across prior sessions and five
++10 MiB segments per process. For longer collection, archive closed session
++files to a separate dataset directory or deliberately increase
++`AUDIT_LOG_RETENTION_DAYS`, `AUDIT_LOG_RETENTION_MAX_BYTES`,
++`AUDIT_LOG_MAX_BYTES`, and `AUDIT_LOG_MAX_FILES`. Never train while files are
++being rewritten: use a snapshot of closed sessions, and retain whole sessions
++when splitting training from validation.
+diff --git c/docs/configuration.md w/docs/configuration.md
+index 1ee1bad46f3f0fedca9b3fc0c72afe64f3cb5ce0..7d0d7b36545959e886a0cace12093794b80c389a 100644
+--- c/docs/configuration.md
++++ w/docs/configuration.md
+@@ -114,6 +114,7 @@ These settings use the same three-source cascade. When placed in `configs.json`,
+ |---|---|---|
+ | `ATLASSIAN_REQUEST_TIMEOUT` | `30000` ms; positive integer | Shared upstream HTTP request timeout. Despite the historical name, it applies to the shared HTTP transport. |
+ | `HTTP_CACHE_ENABLED` | `false` | Enables the bounded in-process cache for successful upstream reads. |
++| `HTTP_CACHE_EXPLORATION_ENABLED` | `false` | Samples normal TTL (75%), half TTL (12.5%), or reject (12.5%) for eligible admissions. Can increase upstream traffic; see [cache training data](cache-training-data.md). |
+ | `HTTP_CACHE_DEFAULT_TTL_SECONDS` | `60`; positive integer | TTL used when the upstream response provides no usable cache lifetime. |
+ | `HTTP_CACHE_MAX_TTL_SECONDS` | `3600`; positive integer | Maximum admitted TTL. |
+ | `HTTP_CACHE_MAX_ENTRIES` | `512`; positive integer | Maximum cached response count. |
+diff --git c/scripts/operations/cache-training-readiness.py w/scripts/operations/cache-training-readiness.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..473c6e7f785a15e476de3501c906304ebe388d25
+--- /dev/null
++++ w/scripts/operations/cache-training-readiness.py
+@@ -0,0 +1,115 @@
++#!/usr/bin/env python3
++"""Inspect cache observations read-only; report coverage, never infer absent rewards."""
++
++import argparse
++import collections
++import json
++import math
++from pathlib import Path
++
++
++def inspect(directory):
++    events = collections.Counter()
++    policies = collections.Counter()
++    decisions = {}
++    outcomes = {}
++    corrupt = []
++    duplicate_decisions = 0
++    duplicate_outcomes = 0
++    invalid_policies = 0
++    legacy_decisions = 0
++    legacy_tracked = 0
++    sequences = collections.defaultdict(set)
++    duplicate_sequences = 0
++    files = sorted(directory.glob("*.audit.jsonl*"))
++    for path in files:
++        with path.open(encoding="utf-8", errors="replace") as stream:
++            for line_number, line in enumerate(stream, 1):
++                try:
++                    row = json.loads(line)
++                    if not isinstance(row, dict) or not isinstance(row.get("event"), str):
++                        raise ValueError("expected event object")
++                    if not isinstance(row.get("sessionId"), str):
++                        raise ValueError("expected session ID")
++                    if "decisionId" in row and not isinstance(row["decisionId"], str):
++                        raise ValueError("expected decision ID")
++                except (ValueError, TypeError):
++                    corrupt.append({"file": path.name, "line": line_number})
++                    continue
++                event = row.get("event", "unknown")
++                events[event] += 1
++                sequence = row.get("cacheEventSequence")
++                if isinstance(sequence, int) and sequence > 0:
++                    seen = sequences[row.get("sessionId")]
++                    duplicate_sequences += sequence in seen
++                    seen.add(sequence)
++                if event not in ("http_cache_decision", "http_cache_outcome"):
++                    continue
++                identity = (row.get("sessionId"), row.get("decisionId"))
++                if not all(identity):
++                    legacy_decisions += event == "http_cache_decision"
++                    continue
++                if event == "http_cache_outcome":
++                    duplicate_outcomes += identity in outcomes
++                    outcomes[identity] = row
++                    continue
++                duplicate_decisions += identity in decisions
++                decisions[identity] = row
++                policies[row.get("policyVersion", "missing")] += 1
++                if row.get("schemaVersion") != 2:
++                    legacy_tracked += 1
++                elif not valid_policy(row):
++                    invalid_policies += 1
++
++    closed = decisions.keys() & outcomes.keys()
++    complete = {key for key in closed if outcomes[key].get("observationComplete") is True}
++    exploratory = {key for key in complete if decisions[key].get("schemaVersion") == 2 and decisions[key].get("policyVersion") == "collect-v2" and valid_policy(decisions[key])}
++    return {
++        "files": len(files),
++        "events": dict(events),
++        "corruptRecords": corrupt,
++        "legacyDecisionsWithoutIds": legacy_decisions,
++        "legacyTrackedDecisions": legacy_tracked,
++        "trackedDecisions": len(decisions),
++        "policies": dict(policies),
++        "invalidPolicyRecords": invalid_policies,
++        "duplicateDecisions": duplicate_decisions,
++        "duplicateOutcomes": duplicate_outcomes,
++        "duplicateCacheSequences": duplicate_sequences,
++        "missingCacheSequences": sum(max(seen) - len(seen) for seen in sequences.values()),
++        "matchedTerminalOutcomes": len(closed),
++        "missingTerminalOutcomes": len(decisions.keys() - outcomes.keys()),
++        "orphanOutcomes": len(outcomes.keys() - decisions.keys()),
++        "explicitlyCompleteOutcomes": len(complete),
++        "censoredOrLegacyTerminalOutcomes": len(closed - complete),
++        "completeExploratoryDecisionsByAction": dict(collections.Counter(decisions[key]["action"] for key in exploratory)),
++        "completeExploratorySessions": len({key[0] for key in exploratory}),
++        "completeExploratoryVendors": dict(collections.Counter(decisions[key].get("vendor", "unknown") for key in exploratory)),
++        "completeExploratoryPositiveHitOutcomes": sum(outcomes[key].get("hitCount", 0) > 0 for key in exploratory),
++        "assessment": "Coverage report only: training readiness also requires a chosen reward, independent validation sessions, and acceptable uncertainty. Missing outcomes are not zero rewards.",
++    }
++
++
++def valid_policy(row):
++    actions = row.get("candidateActions")
++    probabilities = row.get("candidateProbabilities")
++    if not isinstance(actions, list) or not actions or not all(isinstance(a, str) for a in actions) or len(set(actions)) != len(actions):
++        return False
++    if not isinstance(probabilities, list) or len(actions) != len(probabilities):
++        return False
++    if not all(isinstance(p, (int, float)) and not isinstance(p, bool) and math.isfinite(p) and 0 < p <= 1 for p in probabilities):
++        return False
++    if not math.isclose(sum(probabilities), 1.0):
++        return False
++    action = row.get("action")
++    probability = row.get("actionProbability")
++    return action in actions and isinstance(probability, (int, float)) and not isinstance(probability, bool) and math.isclose(probability, probabilities[actions.index(action)])
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("directory", nargs="?", type=Path, default=Path.home() / ".mcp/data")
++    args = parser.parse_args()
++    if not args.directory.is_dir():
++        parser.error("directory does not exist")
++    print(json.dumps(inspect(args.directory), indent=2, sort_keys=True))
+diff --git c/scripts/operations/test_cache_training_readiness.py w/scripts/operations/test_cache_training_readiness.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b04dc3f1073f936cb6ebf622eb2ecc3ef591a69f
+--- /dev/null
++++ w/scripts/operations/test_cache_training_readiness.py
+@@ -0,0 +1,39 @@
++import importlib.util
++import json
++from pathlib import Path
++import tempfile
++import unittest
++
++spec = importlib.util.spec_from_file_location("readiness", Path(__file__).with_name("cache-training-readiness.py"))
++readiness = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(readiness)
++
++
++class ReadinessTests(unittest.TestCase):
++    def test_counts_closed_missing_censored_and_corrupt_without_imputing_rewards(self):
++        base = {"schemaVersion": 2, "sessionId": "s", "policyVersion": "collect-v2", "vendor": "test", "event": "http_cache_decision", "action": "admit", "candidateActions": ["reject", "admit_half_ttl", "admit"], "candidateProbabilities": [0.125, 0.125, 0.75], "actionProbability": 0.75}
++        rows = [dict(base, decisionId=str(n), cacheEventSequence=n + 1) for n in range(3)]
++        rows.extend([
++            {"sessionId": "s", "decisionId": "0", "event": "http_cache_outcome", "observationComplete": True, "hitCount": 1, "cacheEventSequence": 5},
++            {"sessionId": "s", "decisionId": "1", "event": "http_cache_outcome", "observationComplete": False, "hitCount": 0, "cacheEventSequence": 6},
++        ])
++        with tempfile.TemporaryDirectory() as folder:
++            path = Path(folder) / "test.audit.jsonl"
++            path.write_text("\n".join(json.dumps(r) for r in rows) + "\n\x00damaged\n")
++            result = readiness.inspect(Path(folder))
++        self.assertEqual(result["missingTerminalOutcomes"], 1)
++        self.assertEqual(result["censoredOrLegacyTerminalOutcomes"], 1)
++        self.assertEqual(result["completeExploratoryDecisionsByAction"], {"admit": 1})
++        self.assertEqual(result["completeExploratoryPositiveHitOutcomes"], 1)
++        self.assertEqual(result["missingCacheSequences"], 1)
++        self.assertEqual(result["corruptRecords"], [{"file": "test.audit.jsonl", "line": 6}])
++
++    def test_policy_probabilities_must_describe_the_selected_action(self):
++        base = {"action": "admit", "candidateActions": ["reject", "admit"], "candidateProbabilities": [0.25, 0.75], "actionProbability": 0.75}
++        self.assertTrue(readiness.valid_policy(base))
++        for update in [{"actionProbability": 1.0}, {"candidateProbabilities": [0, 1]}, {"candidateProbabilities": [0.5, 0.75]}, {"action": "unknown"}, {"candidateProbabilities": [float("nan"), 0.75]}]:
++            self.assertFalse(readiness.valid_policy(dict(base, **update)))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git c/src/audit/mod.rs w/src/audit/mod.rs
+index 62a21d8b8e05c95aaa390dfa604e11d689fa36d4..38fd1b93b580afdb7587783604970f6902a90f25 100644
+--- c/src/audit/mod.rs
++++ w/src/audit/mod.rs
+@@ -17,6 +17,7 @@ pub mod verify;
+ use std::fs::{File, OpenOptions};
+ use std::io::{self, Write};
+ use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::{Mutex, OnceLock, mpsc};
+ use std::time::{Duration, Instant, SystemTime};
+ 
+@@ -30,6 +31,7 @@ const DEFAULT_RETENTION_DAYS: u64 = 30;
+ const DEFAULT_RETENTION_MAX_BYTES: u64 = 100 * 1024 * 1024;
+ 
+ static AUDIT_LOG: OnceLock<Option<AuditLog>> = OnceLock::new();
++static CACHE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+ 
+ struct AuditLog {
+     session_id: String,
+@@ -70,29 +72,13 @@ struct AuditRecord<'a> {
+     duration_ms: Option<u128>,
+ }
+ 
+-#[derive(Serialize)]
+-#[serde(rename_all = "camelCase")]
+-pub(crate) struct CacheEvent<'a> {
+-    pub timestamp: String,
+-    pub event: &'static str,
+-    pub session_id: &'a str,
+-    pub process_id: u32,
+-    pub vendor: &'a str,
+-    pub cache_key: &'a str,
+-    pub outcome: &'a str,
+-    pub reason: Option<&'a str>,
+-    pub action: Option<&'a str>,
+-    pub ttl_ms: Option<u128>,
+-    pub age_ms: Option<u128>,
+-    pub remaining_ttl_ms: Option<u128>,
+-    pub upstream_latency_ms: Option<u128>,
+-    pub response_bytes: Option<usize>,
+-    pub entry_bytes: Option<usize>,
+-    pub compressed: Option<bool>,
+-    pub cumulative_hits: u64,
+-    pub cumulative_misses: u64,
+-    pub entries: usize,
+-    pub cache_bytes: usize,
++tokio::task_local! {
++    static CACHE_CALL: (String, String);
++}
++
++/// Capture correlation before moving cache work onto a blocking worker.
++pub(crate) fn cache_call() -> Option<(String, String)> {
++    CACHE_CALL.try_with(Clone::clone).ok()
+ }
+ 
+ /// In-flight tool-call audit state. Dropping it without calling [`complete`]
+@@ -139,6 +125,13 @@ impl AuditCall {
+         call
+     }
+ 
++    /// Correlate cache telemetry with this tool call, independently of policy mode.
++    pub async fn scope<F: std::future::Future>(&self, future: F) -> F::Output {
++        CACHE_CALL
++            .scope((self.call_id.clone(), self.tool.clone()), future)
++            .await
++    }
++
+     pub fn complete(self, outcome: &str) {
+         let duration_ms = self.started.elapsed().as_millis();
+         write_record(
+@@ -207,14 +200,34 @@ pub fn shutdown() {
+ 
+ /// Record cache-policy context and outcomes without exposing URLs,
+ /// credentials, or response data.
+-pub(crate) fn cache_event(mut event: CacheEvent<'_>) {
++pub(crate) fn cache_event(event: &impl Serialize) {
++    #[derive(Serialize)]
++    #[serde(rename_all = "camelCase")]
++    struct Envelope<'a, T> {
++        timestamp: String,
++        schema_version: u32,
++        cache_event_sequence: u64,
++        server_version: &'static str,
++        session_id: &'a str,
++        process_id: u32,
++        #[serde(flatten)]
++        event: &'a T,
++    }
+     let Some(log) = AUDIT_LOG.get().and_then(Option::as_ref) else {
+         return;
+     };
+-    event.timestamp = crate::logger::iso_timestamp();
+-    event.session_id = &log.session_id;
+-    event.process_id = std::process::id();
+-    write_json(log, &event);
++    write_json(
++        log,
++        &Envelope {
++            timestamp: crate::logger::iso_timestamp(),
++            schema_version: 2,
++            cache_event_sequence: CACHE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1,
++            server_version: crate::constants::VERSION,
++            session_id: &log.session_id,
++            process_id: std::process::id(),
++            event,
++        },
++    );
+ }
+ 
+ fn write_record(call: &AuditCall, event: &str, outcome: Option<&str>, duration_ms: Option<u128>) {
+@@ -249,7 +262,9 @@ fn audit_worker(mut writer: RotatingWriter, receiver: &mpsc::Receiver<AuditMessa
+     while let Ok(message) = receiver.recv() {
+         match message {
+             AuditMessage::Record(line) => {
+-                let _ = writer.write_record(&line);
++                if let Err(error) = writer.write_record(&line) {
++                    tracing::warn!(kind = ?error.kind(), "audit record write failed; collected observations may be incomplete");
++                }
+             }
+             AuditMessage::Shutdown => break,
+         }
+diff --git c/src/main.rs w/src/main.rs
+index 72651588b5ea8efccf4848a4980c3edf9e800c32..8f90a0ac33878374da3f95596f87daa4437d1527 100644
+--- c/src/main.rs
++++ w/src/main.rs
+@@ -14,6 +14,10 @@ use mcp_server_devtools::{audit, cli, logger, server, transport::raw_response};
+ async fn main() -> ExitCode {
+     logger::init();
+     raw_response::init();
++    let (cache_shutdown, cache_stopped) = tokio::sync::oneshot::channel();
++    let cache_worker = tokio::spawn(mcp_server_devtools::transport::maintain_response_cache(
++        cache_stopped,
++    ));
+ 
+     let args: Vec<String> = std::env::args().collect();
+     let exit = if args.len() > 1 {
+@@ -39,6 +43,8 @@ async fn main() -> ExitCode {
+         }
+     };
+     raw_response::shutdown_and_cleanup().await;
+-    audit::shutdown();
++    let _ = cache_shutdown.send(());
++    let _ = cache_worker.await;
++    let _ = tokio::task::spawn_blocking(audit::shutdown).await;
+     exit
+ }
+diff --git c/src/tools/mod.rs w/src/tools/mod.rs
+index 60e78eb5a90049ef40ee935508256c6c11586968..879b6a2301c5a709d1ca8c230d7064906db5ad4e 100644
+--- c/src/tools/mod.rs
++++ w/src/tools/mod.rs
+@@ -1076,16 +1076,20 @@ impl ServerHandler for DevtoolsServer {
+         // being handed it. Local mode sets no scope and pays nothing.
+         let tool_context =
+             rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+-        let mut result = match &enterprise {
+-            Some(call) => {
+-                crate::policy::CallScope::enter(
+-                    Arc::clone(&call.scope),
+-                    self.tool_router.call(tool_context),
+-                )
+-                .await
+-            }
+-            None => self.tool_router.call(tool_context).await,
+-        };
++        let mut result = audit
++            .scope(async {
++                match &enterprise {
++                    Some(call) => {
++                        crate::policy::CallScope::enter(
++                            Arc::clone(&call.scope),
++                            self.tool_router.call(tool_context),
++                        )
++                        .await
++                    }
++                    None => self.tool_router.call(tool_context).await,
++                }
++            })
++            .await;
+         // Plan §3.7: the upstream identity goes in structured result
+         // metadata, never appended to text content. Enterprise mode only;
+         // a local-mode result is byte-for-byte what it was.
+diff --git c/src/transport/mod.rs w/src/transport/mod.rs
+index 00bf653d24c35b3949dc4799f04e70ab123de647..5d2fd485bcf7606c77a07777ceb31ed2cd13b9e3 100644
+--- c/src/transport/mod.rs
++++ w/src/transport/mod.rs
+@@ -27,6 +27,27 @@ pub mod multipart;
+ pub mod raw_response;
+ mod response_cache;
+ 
++/// Expire idle cache entries and close observations before the audit writer stops.
++/// The caller must stop serving requests before signaling shutdown.
++pub async fn maintain_response_cache(mut shutdown: tokio::sync::oneshot::Receiver<()>) {
++    let mut interval = tokio::time::interval(Duration::from_secs(1));
++    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
++    loop {
++        let closing = tokio::select! {
++            _ = &mut shutdown => true,
++            _ = interval.tick() => false,
++        };
++        if let Err(error) =
++            tokio::task::spawn_blocking(move || response_cache::maintain(closing)).await
++        {
++            tracing::warn!(%error, "cache observation maintenance failed");
++        }
++        if closing {
++            break;
++        }
++    }
++}
++
+ /// Re-export of the Bitbucket error parser at its old path. Kept so
+ /// downstream tests (`tests/bitbucket_error_tests.rs`) and any external
+ /// consumers continue to compile after the parser moved into
+@@ -1641,7 +1662,7 @@ pub async fn fetch(
+             &body,
+             &response_headers,
+             &cache_config,
+-            duration,
++            start.elapsed(),
+             &metadata,
+         );
+     }
+diff --git c/src/transport/response_cache.rs w/src/transport/response_cache.rs
+index b94d15ddbb0e38ab12e493585db6478edf9a0493..b0113a060b501ee97ed2267652e520d1746b6492 100644
+--- c/src/transport/response_cache.rs
++++ w/src/transport/response_cache.rs
+@@ -2,12 +2,15 @@
+ 
+ use std::collections::HashMap;
+ use std::io::Cursor;
+-use std::sync::{Mutex, OnceLock};
++use std::sync::{Arc, Mutex, OnceLock};
+ use std::time::{Duration, Instant, SystemTime};
+ 
+ use http::header::{CACHE_CONTROL, EXPIRES, HeaderMap, HeaderName, HeaderValue, SET_COOKIE, VARY};
+ use sha2::{Digest, Sha256};
+-use tracing::{debug, warn};
++use tracing::warn;
++
++mod observation;
++use observation::{Decision, Snapshot};
+ 
+ use super::{CacheMetadata, RequestOptions, ResponseBody};
+ use crate::config::Config;
+@@ -25,12 +28,14 @@ pub(super) struct CacheConfig {
+     max_entries: usize,
+     max_bytes: usize,
+     compression_threshold: usize,
++    exploration: bool,
+ }
+ 
+ impl CacheConfig {
+     pub fn from_config(config: &Config) -> Self {
+         Self {
+             enabled: config.get_bool("HTTP_CACHE_ENABLED", false),
++            exploration: config.get_bool("HTTP_CACHE_EXPLORATION_ENABLED", false),
+             default_ttl: seconds(
+                 config,
+                 "HTTP_CACHE_DEFAULT_TTL_SECONDS",
+@@ -156,6 +161,9 @@ struct Entry {
+     response_bytes: usize,
+     upstream_latency_ms: u128,
+     last_used: u64,
++    decision: Arc<Decision>,
++    hit_count: u64,
++    decode_duration_us: u128,
+ }
+ 
+ impl Entry {
+@@ -210,95 +218,70 @@ pub(super) fn request_is_cacheable(
+ }
+ 
+ pub(super) fn get(key: &CacheKey) -> Option<(ResponseBody, CacheMetadata)> {
+-    let fingerprint = key.audit_fingerprint();
+     let mut cache = cache().lock().ok()?;
+     let now = Instant::now();
+     let expired = cache
+         .entries
+         .get(key)
+         .is_some_and(|entry| entry.expires_at <= now);
+-    let mut reason = "not_found";
+-    let mut ttl_ms = None;
+-    let mut age_ms = None;
+-    let mut remaining_ttl_ms = None;
+-    let mut upstream_latency_ms = None;
+-    let mut response_bytes = None;
+-    let mut entry_bytes = None;
+-    let mut compressed = None;
+-    if expired {
+-        if let Some(entry) = cache.entries.get(key) {
+-            reason = "expired";
+-            ttl_ms = Some(entry.ttl.as_millis());
+-            age_ms = Some(now.saturating_duration_since(entry.stored_at).as_millis());
+-            remaining_ttl_ms = Some(0);
+-            upstream_latency_ms = Some(entry.upstream_latency_ms);
+-            response_bytes = Some(entry.response_bytes);
+-            entry_bytes = Some(entry.stored_bytes);
+-            compressed = Some(matches!(&entry.bytes, StoredBytes::Zstd(_)));
+-        }
+-        remove(&mut cache, key);
+-    }
++    let ended = if expired {
++        remove(&mut cache, key)
++    } else {
++        None
++    };
+     cache.clock = cache.clock.wrapping_add(1);
+     let tick = cache.clock;
++    let mut snapshot = None;
+     let result = cache.entries.get_mut(key).and_then(|entry| {
+         entry.last_used = tick;
+-        reason = "reused";
+-        ttl_ms = Some(entry.ttl.as_millis());
+-        age_ms = Some(now.saturating_duration_since(entry.stored_at).as_millis());
+-        remaining_ttl_ms = Some(entry.expires_at.saturating_duration_since(now).as_millis());
+-        upstream_latency_ms = Some(entry.upstream_latency_ms);
+-        response_bytes = Some(entry.response_bytes);
+-        entry_bytes = Some(entry.stored_bytes);
+-        compressed = Some(matches!(&entry.bytes, StoredBytes::Zstd(_)));
+-        let body = entry.decode()?;
+-        Some((
+-            body,
+-            CacheMetadata {
+-                hit: true,
+-                age_ms: now.saturating_duration_since(entry.stored_at).as_millis(),
+-                fetched_at: entry.fetched_at.clone(),
+-            },
+-        ))
+-    });
+-    let outcome = if result.is_some() {
+-        cache.hits = cache.hits.saturating_add(1);
+-        "hit"
+-    } else {
+-        if reason == "reused" {
+-            reason = "decode_failed";
++        let started = Instant::now();
++        let body = entry.decode();
++        entry.decode_duration_us = entry
++            .decode_duration_us
++            .saturating_add(started.elapsed().as_micros());
++        if body.is_some() {
++            entry.hit_count = entry.hit_count.saturating_add(1);
+         }
+-        cache.misses = cache.misses.saturating_add(1);
+-        "miss"
+-    };
+-    let (hits, misses, entries, stored_bytes) = (
+-        cache.hits,
+-        cache.misses,
+-        cache.entries.len(),
+-        cache.stored_bytes,
+-    );
+-    drop(cache);
+-    crate::audit::cache_event(crate::audit::CacheEvent {
+-        timestamp: String::new(),
+-        event: "http_cache_lookup",
+-        session_id: "",
+-        process_id: 0,
+-        vendor: &key.vendor,
+-        cache_key: &fingerprint,
+-        outcome,
+-        reason: Some(reason),
+-        action: None,
+-        ttl_ms,
+-        age_ms,
+-        remaining_ttl_ms,
+-        upstream_latency_ms,
+-        response_bytes,
+-        entry_bytes,
+-        compressed,
+-        cumulative_hits: hits,
+-        cumulative_misses: misses,
+-        entries,
+-        cache_bytes: stored_bytes,
++        snapshot = Some(Snapshot::new(entry, now));
++        body.map(|body| {
++            (
++                body,
++                CacheMetadata {
++                    hit: true,
++                    age_ms: now.saturating_duration_since(entry.stored_at).as_millis(),
++                    fetched_at: entry.fetched_at.clone(),
++                },
++            )
++        })
+     });
++    let reason = if result.is_some() {
++        "reused"
++    } else if expired {
++        "expired"
++    } else if snapshot.is_some() {
++        "decode_failed"
++    } else {
++        "not_found"
++    };
++    if result.is_some() {
++        cache.hits = cache.hits.saturating_add(1);
++    } else {
++        cache.misses = cache.misses.saturating_add(1);
++    }
++    let failed = if reason == "decode_failed" {
++        remove(&mut cache, key)
++    } else {
++        None
++    };
++    let totals = observation::Totals::new(&cache);
++    drop(cache);
++    if let Some(entry) = ended {
++        observation::outcome(&entry, now, "expired", totals);
++    }
++    if let Some(entry) = failed {
++        observation::outcome(&entry, now, "decode_failed", totals);
++    }
++    observation::lookup(key, snapshot.as_ref(), result.is_some(), reason, totals);
+     result
+ }
+ 
+@@ -310,28 +293,35 @@ pub(super) fn store(
+     upstream_latency: Duration,
+     metadata: &CacheMetadata,
+ ) {
+-    if headers.contains_key(SET_COOKIE)
++    let blocked = headers.contains_key(SET_COOKIE)
+         && !key
+             .url
+             .to_ascii_lowercase()
+-            .contains("/webapp/sessionproperties")
+-    {
++            .contains("/webapp/sessionproperties");
++    let lifetime = response_ttl(headers, config);
++    if blocked || lifetime.is_none() {
++        observation::ineligible(
++            &key,
++            if blocked {
++                "set_cookie"
++            } else {
++                "response_cache_policy"
++            },
++        );
+         return;
+     }
+-    let Some(ttl) = response_ttl(headers, config) else {
++    let Some((base_ttl, ttl_source)) = lifetime else {
+         return;
+     };
+-    let (kind, plain) = match body {
+-        ResponseBody::Json(value) => match serde_json::to_vec(value) {
+-            Ok(bytes) => (BodyKind::Json, bytes),
+-            Err(_) => return,
+-        },
+-        ResponseBody::Text(text) => (BodyKind::Text, text.as_bytes().to_vec()),
+-        ResponseBody::Empty => (BodyKind::Empty, Vec::new()),
++    let Some((kind, plain)) = encode_body(body) else {
++        return;
+     };
+-    if plain.len() > config.max_bytes / 2 {
++    let response_bytes = plain.len();
++    if response_bytes > config.max_bytes / 2 {
++        observation::ineligible(&key, "response_too_large");
+         return;
+     }
++    let compression_started = Instant::now();
+     let bytes = if plain.len() >= config.compression_threshold {
+         match zstd::stream::encode_all(Cursor::new(&plain), 1) {
+             Ok(compressed) if compressed.len() < plain.len() => StoredBytes::Zstd(compressed),
+@@ -340,13 +330,17 @@ pub(super) fn store(
+     } else {
+         StoredBytes::Plain(plain)
+     };
++    let compression_duration_us = compression_started.elapsed().as_micros();
+     let stored_bytes = match &bytes {
+         StoredBytes::Plain(bytes) | StoredBytes::Zstd(bytes) => bytes.len(),
+     };
+-    let compressed = matches!(&bytes, StoredBytes::Zstd(_));
+-    let response_bytes = plain_len(body);
+-    let fingerprint = key.audit_fingerprint();
+-    let vendor = key.vendor.clone();
++    let choice = observation::choose(
++        config.exploration,
++        base_ttl,
++        uuid::Uuid::new_v4().as_bytes()[0],
++    );
++    let mut decision = Decision::new(&key, headers, config, choice, ttl_source);
++    decision.compression_duration_us = compression_duration_us;
+     let mut cache = match cache().lock() {
+         Ok(cache) => cache,
+         Err(error) => {
+@@ -354,91 +348,112 @@ pub(super) fn store(
+             return;
+         }
+     };
+-    remove(&mut cache, &key);
+-    cache.clock = cache.clock.wrapping_add(1);
+-    let tick = cache.clock;
++    decision.entries_before = cache.entries.len();
++    decision.cache_bytes_before = cache.stored_bytes;
+     let now = Instant::now();
++    let mut entry = Entry {
++        kind,
++        bytes,
++        stored_bytes,
++        expires_at: now + choice.ttl,
++        stored_at: now,
++        fetched_at: metadata.fetched_at.clone(),
++        ttl: choice.ttl,
++        response_bytes,
++        upstream_latency_ms: upstream_latency.as_millis(),
++        last_used: 0,
++        decision: Arc::new(decision),
++        hit_count: 0,
++        decode_duration_us: 0,
++    };
++    let snapshot = Snapshot::new(&entry, now);
++    // A rejected admission has no residency or saved-latency reward. Its
++    // compression work is still charged, because it was actually performed.
++    if choice.action == "reject" {
++        let totals = observation::Totals::new(&cache);
++        drop(cache);
++        observation::decision(&snapshot, totals);
++        observation::outcome(&entry, now, "rejected", totals);
++        return;
++    }
++    let replaced = remove(&mut cache, &key);
++    cache.clock = cache.clock.wrapping_add(1);
++    entry.last_used = cache.clock;
+     cache.stored_bytes += stored_bytes;
+-    cache.entries.insert(
+-        key,
+-        Entry {
+-            kind,
+-            bytes,
+-            stored_bytes,
+-            expires_at: now + ttl,
+-            stored_at: now,
+-            fetched_at: metadata.fetched_at.clone(),
+-            ttl,
+-            response_bytes,
+-            upstream_latency_ms: upstream_latency.as_millis(),
+-            last_used: tick,
+-        },
+-    );
+-    evict(&mut cache, config);
+-    let (hits, misses, entries, cache_bytes) = (
+-        cache.hits,
+-        cache.misses,
+-        cache.entries.len(),
+-        cache.stored_bytes,
+-    );
++    cache.entries.insert(key, entry);
++    let evicted = evict(&mut cache, config);
++    let totals = observation::Totals::new(&cache);
+     drop(cache);
+-    crate::audit::cache_event(crate::audit::CacheEvent {
+-        timestamp: String::new(),
+-        event: "http_cache_decision",
+-        session_id: "",
+-        process_id: 0,
+-        vendor: &vendor,
+-        cache_key: &fingerprint,
+-        outcome: "stored",
+-        reason: Some("cacheable_success"),
+-        action: Some("admit"),
+-        ttl_ms: Some(ttl.as_millis()),
+-        age_ms: Some(0),
+-        remaining_ttl_ms: Some(ttl.as_millis()),
+-        upstream_latency_ms: Some(upstream_latency.as_millis()),
+-        response_bytes: Some(response_bytes),
+-        entry_bytes: Some(stored_bytes),
+-        compressed: Some(compressed),
+-        cumulative_hits: hits,
+-        cumulative_misses: misses,
+-        entries,
+-        cache_bytes,
+-    });
+-}
+-
+-fn plain_len(body: &ResponseBody) -> usize {
+-    match body {
+-        ResponseBody::Json(value) => serde_json::to_vec(value).map_or(0, |bytes| bytes.len()),
+-        ResponseBody::Text(text) => text.len(),
+-        ResponseBody::Empty => 0,
++    observation::decision(&snapshot, totals);
++    if let Some(entry) = replaced {
++        observation::outcome(&entry, now, "replaced", totals);
++    }
++    for entry in evicted {
++        observation::outcome(&entry, now, "evicted", totals);
+     }
+ }
+ 
+-/// Discard a previous representation before an explicit fresh read, so a
+-/// later ordinary read cannot fall back to the older cached snapshot.
++fn encode_body(body: &ResponseBody) -> Option<(BodyKind, Vec<u8>)> {
++    match body {
++        ResponseBody::Json(value) => serde_json::to_vec(value)
++            .ok()
++            .map(|bytes| (BodyKind::Json, bytes)),
++        ResponseBody::Text(text) => Some((BodyKind::Text, text.as_bytes().to_vec())),
++        ResponseBody::Empty => Some((BodyKind::Empty, Vec::new())),
++    }
++}
++
++/// Discard a previous representation before an explicit fresh read.
+ pub(super) fn invalidate(key: &CacheKey) {
+     let Ok(mut cache) = cache().lock() else {
+         return;
+     };
+-    remove(&mut cache, key);
+-}
+-
+-pub(super) fn invalidate_namespace(vendor: &str, base_url: &str) {
+-    let Ok(mut cache) = cache().lock() else {
+-        return;
+-    };
+-    let keys: Vec<_> = cache
+-        .entries
+-        .keys()
+-        .filter(|key| key.vendor == vendor && key.url.starts_with(base_url))
+-        .cloned()
+-        .collect();
+-    for key in keys {
+-        remove(&mut cache, &key);
++    let removed = remove(&mut cache, key);
++    let totals = observation::Totals::new(&cache);
++    drop(cache);
++    if let Some(entry) = removed {
++        observation::outcome(&entry, Instant::now(), "invalidated", totals);
+     }
+ }
+ 
+-fn response_ttl(headers: &HeaderMap, config: &CacheConfig) -> Option<Duration> {
++pub(super) fn invalidate_namespace(vendor: &str, base_url: &str) {
++    drain_matching(
++        |key, _| key.vendor == vendor && key.url.starts_with(base_url),
++        "invalidated",
++    );
++}
++
++pub(super) fn maintain(shutdown: bool) {
++    let now = Instant::now();
++    drain_matching(|_, entry| entry.expires_at <= now, "expired");
++    if shutdown {
++        drain_matching(|_, _| true, "session_end");
++    }
++}
++
++fn drain_matching(predicate: impl Fn(&CacheKey, &Entry) -> bool, outcome: &'static str) {
++    let Ok(mut cache) = cache().lock() else {
++        return;
++    };
++    let mut removed = Vec::new();
++    // Snapshot metadata without cloning URL-bearing keys or response buffers.
++    cache.entries.retain(|key, entry| {
++        if predicate(key, entry) {
++            removed.push(Snapshot::new(entry, Instant::now()));
++            false
++        } else {
++            true
++        }
++    });
++    cache.stored_bytes = cache.entries.values().map(|entry| entry.stored_bytes).sum();
++    let totals = observation::Totals::new(&cache);
++    drop(cache);
++    for snapshot in removed {
++        observation::terminal(&snapshot, outcome, totals);
++    }
++}
++
++fn response_ttl(headers: &HeaderMap, config: &CacheConfig) -> Option<(Duration, &'static str)> {
+     if headers
+         .get(VARY)
+         .and_then(|value| value.to_str().ok())
+@@ -447,17 +462,22 @@ fn response_ttl(headers: &HeaderMap, config: &CacheConfig) -> Option<Duration> {
+         return None;
+     }
+     if let Some(value) = headers.get(CACHE_CONTROL).and_then(|v| v.to_str().ok()) {
++        if value.split(',').map(str::trim).any(|directive| {
++            directive.eq_ignore_ascii_case("no-store") || directive.eq_ignore_ascii_case("no-cache")
++        }) {
++            return None;
++        }
+         for directive in value.split(',').map(str::trim) {
+-            if directive.eq_ignore_ascii_case("no-store")
+-                || directive.eq_ignore_ascii_case("no-cache")
+-            {
+-                return None;
+-            }
+             if let Some(seconds) = directive
+                 .strip_prefix("max-age=")
+                 .and_then(|value| value.trim_matches('"').parse::<u64>().ok())
+             {
+-                return (seconds > 0).then(|| Duration::from_secs(seconds).min(config.max_ttl));
++                return (seconds > 0).then(|| {
++                    (
++                        Duration::from_secs(seconds).min(config.max_ttl),
++                        "cache_control",
++                    )
++                });
+             }
+         }
+     }
+@@ -465,18 +485,19 @@ fn response_ttl(headers: &HeaderMap, config: &CacheConfig) -> Option<Duration> {
+         && let Ok(at) = httpdate::parse_http_date(expires)
+         && let Ok(ttl) = at.duration_since(SystemTime::now())
+     {
+-        return (!ttl.is_zero()).then(|| ttl.min(config.max_ttl));
++        return (!ttl.is_zero()).then(|| (ttl.min(config.max_ttl), "expires"));
+     }
+-    Some(config.default_ttl.min(config.max_ttl))
++    Some((config.default_ttl.min(config.max_ttl), "default"))
+ }
+ 
+-fn remove(cache: &mut Cache, key: &CacheKey) {
+-    if let Some(entry) = cache.entries.remove(key) {
+-        cache.stored_bytes = cache.stored_bytes.saturating_sub(entry.stored_bytes);
+-    }
++fn remove(cache: &mut Cache, key: &CacheKey) -> Option<Entry> {
++    let entry = cache.entries.remove(key)?;
++    cache.stored_bytes = cache.stored_bytes.saturating_sub(entry.stored_bytes);
++    Some(entry)
+ }
+ 
+-fn evict(cache: &mut Cache, config: &CacheConfig) {
++fn evict(cache: &mut Cache, config: &CacheConfig) -> Vec<Entry> {
++    let mut removed = Vec::new();
+     while cache.entries.len() > config.max_entries || cache.stored_bytes > config.max_bytes {
+         let Some(key) = cache
+             .entries
+@@ -486,11 +507,9 @@ fn evict(cache: &mut Cache, config: &CacheConfig) {
+         else {
+             break;
+         };
+-        remove(cache, &key);
+-        debug!(
+-            entries = cache.entries.len(),
+-            bytes = cache.stored_bytes,
+-            "evicted HTTP cache entry"
+-        );
++        if let Some(entry) = remove(cache, &key) {
++            removed.push(entry);
++        }
+     }
++    removed
+ }
+diff --git c/src/transport/response_cache/observation.rs w/src/transport/response_cache/observation.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..6179fb0ab0cb80fa59a43486a907acff4deb3ade
+--- /dev/null
++++ w/src/transport/response_cache/observation.rs
+@@ -0,0 +1,358 @@
++//! Metadata-only cache observations. Serialize and enqueue only after releasing
++//! the cache mutex. Rewards describe one entry's observed residency, not a
++//! counterfactual upstream request or end-to-end tool success.
++
++use std::sync::Arc;
++use std::time::{Duration, Instant};
++
++use http::HeaderMap;
++use http::header::{ETAG, LAST_MODIFIED};
++use serde::{Serialize, Serializer};
++use sha2::{Digest, Sha256};
++
++use super::{Cache, CacheConfig, CacheKey, Entry, StoredBytes};
++
++#[derive(Clone, Copy)]
++pub(super) struct Choice {
++    pub action: &'static str,
++    pub probability: f64,
++    pub ttl: Duration,
++    pub base_ttl: Duration,
++    pub exploration: bool,
++}
++
++pub(super) fn choose(exploration: bool, ttl: Duration, random: u8) -> Choice {
++    let (action, probability, selected_ttl) = if !exploration {
++        ("admit", 1.0, ttl)
++    } else if random < 32 {
++        ("reject", 0.125, Duration::ZERO)
++    } else if random < 64 {
++        ("admit_half_ttl", 0.125, ttl / 2)
++    } else {
++        ("admit", 0.75, ttl)
++    };
++    Choice {
++        action,
++        probability,
++        ttl: selected_ttl,
++        base_ttl: ttl,
++        exploration,
++    }
++}
++
++#[derive(Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub(super) struct Decision {
++    #[serde(skip)]
++    vendor: String,
++    #[serde(skip)]
++    cache_key: String,
++    #[serde(rename = "decisionId")]
++    id: String,
++    resource_fingerprint: String,
++    policy_version: &'static str,
++    action: &'static str,
++    action_probability: f64,
++    candidate_actions: &'static [&'static str],
++    candidate_probabilities: &'static [f64],
++    base_ttl_ms: u128,
++    ttl_source: &'static str,
++    has_etag: bool,
++    has_last_modified: bool,
++    pub compression_duration_us: u128,
++    pub entries_before: usize,
++    pub cache_bytes_before: usize,
++    max_entries: usize,
++    max_bytes: usize,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    origin_call_id: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    origin_tool: Option<String>,
++}
++
++impl Decision {
++    pub(super) fn new(
++        key: &CacheKey,
++        headers: &HeaderMap,
++        config: &CacheConfig,
++        choice: Choice,
++        ttl_source: &'static str,
++    ) -> Self {
++        let correlation = crate::audit::cache_call();
++        let (call_id, tool) =
++            correlation.map_or((None, None), |(call, tool)| (Some(call), Some(tool)));
++        // Domain-separated, full-length hash; includes vendor but no identity.
++        let mut digest = Sha256::new();
++        digest.update(b"cache-resource-v2\0");
++        digest.update(key.vendor.as_bytes());
++        digest.update([0]);
++        digest.update(key.url.as_bytes());
++        Self {
++            vendor: key.vendor.clone(),
++            cache_key: key.audit_fingerprint(),
++            id: uuid::Uuid::new_v4().to_string(),
++            resource_fingerprint: hex::encode(digest.finalize()),
++            policy_version: if choice.exploration {
++                "collect-v2"
++            } else {
++                "fixed-v2"
++            },
++            action: choice.action,
++            action_probability: choice.probability,
++            candidate_actions: if choice.exploration {
++                &["reject", "admit_half_ttl", "admit"]
++            } else {
++                &["admit"]
++            },
++            candidate_probabilities: if choice.exploration {
++                &[0.125, 0.125, 0.75]
++            } else {
++                &[1.0]
++            },
++            base_ttl_ms: choice.base_ttl.as_millis(),
++            ttl_source,
++            has_etag: headers.contains_key(ETAG),
++            has_last_modified: headers.contains_key(LAST_MODIFIED),
++            compression_duration_us: 0,
++            entries_before: 0,
++            cache_bytes_before: 0,
++            max_entries: config.max_entries,
++            max_bytes: config.max_bytes,
++            origin_call_id: call_id,
++            origin_tool: tool,
++        }
++    }
++}
++
++#[derive(Serialize)]
++#[serde(rename_all = "camelCase")]
++pub(super) struct Snapshot {
++    #[serde(flatten, serialize_with = "serialize_decision")]
++    decision: Arc<Decision>,
++    ttl_ms: u128,
++    age_ms: u128,
++    remaining_ttl_ms: u128,
++    upstream_latency_ms: u128,
++    response_bytes: usize,
++    entry_bytes: usize,
++    compressed: bool,
++    hit_count: u64,
++    decode_duration_us: u128,
++    estimated_saved_latency_ms: u128,
++    residency_byte_ms: u128,
++}
++
++fn serialize_decision<S: Serializer>(
++    decision: &Arc<Decision>,
++    serializer: S,
++) -> Result<S::Ok, S::Error> {
++    decision.as_ref().serialize(serializer)
++}
++
++impl Snapshot {
++    pub(super) fn new(entry: &Entry, now: Instant) -> Self {
++        let age_ms = now.saturating_duration_since(entry.stored_at).as_millis();
++        Self {
++            decision: Arc::clone(&entry.decision),
++            ttl_ms: entry.ttl.as_millis(),
++            age_ms,
++            remaining_ttl_ms: entry.expires_at.saturating_duration_since(now).as_millis(),
++            upstream_latency_ms: entry.upstream_latency_ms,
++            response_bytes: entry.response_bytes,
++            entry_bytes: entry.stored_bytes,
++            compressed: matches!(&entry.bytes, StoredBytes::Zstd(_)),
++            hit_count: entry.hit_count,
++            decode_duration_us: entry.decode_duration_us,
++            estimated_saved_latency_ms: entry
++                .upstream_latency_ms
++                .saturating_mul(u128::from(entry.hit_count)),
++            residency_byte_ms: if entry.decision.action == "reject" {
++                0
++            } else {
++                age_ms.saturating_mul(entry.stored_bytes as u128)
++            },
++        }
++    }
++}
++
++#[derive(Clone, Copy, Default, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub(super) struct Totals {
++    cumulative_hits: u64,
++    cumulative_misses: u64,
++    entries: usize,
++    cache_bytes: usize,
++}
++
++impl Totals {
++    pub(super) fn new(cache: &Cache) -> Self {
++        Self {
++            cumulative_hits: cache.hits,
++            cumulative_misses: cache.misses,
++            entries: cache.entries.len(),
++            cache_bytes: cache.stored_bytes,
++        }
++    }
++}
++
++#[derive(Default, Serialize)]
++#[serde(rename_all = "camelCase")]
++struct Correlation {
++    #[serde(skip_serializing_if = "Option::is_none")]
++    call_id: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    tool: Option<String>,
++}
++
++impl Correlation {
++    fn current() -> Self {
++        crate::audit::cache_call().map_or_else(Self::default, |(call_id, tool)| Self {
++            call_id: Some(call_id),
++            tool: Some(tool),
++        })
++    }
++}
++
++#[derive(Serialize)]
++#[serde(rename_all = "camelCase")]
++struct Record<'a> {
++    event: &'static str,
++    vendor: &'a str,
++    cache_key: &'a str,
++    outcome: &'static str,
++    reason: &'static str,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    observation_complete: Option<bool>,
++    #[serde(flatten)]
++    snapshot: Option<&'a Snapshot>,
++    #[serde(flatten)]
++    totals: Totals,
++    #[serde(flatten)]
++    correlation: Correlation,
++}
++
++pub(super) fn lookup(
++    key: &CacheKey,
++    snapshot: Option<&Snapshot>,
++    hit: bool,
++    reason: &'static str,
++    totals: Totals,
++) {
++    crate::audit::cache_event(&Record {
++        event: "http_cache_lookup",
++        vendor: &key.vendor,
++        cache_key: &key.audit_fingerprint(),
++        outcome: if hit { "hit" } else { "miss" },
++        reason,
++        observation_complete: None,
++        snapshot,
++        totals,
++        correlation: Correlation::current(),
++    });
++}
++
++pub(super) fn decision(snapshot: &Snapshot, totals: Totals) {
++    emit(
++        snapshot,
++        "http_cache_decision",
++        if snapshot.decision.action == "reject" {
++            "rejected"
++        } else {
++            "stored"
++        },
++        None,
++        totals,
++    );
++}
++
++pub(super) fn outcome(entry: &Entry, now: Instant, reason: &'static str, totals: Totals) {
++    terminal(&Snapshot::new(entry, now), reason, totals);
++}
++
++pub(super) fn terminal(snapshot: &Snapshot, reason: &'static str, totals: Totals) {
++    emit(
++        snapshot,
++        "http_cache_outcome",
++        reason,
++        Some(!matches!(reason, "session_end" | "decode_failed")),
++        totals,
++    );
++}
++
++fn emit(
++    snapshot: &Snapshot,
++    event: &'static str,
++    outcome: &'static str,
++    complete: Option<bool>,
++    totals: Totals,
++) {
++    crate::audit::cache_event(&Record {
++        event,
++        vendor: &snapshot.decision.vendor,
++        cache_key: &snapshot.decision.cache_key,
++        outcome,
++        reason: outcome,
++        observation_complete: complete,
++        snapshot: Some(snapshot),
++        totals,
++        correlation: Correlation::current(),
++    });
++}
++
++pub(super) fn ineligible(key: &CacheKey, reason: &'static str) {
++    #[derive(Serialize)]
++    #[serde(rename_all = "camelCase")]
++    struct Ineligible<'a> {
++        event: &'static str,
++        vendor: &'a str,
++        cache_key: String,
++        outcome: &'static str,
++        reason: &'static str,
++        #[serde(flatten)]
++        correlation: Correlation,
++    }
++    crate::audit::cache_event(&Ineligible {
++        event: "http_cache_ineligible",
++        vendor: &key.vendor,
++        cache_key: key.audit_fingerprint(),
++        outcome: "bypassed",
++        reason,
++        correlation: Correlation::current(),
++    });
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn all_random_buckets_match_logged_probabilities_and_ttl_bounds() {
++        let mut counts = [0_u32; 3];
++        for random in 0..=u8::MAX {
++            let ttl = Duration::from_mins(1);
++            let choice = choose(true, ttl, random);
++            let index = match choice.action {
++                "reject" => {
++                    assert_eq!(choice.ttl, Duration::ZERO);
++                    0
++                }
++                "admit_half_ttl" => {
++                    assert_eq!(choice.ttl, ttl / 2);
++                    1
++                }
++                "admit" => {
++                    assert_eq!(choice.ttl, ttl);
++                    2
++                }
++                _ => panic!("unexpected action"),
++            };
++            counts[index] += 1;
++            assert!((choice.probability - [0.125, 0.125, 0.75][index]).abs() < f64::EPSILON);
++            let fixed = choose(false, ttl, random);
++            assert_eq!(fixed.action, "admit");
++            assert!((fixed.probability - 1.0).abs() < f64::EPSILON);
++            assert_eq!(fixed.ttl, ttl);
++        }
++        assert_eq!(counts, [32, 32, 192]);
++    }
++}
+diff --git c/tests/cache_observation_tests.rs w/tests/cache_observation_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..6810093adb617041898d3316a0d6c26dcd96100f
+--- /dev/null
++++ w/tests/cache_observation_tests.rs
+@@ -0,0 +1,222 @@
++//! Exercise the real transport and on-disk audit stream together. Keep this in
++//! its own test binary because the process audit writer is initialized once.
++
++use std::collections::{HashMap, HashSet};
++use std::time::Duration;
++
++use mcp_server_devtools::audit::{self, AuditCall};
++use mcp_server_devtools::auth::Credentials;
++use mcp_server_devtools::config::Config;
++use mcp_server_devtools::transport::{
++    RequestOptions, build_client, fetch_bitbucket_with_base, maintain_response_cache,
++};
++use serde_json::Value;
++use wiremock::matchers::path;
++use wiremock::{Mock, MockServer, ResponseTemplate};
++
++fn config(ttl: &str, limit: &str, explore: bool) -> Config {
++    Config::from_map(HashMap::from([
++        ("HTTP_CACHE_ENABLED".into(), "true".into()),
++        ("HTTP_CACHE_DEFAULT_TTL_SECONDS".into(), ttl.into()),
++        ("HTTP_CACHE_MAX_ENTRIES".into(), limit.into()),
++        ("HTTP_CACHE_EXPLORATION_ENABLED".into(), explore.to_string()),
++    ]))
++}
++
++#[tokio::test]
++#[allow(clippy::too_many_lines)]
++async fn cache_observations_cover_real_lifecycles_without_exposing_content() {
++    let directory = tempfile::tempdir().unwrap();
++    audit::init(directory.path(), "cache-observation-test");
++    let server = MockServer::start().await;
++    Mock::given(path("/2.0/forbidden"))
++        .respond_with(
++            ResponseTemplate::new(200)
++                .insert_header("cache-control", "max-age=60, no-store")
++                .set_body_json(serde_json::json!({"private": true})),
++        )
++        .expect(2)
++        .mount(&server)
++        .await;
++    Mock::given(path("/2.0/race"))
++        .respond_with(
++            ResponseTemplate::new(200)
++                .set_delay(Duration::from_millis(50))
++                .set_body_json(
++                    serde_json::json!({"secret-response": "private-payload".repeat(2000)}),
++                ),
++        )
++        .expect(2)
++        .mount(&server)
++        .await;
++    Mock::given(wiremock::matchers::method("GET"))
++        .respond_with(
++            ResponseTemplate::new(200).set_body_json(
++                serde_json::json!({"secret-response": "private-payload".repeat(2000)}),
++            ),
++        )
++        .with_priority(10)
++        .mount(&server)
++        .await;
++    let client = build_client().unwrap();
++    let credentials = Credentials::AtlassianApiToken {
++        email: "private-user@example.com".into(),
++        token: "private-token-value".into(),
++    };
++    let normal = config("60", "512", false);
++    let fetch = |route: &'static str, settings: Config, fresh| {
++        let client = &client;
++        let credentials = &credentials;
++        let base = server.uri();
++        async move {
++            fetch_bitbucket_with_base(
++                &base,
++                client,
++                credentials,
++                &settings,
++                route,
++                RequestOptions {
++                    fresh,
++                    ..RequestOptions::default()
++                },
++            )
++            .await
++            .unwrap()
++        }
++    };
++    let call = AuditCall::start("bb_get", "first-request".into(), None, None);
++    call.scope(fetch("/2.0/first", normal.clone(), false)).await;
++    call.complete("success");
++    let hit_call = AuditCall::start("bb_get", "hit-request".into(), None, None);
++    assert!(
++        hit_call
++            .scope(fetch("/2.0/first", normal.clone(), false))
++            .await
++            .cache
++            .hit
++    );
++    hit_call.complete("success");
++    assert!(!fetch("/2.0/first", normal.clone(), true).await.cache.hit);
++    fetch("/2.0/evict-a", config("60", "1", false), false).await;
++    fetch("/2.0/evict-b", config("60", "1", false), false).await;
++    fetch("/2.0/idle-expiry", config("1", "512", false), false).await;
++    for _ in 0..2 {
++        assert!(
++            !fetch("/2.0/forbidden", normal.clone(), false)
++                .await
++                .cache
++                .hit
++        );
++    }
++    // Check every sampled decision against its realized behavior; exhaustive
++    // bucket tests separately verify probabilities without statistical flakes.
++    for _ in 0..32 {
++        fetch("/2.0/explore", config("60", "512", true), false).await;
++        fetch("/2.0/explore", normal.clone(), true).await;
++    }
++    tokio::join!(
++        fetch("/2.0/race", normal.clone(), false),
++        fetch("/2.0/race", normal.clone(), false)
++    );
++    tokio::time::sleep(Duration::from_millis(1100)).await;
++    let (stop, stopped) = tokio::sync::oneshot::channel();
++    let maintenance = tokio::spawn(maintain_response_cache(stopped));
++    // Shutdown itself must expire idle entries before censoring survivors.
++    stop.send(()).unwrap();
++    maintenance.await.unwrap();
++    tokio::task::spawn_blocking(audit::shutdown).await.unwrap();
++    let text = std::fs::read_to_string(
++        directory
++            .path()
++            .join("mcp-server-devtools.cache-observation-test.audit.jsonl"),
++    )
++    .unwrap();
++    for secret in [
++        "private-user",
++        "private-token",
++        "secret-response",
++        "private-payload",
++        "/2.0/",
++        &server.uri(),
++    ] {
++        assert!(!text.contains(secret), "audit exposed {secret}");
++    }
++    let rows: Vec<Value> = text
++        .lines()
++        .map(|line| serde_json::from_str(line).unwrap())
++        .collect();
++    let decisions: HashMap<&str, &Value> = rows
++        .iter()
++        .filter(|r| r["event"] == "http_cache_decision")
++        .map(|r| (r["decisionId"].as_str().unwrap(), r))
++        .collect();
++    let outcomes: Vec<&Value> = rows
++        .iter()
++        .filter(|r| r["event"] == "http_cache_outcome")
++        .collect();
++    assert_eq!(decisions.len(), outcomes.len());
++    let mut seen = HashSet::new();
++    for outcome in &outcomes {
++        let id = outcome["decisionId"].as_str().unwrap();
++        assert!(seen.insert(id), "duplicate terminal outcome");
++        let decision = decisions[id];
++        assert_eq!(outcome["policyVersion"], decision["policyVersion"]);
++        assert_eq!(outcome["originCallId"], decision["originCallId"]);
++        assert_eq!(
++            outcome["observationComplete"],
++            outcome["outcome"] != "session_end"
++        );
++        if outcome["outcome"] == "rejected" {
++            assert_eq!(outcome["residencyByteMs"], 0);
++            assert_eq!(outcome["estimatedSavedLatencyMs"], 0);
++            assert_eq!(outcome["hitCount"], 0);
++        }
++    }
++    for decision in decisions.values() {
++        assert_eq!(decision["schemaVersion"], 2);
++        assert_eq!(decision["serverVersion"], env!("CARGO_PKG_VERSION"));
++        assert!(
++            decision["entryBytes"].as_u64().unwrap() < decision["responseBytes"].as_u64().unwrap()
++        );
++        let action = decision["action"].as_str().unwrap();
++        let index = decision["candidateActions"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .position(|a| a == action)
++            .unwrap();
++        assert_eq!(
++            decision["actionProbability"],
++            decision["candidateProbabilities"][index]
++        );
++        assert!(decision["ttlMs"].as_u64().unwrap() <= decision["baseTtlMs"].as_u64().unwrap());
++    }
++    for reason in [
++        "expired",
++        "invalidated",
++        "evicted",
++        "replaced",
++        "session_end",
++    ] {
++        assert!(
++            outcomes.iter().any(|r| r["outcome"] == reason),
++            "missing {reason}"
++        );
++    }
++    let hit = rows
++        .iter()
++        .find(|r| r["event"] == "http_cache_lookup" && r["outcome"] == "hit")
++        .unwrap();
++    assert_eq!(hit["hitCount"], 1);
++    assert_ne!(hit["callId"], hit["originCallId"]);
++    assert_eq!(
++        hit["originCallId"],
++        decisions[hit["decisionId"].as_str().unwrap()]["callId"]
++    );
++    assert!(
++        rows.iter()
++            .filter(|r| r["event"] == "http_cache_ineligible")
++            .count()
++            >= 2
++    );
++}

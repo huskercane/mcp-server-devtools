@@ -17,6 +17,7 @@ pub mod verify;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -30,6 +31,7 @@ const DEFAULT_RETENTION_DAYS: u64 = 30;
 const DEFAULT_RETENTION_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 static AUDIT_LOG: OnceLock<Option<AuditLog>> = OnceLock::new();
+static CACHE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct AuditLog {
     session_id: String,
@@ -70,29 +72,13 @@ struct AuditRecord<'a> {
     duration_ms: Option<u128>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct CacheEvent<'a> {
-    pub timestamp: String,
-    pub event: &'static str,
-    pub session_id: &'a str,
-    pub process_id: u32,
-    pub vendor: &'a str,
-    pub cache_key: &'a str,
-    pub outcome: &'a str,
-    pub reason: Option<&'a str>,
-    pub action: Option<&'a str>,
-    pub ttl_ms: Option<u128>,
-    pub age_ms: Option<u128>,
-    pub remaining_ttl_ms: Option<u128>,
-    pub upstream_latency_ms: Option<u128>,
-    pub response_bytes: Option<usize>,
-    pub entry_bytes: Option<usize>,
-    pub compressed: Option<bool>,
-    pub cumulative_hits: u64,
-    pub cumulative_misses: u64,
-    pub entries: usize,
-    pub cache_bytes: usize,
+tokio::task_local! {
+    static CACHE_CALL: (String, String);
+}
+
+/// Capture correlation before moving cache work onto a blocking worker.
+pub(crate) fn cache_call() -> Option<(String, String)> {
+    CACHE_CALL.try_with(Clone::clone).ok()
 }
 
 /// In-flight tool-call audit state. Dropping it without calling [`complete`]
@@ -137,6 +123,13 @@ impl AuditCall {
         };
         write_record(&call, "tool_call_started", None, None);
         call
+    }
+
+    /// Correlate cache telemetry with this tool call, independently of policy mode.
+    pub async fn scope<F: std::future::Future>(&self, future: F) -> F::Output {
+        CACHE_CALL
+            .scope((self.call_id.clone(), self.tool.clone()), future)
+            .await
     }
 
     pub fn complete(self, outcome: &str) {
@@ -207,14 +200,34 @@ pub fn shutdown() {
 
 /// Record cache-policy context and outcomes without exposing URLs,
 /// credentials, or response data.
-pub(crate) fn cache_event(mut event: CacheEvent<'_>) {
+pub(crate) fn cache_event(event: &impl Serialize) {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Envelope<'a, T> {
+        timestamp: String,
+        schema_version: u32,
+        cache_event_sequence: u64,
+        server_version: &'static str,
+        session_id: &'a str,
+        process_id: u32,
+        #[serde(flatten)]
+        event: &'a T,
+    }
     let Some(log) = AUDIT_LOG.get().and_then(Option::as_ref) else {
         return;
     };
-    event.timestamp = crate::logger::iso_timestamp();
-    event.session_id = &log.session_id;
-    event.process_id = std::process::id();
-    write_json(log, &event);
+    write_json(
+        log,
+        &Envelope {
+            timestamp: crate::logger::iso_timestamp(),
+            schema_version: 2,
+            cache_event_sequence: CACHE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1,
+            server_version: crate::constants::VERSION,
+            session_id: &log.session_id,
+            process_id: std::process::id(),
+            event,
+        },
+    );
 }
 
 fn write_record(call: &AuditCall, event: &str, outcome: Option<&str>, duration_ms: Option<u128>) {
@@ -249,7 +262,9 @@ fn audit_worker(mut writer: RotatingWriter, receiver: &mpsc::Receiver<AuditMessa
     while let Ok(message) = receiver.recv() {
         match message {
             AuditMessage::Record(line) => {
-                let _ = writer.write_record(&line);
+                if let Err(error) = writer.write_record(&line) {
+                    tracing::warn!(kind = ?error.kind(), "audit record write failed; collected observations may be incomplete");
+                }
             }
             AuditMessage::Shutdown => break,
         }

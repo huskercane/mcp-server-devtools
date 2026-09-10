@@ -1076,16 +1076,20 @@ impl ServerHandler for DevtoolsServer {
         // being handed it. Local mode sets no scope and pays nothing.
         let tool_context =
             rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let mut result = match &enterprise {
-            Some(call) => {
-                crate::policy::CallScope::enter(
-                    Arc::clone(&call.scope),
-                    self.tool_router.call(tool_context),
-                )
-                .await
-            }
-            None => self.tool_router.call(tool_context).await,
-        };
+        let mut result = audit
+            .scope(async {
+                match &enterprise {
+                    Some(call) => {
+                        crate::policy::CallScope::enter(
+                            Arc::clone(&call.scope),
+                            self.tool_router.call(tool_context),
+                        )
+                        .await
+                    }
+                    None => self.tool_router.call(tool_context).await,
+                }
+            })
+            .await;
         // Plan §3.7: the upstream identity goes in structured result
         // metadata, never appended to text content. Enterprise mode only;
         // a local-mode result is byte-for-byte what it was.
@@ -1110,19 +1114,19 @@ impl ServerHandler for DevtoolsServer {
         result
     }
 
-    async fn list_tools(
+    fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<rmcp::model::ListToolsResult, RmcpError> {
+    ) -> impl Future<Output = Result<rmcp::model::ListToolsResult, RmcpError>> + Send {
         let mut tools = self.tool_router.list_all();
         // MCP 2026-07-28 recommends deterministic ordering so clients can
         // reuse prompt caches. The list is build-static and principal-agnostic,
         // making a short public cache safe.
         tools.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(rmcp::model::ListToolsResult::with_all_items(tools)
+        std::future::ready(Ok(rmcp::model::ListToolsResult::with_all_items(tools)
             .with_ttl_ms(300_000)
-            .with_cache_scope(rmcp::model::CacheScope::Public))
+            .with_cache_scope(rmcp::model::CacheScope::Public)))
     }
 
     fn get_info(&self) -> ServerInfo {

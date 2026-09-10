@@ -38,11 +38,11 @@ struct SpikePrincipal {
 struct SpikeServer;
 
 impl ServerHandler for SpikeServer {
-    async fn call_tool(
+    fn call_tool(
         &self,
         _request: CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<CallToolResponse, ErrorData> {
+    ) -> impl Future<Output = Result<CallToolResponse, ErrorData>> + Send {
         // The exact production lookup: RequestContext extensions carry the
         // HTTP request's Parts; the Parts extensions carry middleware state.
         let principal = context
@@ -54,16 +54,16 @@ impl ServerHandler for SpikeServer {
             Some(principal) => format!("principal:{}", principal.subject),
             None => "principal:absent".to_owned(),
         };
-        Ok(CallToolResponse::Complete(CallToolResult::success(vec![
-            Content::text(text),
-        ])))
+        std::future::ready(Ok(CallToolResponse::Complete(CallToolResult::success(
+            vec![Content::text(text)],
+        ))))
     }
 
-    async fn list_tools(
+    fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<ListToolsResult, ErrorData> {
+    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send {
         let tool = Tool::new(
             "spike_probe",
             "Echoes the principal observed in request extensions.",
@@ -72,7 +72,7 @@ impl ServerHandler for SpikeServer {
                     .expect("static schema"),
             ),
         );
-        Ok(ListToolsResult::with_all_items(vec![tool]))
+        std::future::ready(Ok(ListToolsResult::with_all_items(vec![tool])))
     }
 
     fn get_info(&self) -> ServerInfo {

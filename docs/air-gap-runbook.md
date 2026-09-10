@@ -90,7 +90,7 @@ keys, so treat rollback as a security decision and preserve change evidence.
 
 ## Build from the vendored archive
 
-Pre-provision Rust/Cargo **1.96.0**, a compatible host linker/C compiler,
+Pre-provision Rust/Cargo **1.98.1**, a compatible host linker/C compiler,
 cmake, perl and pkg-config. The verified headless path uses bundled SQLite
 and TLS crypto; OS keychain libraries are required only if enabling default
 features. Verify and unpack:
