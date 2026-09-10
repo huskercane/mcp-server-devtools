@@ -111,6 +111,9 @@ pub const VENDOR_GRAFANA: &str = "grafana";
 /// headline use is reading back *why* a CI quality gate failed.
 pub const VENDOR_SONARQUBE: &str = "sonarqube";
 
+/// Canonical vendor name for `TeamCity`.
+pub const VENDOR_TEAMCITY: &str = "teamcity";
+
 /// Canonical vendor name for Splunk. Splunk uses its management REST API,
 /// configured by `SPLUNK_URL`, and authenticates with a token from
 /// `SPLUNK_TOKEN`.
@@ -735,6 +738,14 @@ pub fn vendor_aliases(package_name: &str) -> Vec<(&'static str, Vec<String>)> {
         (VENDOR_NEWRELIC, newrelic_aliases),
         (VENDOR_GRAFANA, grafana_aliases),
         (VENDOR_SONARQUBE, sonarqube_aliases),
+        (
+            VENDOR_TEAMCITY,
+            vec![
+                "teamcity".to_owned(),
+                "team-city".to_owned(),
+                "mcp-server-teamcity".to_owned(),
+            ],
+        ),
         (VENDOR_SPLUNK, splunk_aliases),
         (VENDOR_NINJAONE, ninjaone_aliases),
         (VENDOR_WRDS, wrds_aliases),

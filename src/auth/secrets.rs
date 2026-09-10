@@ -201,6 +201,7 @@ pub const VENDOR_SECRETS: &[VendorSecret] = &[
     token(VENDOR_NEWRELIC, "NEW_RELIC_API_KEY"),
     token(VENDOR_GRAFANA, "GRAFANA_TOKEN"),
     token(VENDOR_SONARQUBE, "SONARQUBE_TOKEN"),
+    token(crate::config::VENDOR_TEAMCITY, "TEAMCITY_TOKEN"),
     token(VENDOR_SPLUNK, "SPLUNK_TOKEN"),
     token(VENDOR_EDX, "EDX_ACCESS_TOKEN"),
     // WRDS logs in with a real account.

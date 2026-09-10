@@ -40,6 +40,7 @@ mod postman;
 mod slack;
 mod sonarqube;
 mod splunk;
+mod teamcity;
 #[cfg(feature = "wrds")]
 mod wrds;
 mod zoom;
@@ -69,6 +70,7 @@ use crate::controllers::postman::PostmanContext;
 use crate::controllers::slack::SlackContext;
 use crate::controllers::sonarqube::SonarqubeContext;
 use crate::controllers::splunk::SplunkContext;
+use crate::controllers::teamcity::TeamcityContext;
 #[cfg(feature = "wrds")]
 use crate::controllers::wrds::WrdsContext;
 use crate::controllers::zoom::ZoomContext;
@@ -134,6 +136,7 @@ impl DevtoolsServer {
             + Self::newrelic_router()
             + Self::grafana_router()
             + Self::sonarqube_router()
+            + Self::teamcity_router()
             + Self::splunk_router();
         let router = router + Self::ninjaone_router();
         // WRDS tools only exist when the `wrds` feature is on (default).
@@ -469,6 +472,14 @@ impl DevtoolsServer {
             &self.components.client,
             config,
             &self.components.vendors.sonarqube,
+        )
+    }
+
+    fn teamcity_ctx<'a>(&'a self, config: &'a Config) -> TeamcityContext<'a> {
+        TeamcityContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.teamcity,
         )
     }
 
@@ -1219,6 +1230,7 @@ pub fn vendor_for_tool(tool: &str) -> Option<&'static str> {
         "newrelic" => Some(VENDOR_NEWRELIC),
         "grafana" => Some(VENDOR_GRAFANA),
         "sonarqube" => Some(VENDOR_SONARQUBE),
+        "teamcity" => Some(crate::config::VENDOR_TEAMCITY),
         "splunk" => Some(VENDOR_SPLUNK),
         "ninjaone" => Some(VENDOR_NINJAONE),
         "wrds" => Some(VENDOR_WRDS),

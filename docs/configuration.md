@@ -69,6 +69,8 @@ Not covered yet: the one-shot CLI subcommands (`mcp-devtools jira|bb|conf …`) 
 | `zoom` | `ZOOM_ACCOUNT_ID` | Required | Server-to-Server OAuth account ID. |
 | `zoom` | `ZOOM_CLIENT_ID` | Required | Server-to-Server OAuth client ID. |
 | `zoom` | `ZOOM_CLIENT_SECRET` | Required | Server-to-Server OAuth client secret. |
+| `teamcity` | `TEAMCITY_URL` | Required | Server URL including any deployment context path, without `/app/rest` (e.g. `https://ci.example.com/teamcity`). |
+| `teamcity` | `TEAMCITY_TOKEN` | Required | Personal access token, sent as `Authorization: Bearer`. Supports the registered-secret/keychain mechanisms. |
 | `circleci` | `CIRCLECI_TOKEN` | Required | Personal API token. |
 | `slack` | `SLACK_TOKEN` | Required | Bot or user OAuth token. |
 | `postman` | `POSTMAN_API_KEY` | Required | Postman API key. |

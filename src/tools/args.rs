@@ -1149,3 +1149,39 @@ pub struct JiraGetAttachmentArgs {
     /// Numeric Jira attachment ID from fields.attachment, not a media UUID or blob URL.
     pub attachment_id: String,
 }
+
+/// Arguments for the `TeamCity` REST tools.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamcityReadArgs {
+    /// REST endpoint, e.g. `builds` or `/app/rest/builds/id:123`.
+    pub path: String,
+    /// Query parameters, including `locator` for selection and `fields` for projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_params: Option<QueryParams>,
+    /// JMESPath expression to filter or transform the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
+
+/// Arguments for the `TeamCity` REST tools.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamcityWriteArgs {
+    /// REST endpoint, e.g. `builds` or `/app/rest/builds/id:123`.
+    pub path: String,
+    /// JSON request body for the selected endpoint.
+    pub body: Value,
+    /// Query parameters, including `locator` for selection and `fields` for projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_params: Option<QueryParams>,
+    /// JMESPath expression to filter or transform the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
+    /// Output format: "toon" (default) or "json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormatArg>,
+}
