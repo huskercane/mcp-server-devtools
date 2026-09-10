@@ -38,8 +38,17 @@ const GOLDEN: &str = concat!(
 /// Drive the binary through initialize → initialized → tools/list and return
 /// the `tools` array, normalised for stable comparison.
 fn live_tool_surface() -> Value {
+    live_exchange(
+        "all",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+    )["result"]["tools"]
+        .clone()
+}
+
+fn live_exchange(selection: &str, request: &str) -> Value {
     let mut child = StdCommand::new(cargo_bin(BIN))
         .env_remove("TRANSPORT_MODE")
+        .env("MCP_ENABLED_VENDORS", selection)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -52,7 +61,7 @@ fn live_tool_surface() -> Value {
     for line in [
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"parity-test","version":"0"}}}"#,
         r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+        request,
     ] {
         stdin.write_all(line.as_bytes()).expect("write request");
         stdin.write_all(b"\n").expect("write newline");
@@ -66,7 +75,7 @@ fn live_tool_surface() -> Value {
         if let Ok(value) = serde_json::from_str::<Value>(line.trim())
             && value.get("id").and_then(Value::as_u64) == Some(2)
         {
-            tools = value.get("result").and_then(|r| r.get("tools")).cloned();
+            tools = Some(value);
             break;
         }
         line.clear();
@@ -76,7 +85,7 @@ fn live_tool_surface() -> Value {
     drop(reader);
     let _ = child.wait();
 
-    tools.expect("tools/list returned no tools array")
+    tools.expect("exchange returned no response")
 }
 
 /// Sort by tool name so router-registration order never makes this flaky.
@@ -143,4 +152,29 @@ fn regenerate_golden() {
     let pretty = serde_json::to_string_pretty(&live).expect("serialise");
     std::fs::write(GOLDEN, pretty + "\n").expect("write golden");
     println!("regenerated {GOLDEN}");
+}
+
+#[test]
+fn explicit_session_selection_filters_discovery_and_refuses_disabled_calls() {
+    let listed = live_exchange(
+        "github,gitlab",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+    );
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 21);
+    assert!(tools.iter().all(|tool| {
+        let name = tool["name"].as_str().unwrap();
+        name == "artifact_read" || name.starts_with("github_") || name.starts_with("gitlab_")
+    }));
+    let called = live_exchange(
+        "github,gitlab",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"figma_get_file","arguments":{"file":"fixture"}}}"#,
+    );
+    assert_eq!(called["error"]["code"], -32602);
+    assert!(
+        called["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("disabled")
+    );
 }

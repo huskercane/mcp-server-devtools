@@ -202,6 +202,22 @@ pub const VENDOR_SECRETS: &[VendorSecret] = &[
     token(VENDOR_GRAFANA, "GRAFANA_TOKEN"),
     token(VENDOR_SONARQUBE, "SONARQUBE_TOKEN"),
     token(crate::config::VENDOR_TEAMCITY, "TEAMCITY_TOKEN"),
+    token(crate::config::VENDOR_GITHUB, "GITHUB_TOKEN"),
+    token(crate::config::VENDOR_GITLAB, "GITLAB_TOKEN"),
+    token(crate::config::VENDOR_FIGMA, "FIGMA_TOKEN"),
+    token(crate::config::VENDOR_VERCEL, "VERCEL_TOKEN"),
+    token(crate::config::VENDOR_SENTRY, "SENTRY_TOKEN"),
+    token(crate::config::VENDOR_ARTIFACTORY, "ARTIFACTORY_TOKEN"),
+    token(crate::config::VENDOR_SNYK, "SNYK_TOKEN"),
+    // Mend: the user key is an input to the API 3.0 login exchange, which
+    // mints the short-lived JWT that actually acts. Owned by the account
+    // email so rotating the login moves the slot.
+    login_input(
+        crate::config::VENDOR_MEND,
+        "MEND_USER_KEY",
+        "MEND_EMAIL",
+        SecretKind::Password,
+    ),
     token(VENDOR_SPLUNK, "SPLUNK_TOKEN"),
     token(VENDOR_EDX, "EDX_ACCESS_TOKEN"),
     // WRDS logs in with a real account.

@@ -114,6 +114,30 @@ pub const VENDOR_SONARQUBE: &str = "sonarqube";
 /// Canonical vendor name for `TeamCity`.
 pub const VENDOR_TEAMCITY: &str = "teamcity";
 
+/// Canonical vendor name for GitHub.
+pub const VENDOR_GITHUB: &str = "github";
+
+/// Canonical vendor name for GitLab.
+pub const VENDOR_GITLAB: &str = "gitlab";
+
+/// Canonical vendor name for Figma.
+pub const VENDOR_FIGMA: &str = "figma";
+
+/// Canonical vendor name for Vercel.
+pub const VENDOR_VERCEL: &str = "vercel";
+
+/// Canonical vendor name for Sentry.
+pub const VENDOR_SENTRY: &str = "sentry";
+
+/// Canonical vendor name for `JFrog` Artifactory.
+pub const VENDOR_ARTIFACTORY: &str = "artifactory";
+
+/// Canonical vendor name for Snyk.
+pub const VENDOR_SNYK: &str = "snyk";
+
+/// Canonical vendor name for Mend.
+pub const VENDOR_MEND: &str = "mend";
+
 /// Canonical vendor name for Splunk. Splunk uses its management REST API,
 /// configured by `SPLUNK_URL`, and authenticates with a token from
 /// `SPLUNK_TOKEN`.
@@ -453,6 +477,32 @@ impl Config {
         }
     }
 
+    /// Presence-only discovery: never expand references or contact a secret provider.
+    pub(crate) fn vendor_is_configured(&self, vendor: &str) -> bool {
+        let present = |value: &String| !value.trim().is_empty();
+        if self
+            .by_vendor
+            .get(vendor)
+            .is_some_and(|values| values.values().any(present))
+        {
+            return true;
+        }
+        if crate::auth::secrets::for_vendor(vendor).any(|slot| {
+            self.raw_for(vendor, slot.secret_key())
+                .is_some_and(|value| !value.trim().is_empty())
+        }) {
+            return true;
+        }
+        let prefix = if vendor == "newrelic" {
+            "NEW_RELIC_".to_owned()
+        } else {
+            format!("{}_", vendor.to_ascii_uppercase())
+        };
+        self.shared
+            .iter()
+            .any(|(key, value)| key.starts_with(&prefix) && present(value))
+    }
+
     /// Vendor-scoped lookup. Reads `shared` first, then the named vendor's
     /// section only. Never reads another vendor's section.
     ///
@@ -726,7 +776,7 @@ pub fn vendor_aliases(package_name: &str) -> Vec<(&'static str, Vec<String>)> {
     ];
     let wrds_aliases = vec!["wrds".to_string(), "mcp-server-wrds".to_string()];
 
-    vec![
+    let mut aliases = vec![
         (VENDOR_BITBUCKET, bitbucket_aliases),
         (VENDOR_JIRA, jira_aliases),
         (VENDOR_CONFLUENCE, confluence_aliases),
@@ -749,6 +799,53 @@ pub fn vendor_aliases(package_name: &str) -> Vec<(&'static str, Vec<String>)> {
         (VENDOR_SPLUNK, splunk_aliases),
         (VENDOR_NINJAONE, ninjaone_aliases),
         (VENDOR_WRDS, wrds_aliases),
+    ];
+    aliases.extend(native_vendor_aliases());
+    aliases
+}
+
+fn native_vendor_aliases() -> Vec<(&'static str, Vec<String>)> {
+    vec![
+        (
+            VENDOR_GITHUB,
+            vec!["github".to_owned(), "mcp-server-github".to_owned()],
+        ),
+        (
+            VENDOR_GITLAB,
+            vec!["gitlab".to_owned(), "mcp-server-gitlab".to_owned()],
+        ),
+        (
+            VENDOR_FIGMA,
+            vec!["figma".to_owned(), "mcp-server-figma".to_owned()],
+        ),
+        (
+            VENDOR_VERCEL,
+            vec!["vercel".to_owned(), "mcp-server-vercel".to_owned()],
+        ),
+        (
+            VENDOR_SENTRY,
+            vec!["sentry".to_owned(), "mcp-server-sentry".to_owned()],
+        ),
+        (
+            VENDOR_ARTIFACTORY,
+            vec![
+                "artifactory".to_owned(),
+                "jfrog".to_owned(),
+                "mcp-server-artifactory".to_owned(),
+            ],
+        ),
+        (
+            VENDOR_SNYK,
+            vec!["snyk".to_owned(), "mcp-server-snyk".to_owned()],
+        ),
+        (
+            VENDOR_MEND,
+            vec![
+                "mend".to_owned(),
+                "whitesource".to_owned(),
+                "mcp-server-mend".to_owned(),
+            ],
+        ),
     ]
 }
 

@@ -1,0 +1,1 @@
+Download the text log for one GitHub Actions job as a bounded, owner-scoped artifact. Requires Actions read access. Redirect destinations must be configured in MCP_DOWNLOAD_ALLOWED_ORIGINS; API credentials are stripped across origins. Returns metadata and SHA-256; use artifact_read for bounded chunks.

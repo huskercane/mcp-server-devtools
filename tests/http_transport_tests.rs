@@ -7,7 +7,6 @@
 
 use std::time::Duration;
 
-use mcp_server_devtools::server::http::build_app;
 use mcp_server_devtools::server::session::{DEFAULT_IDLE_TTL, DEFAULT_SWEEP_INTERVAL};
 use reqwest::StatusCode;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue, ORIGIN};
@@ -23,7 +22,18 @@ const ALLOWED_ORIGIN: &str = "http://localhost:3000";
 async fn spawn_app(idle_ttl: Duration, sweep_interval: Duration) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
-    let app = build_app(idle_ttl, sweep_interval).expect("build_app");
+    let server = mcp_server_devtools::bootstrap::ServerBuilder::new()
+        .config(mcp_server_devtools::config::Config::from_map(
+            std::collections::HashMap::from([("MCP_ENABLED_VENDORS".into(), "all".into())]),
+        ))
+        .build()
+        .unwrap();
+    let app = mcp_server_devtools::server::http::build_app_with_server(
+        server,
+        idle_ttl,
+        sweep_interval,
+        tokio_util::sync::CancellationToken::new(),
+    );
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("axum::serve");
     });
@@ -129,8 +139,8 @@ async fn modern_tools_list_is_stateless_deterministic_and_cacheable() {
     let body = response_json(response).await;
     let result = &body["result"];
     assert_eq!(result["resultType"], "complete");
-    assert_eq!(result["ttlMs"], 300_000);
-    assert_eq!(result["cacheScope"], "public");
+    assert_eq!(result["ttlMs"], 0);
+    assert_eq!(result["cacheScope"], "private");
 
     let names: Vec<&str> = result["tools"]
         .as_array()
@@ -138,7 +148,7 @@ async fn modern_tools_list_is_stateless_deterministic_and_cacheable() {
         .iter()
         .map(|tool| tool["name"].as_str().expect("tool name"))
         .collect();
-    assert_eq!(names.len(), 75);
+    assert_eq!(names.len(), if cfg!(feature = "wrds") { 122 } else { 118 });
     assert!(names.contains(&"artifact_read"));
     assert!(names.windows(2).all(|pair| pair[0] <= pair[1]));
 }

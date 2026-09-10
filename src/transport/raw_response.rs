@@ -257,6 +257,7 @@ pub struct ArtifactWriter {
     writer: Option<BufWriter<fs::File>>,
     size: u64,
     max_bytes: u64,
+    preview_enabled: bool,
     head: Vec<u8>,
     tail: std::collections::VecDeque<u8>,
     hasher: Sha256,
@@ -312,15 +313,17 @@ impl ArtifactWriter {
             .expect("artifact writer is open")
             .write_all(bytes)
             .await?;
-        let head_limit = crate::constants::data_limits::STREAM_PREVIEW_HEAD_SIZE;
-        if self.head.len() < head_limit {
-            let take = (head_limit - self.head.len()).min(bytes.len());
-            self.head.extend_from_slice(&bytes[..take]);
-        }
-        let tail_limit = crate::constants::data_limits::STREAM_PREVIEW_TAIL_SIZE;
-        self.tail.extend(bytes.iter().copied());
-        while self.tail.len() > tail_limit {
-            self.tail.pop_front();
+        if self.preview_enabled {
+            let head_limit = crate::constants::data_limits::STREAM_PREVIEW_HEAD_SIZE;
+            if self.head.len() < head_limit {
+                let take = (head_limit - self.head.len()).min(bytes.len());
+                self.head.extend_from_slice(&bytes[..take]);
+            }
+            let tail_limit = crate::constants::data_limits::STREAM_PREVIEW_TAIL_SIZE;
+            let suffix = &bytes[bytes.len().saturating_sub(tail_limit)..];
+            let discard = (self.tail.len() + suffix.len()).saturating_sub(tail_limit);
+            self.tail.drain(..discard);
+            self.tail.extend(suffix.iter().copied());
         }
         self.hasher.update(bytes);
         self.size = next;
@@ -433,6 +436,8 @@ pub async fn begin_artifact_in_operation(
     let path = dir.join(&filename);
     let partial_path = dir.join(format!(".{filename}.part"));
     let file = fs::File::create(&partial_path).await?;
+    let preview_enabled = content_type.starts_with("text/")
+        || matches!(content_type, "application/json" | "application/x-ndjson");
     Ok(ArtifactWriter {
         id,
         filename,
@@ -446,10 +451,17 @@ pub async fn begin_artifact_in_operation(
         )),
         size: 0,
         max_bytes,
-        head: Vec::with_capacity(crate::constants::data_limits::STREAM_PREVIEW_HEAD_SIZE),
-        tail: std::collections::VecDeque::with_capacity(
-            crate::constants::data_limits::STREAM_PREVIEW_TAIL_SIZE,
-        ),
+        preview_enabled,
+        head: Vec::with_capacity(if preview_enabled {
+            crate::constants::data_limits::STREAM_PREVIEW_HEAD_SIZE
+        } else {
+            0
+        }),
+        tail: std::collections::VecDeque::with_capacity(if preview_enabled {
+            crate::constants::data_limits::STREAM_PREVIEW_TAIL_SIZE
+        } else {
+            0
+        }),
         hasher: Sha256::new(),
         committed: false,
         disk_reservation: None,
@@ -893,6 +905,18 @@ pub(crate) fn attach_sidecar_reservation(
     registered.committed_at = monotonic_now();
     registered.retention_eligible = true;
     Ok(())
+}
+
+/// Start retention for a standalone completed download without a manifest.
+pub(crate) fn retain_download(id: &str) {
+    if let Some(entry) = artifacts()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_mut(id)
+    {
+        entry.committed_at = monotonic_now();
+        entry.retention_eligible = true;
+    }
 }
 
 /// Start the bounded periodic retention pass for the process session.

@@ -25,7 +25,9 @@ pub mod client;
 pub mod image;
 pub mod multipart;
 pub mod raw_response;
+mod redirect;
 mod response_cache;
+mod retry;
 
 /// Expire idle cache entries and close observations before the audit writer stops.
 /// The caller must stop serving requests before signaling shutdown.
@@ -1028,7 +1030,8 @@ impl StreamingPolicy {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+// Keep the retry state, deadline, and per-attempt attribution together.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn fetch_streamed_artifact_with_policy(
     vendor: &dyn Vendor,
     credentials: &Credentials,
@@ -1045,9 +1048,19 @@ pub async fn fetch_streamed_artifact_with_policy(
     let method = options.method.unwrap_or(HttpMethod::Get);
     // Plan §1.3: the request about to go on the wire is the fact policy is
     // evaluated on. Outside an enforcing call scope this is one lookup.
-    let ticket =
-        crate::policy::authorize_egress(vendor.name(), method, &target, options.body.as_ref())
-            .await?;
+    let destination = redirect::destination(&target.url_under(&base))?;
+    let ticket = if vendor.name() == "artifactory" && method == HttpMethod::Get {
+        crate::policy::authorize_download_egress(vendor.name(), &target, &destination).await?
+    } else {
+        crate::policy::authorize_egress_at(
+            vendor.name(),
+            method,
+            &target,
+            options.body.as_ref(),
+            Some(&destination),
+        )
+        .await?
+    };
     // Each wire attempt, and how the last one ended, for the egress record.
     let report = |status, failure| report_attempt(ticket.as_ref(), status, failure);
     let url = target.url_under(&base);
@@ -1083,7 +1096,7 @@ pub async fn fetch_streamed_artifact_with_policy(
                 Ok(Err(error)) if attempt < attempts && is_retryable_stream_request_error(&error) => {
                     report(None, Some("transport_error"));
                     log_http_transport_failure(call, &error, true);
-                    retry_stream_attempt(attempt, &policy, deadline).await?;
+                    retry_stream_attempt(attempt, &policy, deadline, None).await?;
                     continue;
                 }
                 Ok(Err(error)) => {
@@ -1094,7 +1107,7 @@ pub async fn fetch_streamed_artifact_with_policy(
                 Err(_) if attempt < attempts => {
                     report(None, Some("timeout"));
                     log_http_timeout_failure(call, true);
-                    retry_stream_attempt(attempt, &policy, deadline).await?;
+                    retry_stream_attempt(attempt, &policy, deadline, None).await?;
                     continue;
                 }
                 Err(_) => {
@@ -1104,17 +1117,39 @@ pub async fn fetch_streamed_artifact_with_policy(
                 }
             }
         };
+        report(Some(response.status().as_u16()), None);
+        let response = redirect::follow(
+            client,
+            vendor.name(),
+            config,
+            &url,
+            response,
+            method,
+            &options,
+            Some((&auth_name, &auth_header)),
+            deadline,
+            &policy.cancellation,
+        )
+        .await?;
         let status = response.status();
-        report(Some(status.as_u16()), None);
         if !status.is_success() {
             let will_retry = attempt < attempts && matches!(status.as_u16(), 429 | 502 | 503 | 504);
             log_http_status_failure(call, status, will_retry);
             if will_retry {
-                retry_stream_attempt(attempt, &policy, deadline).await?;
+                let delay = retry::parse(response.headers(), std::time::SystemTime::now());
+                drop(response);
+                retry_stream_attempt(attempt, &policy, deadline, delay).await?;
                 continue;
             }
-            let body = response.text().await.unwrap_or_default();
-            return Err(vendor.classify_error(status, &body));
+            let delay = retry::parse(response.headers(), std::time::SystemTime::now());
+            let redirected = response.url().as_str() != url;
+            let body = bounded_body(response, &policy, deadline).await?;
+            let error = if redirected {
+                api_error("Redirected download failed", Some(status.as_u16()), None)
+            } else {
+                vendor.classify_error(status, &body)
+            };
+            return Err(retry::metadata(error, delay));
         }
         enforce_streamed_length_cap(&response, &policy)?;
         let artifact = tokio::time::timeout(
@@ -1159,7 +1194,7 @@ fn decoded_reader(
     let aggregate = policy.aggregate.clone();
     let stream = response
         .bytes_stream()
-        .map_err(std::io::Error::other)
+        .map_err(|_| std::io::Error::other("upstream response body interrupted"))
         .and_then(move |chunk| {
             let counter = encoded.clone();
             let aggregate = aggregate.clone();
@@ -1223,6 +1258,20 @@ async fn persist_decoded_response(
     content_type: &str,
     policy: &StreamingPolicy,
 ) -> Result<raw_response::StreamedArtifact, McpError> {
+    let expected_checksum = response
+        .headers()
+        .get("x-checksum-sha256")
+        .map(|header| {
+            header
+                .to_str()
+                .ok()
+                .filter(|value| {
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .map(str::to_ascii_lowercase)
+                .ok_or_else(|| api_error("Invalid upstream SHA-256", Some(502), None))
+        })
+        .transpose()?;
     let encoded = std::sync::Arc::new(AtomicU64::new(0));
     let mut reader = decoded_reader(response, policy, encoded.clone())?;
     let mut writer = raw_response::begin_artifact_in_operation(
@@ -1275,6 +1324,25 @@ async fn persist_decoded_response(
     let mut artifact = writer.commit().await.map_err(|error| {
         unexpected(format!("failed to commit streamed artifact: {error}"), None)
     })?;
+    if expected_checksum
+        .as_ref()
+        .is_some_and(|expected| expected != &artifact.sha256)
+    {
+        raw_response::remove_artifact(&artifact.artifact.path)
+            .await
+            .map_err(|_| {
+                api_error(
+                    "Checksum mismatch; artifact cleanup failed",
+                    Some(502),
+                    None,
+                )
+            })?;
+        return Err(api_error(
+            "Upstream SHA-256 checksum mismatch",
+            Some(502),
+            None,
+        ));
+    }
     artifact.encoded_bytes = encoded.load(Ordering::Relaxed);
     artifact.decoded_bytes = artifact.artifact.size;
     Ok(artifact)
@@ -1282,57 +1350,99 @@ async fn persist_decoded_response(
 
 /// Stream an absolute, unauthenticated URL (for example a signed log-output
 /// URL) through the same explicit wire accounting and decoder path.
+// Keep the retry state, deadline, and per-attempt attribution together.
+#[allow(clippy::too_many_lines)]
 pub async fn fetch_streamed_url(
+    vendor: &str,
+    config: &Config,
     url: &str,
     filename_prefix: &str,
     extension: &str,
     content_type: &str,
     policy: StreamingPolicy,
 ) -> Result<raw_response::StreamedArtifact, McpError> {
+    let destination = redirect::destination(url)?;
+    let ticket = redirect::authorize(vendor, &destination).await?;
+    if !redirect::allowed(config, vendor, &destination) {
+        return Err(api_error(
+            "Download origin is not in MCP_DOWNLOAD_ALLOWED_ORIGINS",
+            Some(403),
+            None,
+        ));
+    }
     let client = streaming_client()?;
     let deadline = tokio::time::Instant::now() + policy.total_deadline;
     let attempts = policy.max_attempts.max(1);
     let download_started = Instant::now();
     for attempt in 1..=attempts {
         let remaining = remaining_until(deadline)?;
-        let call = HttpCallLog::new("streaming-url", "GET", url).for_attempt(attempt, attempts);
+        let call = HttpCallLog::new(vendor, "GET", url).for_attempt(attempt, attempts);
         let response = tokio::select! {
-            () = policy.cancellation.cancelled() => return Err(api_error("streaming request cancelled", Some(499), None)),
+            () = policy.cancellation.cancelled() => {
+                report_attempt(ticket.as_ref(), None, Some("cancelled"));
+                return Err(api_error("streaming request cancelled", Some(499), None));
+            },
             result = tokio::time::timeout(remaining, client.get(url).timeout(remaining).send()) => match result {
                 Ok(Ok(response)) => response,
                 Ok(Err(error)) if attempt < attempts && is_retryable_stream_request_error(&error) => {
+                    report_attempt(ticket.as_ref(), None, Some("transport_error"));
                     log_http_transport_failure(call, &error, true);
-                    retry_stream_attempt(attempt, &policy, deadline).await?;
+                    retry_stream_attempt(attempt, &policy, deadline, None).await?;
                     continue;
                 }
                 Ok(Err(error)) => {
+                    report_attempt(ticket.as_ref(), None, Some("transport_error"));
                     log_http_transport_failure(call, &error, false);
-                    return Err(map_transport_error(&error, url));
+                    return Err(api_error("Download request failed", Some(if error.is_timeout() { 408 } else { 502 }), None));
                 }
                 Err(_) if attempt < attempts => {
+                    report_attempt(ticket.as_ref(), None, Some("timeout"));
                     log_http_timeout_failure(call, true);
-                    retry_stream_attempt(attempt, &policy, deadline).await?;
+                    retry_stream_attempt(attempt, &policy, deadline, None).await?;
                     continue;
                 }
                 Err(_) => {
+                    report_attempt(ticket.as_ref(), None, Some("timeout"));
                     log_http_timeout_failure(call, false);
                     return Err(api_error("streaming request exceeded total deadline", Some(408), None));
                 }
             }
         };
+        report_attempt(ticket.as_ref(), Some(response.status().as_u16()), None);
+        let response = redirect::follow(
+            client,
+            vendor,
+            config,
+            url,
+            response,
+            HttpMethod::Get,
+            &RequestOptions::default(),
+            None,
+            deadline,
+            &policy.cancellation,
+        )
+        .await?;
         let status = response.status();
         if !status.is_success() {
             let will_retry = attempt < attempts && matches!(status.as_u16(), 429 | 502 | 503 | 504);
             log_http_status_failure(call, status, will_retry);
             if will_retry {
-                retry_stream_attempt(attempt, &policy, deadline).await?;
+                let delay = retry::parse(response.headers(), std::time::SystemTime::now());
+                drop(response);
+                retry_stream_attempt(attempt, &policy, deadline, delay).await?;
                 continue;
             }
-            let body = response.text().await.unwrap_or_default();
-            return Err(api_error(
-                format!("streaming request failed with status {}", status.as_u16()),
-                Some(status.as_u16()),
-                Some(OriginalError::String(body)),
+            let delay = retry::parse(response.headers(), std::time::SystemTime::now());
+            // Consume under the same bounds, but never echo an object-store error
+            // body: it can contain the signed URL or credentials.
+            let _ = bounded_body(response, &policy, deadline).await?;
+            return Err(retry::metadata(
+                api_error(
+                    format!("streaming request failed with status {}", status.as_u16()),
+                    Some(status.as_u16()),
+                    None,
+                ),
+                delay,
             ));
         }
         if response
@@ -1352,7 +1462,7 @@ pub async fn fetch_streamed_url(
         .await
         .map_err(|_| api_error("streaming request exceeded total deadline", Some(408), None))??;
         log_streamed_download(
-            "streaming-url",
+            vendor,
             "GET",
             url,
             filename_prefix,
@@ -1376,8 +1486,18 @@ async fn retry_stream_attempt(
     attempt: usize,
     policy: &StreamingPolicy,
     deadline: tokio::time::Instant,
+    requested: Option<Duration>,
 ) -> Result<(), McpError> {
-    let delay = Duration::from_millis(100_u64.saturating_mul(1_u64 << attempt.min(5)));
+    let delay = requested.unwrap_or_else(|| retry::jitter(attempt));
+    if delay >= remaining_until(deadline)? {
+        return Err(api_error(
+            "retry delay exceeds remaining request deadline",
+            Some(408),
+            Some(OriginalError::Json(
+                serde_json::json!({"retryAfterMs": u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)}),
+            )),
+        ));
+    }
     tokio::select! {
         () = policy.cancellation.cancelled() => Err(api_error("streaming request cancelled", Some(499), None)),
         () = tokio::time::sleep_until(deadline) => Err(api_error("streaming request exceeded total deadline", Some(408), None)),
@@ -1423,6 +1543,8 @@ impl HttpMethod {
 pub struct RequestOptions {
     /// Bypass local cache lookup and admission for this request.
     pub fresh: bool,
+    /// Sensitive response: bypass caching and raw-response persistence.
+    pub sensitive_response: bool,
     pub method: Option<HttpMethod>,
     pub headers: Vec<(String, String)>,
     pub body: Option<Value>,
@@ -1430,6 +1552,11 @@ pub struct RequestOptions {
     /// endpoints do not accept JSON. Mutually exclusive with `body`;
     /// `form` takes precedence if both are supplied.
     pub form: Option<BTreeMap<String, String>>,
+    /// Plain-text request body (`Content-Type: text/plain`). Used by APIs
+    /// whose query language is not JSON — Artifactory's AQL search endpoint
+    /// is a `POST` with the query as the body. Lowest precedence of the three
+    /// body forms: `form`, then `body`, then `text_body`.
+    pub text_body: Option<String>,
     pub timeout: Option<Duration>,
 }
 
@@ -1442,6 +1569,13 @@ pub struct TransportResponse {
     pub cache: CacheMetadata,
     pub data: ResponseBody,
     pub raw_response_path: Option<std::path::PathBuf>,
+    /// Upstream response headers. Purpose-built tools read pagination
+    /// headers from here (Sentry's `Link` cursor, GitHub's `Link`), which the
+    /// body does not carry. Empty on a local cache hit — the cache stores
+    /// bodies, and a cursor into a page that was served from cache is the
+    /// same cursor the origin would have returned when it was stored, so
+    /// list tools bypass the cache (see `Vendor::cache_reads`).
+    pub headers: http::HeaderMap,
 }
 
 /// Provenance of the local HTTP response, independent of upstream cache age.
@@ -1556,13 +1690,20 @@ pub async fn fetch(
     let method = options.method.unwrap_or(HttpMethod::Get);
     // Plan §1.3: the request about to go on the wire is the fact policy is
     // evaluated on. Outside an enforcing call scope this is one lookup.
-    let ticket =
-        crate::policy::authorize_egress(vendor.name(), method, &target, options.body.as_ref())
-            .await?;
+    let destination = redirect::destination(&target.url_under(&base))?;
+    let ticket = crate::policy::authorize_egress_at(
+        vendor.name(),
+        method,
+        &target,
+        options.body.as_ref(),
+        Some(&destination),
+    )
+    .await?;
     let url = target.url_under(&base);
 
     let (auth_name, auth_header) = validate_auth(credentials)?;
     let timeout = resolve_timeout(config, options.timeout);
+    let deadline = tokio::time::Instant::now() + timeout;
 
     let cache_config = response_cache::CacheConfig::from_config(config);
     // Partitioned by the acting principal (WP A.5). `OwnerKey::current`
@@ -1581,6 +1722,7 @@ pub async fn fetch(
     }
     let cacheable = cache_config.enabled
         && !options.fresh
+        && !options.sensitive_response
         && vendor.cache_reads(path)
         && response_cache::request_is_cacheable(&url, &auth_name, &options);
     if method != HttpMethod::Get {
@@ -1592,6 +1734,7 @@ pub async fn fetch(
             data: body,
             cache: metadata,
             raw_response_path: None,
+            headers: http::HeaderMap::new(),
         });
     }
 
@@ -1621,10 +1764,23 @@ pub async fn fetch(
         log_http_transport_failure(call, &error, false);
         map_transport_error(&error, &url)
     })?;
+    report_attempt(ticket.as_ref(), Some(response.status().as_u16()), None);
+    let response = redirect::follow(
+        client,
+        vendor.name(),
+        config,
+        &url,
+        response,
+        method,
+        &options,
+        Some((&auth_name, &auth_header)),
+        deadline,
+        &CancellationToken::new(),
+    )
+    .await?;
     let duration = start.elapsed();
 
     let status = response.status();
-    report_attempt(ticket.as_ref(), Some(status.as_u16()), None);
     if !status.is_success() {
         log_http_status_failure(call, status, false);
     }
@@ -1632,9 +1788,20 @@ pub async fn fetch(
 
     let response_headers = response.headers().clone();
     if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_default();
+        let policy = StreamingPolicy::new(MAX_RESPONSE_SIZE as u64, MAX_RESPONSE_SIZE as u64);
+        let redirected = response.url().as_str() != url;
+        let body_text = bounded_body(response, &policy, deadline).await?;
+        if redirected {
+            return Err(retry::metadata(
+                api_error("Redirected request failed", Some(status.as_u16()), None),
+                retry::parse(&response_headers, std::time::SystemTime::now()),
+            ));
+        }
         log_ninjaone_error_response(vendor.name(), &url, method, status, &body_text);
-        return Err(vendor.classify_error(status, &body_text));
+        return Err(retry::metadata(
+            vendor.classify_error(status, &body_text),
+            retry::parse(&response_headers, std::time::SystemTime::now()),
+        ));
     }
 
     let body = classify_body(response).await?;
@@ -1667,7 +1834,9 @@ pub async fn fetch(
         );
     }
 
-    let raw_path = if let ResponseBody::Json(value) = &body {
+    let raw_path = if !options.sensitive_response
+        && let ResponseBody::Json(value) = &body
+    {
         raw_response::save(
             &url,
             method.as_str(),
@@ -1685,6 +1854,7 @@ pub async fn fetch(
         data: body,
         cache: metadata,
         raw_response_path: raw_path,
+        headers: response_headers,
     })
 }
 
@@ -1722,6 +1892,7 @@ pub async fn fetch_bitbucket_with_base(
 pub fn build_client() -> Result<HttpClient, McpError> {
     HttpClient::builder()
         .crate_user_agent()
+        .no_redirects()
         .build()
         .map_err(|e| unexpected(format!("failed to build HTTP client: {e}"), None))
 }
@@ -1734,6 +1905,7 @@ fn streaming_client() -> Result<&'static HttpClient, McpError> {
         .get_or_init(|| {
             HttpClient::builder()
                 .crate_user_agent()
+                .no_redirects()
                 .no_decompression()
                 .build()
                 .map_err(|error| error.to_string())
@@ -1790,12 +1962,16 @@ fn report_cache_hit(ticket: Option<&crate::policy::EgressTicket>) {
 /// The request body as the diagnostic log and raw-response record show it:
 /// the JSON body, or the form encoded as JSON.
 fn request_body_for_log(options: &RequestOptions) -> Option<Value> {
-    options.body.clone().or_else(|| {
-        options
-            .form
-            .as_ref()
-            .and_then(|form| serde_json::to_value(form).ok())
-    })
+    options
+        .body
+        .clone()
+        .or_else(|| {
+            options
+                .form
+                .as_ref()
+                .and_then(|form| serde_json::to_value(form).ok())
+        })
+        .or_else(|| options.text_body.clone().map(Value::String))
 }
 
 /// Canonicalize the caller's path-and-query (plan §3.5) before it is joined
@@ -1858,6 +2034,10 @@ fn build_request(
         req = req.form(form);
     } else if let Some(body) = options.body.as_ref() {
         req = req.json(body);
+    } else if let Some(text) = options.text_body.as_ref() {
+        req = req
+            .header(CONTENT_TYPE, HeaderValue::from_static("text/plain"))
+            .body(text.clone());
     } else {
         req = req.header(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     }
@@ -1888,6 +2068,50 @@ fn enforce_content_length_cap(response: &HttpResponse) -> Result<(), McpError> {
     Ok(())
 }
 
+/// Read decoded bodies with actual byte, idle, cancellation and total limits.
+/// No artifact/cache entry is created for an error response.
+pub(crate) async fn bounded_body(
+    response: HttpResponse,
+    policy: &StreamingPolicy,
+    deadline: tokio::time::Instant,
+) -> Result<String, McpError> {
+    let cap = policy.max_decoded_bytes.min(MAX_RESPONSE_SIZE as u64);
+    let mut reader = decoded_reader(response, policy, Arc::new(AtomicU64::new(0)))?;
+    let mut body = Vec::with_capacity(8192.min(usize::try_from(cap).unwrap_or(8192)));
+    let mut buffer = vec![0; 8192];
+    loop {
+        let count = tokio::select! {
+            () = policy.cancellation.cancelled() => return Err(api_error("response read cancelled", Some(499), None)),
+            () = tokio::time::sleep_until(deadline) => return Err(api_error("response body exceeded total deadline", Some(408), None)),
+            result = tokio::time::timeout(policy.idle_read_timeout, reader.read(&mut buffer)) => {
+                result.map_err(|_| api_error("response body idle timeout", Some(408), None))?
+                    .map_err(|error| {
+                        let status = if error.kind() == std::io::ErrorKind::FileTooLarge { 413 } else { 502 };
+                        api_error(format!("failed to read bounded response: {error}"), Some(status), None)
+                    })?
+            }
+        };
+        if count == 0 {
+            break;
+        }
+        if body.len() as u64 + count as u64 > cap {
+            return Err(api_error(
+                "response body exceeds maximum size",
+                Some(413),
+                None,
+            ));
+        }
+        if let Some(aggregate) = &policy.aggregate {
+            aggregate
+                .add_decoded(count as u64)
+                .map_err(|error| api_error(error.to_string(), Some(413), None))?;
+        }
+        body.extend_from_slice(&buffer[..count]);
+    }
+    Ok(String::from_utf8(body)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()))
+}
+
 async fn classify_body(response: HttpResponse) -> Result<ResponseBody, McpError> {
     if response.status() == StatusCode::NO_CONTENT {
         return Ok(ResponseBody::Empty);
@@ -1900,18 +2124,16 @@ async fn classify_body(response: HttpResponse) -> Result<ResponseBody, McpError>
         .unwrap_or("")
         .to_owned();
 
+    let policy = StreamingPolicy::new(MAX_RESPONSE_SIZE as u64, MAX_RESPONSE_SIZE as u64);
+    let text = bounded_body(
+        response,
+        &policy,
+        tokio::time::Instant::now() + policy.total_deadline,
+    )
+    .await?;
     if content_type.contains("text/plain") {
-        let text = response
-            .text()
-            .await
-            .map_err(|e| unexpected(format!("failed to read text body: {e}"), None))?;
         return Ok(ResponseBody::Text(text));
     }
-
-    let text = response
-        .text()
-        .await
-        .map_err(|e| unexpected(format!("failed to read body: {e}"), None))?;
 
     if text.trim().is_empty() {
         return Ok(ResponseBody::Empty);

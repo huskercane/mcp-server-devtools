@@ -224,6 +224,8 @@ struct MatchDocument {
     method: Option<OneOrMany<String>>,
     #[serde(default)]
     canonical_path: Option<OneOrMany<String>>,
+    #[serde(default)]
+    destination_origin: Option<OneOrMany<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -345,6 +347,7 @@ struct CompiledRule {
     upstream_authority: Option<Vec<UpstreamAuthority>>,
     method: Option<Vec<HttpMethod>>,
     canonical_path: Option<Vec<Glob>>,
+    destination_origin: Option<Vec<String>>,
 }
 
 impl CompiledRule {
@@ -356,6 +359,13 @@ impl CompiledRule {
     /// rule matches. The same early-return walk `matches` always did; the
     /// key name is what `policy explain` prints (WP B.2).
     fn mismatch(&self, context: &ActionContext) -> Option<&'static str> {
+        if self.destination_origin.as_ref().is_some_and(|origins| {
+            !context
+                .destination_origin()
+                .is_some_and(|origin| origins.iter().any(|allowed| allowed == origin))
+        }) {
+            return Some("destination_origin");
+        }
         if !self.subjects.matches(context.principal()) {
             return Some("subjects");
         }
@@ -630,6 +640,7 @@ fn compile_rule(rule: RuleDocument) -> Result<CompiledRule, PolicyError> {
         upstream_authority: matcher.upstream_authority.map(OneOrMany::into_vec),
         method,
         canonical_path: globs(matcher.canonical_path),
+        destination_origin: matcher.destination_origin.map(OneOrMany::into_vec),
     })
 }
 
@@ -888,6 +899,10 @@ impl CompiledRule {
         put(
             "canonical_path",
             glob_patterns(self.canonical_path.as_ref()),
+        );
+        put(
+            "destination_origin",
+            self.destination_origin.clone().unwrap_or_default(),
         );
         RuleDescription {
             id: self.id.clone(),

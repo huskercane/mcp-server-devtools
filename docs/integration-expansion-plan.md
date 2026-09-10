@@ -1,6 +1,18 @@
 # Integration expansion plan
 
-Date: September 9, 2026. Status: proposed; implementation has not started.
+Date: September 9, 2026. Updated September 10, 2026.
+
+> **Implementation status:** the eight REST integrations and shared transport
+> prerequisites are implemented for the 0.17.0 change. This adds 47 native tools
+> to the current 75-tool baseline (122 default; 118 without default features).
+> It includes session vendor filtering, Retry-After handling, explicit per-hop
+> egress enforcement, GitHub job logs, GitLab streamed traces, Figma PNG exports,
+> and Artifactory downloads using the existing artifact pipeline. See
+> [implementation status and validation](integration-expansion-status.md) and
+> [configuration](configuration.md#native-rest-integrations).
+> AWS and Playwright are excluded from this implementation at the user's request.
+> Adaptive/experimental telemetry and follow-on mutations remain deferred.
+> Hosted/self-hosted live compatibility is not claimed from fixture results.
 
 Add AWS, Snyk, Playwright, Vercel, Sentry, JFrog Artifactory, Mend, GitHub,
 GitLab, and Figma to the

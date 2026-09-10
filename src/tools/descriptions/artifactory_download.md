@@ -1,0 +1,1 @@
+Download one Artifactory repository item into a bounded, owner-scoped artifact. The file remains opaque and archives are never extracted. Verifies X-Checksum-Sha256 when supplied and computes SHA-256 locally. Returns metadata only; use artifact_read for bounded chunks.

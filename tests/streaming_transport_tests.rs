@@ -20,6 +20,11 @@ async fn explicitly_decodes_and_accounts_for_zstd_without_content_length_assumpt
         .await;
 
     let artifact = fetch_streamed_url(
+        "circleci",
+        &mcp_server_devtools::config::Config::from_map(std::collections::HashMap::from([(
+            "MCP_DOWNLOAD_ALLOWED_ORIGINS".into(),
+            server.uri(),
+        )])),
         &format!("{}/logs", server.uri()),
         "compressed-accounting-test",
         "log",
@@ -64,6 +69,11 @@ async fn transient_request_send_errors_are_retried() {
     let mut policy = StreamingPolicy::new(64, 64);
     policy.max_attempts = 2;
     let artifact = fetch_streamed_url(
+        "circleci",
+        &mcp_server_devtools::config::Config::from_map(std::collections::HashMap::from([(
+            "MCP_DOWNLOAD_ALLOWED_ORIGINS".into(),
+            server.uri(),
+        )])),
         &format!("{}/transient", server.uri()),
         "transient-request-retry",
         "log",
@@ -97,6 +107,11 @@ async fn decoded_quota_is_enforced_during_decompression() {
         .await;
 
     let error = fetch_streamed_url(
+        "circleci",
+        &mcp_server_devtools::config::Config::from_map(std::collections::HashMap::from([(
+            "MCP_DOWNLOAD_ALLOWED_ORIGINS".into(),
+            server.uri(),
+        )])),
         &format!("{}/bomb", server.uri()),
         "decoded-limit-test",
         "log",
@@ -131,6 +146,11 @@ async fn encoded_quota_is_enforced_and_partial_artifact_is_cleaned() {
         .collect::<std::collections::HashSet<_>>();
 
     let error = fetch_streamed_url(
+        "circleci",
+        &mcp_server_devtools::config::Config::from_map(std::collections::HashMap::from([(
+            "MCP_DOWNLOAD_ALLOWED_ORIGINS".into(),
+            server.uri(),
+        )])),
         &format!("{}/encoded-limit", server.uri()),
         "encoded-limit-test",
         "log",

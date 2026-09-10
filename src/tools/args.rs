@@ -1185,3 +1185,24 @@ pub struct TeamcityWriteArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_format: Option<OutputFormatArg>,
 }
+
+// Per-vendor argument DTOs for the purpose-built native adapters. Each
+// lives in its own file under `args/` so the vendor's contract is reviewed
+// and edited in one place; they are re-exported flat so call sites keep
+// addressing `crate::tools::args::<Type>`.
+pub mod github;
+pub use github::*;
+pub mod gitlab;
+pub use gitlab::*;
+pub mod figma;
+pub use figma::*;
+pub mod vercel;
+pub use vercel::*;
+pub mod sentry;
+pub use sentry::*;
+pub mod artifactory;
+pub use artifactory::*;
+pub mod snyk;
+pub use snyk::*;
+pub mod mend;
+pub use mend::*;

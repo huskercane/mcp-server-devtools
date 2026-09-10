@@ -25,19 +25,27 @@
 //! configured. Jira tools surface a clear "missing `ATLASSIAN_SITE_NAME`"
 //! error at tool-call time rather than crashing the process at boot.
 
+pub mod artifactory;
 pub mod bitbucket;
 pub mod circleci;
 pub mod confluence;
 pub mod edx;
+pub mod figma;
+pub mod github;
+pub mod gitlab;
 pub mod grafana;
 pub mod jira;
+pub mod mend;
 pub mod newrelic;
 pub mod ninjaone;
 pub mod postman;
+pub mod sentry;
 pub mod slack;
+pub mod snyk;
 pub mod sonarqube;
 pub mod splunk;
 pub mod teamcity;
+pub mod vercel;
 #[cfg(feature = "wrds")]
 pub mod wrds;
 pub mod zoom;

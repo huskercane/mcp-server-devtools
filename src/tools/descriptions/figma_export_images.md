@@ -1,0 +1,1 @@
+Export up to 10 explicit Figma nodes as PNG artifacts. Requires file content read access and configured MCP_DOWNLOAD_ALLOWED_ORIGINS for render hosts. Transfers share maxBytes; null renders are marked incomplete. PNG dimensions are bounded; images are never decoded or inlined. Returns owner-scoped artifact handles for artifact_read.

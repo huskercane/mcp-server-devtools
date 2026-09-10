@@ -40,7 +40,8 @@ pub use bundle::{
     BundleAudit, BundleChange, BundleError, ChangeHook, Loaded, SignedBundle, Staged,
 };
 pub use canonical::{CanonicalPath, CanonicalTarget, CanonicalizeError};
-pub use egress::{Enforcement, authorize_egress};
+mod native;
+pub use egress::{Enforcement, authorize_download_egress, authorize_egress, authorize_egress_at};
 pub use engine::{
     CompiledPolicy, Explanation, FilePolicy, PolicyError, RuleDescription, RuleTrace,
     SubjectsDescription,
@@ -489,6 +490,8 @@ pub struct UpstreamIdentity {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ResourceType {
+    /// Native REST adapter resource; no object-level scope is inferred.
+    VendorResource,
     Issue,
     Project,
     Channel,
@@ -507,6 +510,7 @@ pub enum ResourceType {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum NormalizedAction {
+    ReadVendorResource,
     ReadIssue,
     SearchIssues,
     ReadProject,
@@ -688,6 +692,22 @@ impl ActionDetails {
             constrained_by: None,
             request_risk: risk,
         }
+    }
+
+    /// Reviewed native read-only POST endpoints. Endpoint checks live here so
+    /// callers cannot manufacture a read classification for arbitrary writes.
+    pub(super) fn native_post_read(vendor: &str, path: CanonicalPath) -> Self {
+        let mut parts = path.as_str().trim_matches('/').split('/');
+        let approved = (vendor == "artifactory" && path.as_str() == "/api/search/aql")
+            || (vendor == "mend"
+                && matches!((parts.next(), parts.next(), parts.next(), parts.next(), parts.next(), parts.next(), parts.next()), (Some("api"), Some("v3.0"), Some("orgs"), Some(org), Some("projects"), Some("summaries"), None) if !org.is_empty()));
+        let mut details = Self::unclassified(HttpMethod::Post, path);
+        if approved {
+            details.request_risk = RequestRisk::Read;
+            details.resource_type = ResourceType::VendorResource;
+            details.normalized_action = NormalizedAction::ReadVendorResource;
+        }
+        details
     }
 
     /// Attach the constraint an extractor proved (CF-2). Builder-style so
@@ -987,6 +1007,8 @@ pub struct ActionContext {
     #[serde(serialize_with = "serialize_method")]
     method: HttpMethod,
     canonical_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    destination_origin: Option<String>,
     query_attributes: Vec<(String, String)>,
     resource_type: ResourceType,
     resource_scope: ResourceScope,
@@ -999,6 +1021,16 @@ pub struct ActionContext {
 }
 
 impl ActionContext {
+    /// Validated HTTP origin of the actual egress destination, absent for tool intent.
+    #[must_use]
+    pub fn destination_origin(&self) -> Option<&str> {
+        self.destination_origin.as_deref()
+    }
+
+    pub(crate) fn set_destination(&mut self, destination: &url::Url) {
+        self.destination_origin = Some(destination.origin().ascii_serialization());
+    }
+
     /// Join the identity-shaped fields with an extractor's [`ActionDetails`].
     ///
     /// `vendor` and `environment` are **not** parameters: they are read off
@@ -1025,6 +1057,7 @@ impl ActionContext {
             normalized_action: details.normalized_action,
             method: details.method,
             canonical_path: details.canonical_path,
+            destination_origin: None,
             query_attributes: details.query_attributes,
             resource_type: details.resource_type,
             resource_scope: details.resource_scope,

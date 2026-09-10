@@ -93,5 +93,58 @@
       "WRDS_DBNAME": "wrds",
       "WRDS_SSLMODE": "require"
     }
+  },
+  "github": {
+    "environments": {
+      "GITHUB_TOKEN": "keychain",
+      "GITHUB_API_BASE": "https://api.github.com",
+      "GITHUB_API_VERSION": "2022-11-28"
+    }
+  },
+  "gitlab": {
+    "environments": {
+      "GITLAB_TOKEN": "keychain",
+      "GITLAB_API_BASE": "https://gitlab.com/api/v4"
+    }
+  },
+  "figma": {
+    "environments": {
+      "FIGMA_TOKEN": "keychain"
+    }
+  },
+  "vercel": {
+    "environments": {
+      "VERCEL_TOKEN": "keychain",
+      "VERCEL_TEAM_ID": "team_your_team"
+    }
+  },
+  "sentry": {
+    "environments": {
+      "SENTRY_TOKEN": "keychain",
+      "SENTRY_ORG": "your-org",
+      "SENTRY_URL": "https://sentry.io"
+    }
+  },
+  "artifactory": {
+    "environments": {
+      "ARTIFACTORY_URL": "https://packages.example.com/artifactory",
+      "ARTIFACTORY_TOKEN": "keychain"
+    }
+  },
+  "snyk": {
+    "environments": {
+      "SNYK_TOKEN": "keychain",
+      "SNYK_ORG_ID": "your-org-uuid",
+      "SNYK_API_BASE": "https://api.snyk.io",
+      "SNYK_API_VERSION": "2024-10-15"
+    }
+  },
+  "mend": {
+    "environments": {
+      "MEND_API_BASE": "https://api-saas.mend.io",
+      "MEND_EMAIL": "you@example.com",
+      "MEND_USER_KEY": "keychain",
+      "MEND_ORG_UUID": "your-org-uuid"
+    }
   }
 }
