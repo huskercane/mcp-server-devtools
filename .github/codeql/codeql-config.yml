@@ -1,0 +1,26 @@
+# CodeQL analysis config (advanced setup).
+#
+# Replaces the repository's default setup so that non-shipped code can be
+# excluded from analysis. Default setup offers no such knob, and without it
+# every synthetic credential and `http://` literal in the integration suite
+# is reported as a finding: of the 29 alerts open when this was written, 19
+# were test fixtures and a 20th was a `src/` sink whose only tainted source
+# was a test literal.
+#
+# Excluding a path removes it as a taint *source* as well as a sink, which is
+# the point — `tests/token_validator_tests.rs` feeding "http://keys.example/jwks"
+# into the shared outbound HTTP facade is a property of the test, not of the
+# binary.
+#
+# Caveat this does not cover: `#[cfg(test)]` modules that live inside `src/`
+# files (for example the env-var fixtures at the bottom of `src/auth/oidc.rs`)
+# are still analysed. `paths-ignore` filters whole files, and CodeQL's
+# build-mode `none` extractor does not evaluate `cfg` attributes, so those
+# have to be judged alert by alert.
+paths-ignore:
+  # Integration tests. Not compiled into the binary; carry deliberate
+  # synthetic credentials and plaintext URLs.
+  - tests/**
+  # Hand-run profiling harnesses (`harness = false`), not shipped and not a
+  # CI gate. See CLAUDE.md "Profiling".
+  - benches/**

@@ -1,0 +1,55 @@
+# CodeQL advanced setup.
+#
+# This replaces GitHub's default setup, which was configured for the same two
+# languages (`actions`, `rust`) on a weekly schedule but cannot be pointed at
+# a config file. The only reason to run it by hand is `.github/codeql/codeql-config.yml`,
+# which excludes `tests/` and `benches/` from analysis; see that file for why.
+#
+# Keep the `category` values as `/language:<lang>`. That is what default setup
+# used, and code-scanning matches alerts (and therefore carries dismissals
+# forward) within a category — changing it resurfaces every dismissed alert as
+# a new one.
+name: CodeQL
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    # Weekly, matching the cadence default setup ran on.
+    - cron: '7 4 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to upload the SARIF results to code scanning.
+      security-events: write
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: actions
+            build-mode: none
+          - language: rust
+            build-mode: none
+    steps:
+    - uses: actions/checkout@v4
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: ${{ matrix.language }}
+        build-mode: ${{ matrix.build-mode }}
+        config-file: ./.github/codeql/codeql-config.yml
+    - name: Perform CodeQL analysis
+      uses: github/codeql-action/analyze@v3
+      with:
+        category: "/language:${{ matrix.language }}"
