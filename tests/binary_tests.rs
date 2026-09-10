@@ -383,6 +383,49 @@ fn version_reported_to_users_is_the_crate_version() {
     );
 }
 
+/// `Cargo.lock` must record the crate's current version.
+///
+/// Regression guard: `v0.16.0` bumped `Cargo.toml` without rebuilding, so the
+/// lock file still said `0.15.0`. None of the local gates pass `--locked`, so
+/// the tree looked green — but every release job does, and each one died on
+/// `cannot update the lock file ... because --locked was passed`, publishing a
+/// tag that produced no artifacts. Release step 1 in CLAUDE.md ("build so
+/// `Cargo.lock` picks it up") is now enforced here rather than remembered.
+#[test]
+fn cargo_lock_records_the_crate_version() {
+    let lock = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"),
+    )
+    .expect("read Cargo.lock");
+
+    // Hand-parsed rather than pulling in a TOML dependency: the shape needed
+    // here is one `[[package]]` block's two scalar fields.
+    let recorded = lock
+        .split("[[package]]")
+        .find_map(|block| {
+            let mut version = None;
+            let mut is_this_crate = false;
+            for line in block.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("name = ") {
+                    is_this_crate = rest.trim_matches('"') == "mcp-server-devtools";
+                } else if let Some(rest) = line.strip_prefix("version = ") {
+                    version = Some(rest.trim_matches('"'));
+                }
+            }
+            if is_this_crate { version } else { None }
+        })
+        .expect("Cargo.lock has no mcp-server-devtools package entry");
+
+    assert_eq!(
+        recorded,
+        env!("CARGO_PKG_VERSION"),
+        "Cargo.lock records {recorded}, Cargo.toml says {}. Run a build so the \
+         lock file picks the bump up, or every `--locked` release job will fail.",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Fail-closed startup: an audit-incapable process must not report itself ready
 // ---------------------------------------------------------------------------
