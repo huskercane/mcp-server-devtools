@@ -1179,16 +1179,23 @@ async fn the_control_role_forwards_and_the_gateway_role_does_not() {
         .await
         .unwrap_or(false);
         assert_eq!(arrived, expect_forwarding, "role {role}");
+        let cursor_path = journal.path().join(CURSOR_FILE_NAME);
         if expect_forwarding {
-            assert!(
-                journal.path().join(CURSOR_FILE_NAME).exists(),
-                "role {role}: cursor persisted"
-            );
+            // The cursor is deliberately written *after* the adapter
+            // acknowledges, and on a `spawn_blocking` thread, so the collector
+            // observes the POST before the file reaches disk. Poll for it
+            // instead of racing that write: asserting immediately passed on
+            // Linux and failed on macOS and Windows.
+            let persisted = tokio::time::timeout(Duration::from_secs(8), async {
+                while !cursor_path.exists() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .is_ok();
+            assert!(persisted, "role {role}: cursor persisted");
         } else {
-            assert!(
-                !journal.path().join(CURSOR_FILE_NAME).exists(),
-                "role {role}: no shipper ran"
-            );
+            assert!(!cursor_path.exists(), "role {role}: no shipper ran");
         }
         drop(child);
     }
