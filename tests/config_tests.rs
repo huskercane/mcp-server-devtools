@@ -845,3 +845,45 @@ fn upload_limits_default_and_clamp_per_vendor() {
         MAX_UPLOAD_BYTES_CEILING
     );
 }
+
+#[cfg(feature = "ninjaone-db")]
+/// The two spellings are interchangeable: whichever an operator picks, the
+/// vendor client is handed the same document.
+#[test]
+fn nested_and_escaped_spellings_resolve_to_the_same_document() {
+    let escaped = r#"{"qa5":{"centralHost":"central.qa5.internal","divisionHosts":{"db-host-1":"division-1.qa5.internal"},"username":"readonly_user","password":"secret"}}"#;
+    let dir = TempDir::new().unwrap();
+    let global = write_global(
+        &dir,
+        &json!({
+            "ninjaone": {
+                "environments": {
+                    "NINJAONE_DB_ENVIRONMENTS": {
+                        "qa5": {
+                            "centralHost": "central.qa5.internal",
+                            "divisionHosts": { "db-host-1": "division-1.qa5.internal" },
+                            "username": "readonly_user",
+                            "password": "secret"
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    let cfg = Config::load_from_sources(Some(&global), None, &HashMap::new());
+    let nested = cfg
+        .get_for(
+            mcp_server_devtools::config::VENDOR_NINJAONE,
+            "NINJAONE_DB_ENVIRONMENTS",
+        )
+        .expect("nested document is loaded");
+    assert_eq!(nested, escaped);
+
+    // And it is a document the vendor actually accepts, not merely valid JSON.
+    let parsed =
+        mcp_server_devtools::vendor::ninjaone_db::environments::Environments::parse(nested)
+            .expect("nested form parses");
+    let (alias, environment) = parsed.get("QA5").unwrap();
+    assert_eq!(alias, "qa5");
+    assert_eq!(environment.central_host, "central.qa5.internal");
+}

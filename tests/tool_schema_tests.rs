@@ -177,3 +177,39 @@ fn upload_args_use_camel_case_json_and_default_to_failing_on_conflict() {
         })
     );
 }
+
+#[cfg(feature = "ninjaone-db")]
+use mcp_server_devtools::tools::args::{QueryDivisionDbArgs, ResolveDivisionArgs};
+
+#[cfg(feature = "ninjaone-db")]
+#[test]
+fn ninjaone_database_args_use_camel_case_json() {
+    let resolve: ResolveDivisionArgs = serde_json::from_value(json!({
+        "environment": "qa5",
+        "division": "division-uid"
+    }))
+    .unwrap();
+    assert_eq!(resolve.environment, "qa5");
+
+    let query: QueryDivisionDbArgs = serde_json::from_value(json!({
+        "environment": "dev-backup2",
+        "dbHost": "host-1",
+        "dbName": "div_acme_Ab12Cd34Ef",
+        "sql": "SELECT uid FROM device",
+        "rowLimit": 25,
+        "outputFormat": "json"
+    }))
+    .unwrap();
+    assert_eq!(query.db_host.as_deref(), Some("host-1"));
+    assert_eq!(query.db_name, "div_acme_Ab12Cd34Ef");
+    assert_eq!(query.row_limit, Some(25));
+
+    let query_without_host: QueryDivisionDbArgs = serde_json::from_value(json!({
+        "environment": "dev-backup2",
+        "dbHost": null,
+        "dbName": "div_acme_Ab12Cd34Ef",
+        "sql": "SELECT uid FROM device"
+    }))
+    .unwrap();
+    assert_eq!(query_without_host.db_host, None);
+}

@@ -42,6 +42,8 @@ mod jira;
 mod mend;
 mod newrelic;
 mod ninjaone;
+#[cfg(feature = "ninjaone-db")]
+mod ninjaone_db;
 mod postman;
 mod sentry;
 mod slack;
@@ -80,6 +82,8 @@ use crate::controllers::grafana::GrafanaContext;
 use crate::controllers::mend::MendContext;
 use crate::controllers::newrelic::NewRelicContext;
 use crate::controllers::ninjaone::NinjaOneContext;
+#[cfg(feature = "ninjaone-db")]
+use crate::controllers::ninjaone_db::NinjaOneDbContext;
 use crate::controllers::postman::PostmanContext;
 use crate::controllers::sentry::SentryContext;
 use crate::controllers::slack::SlackContext;
@@ -172,6 +176,8 @@ impl DevtoolsServer {
             + Self::mend_router()
             + Self::splunk_router();
         let router = router + Self::ninjaone_router();
+        #[cfg(feature = "ninjaone-db")]
+        let router = router + Self::ninjaone_db_router();
         // WRDS tools only exist when the `wrds` feature is on (default).
         #[cfg(feature = "wrds")]
         let router = router + Self::wrds_router();
@@ -594,6 +600,13 @@ impl DevtoolsServer {
             config,
             &self.components.vendors.ninjaone,
         )
+    }
+
+    /// NinjaOne database context. Like WRDS this is a direct Postgres path, so
+    /// it carries config and the vendor only.
+    #[cfg(feature = "ninjaone-db")]
+    fn ninjaone_db_ctx<'a>(&'a self, config: &'a Config) -> NinjaOneDbContext<'a> {
+        NinjaOneDbContext::new(config, &self.components.vendors.ninjaone_db)
     }
 
     /// WRDS-specific context. WRDS is PostgreSQL, not HTTP, so this context
