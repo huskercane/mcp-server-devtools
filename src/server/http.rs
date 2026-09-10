@@ -675,7 +675,7 @@ fn build_app_inner(
     };
     let health_server = shared_server.clone();
     let streamable = StreamableHttpService::new(
-        move || Ok(shared_server.clone()),
+        move || Ok(shared_server.new_session()),
         Arc::clone(&manager),
         StreamableHttpServerConfig::default()
             // Keep initialized sessions for older clients while requiring the

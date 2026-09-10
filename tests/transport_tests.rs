@@ -450,3 +450,74 @@ async fn timeout_maps_to_408() {
     assert_eq!(err.status_code, Some(408));
     assert!(err.message.to_lowercase().contains("timeout"));
 }
+
+/// A `text_body` goes on the wire verbatim as `text/plain` — Artifactory's
+/// AQL search is a `POST` whose body is a query, not JSON — and takes the
+/// lowest precedence of the three body forms.
+#[tokio::test]
+async fn text_body_is_sent_as_plain_text() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.0/search/aql"))
+        .and(header("content-type", "text/plain"))
+        .and(wiremock::matchers::body_string(
+            "items.find({\"repo\":\"libs\"}).limit(5)",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results": []})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let opts = RequestOptions {
+        method: Some(HttpMethod::Post),
+        text_body: Some("items.find({\"repo\":\"libs\"}).limit(5)".to_owned()),
+        ..Default::default()
+    };
+    let resp = call_mock(&server, "/2.0/search/aql", opts).await.unwrap();
+    assert_eq!(resp.data.as_json().unwrap()["results"], json!([]));
+    if let Some(p) = resp.raw_response_path {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// Upstream response headers ride on the `TransportResponse` so purpose-built
+/// tools can read pagination that only lives in headers (Sentry's `Link`
+/// cursor). A cache hit has no headers: the cache stores bodies only.
+#[tokio::test]
+async fn response_headers_are_exposed_and_absent_on_cache_hit() {
+    let server = MockServer::start().await;
+    let link = "<https://sentry.example/api/0/x/?cursor=1:100:0>; rel=\"next\"; results=\"true\"; cursor=\"1:100:0\"";
+    Mock::given(method("GET"))
+        .and(path("/2.0/paged"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("link", link)
+                .set_body_json(json!([{"id": 1}])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let creds = Credentials::Bearer {
+        token: "headers-test".into(),
+    };
+    let first = call_mock_cached(&server, "/2.0/paged", creds.clone())
+        .await
+        .unwrap();
+    assert!(!first.cache.hit);
+    assert_eq!(
+        first.headers.get("link").and_then(|v| v.to_str().ok()),
+        Some(link)
+    );
+
+    let second = call_mock_cached(&server, "/2.0/paged", creds)
+        .await
+        .unwrap();
+    assert!(second.cache.hit);
+    assert!(second.headers.is_empty());
+    for resp in [first, second] {
+        if let Some(p) = resp.raw_response_path {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}

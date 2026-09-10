@@ -619,7 +619,6 @@ async fn fetch_action_output(
     disk: std::sync::Arc<crate::transport::StreamingDiskQuota>,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<raw_response::StreamedArtifact, McpError> {
-    let _ = ctx;
     let _permit = output_downloads().acquire().await.map_err(|err| {
         api_error(
             format!("CircleCI output concurrency limiter closed: {err}"),
@@ -634,6 +633,8 @@ async fn fetch_action_output(
     policy.disk = Some(disk);
     policy.cancellation = cancellation;
     crate::transport::fetch_streamed_url(
+        "circleci",
+        ctx.config,
         output_url,
         "circleci-action",
         "json",

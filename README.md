@@ -2,7 +2,7 @@
 
 A unified Rust MCP server that connects AI assistants to the developer tools and services they use every day.
 
-One binary exposes 75 tools across Atlassian, CI/CD, observability, collaboration, API development, device management, learning, and financial research platforms. It supports stdio and streamable HTTP, keeps credentials out of tool arguments, and provides bounded output with resumable artifacts for large responses.
+One binary provides 122 tools across Atlassian, CI/CD, observability, collaboration, API development, device management, learning, and financial research platforms. It supports stdio and streamable HTTP, keeps credentials out of tool arguments, and provides bounded output with resumable artifacts for large responses.
 
 ## Integrations
 
@@ -22,9 +22,21 @@ One binary exposes 75 tools across Atlassian, CI/CD, observability, collaboratio
 | SonarQube / SonarCloud | `sonarqube_quality_gate`, `sonarqube_search_issues`, `sonarqube_get` | User token |
 | Splunk | Four `splunk_*` search and job tools | Authentication token |
 | NinjaOne | `ninjaone_login`, `ninjaone_get`, and write verbs | Bearer, session, or console credentials |
+| GitHub | Ten `github_*` repository, PR, issue, workflow and job-log tools | Personal access token |
+| GitLab | Ten `gitlab_*` project, MR, issue, pipeline and trace tools | Access token |
+| Figma | Five `figma_*` file, node, component, comment and PNG export tools | Personal access token |
+| Vercel | Four `vercel_*` project, deployment and log tools | Account token |
+| Sentry | Five `sentry_*` project, issue, event and release tools | Auth token |
+| Artifactory | Five `artifactory_*` discovery, structured search, metadata and download tools | JFrog access token |
+| Snyk | Four `snyk_*` organization, project and finding tools | API token |
+| Mend | Four `mend_*` application, project and SCA finding tools | User key with automatic token exchange |
 | WRDS | Four `wrds_*` discovery and query tools | WRDS username and password |
 
-`artifact_read` is shared across integrations and lets stdio clients retrieve large temporary artifacts in resumable base64 chunks. WRDS contributes four of the 75 tools and is enabled by the default `wrds` Cargo feature.
+`artifact_read` is shared across integrations and lets stdio clients retrieve large temporary artifacts in resumable base64 chunks. WRDS contributes four of the 122 tools and is enabled by the default `wrds` Cargo feature.
+
+By default, `MCP_ENABLED_VENDORS=auto` advertises configured integrations, plus `artifact_read`. Set a comma-separated list such as `github,gitlab,sentry` to select integrations explicitly, or `all` for the full inventory (118 tools without default features). Selection is fixed for each MCP session; reconnect after changing it. Credentials remain validated when a tool is called.
+
+GitHub job logs, GitLab traces, Figma PNG exports and Artifactory downloads reuse the bounded artifact store. Cross-origin redirects and signed downloads require `MCP_DOWNLOAD_ALLOWED_ORIGINS`; API credentials are removed when crossing origins. Existing uploads continue through the shared upload path. See [configuration](docs/configuration.md#native-rest-integrations) and [implementation status and compatibility notes](docs/integration-expansion-status.md). AWS and Playwright remain deferred.
 
 The Bitbucket, Jira, and Confluence behavior is ported from the corresponding [`@aashari` Atlassian MCP servers](https://github.com/aashari). The other integrations are native to this project.
 

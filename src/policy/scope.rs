@@ -64,6 +64,8 @@ pub struct EgressRecord {
     /// Canonical path and query (§3.5): the form evaluated, and the form
     /// the transport builds the wire URL from.
     pub canonical_target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination_origin: Option<String>,
     pub effect: PolicyEffect,
     pub rule_id: Option<String>,
     pub dispatch: EgressDispatch,

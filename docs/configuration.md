@@ -32,7 +32,7 @@ The global file has this shape:
 }
 ```
 
-Recognized section names are `bitbucket`, `jira`, `confluence`, `zoom`, `circleci`, `slack`, `postman`, `edx`, `newrelic`, `grafana`, `sonarqube`, `splunk`, `ninjaone`, and `wrds`.
+Recognized section names are `bitbucket`, `jira`, `confluence`, `zoom`, `circleci`, `slack`, `postman`, `edx`, `newrelic`, `grafana`, `sonarqube`, `teamcity`, `splunk`, `ninjaone`, `wrds`, `github`, `gitlab`, `figma`, `vercel`, `sentry`, `artifactory`, `snyk`, and `mend`.
 
 ## Secret references
 
@@ -53,6 +53,125 @@ The MCP server resolves every reference **before it starts serving**; a file tha
 Where a referenced value acts as a credential, the audit record and the enterprise-mode result metadata (`_meta["mcp-devtools/upstream"]`) carry its `source` (the scheme) and `version` (the provider's version, or `sha256:` plus the first 16 hex characters of the file's content hash) alongside the credential label; a change of `version` between two records is the evidence of a rotation. The value itself never appears anywhere.
 
 Not covered yet: the one-shot CLI subcommands (`mcp-devtools jira|bb|conf …`) refuse to run while the configuration holds a reference, and credentials nested inside `NINJAONE_SERVERS` entries accept literals and `keychain` only (`docs/enterprise-carry-forward.md`, CF-28 and CF-29).
+
+## Native REST integrations
+
+The eight native adapters are included in both default and headless builds. They
+provide read workflows; Artifactory AQL and Mend project summaries use POST for
+read queries. No AWS SDK or Playwright runtime is included.
+
+| Section | Required when called | Optional settings and defaults |
+|---|---|---|
+| `github` | `GITHUB_TOKEN` | `GITHUB_API_BASE=https://api.github.com`; `GITHUB_API_VERSION=2022-11-28`. For Enterprise Server include `/api/v3` in the base. |
+| `gitlab` | `GITLAB_TOKEN` | `GITLAB_API_BASE=https://gitlab.com/api/v4`; self-managed bases preserve context paths and normalize the `/api/v4` suffix. |
+| `figma` | `FIGMA_TOKEN` | File key or Figma URL comes from tool arguments. API origin is `https://api.figma.com`. |
+| `vercel` | `VERCEL_TOKEN` | `VERCEL_TEAM_ID`; a tool's `teamId` overrides it, otherwise personal-account scope. |
+| `sentry` | `SENTRY_TOKEN` | `SENTRY_URL=https://sentry.io`; `SENTRY_ORG` supplies the default organization slug. |
+| `artifactory` | `ARTIFACTORY_URL`, `ARTIFACTORY_TOKEN` | Set the Artifactory base including any reverse-proxy context. `/artifactory` is normalized by the adapter. |
+| `snyk` | `SNYK_TOKEN` | `SNYK_API_BASE=https://api.snyk.io`, `SNYK_API_VERSION=2024-10-15`, `SNYK_ORG_ID`. Regional API hosts are supported. |
+| `mend` | `MEND_API_BASE`, `MEND_EMAIL`, `MEND_USER_KEY`, `MEND_ORG_UUID` | Explicit Platform API 3.0 base for your tenant; no inferred region or legacy API fallback. |
+
+Tokens use the existing secret store (`keychain`, `file://`, `vault://`) and
+never become tool arguments. See each tool description for operation-specific
+scopes: GitHub repository metadata/contents/PRs/issues/actions read permissions,
+GitLab `read_api`, Figma granular file content/metadata/comments read scopes,
+Vercel team access, Sentry organization/project/event read access, JFrog
+repository/build read permissions, and Snyk/Mend organization and project access.
+Upstream permissions still determine which resources are visible.
+
+Mend logs in with the configured email, user key and organization, then exchanges
+the refresh token at `POST /api/v3.0/login/accessToken` with `wss-refresh-token`
+and `orgUuid`. The access JWT expires according to `tokenTTL` (milliseconds,
+10-minute fallback). Refresh tokens are renewed conservatively after 25 minutes;
+rotated refresh tokens are retained. The cache is isolated by base, email,
+organization and credential fingerprint. Auth responses are bounded, excluded
+from response caches/artifacts, and never echoed in errors. Single-project and
+application-scoped project queries use the organization `projects/summaries`
+endpoint. Optional search/severity/status filters apply locally to each page;
+continue using `additionalData.cursor` even when a filtered page is empty.
+
+GitHub/GitLab paginated tools return `{data, nextPage}`; `jq` filters the native
+body before wrapping it, so continuation survives projection. GitHub PR diff
+pages additionally expose the boolean `patchesUnavailable`. GitLab preserves
+upstream `too_large`/`collapsed` flags. Sentry exposes its cursor from Link
+headers. Snyk and Mend preserve their native pagination envelopes; use the
+cursor arguments rather than asking the server to follow arbitrary next URLs.
+
+### Tool selection and session reloads
+
+`MCP_ENABLED_VENDORS` accepts `auto` (default), `all`, or comma-separated canonical
+vendor names/aliases, for example `github,gitlab,artifactory`. Put this global
+setting in the process environment, `.env`, or the package-wide environment
+section. In `auto`, a nonblank vendor section, vendor-prefixed setting or registered credential setting enables its vendor;
+secret references and the `keychain` sentinel count as configured without
+performing authentication during discovery. A configured base URL also counts. Use explicit selection for centrally supplied credentials. Unknown names
+do not enable tools. `artifact_read` always remains available and owner-checked.
+
+The selection is snapshotted at session creation and enforced for both discovery
+and calls. Global configuration/credential refresh continues for calls, but
+changing the advertised set requires reconnecting. HTTP sessions have separate
+inventories and advertise a private, zero-TTL listing cache. `all` restores the
+pre-filter discovery behavior; it does not bypass authorization.
+
+### Download origins, bounds and binary handling
+
+`MCP_DOWNLOAD_ALLOWED_ORIGINS` is a comma-separated list of exact HTTP(S) origins,
+optionally isolated in a vendor section. For example:
+
+```json
+{
+  "artifactory": {
+    "environments": {
+      "ARTIFACTORY_URL": "https://packages.example.com/artifactory",
+      "ARTIFACTORY_TOKEN": "keychain",
+      "MCP_DOWNLOAD_ALLOWED_ORIGINS": "https://downloads.example.com"
+    }
+  }
+}
+```
+
+Allow the actual trusted object-storage/CDN origin used by your deployment.
+Wildcards, paths, queries and user information are not origin entries. Absolute
+signed downloads require an entry even when no redirect occurs. Same-origin API
+GET redirects need no additional entry; cross-origin redirects do. Each hop is
+authorized, at most five are followed, loops and HTTPS downgrades fail, and API
+credentials/custom headers are removed after crossing origins. Non-GET redirects
+are refused. Signed query values are excluded from download audit records.
+
+This also applies to existing CircleCI signed-log downloads. Configure their
+trusted storage origins before upgrading. Existing same-origin GET workflows,
+including Jira attachments, continue through explicit redirects; uploads retain
+the existing multipart implementation and are never automatically replayed.
+
+Explicit downloads default to 32 MiB and accept `maxBytes` up to 512 MiB. The
+existing encoded/decoded byte limits, aggregate export budget, idle/total
+deadlines, disk reservations, atomic commit, checksum, retention and owner checks
+apply. Artifactory validates an upstream `X-Checksum-Sha256` when supplied.
+Failures produce no complete handle. Successful metadata includes `artifactId`,
+filename, media type, bytes, SHA-256, `complete` and expiry seconds. Retrieve bytes
+with `artifact_read` or the authenticated HTTP artifact endpoint. No arbitrary
+binary body is decoded into text, inline base64, or a preview. Figma exports PNG
+only, at most ten nodes, with bounded header/dimension checks (32 million pixels,
+32,768 per dimension); missing renders remain explicit entries with `complete: false` and an error.
+GitLab large traces provide bounded text head/tail previews; small traces remain
+plain text. The existing streaming storage and retention settings below apply.
+
+Streaming retries honor `Retry-After` seconds or HTTP dates for supported retryable
+statuses, within the same cancellation and total deadline. Missing/invalid values
+use bounded equal jitter. Shared non-retrying requests surface parsed timing
+metadata without automatically replaying mutations. Error bodies are read with
+actual byte/decompression caps rather than trusting Content-Length.
+
+In enforcing deployments the new tools use `read_vendor_resource` and resource
+type `vendor_resource`, conservatively unscoped. Grant the tool intent (canonical
+path `/`) separately from its outbound paths/origins. `match.destination_origin`
+accepts exact serialized origins (one string or a list). An origin-constrained
+rule matches egress, not the origin-less tool intent. Existing rules without the
+field keep their semantics. Unknown native API paths remain denied; this release
+does not infer repository/project resource IDs for resource-level policy rules.
+
+See [implementation status](integration-expansion-status.md) for fixture coverage,
+compatibility limits and release validation.
 
 ## Integration settings
 

@@ -199,7 +199,7 @@ pub(super) fn request_is_cacheable(
     auth_name: &HeaderName,
     options: &RequestOptions,
 ) -> bool {
-    if options.body.is_some() || options.form.is_some() {
+    if options.body.is_some() || options.form.is_some() || options.text_body.is_some() {
         return false;
     }
     let path = url.to_ascii_lowercase();

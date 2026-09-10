@@ -1,0 +1,46 @@
+{
+  "default": [
+    {
+      "selection": "empty auto",
+      "tools": 1,
+      "compactToolsBytes": 844
+    },
+    {
+      "selection": "GitHub auto",
+      "tools": 11,
+      "compactToolsBytes": 35719
+    },
+    {
+      "selection": "GitHub + GitLab",
+      "tools": 21,
+      "compactToolsBytes": 69445
+    },
+    {
+      "selection": "all",
+      "tools": 122,
+      "compactToolsBytes": 322253
+    }
+  ],
+  "no_default_features": [
+    {
+      "selection": "empty auto",
+      "tools": 1,
+      "compactToolsBytes": 844
+    },
+    {
+      "selection": "GitHub auto",
+      "tools": 11,
+      "compactToolsBytes": 35719
+    },
+    {
+      "selection": "GitHub + GitLab",
+      "tools": 21,
+      "compactToolsBytes": 69445
+    },
+    {
+      "selection": "all",
+      "tools": 118,
+      "compactToolsBytes": 315931
+    }
+  ]
+}

@@ -25,22 +25,31 @@
 //!   Same `ATLASSIAN_SITE_NAME`-derived base URL as Jira.
 
 pub mod args;
+mod enablement;
 mod prelude;
 
 mod artifact;
+mod artifactory;
 mod bitbucket;
 mod circleci;
 mod confluence;
 mod edx;
+mod figma;
+mod github;
+mod gitlab;
 mod grafana;
 mod jira;
+mod mend;
 mod newrelic;
 mod ninjaone;
 mod postman;
+mod sentry;
 mod slack;
+mod snyk;
 mod sonarqube;
 mod splunk;
 mod teamcity;
+mod vercel;
 #[cfg(feature = "wrds")]
 mod wrds;
 mod zoom;
@@ -61,16 +70,24 @@ use crate::bootstrap::{Components, ServerBuilder};
 use crate::config::Config;
 use crate::constants::{PACKAGE_NAME, VERSION};
 use crate::controllers::api::{BitbucketContext, HandleContext};
+use crate::controllers::artifactory::ArtifactoryContext;
 use crate::controllers::circleci::CircleCiContext;
 use crate::controllers::edx::EdxContext;
+use crate::controllers::figma::FigmaContext;
+use crate::controllers::github::GithubContext;
+use crate::controllers::gitlab::GitlabContext;
 use crate::controllers::grafana::GrafanaContext;
+use crate::controllers::mend::MendContext;
 use crate::controllers::newrelic::NewRelicContext;
 use crate::controllers::ninjaone::NinjaOneContext;
 use crate::controllers::postman::PostmanContext;
+use crate::controllers::sentry::SentryContext;
 use crate::controllers::slack::SlackContext;
+use crate::controllers::snyk::SnykContext;
 use crate::controllers::sonarqube::SonarqubeContext;
 use crate::controllers::splunk::SplunkContext;
 use crate::controllers::teamcity::TeamcityContext;
+use crate::controllers::vercel::VercelContext;
 #[cfg(feature = "wrds")]
 use crate::controllers::wrds::WrdsContext;
 use crate::controllers::zoom::ZoomContext;
@@ -81,6 +98,7 @@ use crate::ports::{AuditEvent, AuditEventKind, TokenFacts, UsageEvent};
 #[derive(Clone)]
 pub struct DevtoolsServer {
     components: Arc<Components>,
+    enablement: enablement::Enablement,
     ema_enabled: bool,
     // The `#[tool_handler]` macro references this field by name at expansion
     // time; the rustc reference tracker doesn't see that, so we silence the
@@ -112,10 +130,17 @@ impl DevtoolsServer {
         let ema_enabled = components.auth_required
             && crate::auth::ema::enabled(&components.config()).unwrap_or(false);
         Self {
+            enablement: enablement::Enablement::snapshot(&components.config()),
             ema_enabled,
             components,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Create an HTTP session with current enablement and shared live credentials.
+    #[must_use]
+    pub fn new_session(&self) -> Self {
+        Self::from_components(Arc::clone(&self.components))
     }
 
     /// Combined router that drives `#[tool_handler]`. Stitches together
@@ -137,6 +162,14 @@ impl DevtoolsServer {
             + Self::grafana_router()
             + Self::sonarqube_router()
             + Self::teamcity_router()
+            + Self::github_router()
+            + Self::gitlab_router()
+            + Self::figma_router()
+            + Self::vercel_router()
+            + Self::sentry_router()
+            + Self::artifactory_router()
+            + Self::snyk_router()
+            + Self::mend_router()
             + Self::splunk_router();
         let router = router + Self::ninjaone_router();
         // WRDS tools only exist when the `wrds` feature is on (default).
@@ -480,6 +513,70 @@ impl DevtoolsServer {
             &self.components.client,
             config,
             &self.components.vendors.teamcity,
+        )
+    }
+
+    fn github_ctx<'a>(&'a self, config: &'a Config) -> GithubContext<'a> {
+        GithubContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.github,
+        )
+    }
+
+    fn gitlab_ctx<'a>(&'a self, config: &'a Config) -> GitlabContext<'a> {
+        GitlabContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.gitlab,
+        )
+    }
+
+    fn figma_ctx<'a>(&'a self, config: &'a Config) -> FigmaContext<'a> {
+        FigmaContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.figma,
+        )
+    }
+
+    fn vercel_ctx<'a>(&'a self, config: &'a Config) -> VercelContext<'a> {
+        VercelContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.vercel,
+        )
+    }
+
+    fn sentry_ctx<'a>(&'a self, config: &'a Config) -> SentryContext<'a> {
+        SentryContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.sentry,
+        )
+    }
+
+    fn artifactory_ctx<'a>(&'a self, config: &'a Config) -> ArtifactoryContext<'a> {
+        ArtifactoryContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.artifactory,
+        )
+    }
+
+    fn snyk_ctx<'a>(&'a self, config: &'a Config) -> SnykContext<'a> {
+        SnykContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.snyk,
+        )
+    }
+
+    fn mend_ctx<'a>(&'a self, config: &'a Config) -> MendContext<'a> {
+        MendContext::new(
+            &self.components.client,
+            config,
+            &self.components.vendors.mend,
         )
     }
 
@@ -1036,6 +1133,12 @@ impl ServerHandler for DevtoolsServer {
         request: CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResponse, RmcpError> {
+        if !self.enablement.permits(request.name.as_ref()) {
+            return Err(RmcpError::invalid_params(
+                "Tool is unknown or disabled for this session",
+                None,
+            ));
+        }
         let started = std::time::Instant::now();
         let client = context.client_info();
         // One `to_string()`, no clone: local mode pays exactly what it paid
@@ -1131,13 +1234,12 @@ impl ServerHandler for DevtoolsServer {
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> impl Future<Output = Result<rmcp::model::ListToolsResult, RmcpError>> + Send {
         let mut tools = self.tool_router.list_all();
-        // MCP 2026-07-28 recommends deterministic ordering so clients can
-        // reuse prompt caches. The list is build-static and principal-agnostic,
-        // making a short public cache safe.
+        tools.retain(|tool| self.enablement.permits(tool.name.as_ref()));
+        // Inventories are session-specific and must not be reused across reloads.
         tools.sort_by(|left, right| left.name.cmp(&right.name));
         std::future::ready(Ok(rmcp::model::ListToolsResult::with_all_items(tools)
-            .with_ttl_ms(300_000)
-            .with_cache_scope(rmcp::model::CacheScope::Public)))
+            .with_ttl_ms(0)
+            .with_cache_scope(rmcp::model::CacheScope::Private)))
     }
 
     fn get_info(&self) -> ServerInfo {
@@ -1231,6 +1333,14 @@ pub fn vendor_for_tool(tool: &str) -> Option<&'static str> {
         "grafana" => Some(VENDOR_GRAFANA),
         "sonarqube" => Some(VENDOR_SONARQUBE),
         "teamcity" => Some(crate::config::VENDOR_TEAMCITY),
+        "github" => Some(crate::config::VENDOR_GITHUB),
+        "gitlab" => Some(crate::config::VENDOR_GITLAB),
+        "figma" => Some(crate::config::VENDOR_FIGMA),
+        "vercel" => Some(crate::config::VENDOR_VERCEL),
+        "sentry" => Some(crate::config::VENDOR_SENTRY),
+        "artifactory" => Some(crate::config::VENDOR_ARTIFACTORY),
+        "snyk" => Some(crate::config::VENDOR_SNYK),
+        "mend" => Some(crate::config::VENDOR_MEND),
         "splunk" => Some(VENDOR_SPLUNK),
         "ninjaone" => Some(VENDOR_NINJAONE),
         "wrds" => Some(VENDOR_WRDS),
@@ -1318,6 +1428,39 @@ mod config_snapshot_tests {
         assert!(
             Arc::ptr_eq(&first, &second),
             "config() deep-copied the snapshot instead of sharing it"
+        );
+    }
+
+    #[test]
+    fn enablement_is_session_scoped_but_credentials_remain_live() {
+        let server = server_with_config(Config::from_map(HashMap::from([(
+            "GITHUB_TOKEN".into(),
+            "first".into(),
+        )])));
+        assert!(server.enablement.permits("github_get_file"));
+        assert!(!server.enablement.permits("figma_get_file"));
+        server
+            .components
+            .config
+            .replace(Config::from_map(HashMap::from([(
+                "FIGMA_TOKEN".into(),
+                "second".into(),
+            )])));
+        assert!(server.enablement.permits("github_get_file"));
+        assert_eq!(server.config().get_for("github", "GITHUB_TOKEN"), None);
+        let reconnected = server.new_session();
+        assert!(!reconnected.enablement.permits("github_get_file"));
+        assert!(reconnected.enablement.permits("figma_get_file"));
+        server
+            .components
+            .config
+            .replace(Config::from_map(HashMap::from([(
+                "FIGMA_TOKEN".into(),
+                "rotated".into(),
+            )])));
+        assert_eq!(
+            reconnected.config().get_for("figma", "FIGMA_TOKEN"),
+            Some("rotated")
         );
     }
 

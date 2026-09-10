@@ -47,11 +47,10 @@
 //!   bytes outside it (space, quotes, non-ASCII UTF-8, …) become `%XX`.
 //!
 //! Redirects and DNS pinning are transport properties, not guarantees of this
-//! canonicalizer. The shared clients currently retain reqwest's default redirect
-//! behavior; canonicalizing the initial path does not authorize later destinations.
-//! Explicit per-hop transport enforcement is tracked as CF-15 in
-//! `docs/enterprise-carry-forward.md`. Do not assume the final host is the
-//! configured base.
+//! canonicalizer. Shared API transports disable implicit redirects and authorize
+//! each GET hop with its destination origin; cross-origin hops require the
+//! configured download allowlist and shed credentials. DNS pinning remains
+//! outside this canonicalizer. See `docs/integration-expansion-status.md`.
 //!
 //! ## Budget
 //!

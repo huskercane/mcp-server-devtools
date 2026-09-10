@@ -260,6 +260,7 @@ pub async fn post_multipart(
     let (auth_name, auth_header) = validate_auth(credentials)?;
     let body_len = request.body.len();
     let timeout = upload_timeout(resolve_timeout(config, None), body_len);
+    let deadline = tokio::time::Instant::now() + timeout;
     let content_type = HeaderValue::from_str(&request.body.content_type())
         .map_err(|_| unexpected("multipart boundary produced an invalid header", None))?;
 
@@ -304,10 +305,19 @@ pub async fn post_multipart(
     }
     enforce_content_length_cap(&response)?;
     if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_default();
-        return Err(vendor.classify_error(status, &body_text));
+        let delay = super::retry::parse(response.headers(), std::time::SystemTime::now());
+        let policy = super::StreamingPolicy::new(
+            super::MAX_RESPONSE_SIZE as u64,
+            super::MAX_RESPONSE_SIZE as u64,
+        );
+        let body_text = super::bounded_body(response, &policy, deadline).await?;
+        return Err(super::retry::metadata(
+            vendor.classify_error(status, &body_text),
+            delay,
+        ));
     }
 
+    let headers = response.headers().clone();
     let body = classify_body(response).await?;
     if let ResponseBody::Json(value) = &body
         && let Some(err) = vendor.classify_success_json(value)
@@ -329,6 +339,7 @@ pub async fn post_multipart(
             fetched_at: crate::logger::iso_timestamp(),
         },
         raw_response_path,
+        headers,
     })
 }
 

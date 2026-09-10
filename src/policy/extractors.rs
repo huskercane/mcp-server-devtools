@@ -936,8 +936,14 @@ pub fn for_vendor(
     target: &CanonicalTarget,
     body: Option<&serde_json::Value>,
 ) -> ActionDetails {
+    if method == HttpMethod::Get && super::native::endpoint(vendor, target.path().as_str()) {
+        return super::native::read(target.path().clone());
+    }
     let query = target.query_pairs();
     match vendor {
+        "mend" | "artifactory" if method == HttpMethod::Post => {
+            ActionDetails::native_post_read(vendor, target.path().clone())
+        }
         crate::config::VENDOR_GRAFANA => grafana::extract(method, target.path().clone(), &query),
         crate::config::VENDOR_JIRA => jira::extract(method, target.path().clone(), &query, body),
         crate::config::VENDOR_SLACK => slack::extract(method, target.path().clone(), &query),
@@ -958,6 +964,9 @@ pub fn for_tool(
     arguments: Option<&serde_json::Map<String, serde_json::Value>>,
     declared_risk: RequestRisk,
 ) -> ActionDetails {
+    if super::native::tool(tool) {
+        return super::native::read(CanonicalPath::parse("/").expect("static path"));
+    }
     let text = |key: &str| {
         arguments
             .and_then(|args| args.get(key))

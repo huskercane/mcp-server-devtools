@@ -201,14 +201,57 @@ pub async fn authorize_egress(
     target: &CanonicalTarget,
     body: Option<&Value>,
 ) -> Result<Option<EgressTicket>, McpError> {
+    authorize_egress_at(vendor, method, target, body, None).await
+}
+
+/// Authorize a validated destination, retaining its origin in policy and audit.
+pub async fn authorize_egress_at(
+    vendor: &str,
+    method: HttpMethod,
+    target: &CanonicalTarget,
+    body: Option<&Value>,
+    destination: Option<&url::Url>,
+) -> Result<Option<EgressTicket>, McpError> {
+    authorize_at(vendor, method, target, body, destination, false).await
+}
+
+/// Download queries can contain credentials; authorize the path and origin only.
+pub async fn authorize_download_egress(
+    vendor: &str,
+    target: &CanonicalTarget,
+    destination: &url::Url,
+) -> Result<Option<EgressTicket>, McpError> {
+    authorize_at(
+        vendor,
+        HttpMethod::Get,
+        target,
+        None,
+        Some(destination),
+        true,
+    )
+    .await
+}
+
+async fn authorize_at(
+    vendor: &str,
+    method: HttpMethod,
+    target: &CanonicalTarget,
+    body: Option<&Value>,
+    destination: Option<&url::Url>,
+    redact_query: bool,
+) -> Result<Option<EgressTicket>, McpError> {
     let Some(scope) = CallScope::current() else {
         return Ok(None);
     };
     let Some(enforcement) = scope.enforcement() else {
         return Ok(None);
     };
-    let details = extractors::for_vendor(vendor, method, target, body);
-    let context = ActionContext::assemble(
+    let details = if redact_query {
+        super::native::read(target.path().clone())
+    } else {
+        extractors::for_vendor(vendor, method, target, body)
+    };
+    let mut context = ActionContext::assemble(
         scope.principal().clone(),
         scope.client().clone(),
         None,
@@ -217,11 +260,19 @@ pub async fn authorize_egress(
         None,
         enforcement.upstream.clone(),
     );
+    if let Some(destination) = destination {
+        context.set_destination(destination);
+    }
     let decision = enforcement.policy.evaluate(&context);
     let ticket = scope.note_egress(super::EgressRecord {
         vendor: vendor.to_owned(),
         method,
-        canonical_target: target.url_under(""),
+        canonical_target: if redact_query {
+            target.path().as_str().to_owned()
+        } else {
+            target.url_under("")
+        },
+        destination_origin: destination.map(|url| url.origin().ascii_serialization()),
         effect: decision.effect,
         rule_id: decision.rule_id.clone(),
         dispatch: if decision.is_allow() {

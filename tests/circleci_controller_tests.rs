@@ -51,7 +51,9 @@ async fn get_sends_bearer_token_and_filters_response() {
         .await;
 
     let client = build_client().unwrap();
-    let config = Config::from_map(creds());
+    let mut values = creds();
+    values.insert("MCP_DOWNLOAD_ALLOWED_ORIGINS".into(), server.uri());
+    let config = Config::from_map(values);
     let vendor = vendor(&server);
     let ctx = CircleCiContext::new(&client, &config, &vendor);
 
@@ -94,7 +96,9 @@ async fn post_forwards_body_and_returns_created_pipeline() {
         .await;
 
     let client = build_client().unwrap();
-    let config = Config::from_map(creds());
+    let mut values = creds();
+    values.insert("MCP_DOWNLOAD_ALLOWED_ORIGINS".into(), server.uri());
+    let config = Config::from_map(values);
     let vendor = vendor(&server);
     let ctx = CircleCiContext::new(&client, &config, &vendor);
 
@@ -129,7 +133,9 @@ async fn api_404_surfaces_circleci_error_envelope() {
         .await;
 
     let client = build_client().unwrap();
-    let config = Config::from_map(creds());
+    let mut values = creds();
+    values.insert("MCP_DOWNLOAD_ALLOWED_ORIGINS".into(), server.uri());
+    let config = Config::from_map(values);
     let vendor = vendor(&server);
     let ctx = CircleCiContext::new(&client, &config, &vendor);
 
@@ -187,7 +193,9 @@ async fn logs_fetches_build_details_and_flattens_action_output() {
         .await;
 
     let client = build_client().unwrap();
-    let config = Config::from_map(creds());
+    let mut values = creds();
+    values.insert("MCP_DOWNLOAD_ALLOWED_ORIGINS".into(), server.uri());
+    let config = Config::from_map(values);
     let vendor = vendor(&server);
     let ctx = CircleCiContext::new(&client, &config, &vendor);
 
@@ -236,7 +244,9 @@ async fn logs_build_details_request_is_subject_to_egress_policy() {
         .await;
 
     let client = build_client().unwrap();
-    let config = Config::from_map(creds());
+    let mut values = creds();
+    values.insert("MCP_DOWNLOAD_ALLOWED_ORIGINS".into(), server.uri());
+    let config = Config::from_map(values);
     let vendor = vendor(&server);
     let ctx = CircleCiContext::new(&client, &config, &vendor);
     let args = mcp_server_devtools::tools::args::CircleCiLogsArgs {
@@ -374,7 +384,9 @@ async fn logs_failed_only_skips_successful_outputs_and_condenses_errors() {
         .await;
 
     let client = build_client().unwrap();
-    let config = Config::from_map(creds());
+    let mut values = creds();
+    values.insert("MCP_DOWNLOAD_ALLOWED_ORIGINS".into(), server.uri());
+    let config = Config::from_map(values);
     let vendor = vendor(&server);
     let ctx = CircleCiContext::new(&client, &config, &vendor);
     let resp = handle_logs(

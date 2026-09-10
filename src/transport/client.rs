@@ -20,9 +20,9 @@
 //!
 //! What the surface commits a future adapter to, beyond the obvious:
 //!
-//! - **Redirects are followed by default** (the vendor client relies on it)
-//!   and disabled per client wherever a credential must not travel to a
-//!   second host ([`HttpClientBuilder::no_redirects`]).
+//! - The underlying adapter can follow redirects by default, but shared API
+//!   clients explicitly disable them with [`HttpClientBuilder::no_redirects`].
+//!   The transport authorizes and follows bounded GET hops itself.
 //! - **Transparent decompression is on by default** and disabled for the
 //!   streaming client, which accounts for wire bytes itself
 //!   ([`HttpClientBuilder::no_decompression`]).
@@ -281,6 +281,10 @@ impl HttpResponse {
     #[must_use]
     pub fn headers(&self) -> &HeaderMap {
         self.inner.headers()
+    }
+
+    pub(crate) fn url(&self) -> &url::Url {
+        self.inner.url()
     }
 
     /// The declared `Content-Length`, when the response carries one. A

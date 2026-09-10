@@ -19,19 +19,27 @@
 //! };
 //! ```
 
+use crate::vendor::artifactory::ArtifactoryVendor;
 use crate::vendor::bitbucket::BitbucketVendor;
 use crate::vendor::circleci::CircleCiVendor;
 use crate::vendor::confluence::ConfluenceVendor;
 use crate::vendor::edx::EdxVendor;
+use crate::vendor::figma::FigmaVendor;
+use crate::vendor::github::GithubVendor;
+use crate::vendor::gitlab::GitlabVendor;
 use crate::vendor::grafana::GrafanaVendor;
 use crate::vendor::jira::JiraVendor;
+use crate::vendor::mend::MendVendor;
 use crate::vendor::newrelic::NewRelicVendor;
 use crate::vendor::ninjaone::NinjaOneVendor;
 use crate::vendor::postman::PostmanVendor;
+use crate::vendor::sentry::SentryVendor;
 use crate::vendor::slack::SlackVendor;
+use crate::vendor::snyk::SnykVendor;
 use crate::vendor::sonarqube::SonarqubeVendor;
 use crate::vendor::splunk::SplunkVendor;
 use crate::vendor::teamcity::TeamcityVendor;
+use crate::vendor::vercel::VercelVendor;
 #[cfg(feature = "wrds")]
 use crate::vendor::wrds::WrdsVendor;
 use crate::vendor::zoom::ZoomVendor;
@@ -58,6 +66,14 @@ pub struct Vendors {
     pub grafana: GrafanaVendor,
     pub sonarqube: SonarqubeVendor,
     pub teamcity: TeamcityVendor,
+    pub github: GithubVendor,
+    pub gitlab: GitlabVendor,
+    pub figma: FigmaVendor,
+    pub vercel: VercelVendor,
+    pub sentry: SentryVendor,
+    pub artifactory: ArtifactoryVendor,
+    pub snyk: SnykVendor,
+    pub mend: MendVendor,
     pub splunk: SplunkVendor,
     pub ninjaone: NinjaOneVendor,
     /// WRDS (`PostgreSQL`) vendor. Feature-gated: a `--no-default-features`
@@ -82,6 +98,14 @@ impl Default for Vendors {
             grafana: GrafanaVendor::new(),
             sonarqube: SonarqubeVendor::new(),
             teamcity: TeamcityVendor::new(),
+            github: GithubVendor::new(),
+            gitlab: GitlabVendor::new(),
+            figma: FigmaVendor::new(),
+            vercel: VercelVendor::new(),
+            sentry: SentryVendor::new(),
+            artifactory: ArtifactoryVendor::new(),
+            snyk: SnykVendor::new(),
+            mend: MendVendor::new(),
             splunk: SplunkVendor::new(),
             ninjaone: NinjaOneVendor::new(),
             #[cfg(feature = "wrds")]
