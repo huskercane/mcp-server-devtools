@@ -321,6 +321,14 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+          # Only this release's own artifacts. `docker/build-push-action`
+          # also uploads a `<owner>~<repo>~<id>.dockerbuild` build record per
+          # container build, and those are the two artifacts an unfiltered
+          # download failed on ("Artifact download failed after 5 retries")
+          # while all eight release artifacts downloaded fine. They are also
+          # not release content: `files: artifacts/*` below would otherwise
+          # attach docker build records to the published release.
+          pattern: mcp-devtools-*
 
       - name: Resolve tag
         id: tag
