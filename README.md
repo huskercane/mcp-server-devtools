@@ -47,7 +47,7 @@ Each archive has a `.sha256` checksum. On macOS, an unsigned download may need i
 xattr -d com.apple.quarantine ./mcp-devtools
 ```
 
-To build from source (Rust 1.96 or later):
+To build from source (Rust 1.98 or later):
 
 ```bash
 git clone https://github.com/huskercane/mcp-server-devtools.git
@@ -95,9 +95,12 @@ arguments, credentials, URLs, cache contents, or response content. Cache keys
 are represented by short one-way fingerprints so repeated lookups can be
 correlated safely. Cache events also include the admission action, TTL, age,
 remaining TTL, response and stored sizes, compression state, upstream latency,
-and cumulative hit/miss totals. Those observations are suitable for evaluating
-future cache-admission or TTL bandits offline. Each process keeps at most five
-10 MiB segments by default and prunes
+and cumulative hit/miss totals. Schema-2 observations include decision IDs,
+action probabilities, cumulative reward components, and terminal outcomes. Optional randomized collection supports
+future cache-admission/TTL experiments; fixed-policy logs alone do not cover
+alternative actions. See [collecting cache-policy training data](docs/cache-training-data.md)
+for setup, reward limitations, retention, and the readiness checker. Each
+process keeps at most five 10 MiB segments by default and prunes
 prior-session audit data after 30 days or when it exceeds 100 MiB. Configure
 this with `AUDIT_LOG_MAX_BYTES`, `AUDIT_LOG_MAX_FILES`,
 `AUDIT_LOG_RETENTION_DAYS`, and `AUDIT_LOG_RETENTION_MAX_BYTES`; set

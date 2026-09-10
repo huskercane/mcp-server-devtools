@@ -2,12 +2,15 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use http::header::{CACHE_CONTROL, EXPIRES, HeaderMap, HeaderName, HeaderValue, SET_COOKIE, VARY};
 use sha2::{Digest, Sha256};
-use tracing::{debug, warn};
+use tracing::warn;
+
+mod observation;
+use observation::{Decision, Snapshot};
 
 use super::{CacheMetadata, RequestOptions, ResponseBody};
 use crate::config::Config;
@@ -25,12 +28,14 @@ pub(super) struct CacheConfig {
     max_entries: usize,
     max_bytes: usize,
     compression_threshold: usize,
+    exploration: bool,
 }
 
 impl CacheConfig {
     pub fn from_config(config: &Config) -> Self {
         Self {
             enabled: config.get_bool("HTTP_CACHE_ENABLED", false),
+            exploration: config.get_bool("HTTP_CACHE_EXPLORATION_ENABLED", false),
             default_ttl: seconds(
                 config,
                 "HTTP_CACHE_DEFAULT_TTL_SECONDS",
@@ -156,6 +161,9 @@ struct Entry {
     response_bytes: usize,
     upstream_latency_ms: u128,
     last_used: u64,
+    decision: Arc<Decision>,
+    hit_count: u64,
+    decode_duration_us: u128,
 }
 
 impl Entry {
@@ -210,95 +218,70 @@ pub(super) fn request_is_cacheable(
 }
 
 pub(super) fn get(key: &CacheKey) -> Option<(ResponseBody, CacheMetadata)> {
-    let fingerprint = key.audit_fingerprint();
     let mut cache = cache().lock().ok()?;
     let now = Instant::now();
     let expired = cache
         .entries
         .get(key)
         .is_some_and(|entry| entry.expires_at <= now);
-    let mut reason = "not_found";
-    let mut ttl_ms = None;
-    let mut age_ms = None;
-    let mut remaining_ttl_ms = None;
-    let mut upstream_latency_ms = None;
-    let mut response_bytes = None;
-    let mut entry_bytes = None;
-    let mut compressed = None;
-    if expired {
-        if let Some(entry) = cache.entries.get(key) {
-            reason = "expired";
-            ttl_ms = Some(entry.ttl.as_millis());
-            age_ms = Some(now.saturating_duration_since(entry.stored_at).as_millis());
-            remaining_ttl_ms = Some(0);
-            upstream_latency_ms = Some(entry.upstream_latency_ms);
-            response_bytes = Some(entry.response_bytes);
-            entry_bytes = Some(entry.stored_bytes);
-            compressed = Some(matches!(&entry.bytes, StoredBytes::Zstd(_)));
-        }
-        remove(&mut cache, key);
-    }
+    let ended = if expired {
+        remove(&mut cache, key)
+    } else {
+        None
+    };
     cache.clock = cache.clock.wrapping_add(1);
     let tick = cache.clock;
+    let mut snapshot = None;
     let result = cache.entries.get_mut(key).and_then(|entry| {
         entry.last_used = tick;
-        reason = "reused";
-        ttl_ms = Some(entry.ttl.as_millis());
-        age_ms = Some(now.saturating_duration_since(entry.stored_at).as_millis());
-        remaining_ttl_ms = Some(entry.expires_at.saturating_duration_since(now).as_millis());
-        upstream_latency_ms = Some(entry.upstream_latency_ms);
-        response_bytes = Some(entry.response_bytes);
-        entry_bytes = Some(entry.stored_bytes);
-        compressed = Some(matches!(&entry.bytes, StoredBytes::Zstd(_)));
-        let body = entry.decode()?;
-        Some((
-            body,
-            CacheMetadata {
-                hit: true,
-                age_ms: now.saturating_duration_since(entry.stored_at).as_millis(),
-                fetched_at: entry.fetched_at.clone(),
-            },
-        ))
-    });
-    let outcome = if result.is_some() {
-        cache.hits = cache.hits.saturating_add(1);
-        "hit"
-    } else {
-        if reason == "reused" {
-            reason = "decode_failed";
+        let started = Instant::now();
+        let body = entry.decode();
+        entry.decode_duration_us = entry
+            .decode_duration_us
+            .saturating_add(started.elapsed().as_micros());
+        if body.is_some() {
+            entry.hit_count = entry.hit_count.saturating_add(1);
         }
-        cache.misses = cache.misses.saturating_add(1);
-        "miss"
-    };
-    let (hits, misses, entries, stored_bytes) = (
-        cache.hits,
-        cache.misses,
-        cache.entries.len(),
-        cache.stored_bytes,
-    );
-    drop(cache);
-    crate::audit::cache_event(crate::audit::CacheEvent {
-        timestamp: String::new(),
-        event: "http_cache_lookup",
-        session_id: "",
-        process_id: 0,
-        vendor: &key.vendor,
-        cache_key: &fingerprint,
-        outcome,
-        reason: Some(reason),
-        action: None,
-        ttl_ms,
-        age_ms,
-        remaining_ttl_ms,
-        upstream_latency_ms,
-        response_bytes,
-        entry_bytes,
-        compressed,
-        cumulative_hits: hits,
-        cumulative_misses: misses,
-        entries,
-        cache_bytes: stored_bytes,
+        snapshot = Some(Snapshot::new(entry, now));
+        body.map(|body| {
+            (
+                body,
+                CacheMetadata {
+                    hit: true,
+                    age_ms: now.saturating_duration_since(entry.stored_at).as_millis(),
+                    fetched_at: entry.fetched_at.clone(),
+                },
+            )
+        })
     });
+    let reason = if result.is_some() {
+        "reused"
+    } else if expired {
+        "expired"
+    } else if snapshot.is_some() {
+        "decode_failed"
+    } else {
+        "not_found"
+    };
+    if result.is_some() {
+        cache.hits = cache.hits.saturating_add(1);
+    } else {
+        cache.misses = cache.misses.saturating_add(1);
+    }
+    let failed = if reason == "decode_failed" {
+        remove(&mut cache, key)
+    } else {
+        None
+    };
+    let totals = observation::Totals::new(&cache);
+    drop(cache);
+    if let Some(entry) = ended {
+        observation::outcome(&entry, now, "expired", totals);
+    }
+    if let Some(entry) = failed {
+        observation::outcome(&entry, now, "decode_failed", totals);
+    }
+    observation::lookup(key, snapshot.as_ref(), result.is_some(), reason, totals);
     result
 }
 
@@ -310,28 +293,35 @@ pub(super) fn store(
     upstream_latency: Duration,
     metadata: &CacheMetadata,
 ) {
-    if headers.contains_key(SET_COOKIE)
+    let blocked = headers.contains_key(SET_COOKIE)
         && !key
             .url
             .to_ascii_lowercase()
-            .contains("/webapp/sessionproperties")
-    {
+            .contains("/webapp/sessionproperties");
+    let lifetime = response_ttl(headers, config);
+    if blocked || lifetime.is_none() {
+        observation::ineligible(
+            &key,
+            if blocked {
+                "set_cookie"
+            } else {
+                "response_cache_policy"
+            },
+        );
         return;
     }
-    let Some(ttl) = response_ttl(headers, config) else {
+    let Some((base_ttl, ttl_source)) = lifetime else {
         return;
     };
-    let (kind, plain) = match body {
-        ResponseBody::Json(value) => match serde_json::to_vec(value) {
-            Ok(bytes) => (BodyKind::Json, bytes),
-            Err(_) => return,
-        },
-        ResponseBody::Text(text) => (BodyKind::Text, text.as_bytes().to_vec()),
-        ResponseBody::Empty => (BodyKind::Empty, Vec::new()),
+    let Some((kind, plain)) = encode_body(body) else {
+        return;
     };
-    if plain.len() > config.max_bytes / 2 {
+    let response_bytes = plain.len();
+    if response_bytes > config.max_bytes / 2 {
+        observation::ineligible(&key, "response_too_large");
         return;
     }
+    let compression_started = Instant::now();
     let bytes = if plain.len() >= config.compression_threshold {
         match zstd::stream::encode_all(Cursor::new(&plain), 1) {
             Ok(compressed) if compressed.len() < plain.len() => StoredBytes::Zstd(compressed),
@@ -340,13 +330,17 @@ pub(super) fn store(
     } else {
         StoredBytes::Plain(plain)
     };
+    let compression_duration_us = compression_started.elapsed().as_micros();
     let stored_bytes = match &bytes {
         StoredBytes::Plain(bytes) | StoredBytes::Zstd(bytes) => bytes.len(),
     };
-    let compressed = matches!(&bytes, StoredBytes::Zstd(_));
-    let response_bytes = plain_len(body);
-    let fingerprint = key.audit_fingerprint();
-    let vendor = key.vendor.clone();
+    let choice = observation::choose(
+        config.exploration,
+        base_ttl,
+        uuid::Uuid::new_v4().as_bytes()[0],
+    );
+    let mut decision = Decision::new(&key, headers, config, choice, ttl_source);
+    decision.compression_duration_us = compression_duration_us;
     let mut cache = match cache().lock() {
         Ok(cache) => cache,
         Err(error) => {
@@ -354,91 +348,112 @@ pub(super) fn store(
             return;
         }
     };
-    remove(&mut cache, &key);
-    cache.clock = cache.clock.wrapping_add(1);
-    let tick = cache.clock;
+    decision.entries_before = cache.entries.len();
+    decision.cache_bytes_before = cache.stored_bytes;
     let now = Instant::now();
+    let mut entry = Entry {
+        kind,
+        bytes,
+        stored_bytes,
+        expires_at: now + choice.ttl,
+        stored_at: now,
+        fetched_at: metadata.fetched_at.clone(),
+        ttl: choice.ttl,
+        response_bytes,
+        upstream_latency_ms: upstream_latency.as_millis(),
+        last_used: 0,
+        decision: Arc::new(decision),
+        hit_count: 0,
+        decode_duration_us: 0,
+    };
+    let snapshot = Snapshot::new(&entry, now);
+    // A rejected admission has no residency or saved-latency reward. Its
+    // compression work is still charged, because it was actually performed.
+    if choice.action == "reject" {
+        let totals = observation::Totals::new(&cache);
+        drop(cache);
+        observation::decision(&snapshot, totals);
+        observation::outcome(&entry, now, "rejected", totals);
+        return;
+    }
+    let replaced = remove(&mut cache, &key);
+    cache.clock = cache.clock.wrapping_add(1);
+    entry.last_used = cache.clock;
     cache.stored_bytes += stored_bytes;
-    cache.entries.insert(
-        key,
-        Entry {
-            kind,
-            bytes,
-            stored_bytes,
-            expires_at: now + ttl,
-            stored_at: now,
-            fetched_at: metadata.fetched_at.clone(),
-            ttl,
-            response_bytes,
-            upstream_latency_ms: upstream_latency.as_millis(),
-            last_used: tick,
-        },
-    );
-    evict(&mut cache, config);
-    let (hits, misses, entries, cache_bytes) = (
-        cache.hits,
-        cache.misses,
-        cache.entries.len(),
-        cache.stored_bytes,
-    );
+    cache.entries.insert(key, entry);
+    let evicted = evict(&mut cache, config);
+    let totals = observation::Totals::new(&cache);
     drop(cache);
-    crate::audit::cache_event(crate::audit::CacheEvent {
-        timestamp: String::new(),
-        event: "http_cache_decision",
-        session_id: "",
-        process_id: 0,
-        vendor: &vendor,
-        cache_key: &fingerprint,
-        outcome: "stored",
-        reason: Some("cacheable_success"),
-        action: Some("admit"),
-        ttl_ms: Some(ttl.as_millis()),
-        age_ms: Some(0),
-        remaining_ttl_ms: Some(ttl.as_millis()),
-        upstream_latency_ms: Some(upstream_latency.as_millis()),
-        response_bytes: Some(response_bytes),
-        entry_bytes: Some(stored_bytes),
-        compressed: Some(compressed),
-        cumulative_hits: hits,
-        cumulative_misses: misses,
-        entries,
-        cache_bytes,
-    });
-}
-
-fn plain_len(body: &ResponseBody) -> usize {
-    match body {
-        ResponseBody::Json(value) => serde_json::to_vec(value).map_or(0, |bytes| bytes.len()),
-        ResponseBody::Text(text) => text.len(),
-        ResponseBody::Empty => 0,
+    observation::decision(&snapshot, totals);
+    if let Some(entry) = replaced {
+        observation::outcome(&entry, now, "replaced", totals);
+    }
+    for entry in evicted {
+        observation::outcome(&entry, now, "evicted", totals);
     }
 }
 
-/// Discard a previous representation before an explicit fresh read, so a
-/// later ordinary read cannot fall back to the older cached snapshot.
+fn encode_body(body: &ResponseBody) -> Option<(BodyKind, Vec<u8>)> {
+    match body {
+        ResponseBody::Json(value) => serde_json::to_vec(value)
+            .ok()
+            .map(|bytes| (BodyKind::Json, bytes)),
+        ResponseBody::Text(text) => Some((BodyKind::Text, text.as_bytes().to_vec())),
+        ResponseBody::Empty => Some((BodyKind::Empty, Vec::new())),
+    }
+}
+
+/// Discard a previous representation before an explicit fresh read.
 pub(super) fn invalidate(key: &CacheKey) {
     let Ok(mut cache) = cache().lock() else {
         return;
     };
-    remove(&mut cache, key);
-}
-
-pub(super) fn invalidate_namespace(vendor: &str, base_url: &str) {
-    let Ok(mut cache) = cache().lock() else {
-        return;
-    };
-    let keys: Vec<_> = cache
-        .entries
-        .keys()
-        .filter(|key| key.vendor == vendor && key.url.starts_with(base_url))
-        .cloned()
-        .collect();
-    for key in keys {
-        remove(&mut cache, &key);
+    let removed = remove(&mut cache, key);
+    let totals = observation::Totals::new(&cache);
+    drop(cache);
+    if let Some(entry) = removed {
+        observation::outcome(&entry, Instant::now(), "invalidated", totals);
     }
 }
 
-fn response_ttl(headers: &HeaderMap, config: &CacheConfig) -> Option<Duration> {
+pub(super) fn invalidate_namespace(vendor: &str, base_url: &str) {
+    drain_matching(
+        |key, _| key.vendor == vendor && key.url.starts_with(base_url),
+        "invalidated",
+    );
+}
+
+pub(super) fn maintain(shutdown: bool) {
+    let now = Instant::now();
+    drain_matching(|_, entry| entry.expires_at <= now, "expired");
+    if shutdown {
+        drain_matching(|_, _| true, "session_end");
+    }
+}
+
+fn drain_matching(predicate: impl Fn(&CacheKey, &Entry) -> bool, outcome: &'static str) {
+    let Ok(mut cache) = cache().lock() else {
+        return;
+    };
+    let mut removed = Vec::new();
+    // Snapshot metadata without cloning URL-bearing keys or response buffers.
+    cache.entries.retain(|key, entry| {
+        if predicate(key, entry) {
+            removed.push(Snapshot::new(entry, Instant::now()));
+            false
+        } else {
+            true
+        }
+    });
+    cache.stored_bytes = cache.entries.values().map(|entry| entry.stored_bytes).sum();
+    let totals = observation::Totals::new(&cache);
+    drop(cache);
+    for snapshot in removed {
+        observation::terminal(&snapshot, outcome, totals);
+    }
+}
+
+fn response_ttl(headers: &HeaderMap, config: &CacheConfig) -> Option<(Duration, &'static str)> {
     if headers
         .get(VARY)
         .and_then(|value| value.to_str().ok())
@@ -447,17 +462,22 @@ fn response_ttl(headers: &HeaderMap, config: &CacheConfig) -> Option<Duration> {
         return None;
     }
     if let Some(value) = headers.get(CACHE_CONTROL).and_then(|v| v.to_str().ok()) {
+        if value.split(',').map(str::trim).any(|directive| {
+            directive.eq_ignore_ascii_case("no-store") || directive.eq_ignore_ascii_case("no-cache")
+        }) {
+            return None;
+        }
         for directive in value.split(',').map(str::trim) {
-            if directive.eq_ignore_ascii_case("no-store")
-                || directive.eq_ignore_ascii_case("no-cache")
-            {
-                return None;
-            }
             if let Some(seconds) = directive
                 .strip_prefix("max-age=")
                 .and_then(|value| value.trim_matches('"').parse::<u64>().ok())
             {
-                return (seconds > 0).then(|| Duration::from_secs(seconds).min(config.max_ttl));
+                return (seconds > 0).then(|| {
+                    (
+                        Duration::from_secs(seconds).min(config.max_ttl),
+                        "cache_control",
+                    )
+                });
             }
         }
     }
@@ -465,18 +485,19 @@ fn response_ttl(headers: &HeaderMap, config: &CacheConfig) -> Option<Duration> {
         && let Ok(at) = httpdate::parse_http_date(expires)
         && let Ok(ttl) = at.duration_since(SystemTime::now())
     {
-        return (!ttl.is_zero()).then(|| ttl.min(config.max_ttl));
+        return (!ttl.is_zero()).then(|| (ttl.min(config.max_ttl), "expires"));
     }
-    Some(config.default_ttl.min(config.max_ttl))
+    Some((config.default_ttl.min(config.max_ttl), "default"))
 }
 
-fn remove(cache: &mut Cache, key: &CacheKey) {
-    if let Some(entry) = cache.entries.remove(key) {
-        cache.stored_bytes = cache.stored_bytes.saturating_sub(entry.stored_bytes);
-    }
+fn remove(cache: &mut Cache, key: &CacheKey) -> Option<Entry> {
+    let entry = cache.entries.remove(key)?;
+    cache.stored_bytes = cache.stored_bytes.saturating_sub(entry.stored_bytes);
+    Some(entry)
 }
 
-fn evict(cache: &mut Cache, config: &CacheConfig) {
+fn evict(cache: &mut Cache, config: &CacheConfig) -> Vec<Entry> {
+    let mut removed = Vec::new();
     while cache.entries.len() > config.max_entries || cache.stored_bytes > config.max_bytes {
         let Some(key) = cache
             .entries
@@ -486,11 +507,9 @@ fn evict(cache: &mut Cache, config: &CacheConfig) {
         else {
             break;
         };
-        remove(cache, &key);
-        debug!(
-            entries = cache.entries.len(),
-            bytes = cache.stored_bytes,
-            "evicted HTTP cache entry"
-        );
+        if let Some(entry) = remove(cache, &key) {
+            removed.push(entry);
+        }
     }
+    removed
 }

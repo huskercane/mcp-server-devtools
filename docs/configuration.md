@@ -114,6 +114,7 @@ These settings use the same three-source cascade. When placed in `configs.json`,
 |---|---|---|
 | `ATLASSIAN_REQUEST_TIMEOUT` | `30000` ms; positive integer | Shared upstream HTTP request timeout. Despite the historical name, it applies to the shared HTTP transport. |
 | `HTTP_CACHE_ENABLED` | `false` | Enables the bounded in-process cache for successful upstream reads. |
+| `HTTP_CACHE_EXPLORATION_ENABLED` | `false` | Samples normal TTL (75%), half TTL (12.5%), or reject (12.5%) for eligible admissions. Can increase upstream traffic; see [cache training data](cache-training-data.md). |
 | `HTTP_CACHE_DEFAULT_TTL_SECONDS` | `60`; positive integer | TTL used when the upstream response provides no usable cache lifetime. |
 | `HTTP_CACHE_MAX_TTL_SECONDS` | `3600`; positive integer | Maximum admitted TTL. |
 | `HTTP_CACHE_MAX_ENTRIES` | `512`; positive integer | Maximum cached response count. |

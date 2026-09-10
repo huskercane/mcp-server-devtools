@@ -8,8 +8,8 @@ anything LLM-facing.
 
 ## Toolchain & baseline (match it, don't fragment it)
 
-- Rust is **pinned**: `rust-toolchain.toml` → `1.96.0`, `edition = "2024"`,
-  `rust-version = "1.96"`. Use stable only — no nightly/unstable/preview features.
+- Rust is **pinned**: `rust-toolchain.toml` → `1.98.1`, `edition = "2024"`,
+  `rust-version = "1.98"`. Use stable only — no nightly/unstable/preview features.
 - Dependencies are **exact-pinned** (`=x.y.z`) on purpose. When adding/upgrading a
   dep, pin it the same way and update `Cargo.lock` deliberately; don't loosen
   existing pins to a range.

@@ -2,7 +2,7 @@
 name         = "mcp-server-devtools"
 version      = "0.16.2"
 edition      = "2024"
-rust-version = "1.96"
+rust-version = "1.98"
 description  = "A unified Rust MCP server for developer tools and services."
 license      = "Apache-2.0"
 repository   = "https://github.com/huskercane/mcp-server-devtools"

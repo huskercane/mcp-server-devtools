@@ -14,6 +14,10 @@ use mcp_server_devtools::{audit, cli, logger, server, transport::raw_response};
 async fn main() -> ExitCode {
     logger::init();
     raw_response::init();
+    let (cache_shutdown, cache_stopped) = tokio::sync::oneshot::channel();
+    let cache_worker = tokio::spawn(mcp_server_devtools::transport::maintain_response_cache(
+        cache_stopped,
+    ));
 
     let args: Vec<String> = std::env::args().collect();
     let exit = if args.len() > 1 {
@@ -39,6 +43,8 @@ async fn main() -> ExitCode {
         }
     };
     raw_response::shutdown_and_cleanup().await;
-    audit::shutdown();
+    let _ = cache_shutdown.send(());
+    let _ = cache_worker.await;
+    let _ = tokio::task::spawn_blocking(audit::shutdown).await;
     exit
 }

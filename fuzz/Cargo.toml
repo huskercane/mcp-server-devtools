@@ -2,7 +2,7 @@
 name         = "mcp-server-devtools-fuzz"
 version      = "0.0.0"
 edition      = "2024"
-rust-version = "1.96"
+rust-version = "1.98"
 publish      = false
 description  = "libFuzzer targets for mcp-server-devtools (plan §3.5: canonicalization). Run with `cargo +nightly fuzz run canonicalize` from this directory; the targets are stable code, only the libFuzzer runtime needs nightly."
 
