@@ -12,6 +12,15 @@ pub struct Options {
     #[command(subcommand)]
     pub command: Command,
 }
+// Plain comment, not a doc comment: clap renders doc comments into `--help`,
+// and this enum's text is CLI-facing surface held to parity.
+//
+// `ExchangeOptions` is much larger than `JwksOptions`, but clap's `Subcommand`
+// derive requires each tuple variant's inner type to implement
+// `Args`/`FromArgMatches`, which `Box<ExchangeOptions>` does not — so clippy's
+// suggested boxing will not compile here. Fires only on Windows, where the
+// variant sizes land either side of the lint threshold.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Exchange(ExchangeOptions),
@@ -155,7 +164,12 @@ async fn write_private(path: &Path, token: &str) -> Result<(), &'static str> {
         .map_err(|_| "output_write_failed")?;
     file.sync_all().await.map_err(|_| "output_write_failed")
 }
+/// `async` is kept to match the `#[cfg(unix)]` definition above, which does
+/// await; callers `.await` this regardless of platform, so the signatures of
+/// the two cfg arms have to agree. Only this arm has nothing to await, which
+/// is why the lint fires on Windows alone.
 #[cfg(not(unix))]
+#[allow(clippy::unused_async)]
 async fn write_private(_path: &Path, _token: &str) -> Result<(), &'static str> {
     Err("private_output_requires_unix")
 }
