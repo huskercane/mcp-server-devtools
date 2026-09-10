@@ -31,6 +31,7 @@ use crate::vendor::postman::PostmanVendor;
 use crate::vendor::slack::SlackVendor;
 use crate::vendor::sonarqube::SonarqubeVendor;
 use crate::vendor::splunk::SplunkVendor;
+use crate::vendor::teamcity::TeamcityVendor;
 #[cfg(feature = "wrds")]
 use crate::vendor::wrds::WrdsVendor;
 use crate::vendor::zoom::ZoomVendor;
@@ -56,6 +57,7 @@ pub struct Vendors {
     pub newrelic: NewRelicVendor,
     pub grafana: GrafanaVendor,
     pub sonarqube: SonarqubeVendor,
+    pub teamcity: TeamcityVendor,
     pub splunk: SplunkVendor,
     pub ninjaone: NinjaOneVendor,
     /// WRDS (`PostgreSQL`) vendor. Feature-gated: a `--no-default-features`
@@ -79,6 +81,7 @@ impl Default for Vendors {
             newrelic: NewRelicVendor::new(),
             grafana: GrafanaVendor::new(),
             sonarqube: SonarqubeVendor::new(),
+            teamcity: TeamcityVendor::new(),
             splunk: SplunkVendor::new(),
             ninjaone: NinjaOneVendor::new(),
             #[cfg(feature = "wrds")]

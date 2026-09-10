@@ -2,7 +2,7 @@
 
 A unified Rust MCP server that connects AI assistants to the developer tools and services they use every day.
 
-One binary exposes 71 tools across Atlassian, CI/CD, observability, collaboration, API development, device management, learning, and financial research platforms. It supports stdio and streamable HTTP, keeps credentials out of tool arguments, and provides bounded output with resumable artifacts for large responses.
+One binary exposes 75 tools across Atlassian, CI/CD, observability, collaboration, API development, device management, learning, and financial research platforms. It supports stdio and streamable HTTP, keeps credentials out of tool arguments, and provides bounded output with resumable artifacts for large responses.
 
 ## Integrations
 
@@ -18,12 +18,13 @@ One binary exposes 71 tools across Atlassian, CI/CD, observability, collaboratio
 | edX / Open edX | Six `edx_discussion_*` tools | Bearer token |
 | New Relic | `newrelic_query` | User API key |
 | Grafana / Loki | `grafana_list_datasources`, `grafana_query_logs` | Service-account token |
+| TeamCity | `teamcity_get`, `teamcity_post`, `teamcity_put`, `teamcity_delete` | Personal access token |
 | SonarQube / SonarCloud | `sonarqube_quality_gate`, `sonarqube_search_issues`, `sonarqube_get` | User token |
 | Splunk | Four `splunk_*` search and job tools | Authentication token |
 | NinjaOne | `ninjaone_login`, `ninjaone_get`, and write verbs | Bearer, session, or console credentials |
 | WRDS | Four `wrds_*` discovery and query tools | WRDS username and password |
 
-`artifact_read` is shared across integrations and lets stdio clients retrieve large temporary artifacts in resumable base64 chunks. WRDS contributes four of the 71 tools and is enabled by the default `wrds` Cargo feature.
+`artifact_read` is shared across integrations and lets stdio clients retrieve large temporary artifacts in resumable base64 chunks. WRDS contributes four of the 75 tools and is enabled by the default `wrds` Cargo feature.
 
 The Bitbucket, Jira, and Confluence behavior is ported from the corresponding [`@aashari` Atlassian MCP servers](https://github.com/aashari). The other integrations are native to this project.
 
@@ -318,3 +319,38 @@ List image attachments with `jira_get` using path `/rest/api/3/issue/{issueKey}`
 The attachment tool returns an MCP image block with lossless base64 data, supporting PNG, JPEG, GIF, and WebP up to 5 MiB. Use numeric attachment IDs, not media UUIDs or `blob:` links from rendered comments. `jira_get` remains a text/JSON tool and must not be used to download image bytes.
 
 Downloads use Jira's [attachment content endpoint](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-attachments/) with `redirect=false` and the configured Jira credentials. Non-image and oversized attachments return errors. Rebuild and restart the MCP server, then refresh the client's tool list to expose the new tool.
+
+### TeamCity
+
+Set `TEAMCITY_URL` to your server URL (for example `https://ci.example.com/teamcity`,
+including any deployment context path but without `/app/rest`) and `TEAMCITY_TOKEN`
+to a personal access token created in TeamCity under **My Settings & Tools → Access Tokens**.
+Both may be set in the environment or under the
+`teamcity` section of `~/.mcp/configs.json`:
+
+```json
+{
+  "teamcity": {
+    "environments": {
+      "TEAMCITY_URL": "https://ci.example.com/teamcity",
+      "TEAMCITY_TOKEN": "your-personal-access-token"
+    }
+  }
+}
+```
+
+For OS keychain storage, set `TEAMCITY_TOKEN` to `"keychain"` and store the token with:
+
+```bash
+mcp-devtools creds set --kind TEAMCITY_TOKEN --vendor teamcity --principal TEAMCITY_TOKEN
+```
+
+Use `teamcity_get` with `path: "builds"` and
+`queryParams: {"locator": "buildType:MyBuild,count:20"}` to list builds.
+Paths with `/app/rest/` also work. Supply `fields` to narrow responses and follow
+`nextHref` explicitly for subsequent pages. `teamcity_post` can queue a build with
+`path: "buildQueue"` and `body: {"buildType": {"id": "MyBuild"}}`.
+PUT supports JSON endpoints; raw text/XML request bodies and dedicated build-log
+or artifact download tools are not included.
+
+See the [TeamCity REST API reference](https://www.jetbrains.com/help/teamcity/rest/teamcity-rest-api-documentation.html).

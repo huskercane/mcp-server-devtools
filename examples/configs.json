@@ -1,4 +1,10 @@
 {
+  "teamcity": {
+    "environments": {
+      "TEAMCITY_URL": "https://ci.example.com/teamcity",
+      "TEAMCITY_TOKEN": "keychain"
+    }
+  },
   "bitbucket": {
     "environments": {
       "ATLASSIAN_USER_EMAIL": "you@example.com",

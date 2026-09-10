@@ -4250,6 +4250,258 @@
  },
  {
   "annotations": {
+   "destructiveHint": true,
+   "idempotentHint": true,
+   "openWorldHint": true,
+   "readOnlyHint": false
+  },
+  "description": "Delete TeamCity resources, for example path `builds/id:123`. This is destructive; confirm the intended resource before calling.\n\nGeneric `DELETE` against the TeamCity REST API. Paths may be relative (`projects`) or include `/app/rest/` (`/app/rest/projects`); the prefix is added when absent. Configure `TEAMCITY_URL` as the server URL, including any context path but excluding `/app/rest`, and `TEAMCITY_TOKEN` as a personal access token.\n\nReturns TOON by default; use `outputFormat: \"json\"` for JSON and `jq` for JMESPath filtering. Pass TeamCity `locator` and `fields` through `queryParams`. Pagination is explicit: follow `nextHref` using another call; results are not automatically aggregated.\n\nAPI reference: https://www.jetbrains.com/help/teamcity/rest/teamcity-rest-api-documentation.html\n",
+  "inputSchema": {
+   "$defs": {
+    "OutputFormatArg": {
+     "description": "Serializable/deserializable `OutputFormat` for tool arg surfaces.",
+     "enum": [
+      "toon",
+      "json"
+     ],
+     "type": "string"
+    }
+   },
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+   "properties": {
+    "jq": {
+     "description": "JMESPath expression to filter or transform the response.",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "outputFormat": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/OutputFormatArg"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "description": "Output format: \"toon\" (default) or \"json\"."
+    },
+    "path": {
+     "description": "REST endpoint, e.g. `builds` or `/app/rest/builds/id:123`.",
+     "type": "string"
+    },
+    "queryParams": {
+     "additionalProperties": {
+      "type": "string"
+     },
+     "description": "Query parameters, including `locator` for selection and `fields` for projection.",
+     "type": [
+      "object",
+      "null"
+     ]
+    }
+   },
+   "required": [
+    "path"
+   ],
+   "type": "object"
+  },
+  "name": "teamcity_delete"
+ },
+ {
+  "annotations": {
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": true,
+   "readOnlyHint": true
+  },
+  "description": "Read TeamCity builds, build configurations, projects, agents, and queued builds. For example, path `builds` with queryParams `{\"locator\":\"buildType:MyBuild,count:20\",\"fields\":\"build(id,number,status,webUrl),nextHref\"}`.\n\nGeneric `GET` against the TeamCity REST API. Paths may be relative (`projects`) or include `/app/rest/` (`/app/rest/projects`); the prefix is added when absent. Configure `TEAMCITY_URL` as the server URL, including any context path but excluding `/app/rest`, and `TEAMCITY_TOKEN` as a personal access token.\n\nReturns TOON by default; use `outputFormat: \"json\"` for JSON and `jq` for JMESPath filtering. Pass TeamCity `locator` and `fields` through `queryParams`. Pagination is explicit: follow `nextHref` using another call; results are not automatically aggregated.\n\nAPI reference: https://www.jetbrains.com/help/teamcity/rest/teamcity-rest-api-documentation.html\n",
+  "inputSchema": {
+   "$defs": {
+    "OutputFormatArg": {
+     "description": "Serializable/deserializable `OutputFormat` for tool arg surfaces.",
+     "enum": [
+      "toon",
+      "json"
+     ],
+     "type": "string"
+    }
+   },
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+   "properties": {
+    "jq": {
+     "description": "JMESPath expression to filter or transform the response.",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "outputFormat": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/OutputFormatArg"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "description": "Output format: \"toon\" (default) or \"json\"."
+    },
+    "path": {
+     "description": "REST endpoint, e.g. `builds` or `/app/rest/builds/id:123`.",
+     "type": "string"
+    },
+    "queryParams": {
+     "additionalProperties": {
+      "type": "string"
+     },
+     "description": "Query parameters, including `locator` for selection and `fields` for projection.",
+     "type": [
+      "object",
+      "null"
+     ]
+    }
+   },
+   "required": [
+    "path"
+   ],
+   "type": "object"
+  },
+  "name": "teamcity_get"
+ },
+ {
+  "annotations": {
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true,
+   "readOnlyHint": false
+  },
+  "description": "Create TeamCity resources or trigger/cancel builds. To queue a build, use path `buildQueue` and body `{\"buildType\":{\"id\":\"MyBuild\"}}`. This can start CI jobs.\n\nGeneric `POST` against the TeamCity REST API. Paths may be relative (`projects`) or include `/app/rest/` (`/app/rest/projects`); the prefix is added when absent. Configure `TEAMCITY_URL` as the server URL, including any context path but excluding `/app/rest`, and `TEAMCITY_TOKEN` as a personal access token.\n\nReturns TOON by default; use `outputFormat: \"json\"` for JSON and `jq` for JMESPath filtering. Pass TeamCity `locator` and `fields` through `queryParams`. Pagination is explicit: follow `nextHref` using another call; results are not automatically aggregated.\n\nAPI reference: https://www.jetbrains.com/help/teamcity/rest/teamcity-rest-api-documentation.html\n",
+  "inputSchema": {
+   "$defs": {
+    "OutputFormatArg": {
+     "description": "Serializable/deserializable `OutputFormat` for tool arg surfaces.",
+     "enum": [
+      "toon",
+      "json"
+     ],
+     "type": "string"
+    }
+   },
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+   "properties": {
+    "body": {
+     "description": "JSON request body for the selected endpoint."
+    },
+    "jq": {
+     "description": "JMESPath expression to filter or transform the response.",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "outputFormat": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/OutputFormatArg"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "description": "Output format: \"toon\" (default) or \"json\"."
+    },
+    "path": {
+     "description": "REST endpoint, e.g. `builds` or `/app/rest/builds/id:123`.",
+     "type": "string"
+    },
+    "queryParams": {
+     "additionalProperties": {
+      "type": "string"
+     },
+     "description": "Query parameters, including `locator` for selection and `fields` for projection.",
+     "type": [
+      "object",
+      "null"
+     ]
+    }
+   },
+   "required": [
+    "path",
+    "body"
+   ],
+   "type": "object"
+  },
+  "name": "teamcity_post"
+ },
+ {
+  "annotations": {
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": true,
+   "readOnlyHint": false
+  },
+  "description": "Update TeamCity resources using JSON bodies on endpoints that accept JSON. For example, path `buildQueue/pausedState` and body `{\"paused\":true,\"reason\":\"Maintenance\"}`. Endpoints requiring raw text or XML bodies are not supported by this tool.\n\nGeneric `PUT` against the TeamCity REST API. Paths may be relative (`projects`) or include `/app/rest/` (`/app/rest/projects`); the prefix is added when absent. Configure `TEAMCITY_URL` as the server URL, including any context path but excluding `/app/rest`, and `TEAMCITY_TOKEN` as a personal access token.\n\nReturns TOON by default; use `outputFormat: \"json\"` for JSON and `jq` for JMESPath filtering. Pass TeamCity `locator` and `fields` through `queryParams`. Pagination is explicit: follow `nextHref` using another call; results are not automatically aggregated.\n\nAPI reference: https://www.jetbrains.com/help/teamcity/rest/teamcity-rest-api-documentation.html\n",
+  "inputSchema": {
+   "$defs": {
+    "OutputFormatArg": {
+     "description": "Serializable/deserializable `OutputFormat` for tool arg surfaces.",
+     "enum": [
+      "toon",
+      "json"
+     ],
+     "type": "string"
+    }
+   },
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+   "properties": {
+    "body": {
+     "description": "JSON request body for the selected endpoint."
+    },
+    "jq": {
+     "description": "JMESPath expression to filter or transform the response.",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "outputFormat": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/OutputFormatArg"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "description": "Output format: \"toon\" (default) or \"json\"."
+    },
+    "path": {
+     "description": "REST endpoint, e.g. `builds` or `/app/rest/builds/id:123`.",
+     "type": "string"
+    },
+    "queryParams": {
+     "additionalProperties": {
+      "type": "string"
+     },
+     "description": "Query parameters, including `locator` for selection and `fields` for projection.",
+     "type": [
+      "object",
+      "null"
+     ]
+    }
+   },
+   "required": [
+    "path",
+    "body"
+   ],
+   "type": "object"
+  },
+  "name": "teamcity_put"
+ },
+ {
+  "annotations": {
    "destructiveHint": false,
    "idempotentHint": true,
    "openWorldHint": true,

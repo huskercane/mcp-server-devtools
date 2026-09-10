@@ -17,6 +17,7 @@ pub mod postman;
 pub mod slack;
 pub mod sonarqube;
 pub mod splunk;
+pub mod teamcity;
 pub mod upload;
 #[cfg(feature = "wrds")]
 pub mod wrds;

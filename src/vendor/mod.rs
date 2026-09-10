@@ -37,6 +37,7 @@ pub mod postman;
 pub mod slack;
 pub mod sonarqube;
 pub mod splunk;
+pub mod teamcity;
 #[cfg(feature = "wrds")]
 pub mod wrds;
 pub mod zoom;
