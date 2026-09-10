@@ -148,7 +148,10 @@ async fn modern_tools_list_is_stateless_deterministic_and_cacheable() {
         .iter()
         .map(|tool| tool["name"].as_str().expect("tool name"))
         .collect();
-    assert_eq!(names.len(), if cfg!(feature = "wrds") { 122 } else { 118 });
+    let expected = 118
+        + if cfg!(feature = "wrds") { 4 } else { 0 }
+        + if cfg!(feature = "ninjaone-db") { 3 } else { 0 };
+    assert_eq!(names.len(), expected);
     assert!(names.contains(&"artifact_read"));
     assert!(names.windows(2).all(|pair| pair[0] <= pair[1]));
 }

@@ -4885,6 +4885,204 @@
     }
   },
   {
+    "name": "ninjaone_db_query_central",
+    "description": "Run one read-only SQL query against the central database of an allowlisted\nNinjaOne QA/dev environment.\n\nOnly a single `SELECT` or `WITH ... SELECT` is accepted. The connection target\ncomes exclusively from `NINJAONE_DB_ENVIRONMENTS`; production and arbitrary\nhosts are refused. The session is forced read-only, has a 10-second statement\ntimeout, and limits the returned row count. Select only the columns and rows\nneeded, especially when tables may contain customer data or credentials.\n",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$defs": {
+        "OutputFormatArg": {
+          "description": "Serializable/deserializable `OutputFormat` for tool arg surfaces.",
+          "type": "string",
+          "enum": [
+            "toon",
+            "json"
+          ]
+        }
+      },
+      "required": [
+        "environment",
+        "sql"
+      ],
+      "type": "object",
+      "properties": {
+        "environment": {
+          "description": "Fixed QA/dev alias from `NINJAONE_DB_ENVIRONMENTS`.",
+          "type": "string"
+        },
+        "sql": {
+          "description": "One read-only SELECT or WITH ... SELECT statement against `centraldb`.",
+          "type": "string"
+        },
+        "rowLimit": {
+          "description": "Maximum rows returned. Defaults to 500 and is capped at 10,000.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "jq": {
+          "description": "Optional JMESPath expression to filter/transform the result.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outputFormat": {
+          "description": "Output format: \"toon\" (default) or \"json\".",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OutputFormatArg"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "ninjaone_db_query_division",
+    "description": "Run one read-only SQL query against a NinjaOne division database in an\nallowlisted QA/dev environment.\n\nPass `dbHost` and `dbName` from `ninjaone_db_resolve_division`. `dbHost` is resolved through\nthe selected environment's fixed host allowlist; it is never treated as a raw\nnetwork hostname. If the resolved `dbHost` is null, omit it: the query uses the\nconfigured host automatically when exactly one exists, and otherwise asks for\nan explicit host key. Only a single `SELECT` or `WITH ... SELECT` is accepted. The\nsession is forced read-only, has a 10-second statement timeout, and limits the\nreturned row count. Use a narrow projection and WHERE clause to avoid exposing\nunnecessary customer data.\n",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$defs": {
+        "OutputFormatArg": {
+          "description": "Serializable/deserializable `OutputFormat` for tool arg surfaces.",
+          "type": "string",
+          "enum": [
+            "toon",
+            "json"
+          ]
+        }
+      },
+      "required": [
+        "environment",
+        "dbName",
+        "sql"
+      ],
+      "type": "object",
+      "properties": {
+        "environment": {
+          "description": "Fixed QA/dev alias from `NINJAONE_DB_ENVIRONMENTS`.",
+          "type": "string"
+        },
+        "dbHost": {
+          "description": "`db_host` key returned by `resolve_division`. It must map to a connection\nin the selected environment's `divisionHosts` allowlist. May be omitted\nwhen the environment configures exactly one division host.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dbName": {
+          "description": "Physical `div_<company>_<suffix>` database name returned by\n`resolve_division`.",
+          "type": "string"
+        },
+        "sql": {
+          "description": "One read-only SELECT or WITH ... SELECT statement.",
+          "type": "string"
+        },
+        "rowLimit": {
+          "description": "Maximum rows returned. Defaults to 500 and is capped at 10,000.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "jq": {
+          "description": "Optional JMESPath expression to filter/transform the result.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outputFormat": {
+          "description": "Output format: \"toon\" (default) or \"json\".",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OutputFormatArg"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "ninjaone_db_resolve_division",
+    "description": "Resolve a NinjaOne division in an allowlisted QA/dev environment.\n\nUse the `divisionUid` from `/ws/webapp/sessionproperties`, an exact `div_...`\ndatabase name, a `db_host`, or a partial database/hostname fragment. This tool\nqueries only that environment's central `division` table and returns the\nphysical database metadata needed by `ninjaone_db_query_division`. It never connects to\nthe division database. Production and arbitrary hosts are not supported.\n",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$defs": {
+        "OutputFormatArg": {
+          "description": "Serializable/deserializable `OutputFormat` for tool arg surfaces.",
+          "type": "string",
+          "enum": [
+            "toon",
+            "json"
+          ]
+        }
+      },
+      "required": [
+        "environment",
+        "division"
+      ],
+      "type": "object",
+      "properties": {
+        "environment": {
+          "description": "Fixed QA/dev alias from `NINJAONE_DB_ENVIRONMENTS`, e.g. `qa5` or\n`dev-backup2`. Arbitrary hosts and production aliases are rejected.",
+          "type": "string"
+        },
+        "division": {
+          "description": "Division UID, exact `div_...` database name, `db_host`, or a partial\ndatabase/hostname fragment.",
+          "type": "string"
+        },
+        "jq": {
+          "description": "Optional JMESPath expression to filter/transform matching rows.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outputFormat": {
+          "description": "Output format: \"toon\" (default) or \"json\".",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OutputFormatArg"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true
+    }
+  },
+  {
     "name": "ninjaone_delete",
     "description": "DELETE a resource through a NinjaOne API endpoint on a configured server. Pass `server` as an alias from `NINJAONE_SERVERS`, or omit it to use `NINJAONE_URL`. This is destructive: verify the server, path, resource ID, and query parameters before calling. The MCP server adds authentication.\n",
     "inputSchema": {

@@ -32,6 +32,8 @@ use crate::vendor::jira::JiraVendor;
 use crate::vendor::mend::MendVendor;
 use crate::vendor::newrelic::NewRelicVendor;
 use crate::vendor::ninjaone::NinjaOneVendor;
+#[cfg(feature = "ninjaone-db")]
+use crate::vendor::ninjaone_db::NinjaOneDbVendor;
 use crate::vendor::postman::PostmanVendor;
 use crate::vendor::sentry::SentryVendor;
 use crate::vendor::slack::SlackVendor;
@@ -76,6 +78,8 @@ pub struct Vendors {
     pub mend: MendVendor,
     pub splunk: SplunkVendor,
     pub ninjaone: NinjaOneVendor,
+    #[cfg(feature = "ninjaone-db")]
+    pub ninjaone_db: NinjaOneDbVendor,
     /// WRDS (`PostgreSQL`) vendor. Feature-gated: a `--no-default-features`
     /// build drops the Postgres dependency tree entirely, so this field and
     /// the `wrds_*` tools do not exist.
@@ -108,6 +112,8 @@ impl Default for Vendors {
             mend: MendVendor::new(),
             splunk: SplunkVendor::new(),
             ninjaone: NinjaOneVendor::new(),
+            #[cfg(feature = "ninjaone-db")]
+            ninjaone_db: NinjaOneDbVendor::new(),
             #[cfg(feature = "wrds")]
             wrds: WrdsVendor::new(),
         }

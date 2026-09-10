@@ -387,3 +387,54 @@ are documented in [package operations](../deploy/packages/README.md).
 The [Compose reference](../deploy/compose/README.md) runs `all` behind TLS
 with persistent journal, rollup and policy volumes. Environment changes
 require restarting the service; JWKS file contents are checked automatically.
+
+## NinjaOne QA/dev database tools
+
+The default `ninjaone-db` Cargo feature adds `ninjaone_db_resolve_division`,
+`ninjaone_db_query_central`, and `ninjaone_db_query_division`. Connections are
+opened only when a tool is called. Builds without this feature omit these tools;
+WRDS can be enabled independently.
+
+Set `NINJAONE_DB_ENVIRONMENTS` in the `ninjaone` section of `configs.json` as a
+nested object or a JSON-encoded string. Environment variables accept the encoded
+string form. Use database accounts with read-only privileges.
+
+```json
+{
+  "ninjaone": {
+    "environments": {
+      "NINJAONE_DB_ENVIRONMENTS": {
+        "qa5": {
+          "centralHost": "central.qa5.internal",
+          "username": "central_reader",
+          "password": "replace-with-central-password",
+          "divisionHosts": {
+            "db-host-1": {
+              "host": "division-1.qa5.internal",
+              "username": "division_reader",
+              "password": "replace-with-division-password"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Aliases must start with `qa` or `dev`; other aliases cause the entire document
+to be rejected. `centralDatabase` defaults to `centraldb`, `port` to `5432`, and
+`sslMode` to `require`. Division host entries may also be hostname strings,
+which inherit the environment's credentials and connection settings. Tool
+arguments select a configured host key, never an arbitrary hostname.
+
+Resolve a division first, then pass its `db_name` and `db_host` to the division
+query tool. `dbHost` can be omitted when only one division host is configured.
+Queries accept one `SELECT` or `WITH ... SELECT`, run in a read-only transaction,
+and use a ten-second statement timeout. Results default to 500 rows and are
+capped at 10,000; division lookups return at most 25 rows. All three tools support
+`jq` and `outputFormat`.
+
+`sslMode: "prefer"` permits plaintext fallback when the server declines TLS.
+`allowInvalidCertificates: true` explicitly disables server certificate
+verification for a QA/dev connection; its default is `false`.

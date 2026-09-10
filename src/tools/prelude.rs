@@ -42,3 +42,6 @@ pub(crate) use super::args::{
 pub(crate) use super::args::{
     WrdsDescribeTableArgs, WrdsListLibrariesArgs, WrdsListTablesArgs, WrdsQueryArgs,
 };
+
+#[cfg(feature = "ninjaone-db")]
+pub(crate) use super::args::{QueryCentralDbArgs, QueryDivisionDbArgs, ResolveDivisionArgs};

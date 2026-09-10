@@ -18,6 +18,8 @@ pub mod jira;
 pub mod mend;
 pub mod newrelic;
 pub mod ninjaone;
+#[cfg(feature = "ninjaone-db")]
+pub mod ninjaone_db;
 pub mod postman;
 pub mod segment;
 pub mod sentry;

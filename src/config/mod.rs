@@ -667,6 +667,9 @@ fn read_environments_at(root: &Value, key: &str) -> Option<HashMap<String, Strin
                 Value::String(s) => Some((k.clone(), s.clone())),
                 Value::Bool(b) => Some((k.clone(), b.to_string())),
                 Value::Number(n) => Some((k.clone(), n.to_string())),
+                Value::Object(_) if k == "NINJAONE_DB_ENVIRONMENTS" => {
+                    serde_json::to_string(v).ok().map(|text| (k.clone(), text))
+                }
                 _ => None,
             })
             .collect(),

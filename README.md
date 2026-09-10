@@ -21,7 +21,7 @@ One binary provides 122 tools across Atlassian, CI/CD, observability, collaborat
 | TeamCity | `teamcity_get`, `teamcity_post`, `teamcity_put`, `teamcity_delete` | Personal access token |
 | SonarQube / SonarCloud | `sonarqube_quality_gate`, `sonarqube_search_issues`, `sonarqube_get` | User token |
 | Splunk | Four `splunk_*` search and job tools | Authentication token |
-| NinjaOne | `ninjaone_login`, `ninjaone_get`, and write verbs | Bearer, session, or console credentials |
+| NinjaOne | REST tools plus three `ninjaone_db_*` database tools | REST credentials; separate QA/dev PostgreSQL credentials |
 | GitHub | Ten `github_*` repository, PR, issue, workflow and job-log tools | Personal access token |
 | GitLab | Ten `gitlab_*` project, MR, issue, pipeline and trace tools | Access token |
 | Figma | Five `figma_*` file, node, component, comment and PNG export tools | Personal access token |
@@ -32,7 +32,7 @@ One binary provides 122 tools across Atlassian, CI/CD, observability, collaborat
 | Mend | Four `mend_*` application, project and SCA finding tools | User key with automatic token exchange |
 | WRDS | Four `wrds_*` discovery and query tools | WRDS username and password |
 
-`artifact_read` is shared across integrations and lets stdio clients retrieve large temporary artifacts in resumable base64 chunks. WRDS contributes four of the 122 tools and is enabled by the default `wrds` Cargo feature.
+`artifact_read` is shared across integrations and lets stdio clients retrieve large temporary artifacts in resumable base64 chunks. WRDS contributes four tools via the default `wrds` Cargo feature; NinjaOne database access adds three via the default `ninjaone-db` feature. With default features, all integrations expose 125 tools. See [NinjaOne database configuration](docs/configuration.md#ninjaone-qadev-database-tools).
 
 By default, `MCP_ENABLED_VENDORS=auto` advertises configured integrations, plus `artifact_read`. Set a comma-separated list such as `github,gitlab,sentry` to select integrations explicitly, or `all` for the full inventory (118 tools without default features). Selection is fixed for each MCP session; reconnect after changing it. Credentials remain validated when a tool is called.
 

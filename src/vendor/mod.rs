@@ -38,6 +38,10 @@ pub mod jira;
 pub mod mend;
 pub mod newrelic;
 pub mod ninjaone;
+#[cfg(feature = "ninjaone-db")]
+pub mod ninjaone_db;
+#[cfg(any(feature = "wrds", feature = "ninjaone-db"))]
+pub mod postgres;
 pub mod postman;
 pub mod sentry;
 pub mod slack;

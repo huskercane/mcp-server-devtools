@@ -178,3 +178,49 @@ fn explicit_session_selection_filters_discovery_and_refuses_disabled_calls() {
             .contains("disabled")
     );
 }
+
+#[cfg(feature = "ninjaone-db")]
+#[test]
+fn ninjaone_database_tools_follow_vendor_selection_and_reject_writes() {
+    let listed = live_exchange(
+        "ninjaone",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+    );
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    let mut names: Vec<_> = tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .filter(|name| name.starts_with("ninjaone_db_"))
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "ninjaone_db_query_central",
+            "ninjaone_db_query_division",
+            "ninjaone_db_resolve_division"
+        ]
+    );
+    let called = live_exchange(
+        "ninjaone",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ninjaone_db_query_central","arguments":{"environment":"qa5","sql":"DELETE FROM device"}}}"#,
+    );
+    assert_eq!(called["result"]["isError"], true);
+    assert!(
+        called["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("is not allowed")
+    );
+    let disabled = live_exchange(
+        "github",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ninjaone_db_query_central","arguments":{"environment":"qa5","sql":"SELECT 1"}}}"#,
+    );
+    assert_eq!(disabled["error"]["code"], -32602);
+    assert!(
+        disabled["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("disabled")
+    );
+}
