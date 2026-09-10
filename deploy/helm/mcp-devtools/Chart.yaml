@@ -2,5 +2,5 @@ apiVersion: v2
 name: mcp-devtools
 description: MCP DevTools gateway and control roles
 version: 0.1.0
-appVersion: "0.16.1"
+appVersion: "0.16.2"
 type: application
